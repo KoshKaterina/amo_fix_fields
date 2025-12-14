@@ -1,4 +1,5 @@
-﻿import logging
+﻿import datetime
+import logging
 import re
 from pprint import pprint
 
@@ -11,6 +12,9 @@ from help_function import parse_the_cart_field, get_nested, get_custom_field_val
 app = FastAPI()
 
 logger = logging.getLogger("uvicorn")
+
+lead_last_processed = {}
+RATE_LIMIT_SECONDS = 5
 
 
 def insert_nested(data, keys, value):
@@ -31,7 +35,9 @@ async def lead_change(request: Request):
         keys = re.findall(r'([^\[\]]+)', raw_key)
         insert_nested(nested, keys, value)
 
-    ## parsing the specific lead_id
+    ## parsing the specific lead_id#
+
+
 
     goods = None
     delivery_type = None
@@ -40,6 +46,18 @@ async def lead_change(request: Request):
     lead_id = await get_nested(nested, ["leads", "update", "0", "id"])
     if lead_id is None:
         lead_id = await get_nested(nested, ["leads", "add", "0", "id"])
+
+    modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
+
+    logger.info(f'lead_id: {lead_id}, modified_by: {modified_by}')
+
+    current_time = datetime.datetime.now()
+    if lead_id in lead_last_processed:
+        if current_time - lead_last_processed[lead_id] < RATE_LIMIT_SECONDS:
+            logger.info(f"Rate limit hit for lead {lead_id}, skipping.")
+            return HTTP_200_OK
+
+    lead_last_processed[lead_id] = current_time
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
 
