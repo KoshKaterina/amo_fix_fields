@@ -52,7 +52,6 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
 
     logger.info(f'lead_id: {lead_id}, modified_by: {modified_by}')
 
-    current_time = datetime.datetime.now()
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
 
@@ -89,6 +88,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                 logger.info("MATCH: Data is identical (ignoring whitespace).")
                 return HTTP_200_OK
             else:
+                current_time = datetime.datetime.now()
                 if lead_id in lead_last_processed:
                     if (current_time - lead_last_processed[lead_id]).seconds < RATE_LIMIT_SECONDS:
                         logger.info(f"Rate limit hit for lead {lead_id}")
