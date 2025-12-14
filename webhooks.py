@@ -15,7 +15,7 @@ app = FastAPI()
 logger = logging.getLogger("uvicorn")
 
 lead_last_processed = {}
-RATE_LIMIT_SECONDS = 1
+RATE_LIMIT_SECONDS = 3
 
 
 def insert_nested(data, keys, value):
@@ -96,6 +96,12 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                         logger.info(f"Will handle in {execute_after_seconds} seconds")
                         background_tasks.add_task(update_info_later, goods, delivery_type, delivery_address, lead_id, execute_after_seconds, lead_last_processed)
                         return HTTP_200_OK
+                    else:
+                        logger.info(f'No limits are hit, updating lead {lead_id}')
+                        lead_last_processed[lead_id] = current_time
+                        await add_info_from_ms(goods=goods, delivery_type=delivery_type,
+                                               delivery_address=delivery_address, lead_id=lead_id)
+                        logger.info("MISMATCH: Updating info...")
                 else:
                     lead_last_processed[lead_id] = current_time
                     await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id)
