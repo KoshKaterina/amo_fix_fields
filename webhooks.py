@@ -53,7 +53,7 @@ async def lead_change(request: Request):
 
     current_time = datetime.datetime.now()
     if lead_id in lead_last_processed:
-        if current_time - lead_last_processed[lead_id] < RATE_LIMIT_SECONDS:
+        if (current_time - lead_last_processed[lead_id]).seconds < RATE_LIMIT_SECONDS:
             logger.info(f"Rate limit hit for lead {lead_id}, skipping.")
             return HTTP_200_OK
 
