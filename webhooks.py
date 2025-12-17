@@ -66,6 +66,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                 delivery_address = info["values"]['0']['value']
             if info['id'] == '576720':
                 lead_name = info["values"]['0']['value']
+                print(f'lead_name: {lead_name}')
         if goods is not None or delivery_type is not None or delivery_address is not None or lead_id is not None:
             # check if info is already correct
             current_info = await get_lead_by_id(lead_id)
