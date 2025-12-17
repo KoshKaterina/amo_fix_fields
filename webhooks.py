@@ -65,7 +65,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             if info['id'] == '576719':
                 delivery_address = info["values"]['0']['value']
             if info['id'] == '577415':
-                lead_name = info["values"]['0']['value']
+                lead_name = f'Заказ №{info["values"]['0']['value']}'
                 logger.info(f'lead_name: {lead_name}')
         if goods is not None or delivery_type is not None or delivery_address is not None or lead_id is not None:
             # check if info is already correct
@@ -89,7 +89,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_address_match = True
             if lead_name:
-                is_name_match = await normalize_text(current_lead_name) == 'Заказ №' + (await normalize_text(lead_name))
+                is_name_match = await normalize_text(current_lead_name) == await normalize_text(lead_name)
             else:
                 is_name_match = True
 
