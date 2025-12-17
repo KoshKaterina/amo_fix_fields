@@ -91,4 +91,4 @@ async def normalize_text(text: str) -> str | None:
     if not text:
         return None
     # Replace all whitespace characters ( \t\n\r\f\v) with an empty string
-    return re.sub(r'\s+', '', str(text))
+    return re.sub(r'\s+', '', str(text.lower()))

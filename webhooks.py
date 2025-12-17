@@ -89,7 +89,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_address_match = True
             if lead_name:
-                is_name_match = await normalize_text(current_lead_name) == await normalize_text(lead_name)
+                is_name_match = await normalize_text(current_lead_name) == await normalize_text(current_info["name"])
             else:
                 is_name_match = True
 
