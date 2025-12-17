@@ -64,7 +64,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                 goods, delivery_type = await parse_the_cart_field(order_summary)
             if info['id'] == '576719':
                 delivery_address = info["values"]['0']['value']
-            if info['id'] == '576720':
+            if info['id'] == '577415':
                 lead_name = info["values"]['0']['value']
                 logger.info(f'lead_name: {lead_name}')
         if goods is not None or delivery_type is not None or delivery_address is not None or lead_id is not None:
