@@ -54,7 +54,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name
         'custom_fields_values': custom_fields,
     }
     if name:
-        body['name'] = f'Заказ №{name}'
+        body['name'] = name
 
     print(body)
 
