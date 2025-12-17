@@ -83,12 +83,12 @@ async def get_custom_field_value(data: dict, field_id: int, default: Any = None)
     return default
 
 
-async def normalize_text(text: str) -> str:
+async def normalize_text(text: str) -> str | None:
     """
     Removes all whitespace (spaces, tabs, newlines) from the text
     to allow for 'content-only' comparison.
     """
     if not text:
-        return ""
+        return None
     # Replace all whitespace characters ( \t\n\r\f\v) with an empty string
     return re.sub(r'\s+', '', str(text))
