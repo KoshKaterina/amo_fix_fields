@@ -56,6 +56,8 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name
     if name:
         body['name'] = f'Заказ №{name}'
 
+    print(body)
+
     async with httpx.AsyncClient() as client:
         response = await client.patch(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers, json=body)
         print(f'RESPONSE: {response}', f'RESPONSE JSON: {response.json()}')

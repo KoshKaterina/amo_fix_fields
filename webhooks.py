@@ -110,6 +110,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                         await add_info_from_ms(goods=goods, delivery_type=delivery_type,
                                                delivery_address=delivery_address, lead_id=lead_id, name=lead_name)
                         logger.info("MISMATCH: Updating info...")
+                        logger.info(f'UPDATING:\n goods: {is_goods_match}\n delivery_type: {is_delivery_match}\n delivery_address: {is_delivery_match}\n lead_name: {lead_name}')
                 else:
                     lead_last_processed[lead_id] = current_time
                     await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id, name=lead_name)
