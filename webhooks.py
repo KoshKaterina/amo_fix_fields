@@ -89,12 +89,11 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_address_match = True
             if lead_name:
-                is_lead_match = await normalize_text(current_lead_name) == await normalize_text(lead_name)
-                logger.info(await normalize_text(current_lead_name), '\n', await normalize_text(lead_name), '\n')
+                is_name_match = await normalize_text(current_lead_name) == 'Заказ №' + (await normalize_text(lead_name))
             else:
-                is_lead_match = True
+                is_name_match = True
 
-            if is_goods_match and is_delivery_match and is_address_match and is_lead_match:
+            if is_goods_match and is_delivery_match and is_address_match and is_name_match:
                 logger.info("MATCH: Data is identical (ignoring whitespace).")
                 return HTTP_200_OK
             else:
