@@ -1,4 +1,5 @@
-﻿import os
+﻿import asyncio
+import os
 from pprint import pprint
 
 from dotenv import load_dotenv
@@ -35,7 +36,7 @@ async def get_lead_by_id(lead_id):
         return response
 
 
-async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id):
+async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name):
 
     custom_fields = []
     if goods:
@@ -52,6 +53,9 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id):
         'id': lead_id,
         'custom_fields_values': custom_fields,
     }
+    if name:
+        body['name'] = f'Заказ №{name}'
+
     async with httpx.AsyncClient() as client:
         response = await client.patch(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers, json=body)
         print(f'RESPONSE: {response}', f'RESPONSE JSON: {response.json()}')
@@ -68,3 +72,5 @@ async def create_custom_field(value, id):
         }
     return new_field
 
+if __name__ == '__main__':
+    asyncio.run(get_lead_by_id(36337387))
