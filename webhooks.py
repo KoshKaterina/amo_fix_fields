@@ -81,11 +81,11 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_goods_match = True
             if delivery_type:
-                is_delivery_match = await normalize_text(current_delivery_type) == await fix_delivery_address_for_cdek(await normalize_text(delivery_type))
+                is_delivery_match = await normalize_text(current_delivery_type) == await normalize_text(delivery_type)
             else:
                 is_delivery_match = True
             if delivery_address:
-                is_address_match = await normalize_text(current_delivery_address) == await normalize_text(delivery_address)
+                is_address_match = await normalize_text(current_delivery_address) == await fix_delivery_address_for_cdek(await normalize_text(delivery_address))
             else:
                 is_address_match = True
             if lead_name:
