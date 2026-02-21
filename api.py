@@ -1,11 +1,14 @@
 ﻿import asyncio
 import os
+import logging
 from pprint import pprint
 
 from dotenv import load_dotenv
 import httpx
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn")
 
 integration_id = os.environ.get('INTEGRATION_ID')
 secret_key = os.getenv('SECRET_KEY')
@@ -32,8 +35,16 @@ async def auth():
 
 async def get_lead_by_id(lead_id):
     async with httpx.AsyncClient() as client:
-        response = (await client.get(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers)).json()
-        return response
+        try:
+            response = await client.get(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"AmoCRM error {response.status_code} for lead {lead_id}: {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Request error fetching lead {lead_id}: {e}")
+            return None
 
 async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name):
 
@@ -56,8 +67,14 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name
         body['name'] = name
 
     async with httpx.AsyncClient() as client:
-        response = await client.patch(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers, json=body)
-        print(f'RESPONSE: {response}', f'RESPONSE JSON: {response.json()}')
+        try:
+            response = await client.patch(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers, json=body)
+            if response.status_code in [200, 204]:
+                logger.info(f"Successfully updated lead {lead_id}")
+            else:
+                logger.error(f"Failed to update lead {lead_id}: {response.status_code} {response.text}")
+        except Exception as e:
+            logger.error(f"Error patching lead {lead_id}: {e}")
 
 
 async def create_custom_field(value, id):

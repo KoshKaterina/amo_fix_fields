@@ -85,7 +85,8 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_delivery_match = True
             if delivery_address:
-                is_address_match = await normalize_text(current_delivery_address) == await fix_delivery_address_for_cdek(await normalize_text(delivery_address))
+                fixed_incoming_address = await fix_delivery_address_for_cdek(delivery_address)
+                is_address_match = await normalize_text(current_delivery_address) == await normalize_text(fixed_incoming_address)
             else:
                 is_address_match = True
             if lead_name:
@@ -104,9 +105,10 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                     delivery_address = await fix_delivery_address_for_cdek(delivery_address)
                 current_time = datetime.datetime.now()
                 if lead_id in lead_last_processed:
-                    if (current_time - lead_last_processed[lead_id]).seconds < RATE_LIMIT_SECONDS:
+                    elapsed_seconds = (current_time - lead_last_processed[lead_id]).seconds
+                    if elapsed_seconds < RATE_LIMIT_SECONDS:
                         logger.info(f"Rate limit hit for lead {lead_id}")
-                        execute_after_seconds = (current_time - lead_last_processed[lead_id]).seconds
+                        execute_after_seconds = RATE_LIMIT_SECONDS - elapsed_seconds
                         logger.info(f"Will handle in {execute_after_seconds} seconds")
                         background_tasks.add_task(update_info_later, goods, delivery_type, delivery_address, lead_id, lead_name, execute_after_seconds, lead_last_processed)
                         return HTTP_200_OK
@@ -116,7 +118,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                         await add_info_from_ms(goods=goods, delivery_type=delivery_type,
                                                delivery_address=delivery_address, lead_id=lead_id, name=lead_name)
                         logger.info("MISMATCH: Updating info...")
-                        logger.info(f'UPDATING:\n goods: {is_goods_match}\n delivery_type: {is_delivery_match}\n delivery_address: {is_delivery_match}\n lead_name: {lead_name}')
+                        logger.info(f'UPDATING:\n goods: {is_goods_match}\n delivery_type: {is_delivery_match}\n delivery_address: {is_address_match}\n lead_name: {lead_name}')
                 else:
                     lead_last_processed[lead_id] = current_time
                     await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id, name=lead_name)
