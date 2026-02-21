@@ -35,7 +35,6 @@ async def get_lead_by_id(lead_id):
         response = (await client.get(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers)).json()
         return response
 
-
 async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name):
 
     custom_fields = []
@@ -76,5 +75,3 @@ async def create_custom_field(value, id):
 
 if __name__ == '__main__':
     asyncio.run(get_lead_by_id(36337387))
-
-    #meow aoaooaaoaaoa sjfhsdjhjsd
