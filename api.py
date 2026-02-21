@@ -32,7 +32,8 @@ async def auth():
 
 async def get_lead_by_id(lead_id):
     async with httpx.AsyncClient() as client:
-        response = (await client.get(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers)).json()
+        response = (await client.get(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/custom_fields', headers=headers)).json()
+        pprint(response)
         return response
 
 

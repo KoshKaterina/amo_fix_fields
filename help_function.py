@@ -1,5 +1,6 @@
 ﻿import re
 from typing import Tuple, Any, Iterable
+import re
 
 DELIVERY_PREFIXES = (
     "CDEK",
@@ -92,3 +93,20 @@ async def normalize_text(text: str) -> str | None:
         return None
     # Replace all whitespace characters ( \t\n\r\f\v) with an empty string
     return re.sub(r'\s+', '', str(text.lower()))
+
+
+
+
+async def fix_delivery_address_for_cdek(address: str) -> str:
+    # Шаблон: 2 или более заглавные латинские буквы, за которыми сразу идут цифры
+    pattern = r'[A-Z]{2,}\d+'
+    
+    # Ищем совпадение в строке
+    match = re.search(pattern, address)
+    
+    # Если совпадение найдено, возвращаем только его
+    if match:
+        return match.group(0)
+    
+    # Если совпадений нет, возвращаем исходную строку
+    return address
