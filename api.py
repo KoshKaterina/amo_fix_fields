@@ -71,10 +71,13 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name
             response = await client.patch(f'https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}', headers=headers, json=body)
             if response.status_code in [200, 204]:
                 logger.info(f"Successfully updated lead {lead_id}")
+                return True
             else:
                 logger.error(f"Failed to update lead {lead_id}: {response.status_code} {response.text}")
+                return False
         except Exception as e:
             logger.error(f"Error patching lead {lead_id}: {e}")
+            return False
 
 
 async def create_custom_field(value, id):
