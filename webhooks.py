@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from starlette.status import HTTP_200_OK
 
 from api import add_info_from_ms, get_lead_by_id
-from help_function import fix_delivery_address_for_cdek, parse_the_cart_field, get_nested, get_custom_field_value, normalize_text
+from help_function import parse_the_cart_field, get_nested, get_custom_field_value, normalize_text
 from memory import update_info_later
 
 app = FastAPI()
@@ -85,13 +85,13 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_delivery_match = True
             if delivery_address:
-                fixed_incoming_address = await fix_delivery_address_for_cdek(delivery_address)
-                is_address_match = await normalize_text(current_delivery_address) == await normalize_text(fixed_incoming_address)
+                is_address_match = await normalize_text(current_delivery_address) == await normalize_text(delivery_address)
             else:
                 is_address_match = True
             if lead_name:
                 normalized_name = await normalize_text(lead_name)
-                normalized_current_name = await normalize_text(current_info["name"])
+                current_name = current_info.get("name") if isinstance(current_info, dict) else None
+                normalized_current_name = await normalize_text(current_name)
                 is_name_match = normalized_name == normalized_current_name
                 logger.info(f'normalized_name: {normalized_name}, normalized_current_name: {normalized_current_name}')
             else:
@@ -101,8 +101,6 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                 logger.info("MATCH: Data is identical (ignoring whitespace).")
                 return HTTP_200_OK
             else:
-                if not is_address_match:
-                    delivery_address = await fix_delivery_address_for_cdek(delivery_address)
                 current_time = datetime.datetime.now()
                 if lead_id in lead_last_processed:
                     elapsed_seconds = (current_time - lead_last_processed[lead_id]).seconds
