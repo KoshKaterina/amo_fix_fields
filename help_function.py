@@ -6,6 +6,7 @@ DELIVERY_PREFIXES = (
     "CDEK",
     "Доставка курьером",
     "Самовывоз",
+    "Наценка за наложенный платеж"
 )
 
 async def parse_the_cart_field(data: str):
