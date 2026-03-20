@@ -7,7 +7,7 @@ from api import add_info_from_ms
 logger = logging.getLogger("uvicorn")
 
 
-async def update_info_later(goods, delivery_type, delivery_address, lead_id, name, execute_after, lead_last_processed):
+async def update_info_later(goods, delivery_type, delivery_address, lead_id, name, execute_after, lead_last_processed, promo_type=None, comment=None):
     max_retries = 5
     base_delay = max(1, int(execute_after))
 
@@ -24,6 +24,8 @@ async def update_info_later(goods, delivery_type, delivery_address, lead_id, nam
                 delivery_address=delivery_address,
                 lead_id=lead_id,
                 name=name,
+                promo_type=promo_type,
+                comment=comment,
             )
             if is_ok:
                 lead_last_processed[lead_id] = datetime.now()

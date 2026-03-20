@@ -30,6 +30,17 @@ async def parse_the_cart_field(data: str):
 
     return products_str, deliveries_str
 
+async def parse_the_cart_field_2(data: str):
+    promos_str = ""
+    comments_str = data.strip() if isinstance(data, str) else ""
+
+    if isinstance(data, str):
+        m = re.search(r"Promo:\s*([^\s]+)(?:\s+(.*))?", data)
+        if m:
+            promos_str = (m.group(1) or "").strip()
+            comments_str = (m.group(2) or "").strip()
+
+    return promos_str, comments_str
 
 _MISSING = object()
 

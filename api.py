@@ -46,7 +46,7 @@ async def get_lead_by_id(lead_id):
             logger.error(f"Request error fetching lead {lead_id}: {e}")
             return None
 
-async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name):
+async def add_info_from_ms(goods, delivery_type, delivery_address, comment, promo_type, lead_id, name):
 
     custom_fields = []
     if goods:
@@ -55,6 +55,10 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, lead_id, name
         custom_fields.append(await create_custom_field(delivery_type, 577315))
     if delivery_address:
         custom_fields.append(await create_custom_field(delivery_address, 577311))
+    if comment:
+        custom_fields.append(await create_custom_field(comment, 570657))
+    if promo_type:
+        custom_fields.append(await create_custom_field(promo_type, 570661))
 
 
 

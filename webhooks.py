@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from starlette.status import HTTP_200_OK
 
 from api import add_info_from_ms, get_lead_by_id
-from help_function import parse_the_cart_field, get_nested, get_custom_field_value, normalize_text
+from help_function import parse_the_cart_field, get_nested, get_custom_field_value, normalize_text, parse_the_cart_field_2
 from memory import update_info_later
 
 app = FastAPI()
@@ -44,6 +44,8 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
     delivery_type = None
     delivery_address = None
     lead_name = None
+    promo_type = None
+    comment = None
 
     lead_id = await get_nested(nested, ["leads", "update", "0", "id"])
     if lead_id is None:
@@ -62,17 +64,23 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             if info['id'] == '576703':
                 order_summary = info["values"]['0']['value']
                 goods, delivery_type = await parse_the_cart_field(order_summary)
+            if info['id'] == '576711':
+                comment_summary = info["values"]['0']['value']
+                promo_type, comment = await parse_the_cart_field_2(comment_summary)
+
             if info['id'] == '576719':
                 delivery_address = info["values"]['0']['value']
             if info['id'] == '577415':
                 lead_name = f'Заказ №{info["values"]['0']['value']}'
                 logger.info(f'lead_name: {lead_name}')
-        if goods is not None or delivery_type is not None or delivery_address is not None or lead_id is not None:
+        if goods is not None or delivery_type is not None or delivery_address is not None or lead_id is not None or promo_type is not None or comment is not None:
             # check if info is already correct
             current_info = await get_lead_by_id(lead_id)
             current_goods = await get_custom_field_value(current_info, 577313)
             current_delivery_type = await get_custom_field_value(current_info, 577315)
             current_delivery_address = await get_custom_field_value(current_info, 577311)
+            current_promo_type = await get_custom_field_value(current_info, 570661)
+            current_comment = await get_custom_field_value(current_info, 570657)
             current_lead_name = await get_custom_field_value(current_info, 576720)
 
             ## matching ignoring the spaces
@@ -97,7 +105,16 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             else:
                 is_name_match = True
 
-            if is_goods_match and is_delivery_match and is_address_match and is_name_match:
+            if promo_type:
+                is_promo_match = await normalize_text(current_promo_type) == await normalize_text(promo_type)
+            else:
+                is_promo_match = True
+            if comment:
+                is_comment_match = await normalize_text(current_comment) == await normalize_text(comment)
+            else:
+                is_comment_match = True
+
+            if is_goods_match and is_delivery_match and is_address_match and is_name_match and is_promo_match and is_comment_match:
                 logger.info("MATCH: Data is identical (ignoring whitespace).")
                 return HTTP_200_OK
             else:
@@ -108,18 +125,19 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                         logger.info(f"Rate limit hit for lead {lead_id}")
                         execute_after_seconds = RATE_LIMIT_SECONDS - elapsed_seconds
                         logger.info(f"Will handle in {execute_after_seconds} seconds")
-                        background_tasks.add_task(update_info_later, goods, delivery_type, delivery_address, lead_id, lead_name, execute_after_seconds, lead_last_processed)
+                        background_tasks.add_task(update_info_later, goods, delivery_type, delivery_address, lead_id, lead_name, execute_after_seconds, lead_last_processed, promo_type, comment)
                         return HTTP_200_OK
                     else:
                         logger.info(f'No limits are hit, updating lead {lead_id}')
                         lead_last_processed[lead_id] = current_time
                         await add_info_from_ms(goods=goods, delivery_type=delivery_type,
-                                               delivery_address=delivery_address, lead_id=lead_id, name=lead_name)
+                                               delivery_address=delivery_address, lead_id=lead_id, name=lead_name,
+                                               promo_type=promo_type, comment=comment)
                         logger.info("MISMATCH: Updating info...")
-                        logger.info(f'UPDATING:\n goods: {is_goods_match}\n delivery_type: {is_delivery_match}\n delivery_address: {is_address_match}\n lead_name: {lead_name}')
+                        logger.info(f'UPDATING:\n goods: {is_goods_match}\n delivery_type: {is_delivery_match}\n delivery_address: {is_address_match}\n lead_name: {lead_name}\n promo: {is_promo_match}\n comment: {is_comment_match}')
                 else:
                     lead_last_processed[lead_id] = current_time
-                    await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id, name=lead_name)
+                    await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id, name=lead_name, promo_type=promo_type, comment=comment)
                     logger.info("MISMATCH: Updating info...")
                     return HTTP_200_OK
         else:
