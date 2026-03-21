@@ -80,7 +80,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             current_delivery_type = await get_custom_field_value(current_info, 577315)
             current_delivery_address = await get_custom_field_value(current_info, 577311)
             current_promo_type = await get_custom_field_value(current_info, 570661)
-            current_comment = await get_custom_field_value(current_info, 570657)
+            current_comment = await get_custom_field_value(current_info, 577753)
             current_lead_name = await get_custom_field_value(current_info, 576720)
 
             ## matching ignoring the spaces
