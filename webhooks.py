@@ -130,16 +130,18 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                     else:
                         logger.info(f'No limits are hit, updating lead {lead_id}')
                         lead_last_processed[lead_id] = current_time
+                        logger.info("MISMATCH: Updating info...")
                         await add_info_from_ms(goods=goods, delivery_type=delivery_type,
                                                delivery_address=delivery_address, lead_id=lead_id, name=lead_name,
                                                promo_type=promo_type, comment=comment)
-                        logger.info("MISMATCH: Updating info...")
-                        logger.info(f'UPDATING:\n goods: {is_goods_match}\n delivery_type: {is_delivery_match}\n delivery_address: {is_address_match}\n lead_name: {lead_name}\n promo: {is_promo_match}\n comment: {is_comment_match}')
+                        logger.info(f'UPDATING:\n goods: {goods}\n delivery_type: {delivery_type}\n delivery_address: {delivery_address}\n lead_name: {lead_name}\n promo: {promo_type}\n comment: {comment}')
+
                 else:
                     lead_last_processed[lead_id] = current_time
-                    await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id, name=lead_name, promo_type=promo_type, comment=comment)
                     logger.info("MISMATCH: Updating info...")
-                    return HTTP_200_OK
+                    await add_info_from_ms(goods=goods, delivery_type=delivery_type, delivery_address=delivery_address, lead_id=lead_id, name=lead_name, promo_type=promo_type, comment=comment)
+                    logger.info(f'UPDATING:\n goods: {goods}\n delivery_type: {delivery_type}\n delivery_address: {delivery_address}\n lead_name: {lead_name}\n promo: {promo_type}\n comment: {comment}')
+                return HTTP_200_OK
         else:
             logger.info(f'lead_id {lead_id}, nothing to update')
     else:
