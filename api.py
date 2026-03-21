@@ -56,7 +56,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
     if delivery_address:
         custom_fields.append(await create_custom_field(delivery_address, 577311))
     if comment:
-        custom_fields.append(await create_custom_field(comment, 570657))
+        custom_fields.append(await create_custom_field(comment, 577753))
     if promo_type:
         custom_fields.append(await create_custom_field(promo_type, 570661))
 
@@ -96,4 +96,5 @@ async def create_custom_field(value, id):
     return new_field
 
 if __name__ == '__main__':
-    asyncio.run(get_lead_by_id(36349059))
+    lead_info = asyncio.run(get_lead_by_id(36420147))
+    pprint(lead_info)
