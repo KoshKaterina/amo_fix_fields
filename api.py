@@ -20,6 +20,8 @@ current_token = os.getenv("TOKEN")
 headers = {f"Authorization": f"Bearer {current_token}"}
 
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("AMO_REQUEST_TIMEOUT_SECONDS", "20"))
+CONNECT_TIMEOUT_SECONDS = float(os.getenv("AMO_CONNECT_TIMEOUT_SECONDS", "30"))
+POOL_TIMEOUT_SECONDS = float(os.getenv("AMO_POOL_TIMEOUT_SECONDS", "20"))
 MAX_FETCH_RETRIES = int(os.getenv("AMO_FETCH_RETRIES", "4"))
 MAX_PATCH_RETRIES = int(os.getenv("AMO_PATCH_RETRIES", "4"))
 MAX_CUSTOM_FIELD_VALUE_LEN = 256
@@ -28,6 +30,11 @@ RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 _request_lock = asyncio.Lock()
 _last_request_at = 0.0
+HTTP_TIMEOUT = httpx.Timeout(
+    timeout=REQUEST_TIMEOUT_SECONDS,
+    connect=CONNECT_TIMEOUT_SECONDS,
+    pool=POOL_TIMEOUT_SECONDS,
+)
 
 
 async def _throttle_outgoing_requests() -> None:
@@ -93,7 +100,7 @@ async def auth():
 
 
 async def get_lead_by_id(lead_id):
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for attempt in range(1, MAX_FETCH_RETRIES + 1):
             await _throttle_outgoing_requests()
             try:
@@ -101,16 +108,24 @@ async def get_lead_by_id(lead_id):
                     f"https://new5a2e8ea7b16b4.amocrm.ru/api/v4/leads/{lead_id}",
                     headers=headers,
                 )
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
+                if attempt < MAX_FETCH_RETRIES:
+                    delay = _compute_retry_delay(attempt)
+                    logger.warning(
+                        "Request error fetching lead %s on attempt %s/%s (%s). Retrying in %.1fs",
+                        lead_id,
+                        attempt,
+                        MAX_FETCH_RETRIES,
+                        exc.__class__.__name__,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 logger.exception(
-                    "Request error fetching lead %s on attempt %s/%s",
+                    "Request error fetching lead %s after %s attempts",
                     lead_id,
-                    attempt,
                     MAX_FETCH_RETRIES,
                 )
-                if attempt < MAX_FETCH_RETRIES:
-                    await asyncio.sleep(_compute_retry_delay(attempt))
-                    continue
                 return None
 
             if response.status_code == 200:
@@ -168,7 +183,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
     if name:
         body["name"] = str(name)
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for attempt in range(1, MAX_PATCH_RETRIES + 1):
             await _throttle_outgoing_requests()
             try:
@@ -177,16 +192,24 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
                     headers=headers,
                     json=body,
                 )
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
+                if attempt < MAX_PATCH_RETRIES:
+                    delay = _compute_retry_delay(attempt)
+                    logger.warning(
+                        "Request error patching lead %s on attempt %s/%s (%s). Retrying in %.1fs",
+                        lead_id,
+                        attempt,
+                        MAX_PATCH_RETRIES,
+                        exc.__class__.__name__,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 logger.exception(
-                    "Request error patching lead %s on attempt %s/%s",
+                    "Request error patching lead %s after %s attempts",
                     lead_id,
-                    attempt,
                     MAX_PATCH_RETRIES,
                 )
-                if attempt < MAX_PATCH_RETRIES:
-                    await asyncio.sleep(_compute_retry_delay(attempt))
-                    continue
                 return _update_result(ok=False, status_code=None, retryable=True)
 
             if response.status_code in [200, 204]:
