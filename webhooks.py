@@ -76,6 +76,13 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
         if goods is not None or delivery_type is not None or delivery_address is not None or lead_id is not None or promo_type is not None or comment is not None:
             # check if info is already correct
             current_info = await get_lead_by_id(lead_id)
+            if not isinstance(current_info, dict):
+                logger.warning(
+                    "Skipping update for lead %s because current lead fetch failed",
+                    lead_id,
+                )
+                return HTTP_200_OK
+
             current_goods = await get_custom_field_value(current_info, 577313)
             current_delivery_type = await get_custom_field_value(current_info, 577315)
             current_delivery_address = await get_custom_field_value(current_info, 577311)
