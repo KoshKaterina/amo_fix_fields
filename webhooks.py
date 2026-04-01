@@ -53,82 +53,83 @@ async def _process_lead_update(
     lead_name,
     promo_type,
     comment,
-    background_tasks: BackgroundTasks,
 ):
-    current_info = await get_lead_by_id(lead_id)
-    if not isinstance(current_info, dict):
-        logger.warning(
-            "Skipping update for lead %s because current lead fetch failed",
-            lead_id,
-        )
-        return HTTP_200_OK
-
-    current_goods = await get_custom_field_value(current_info, 577313)
-    current_delivery_type = await get_custom_field_value(current_info, 577315)
-    current_delivery_address = await get_custom_field_value(current_info, 577311)
-    current_promo_type = await get_custom_field_value(current_info, 570661)
-    current_comment = await get_custom_field_value(current_info, 577753)
-
-    if goods:
-        is_goods_match = await normalize_text(current_goods) == await normalize_text(goods)
-    else:
-        is_goods_match = True
-
-    if delivery_type:
-        is_delivery_match = await normalize_text(current_delivery_type) == await normalize_text(delivery_type)
-    else:
-        is_delivery_match = True
-
-    if delivery_address:
-        is_address_match = await normalize_text(current_delivery_address) == await normalize_text(delivery_address)
-    else:
-        is_address_match = True
-
-    if lead_name:
-        normalized_name = await normalize_text(lead_name)
-        current_name = current_info.get("name") if isinstance(current_info, dict) else None
-        normalized_current_name = await normalize_text(current_name)
-        is_name_match = normalized_name == normalized_current_name
-        logger.info(f"normalized_name: {normalized_name}, normalized_current_name: {normalized_current_name}")
-    else:
-        is_name_match = True
-
-    if promo_type:
-        is_promo_match = await normalize_text(current_promo_type) == await normalize_text(promo_type)
-    else:
-        is_promo_match = True
-
-    if comment:
-        is_comment_match = await normalize_text(current_comment) == await normalize_text(comment)
-    else:
-        is_comment_match = True
-
-    if is_goods_match and is_delivery_match and is_address_match and is_name_match and is_promo_match and is_comment_match:
-        logger.info("MATCH: Data is identical (ignoring whitespace).")
-        return HTTP_200_OK
-
-    current_time = datetime.datetime.now()
-    if lead_id in lead_last_processed:
-        elapsed_seconds = (current_time - lead_last_processed[lead_id]).seconds
-        if elapsed_seconds < RATE_LIMIT_SECONDS:
-            logger.info(f"Rate limit hit for lead {lead_id}")
-            execute_after_seconds = RATE_LIMIT_SECONDS - elapsed_seconds
-            logger.info(f"Will handle in {execute_after_seconds} seconds")
-            background_tasks.add_task(
-                update_info_later,
-                goods,
-                delivery_type,
-                delivery_address,
+    lead_lock = await _get_lead_processing_lock(str(lead_id))
+    if lead_lock.locked():
+        logger.info("Lead %s is already being processed, waiting for lock", lead_id)
+    async with lead_lock:
+        current_info = await get_lead_by_id(lead_id)
+        if not isinstance(current_info, dict):
+            logger.warning(
+                "Skipping update for lead %s because current lead fetch failed",
                 lead_id,
-                lead_name,
-                execute_after_seconds,
-                lead_last_processed,
-                promo_type,
-                comment,
             )
-            return HTTP_200_OK
+            return
 
-        logger.info(f"No limits are hit, updating lead {lead_id}")
+        current_goods = await get_custom_field_value(current_info, 577313)
+        current_delivery_type = await get_custom_field_value(current_info, 577315)
+        current_delivery_address = await get_custom_field_value(current_info, 577311)
+        current_promo_type = await get_custom_field_value(current_info, 570661)
+        current_comment = await get_custom_field_value(current_info, 577753)
+
+        if goods:
+            is_goods_match = await normalize_text(current_goods) == await normalize_text(goods)
+        else:
+            is_goods_match = True
+
+        if delivery_type:
+            is_delivery_match = await normalize_text(current_delivery_type) == await normalize_text(delivery_type)
+        else:
+            is_delivery_match = True
+
+        if delivery_address:
+            is_address_match = await normalize_text(current_delivery_address) == await normalize_text(delivery_address)
+        else:
+            is_address_match = True
+
+        if lead_name:
+            normalized_name = await normalize_text(lead_name)
+            current_name = current_info.get("name") if isinstance(current_info, dict) else None
+            normalized_current_name = await normalize_text(current_name)
+            is_name_match = normalized_name == normalized_current_name
+            logger.info(f"normalized_name: {normalized_name}, normalized_current_name: {normalized_current_name}")
+        else:
+            is_name_match = True
+
+        if promo_type:
+            is_promo_match = await normalize_text(current_promo_type) == await normalize_text(promo_type)
+        else:
+            is_promo_match = True
+
+        if comment:
+            is_comment_match = await normalize_text(current_comment) == await normalize_text(comment)
+        else:
+            is_comment_match = True
+
+        if is_goods_match and is_delivery_match and is_address_match and is_name_match and is_promo_match and is_comment_match:
+            logger.info("MATCH: Data is identical (ignoring whitespace).")
+            return
+
+        current_time = datetime.datetime.now()
+        if lead_id in lead_last_processed:
+            elapsed_seconds = (current_time - lead_last_processed[lead_id]).total_seconds()
+            if elapsed_seconds < RATE_LIMIT_SECONDS:
+                logger.info(f"Rate limit hit for lead {lead_id}")
+                execute_after_seconds = RATE_LIMIT_SECONDS - elapsed_seconds
+                logger.info(f"Will handle in {execute_after_seconds} seconds")
+                await update_info_later(
+                    goods,
+                    delivery_type,
+                    delivery_address,
+                    lead_id,
+                    lead_name,
+                    execute_after_seconds,
+                    lead_last_processed,
+                    promo_type,
+                    comment,
+                )
+                return
+
         lead_last_processed[lead_id] = current_time
         logger.info("MISMATCH: Updating info...")
         await add_info_from_ms(
@@ -143,23 +144,6 @@ async def _process_lead_update(
         logger.info(
             f"UPDATING:\n goods: {goods}\n delivery_type: {delivery_type}\n delivery_address: {delivery_address}\n lead_name: {lead_name}\n promo: {promo_type}\n comment: {comment}"
         )
-        return HTTP_200_OK
-
-    lead_last_processed[lead_id] = current_time
-    logger.info("MISMATCH: Updating info...")
-    await add_info_from_ms(
-        goods=goods,
-        delivery_type=delivery_type,
-        delivery_address=delivery_address,
-        lead_id=lead_id,
-        name=lead_name,
-        promo_type=promo_type,
-        comment=comment,
-    )
-    logger.info(
-        f"UPDATING:\n goods: {goods}\n delivery_type: {delivery_type}\n delivery_address: {delivery_address}\n lead_name: {lead_name}\n promo: {promo_type}\n comment: {comment}"
-    )
-    return HTTP_200_OK
 
 
 @app.post("/lead_change")
@@ -213,20 +197,17 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                 logger.warning("Skipping update because lead_id is missing in payload")
                 return HTTP_200_OK
 
-            lead_lock = await _get_lead_processing_lock(str(lead_id))
-            if lead_lock.locked():
-                logger.info("Lead %s is already being processed, waiting for lock", lead_id)
-            async with lead_lock:
-                return await _process_lead_update(
-                    lead_id=lead_id,
-                    goods=goods,
-                    delivery_type=delivery_type,
-                    delivery_address=delivery_address,
-                    lead_name=lead_name,
-                    promo_type=promo_type,
-                    comment=comment,
-                    background_tasks=background_tasks,
-                )
+            background_tasks.add_task(
+                _process_lead_update,
+                lead_id=lead_id,
+                goods=goods,
+                delivery_type=delivery_type,
+                delivery_address=delivery_address,
+                lead_name=lead_name,
+                promo_type=promo_type,
+                comment=comment,
+            )
+            return HTTP_200_OK
 
         logger.info(f"lead_id {lead_id}, nothing to update")
     else:
