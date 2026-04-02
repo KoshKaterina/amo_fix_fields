@@ -159,10 +159,17 @@ async def get_lead_by_id(lead_id):
                 return None
 
             if response.status_code == 200:
+                _record_success()
                 try:
                     return response.json()
                 except ValueError:
                     logger.exception("Invalid JSON payload while fetching lead %s", lead_id)
+                    return None
+
+            if response.status_code == 429:
+                _record_429()
+                if is_circuit_open():
+                    logger.warning("Circuit breaker open — aborting fetch for lead %s", lead_id)
                     return None
 
             if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_FETCH_RETRIES:
@@ -243,8 +250,15 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
                 return _update_result(ok=False, status_code=None, retryable=True)
 
             if response.status_code in [200, 204]:
+                _record_success()
                 logger.info("Successfully updated lead %s", lead_id)
                 return _update_result(ok=True, status_code=response.status_code, retryable=False)
+
+            if response.status_code == 429:
+                _record_429()
+                if is_circuit_open():
+                    logger.warning("Circuit breaker open — aborting patch for lead %s", lead_id)
+                    return _update_result(ok=False, status_code=429, retryable=False)
 
             if response.status_code == 400:
                 logger.error(

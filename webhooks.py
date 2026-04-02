@@ -6,7 +6,7 @@ import re
 from fastapi import BackgroundTasks, FastAPI, Request
 from starlette.status import HTTP_200_OK
 
-from api import add_info_from_ms, get_lead_by_id
+from api import add_info_from_ms, get_lead_by_id, is_circuit_open
 from help_function import (
     get_custom_field_value,
     get_nested,
@@ -55,6 +55,10 @@ async def _process_lead_update(
     promo_type,
     comment,
 ):
+    if is_circuit_open():
+        logger.info("Circuit breaker open — dropping update for lead %s", lead_id)
+        return
+
     lead_lock = await _get_lead_processing_lock(str(lead_id))
     if lead_lock.locked():
         logger.info("Lead %s is already being processed, skipping duplicate", lead_id)

@@ -2,7 +2,7 @@
 import logging
 from datetime import datetime
 
-from api import add_info_from_ms
+from api import add_info_from_ms, is_circuit_open
 
 logger = logging.getLogger("uvicorn")
 
@@ -15,6 +15,10 @@ async def update_info_later(goods, delivery_type, delivery_address, lead_id, nam
         delay = base_delay if attempt == 0 else base_delay * (2 ** attempt)
         if delay > 0:
             await asyncio.sleep(delay)
+
+        if is_circuit_open():
+            logger.info("Circuit breaker open — aborting scheduled update for lead %s", lead_id)
+            return
 
         try:
             logger.info(f"Patching scheduled changes in {lead_id} now... attempt {attempt + 1}/{max_retries + 1}")
