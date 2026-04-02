@@ -36,6 +36,36 @@ HTTP_TIMEOUT = httpx.Timeout(
     pool=POOL_TIMEOUT_SECONDS,
 )
 
+# ---------------------------------------------------------------------------
+# Global circuit breaker — pauses all outgoing requests when 429s pile up
+# ---------------------------------------------------------------------------
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("AMO_CB_THRESHOLD", "3"))
+CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("AMO_CB_COOLDOWN", "60"))
+
+_consecutive_429s = 0
+_circuit_open_until = 0.0
+
+
+def is_circuit_open() -> bool:
+    return time.monotonic() < _circuit_open_until
+
+
+def _record_429() -> None:
+    global _consecutive_429s, _circuit_open_until
+    _consecutive_429s += 1
+    if _consecutive_429s >= CIRCUIT_BREAKER_THRESHOLD:
+        _circuit_open_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+        logger.warning(
+            "Circuit breaker OPEN after %s consecutive 429s — pausing all requests for %.0fs",
+            _consecutive_429s,
+            CIRCUIT_BREAKER_COOLDOWN,
+        )
+
+
+def _record_success() -> None:
+    global _consecutive_429s
+    _consecutive_429s = 0
+
 
 async def _throttle_outgoing_requests() -> None:
     if MIN_REQUEST_INTERVAL_SECONDS <= 0:

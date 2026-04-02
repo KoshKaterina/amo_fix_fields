@@ -22,7 +22,7 @@ logger = logging.getLogger("uvicorn")
 
 lead_last_processed = {}
 RATE_LIMIT_SECONDS = 3
-ECHO_COOLDOWN_SECONDS = 5
+ECHO_COOLDOWN_SECONDS = 30
 lead_processing_locks = {}
 lead_processing_locks_guard = asyncio.Lock()
 
@@ -116,6 +116,7 @@ async def _process_lead_update(
 
         if is_goods_match and is_delivery_match and is_address_match and is_name_match and is_promo_match and is_comment_match:
             logger.info("MATCH: Data is identical (ignoring whitespace).")
+            lead_last_processed[lead_id] = datetime.datetime.now()
             return
 
         current_time = datetime.datetime.now()
