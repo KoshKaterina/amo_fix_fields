@@ -22,6 +22,7 @@ logger = logging.getLogger("uvicorn")
 
 lead_last_processed = {}
 RATE_LIMIT_SECONDS = 3
+ECHO_COOLDOWN_SECONDS = 5
 lead_processing_locks = {}
 lead_processing_locks_guard = asyncio.Lock()
 
@@ -56,8 +57,15 @@ async def _process_lead_update(
 ):
     lead_lock = await _get_lead_processing_lock(str(lead_id))
     if lead_lock.locked():
-        logger.info("Lead %s is already being processed, waiting for lock", lead_id)
+        logger.info("Lead %s is already being processed, skipping duplicate", lead_id)
+        return
     async with lead_lock:
+        if lead_id in lead_last_processed:
+            elapsed = (datetime.datetime.now() - lead_last_processed[lead_id]).total_seconds()
+            if elapsed < ECHO_COOLDOWN_SECONDS:
+                logger.info("Lead %s was updated %.1fs ago, skipping echo webhook", lead_id, elapsed)
+                return
+
         current_info = await get_lead_by_id(lead_id)
         if not isinstance(current_info, dict):
             logger.warning(
@@ -189,7 +197,7 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
             goods is not None
             or delivery_type is not None
             or delivery_address is not None
-            or lead_id is not None
+            or lead_name is not None
             or promo_type is not None
             or comment is not None
         ):
