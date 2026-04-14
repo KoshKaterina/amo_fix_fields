@@ -1,3 +1,4 @@
+import datetime
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -16,6 +17,18 @@ from queue_manager import enqueue_new, init_queue, shutdown_queue
 
 @asynccontextmanager
 async def lifespan(app):
+    msk = datetime.timezone(datetime.timedelta(hours=3))
+
+    class MskFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):
+            dt = datetime.datetime.fromtimestamp(record.created, tz=msk)
+            return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
+    formatter = MskFormatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        for handler in logging.getLogger(name).handlers:
+            handler.setFormatter(formatter)
+
     init_api_pipeline()
     init_queue()
     yield
