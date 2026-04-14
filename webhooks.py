@@ -1,30 +1,36 @@
-import asyncio
-import datetime
 import logging
 import re
+from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from starlette.status import HTTP_200_OK
 
-from api import add_info_from_ms, get_lead_by_id, is_circuit_open
+from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
-    get_custom_field_value,
     get_nested,
-    normalize_text,
     parse_the_cart_field,
     parse_the_cart_field_2,
 )
-from memory import update_info_later
+from queue_manager import enqueue_new, init_queue, shutdown_queue
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app):
+    init_api_pipeline()
+    init_queue()
+    yield
+    await shutdown_queue()
+    await shutdown_api_pipeline()
+
+
+app = FastAPI(lifespan=lifespan)
 
 logger = logging.getLogger("uvicorn")
 
-lead_last_processed = {}
-RATE_LIMIT_SECONDS = 3
-ECHO_COOLDOWN_SECONDS = 30
-lead_processing_locks = {}
-lead_processing_locks_guard = asyncio.Lock()
+
+@app.get("/")
+async def health():
+    return {"status": "ok"}
 
 
 def insert_nested(data, keys, value):
@@ -36,131 +42,8 @@ def insert_nested(data, keys, value):
     cur[keys[-1]] = value
 
 
-async def _get_lead_processing_lock(lead_id: str) -> asyncio.Lock:
-    async with lead_processing_locks_guard:
-        lock = lead_processing_locks.get(lead_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            lead_processing_locks[lead_id] = lock
-        return lock
-
-
-async def _process_lead_update(
-    *,
-    lead_id,
-    goods,
-    delivery_type,
-    delivery_address,
-    lead_name,
-    promo_type,
-    comment,
-):
-    if is_circuit_open():
-        logger.info("Circuit breaker open — dropping update for lead %s", lead_id)
-        return
-
-    lead_lock = await _get_lead_processing_lock(str(lead_id))
-    if lead_lock.locked():
-        logger.info("Lead %s is already being processed, skipping duplicate", lead_id)
-        return
-    async with lead_lock:
-        if lead_id in lead_last_processed:
-            elapsed = (datetime.datetime.now() - lead_last_processed[lead_id]).total_seconds()
-            if elapsed < ECHO_COOLDOWN_SECONDS:
-                logger.info("Lead %s was updated %.1fs ago, skipping echo webhook", lead_id, elapsed)
-                return
-
-        current_info = await get_lead_by_id(lead_id)
-        if not isinstance(current_info, dict):
-            logger.warning(
-                "Skipping update for lead %s because current lead fetch failed",
-                lead_id,
-            )
-            return
-
-        current_goods = await get_custom_field_value(current_info, 577313)
-        current_delivery_type = await get_custom_field_value(current_info, 577315)
-        current_delivery_address = await get_custom_field_value(current_info, 577311)
-        current_promo_type = await get_custom_field_value(current_info, 570661)
-        current_comment = await get_custom_field_value(current_info, 577753)
-
-        if goods:
-            is_goods_match = await normalize_text(current_goods) == await normalize_text(goods)
-        else:
-            is_goods_match = True
-
-        if delivery_type:
-            is_delivery_match = await normalize_text(current_delivery_type) == await normalize_text(delivery_type)
-        else:
-            is_delivery_match = True
-
-        if delivery_address:
-            is_address_match = await normalize_text(current_delivery_address) == await normalize_text(delivery_address)
-        else:
-            is_address_match = True
-
-        if lead_name:
-            normalized_name = await normalize_text(lead_name)
-            current_name = current_info.get("name") if isinstance(current_info, dict) else None
-            normalized_current_name = await normalize_text(current_name)
-            is_name_match = normalized_name == normalized_current_name
-            logger.info(f"normalized_name: {normalized_name}, normalized_current_name: {normalized_current_name}")
-        else:
-            is_name_match = True
-
-        if promo_type:
-            is_promo_match = await normalize_text(current_promo_type) == await normalize_text(promo_type)
-        else:
-            is_promo_match = True
-
-        if comment:
-            is_comment_match = await normalize_text(current_comment) == await normalize_text(comment)
-        else:
-            is_comment_match = True
-
-        if is_goods_match and is_delivery_match and is_address_match and is_name_match and is_promo_match and is_comment_match:
-            logger.info("MATCH: Data is identical (ignoring whitespace).")
-            lead_last_processed[lead_id] = datetime.datetime.now()
-            return
-
-        current_time = datetime.datetime.now()
-        if lead_id in lead_last_processed:
-            elapsed_seconds = (current_time - lead_last_processed[lead_id]).total_seconds()
-            if elapsed_seconds < RATE_LIMIT_SECONDS:
-                logger.info(f"Rate limit hit for lead {lead_id}")
-                execute_after_seconds = RATE_LIMIT_SECONDS - elapsed_seconds
-                logger.info(f"Will handle in {execute_after_seconds} seconds")
-                await update_info_later(
-                    goods,
-                    delivery_type,
-                    delivery_address,
-                    lead_id,
-                    lead_name,
-                    execute_after_seconds,
-                    lead_last_processed,
-                    promo_type,
-                    comment,
-                )
-                return
-
-        lead_last_processed[lead_id] = current_time
-        logger.info("MISMATCH: Updating info...")
-        await add_info_from_ms(
-            goods=goods,
-            delivery_type=delivery_type,
-            delivery_address=delivery_address,
-            lead_id=lead_id,
-            name=lead_name,
-            promo_type=promo_type,
-            comment=comment,
-        )
-        logger.info(
-            f"UPDATING:\n goods: {goods}\n delivery_type: {delivery_type}\n delivery_address: {delivery_address}\n lead_name: {lead_name}\n promo: {promo_type}\n comment: {comment}"
-        )
-
-
 @app.post("/lead_change")
-async def lead_change(request: Request, background_tasks: BackgroundTasks):
+async def lead_change(request: Request):
     form = await request.form()
 
     nested = {}
@@ -210,16 +93,15 @@ async def lead_change(request: Request, background_tasks: BackgroundTasks):
                 logger.warning("Skipping update because lead_id is missing in payload")
                 return HTTP_200_OK
 
-            background_tasks.add_task(
-                _process_lead_update,
-                lead_id=lead_id,
-                goods=goods,
-                delivery_type=delivery_type,
-                delivery_address=delivery_address,
-                lead_name=lead_name,
-                promo_type=promo_type,
-                comment=comment,
-            )
+            enqueue_new({
+                "lead_id": lead_id,
+                "goods": goods,
+                "delivery_type": delivery_type,
+                "delivery_address": delivery_address,
+                "lead_name": lead_name,
+                "promo_type": promo_type,
+                "comment": comment,
+            })
             return HTTP_200_OK
 
         logger.info(f"lead_id {lead_id}, nothing to update")

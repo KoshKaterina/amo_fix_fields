@@ -1,6 +1,5 @@
-﻿import re
-from typing import Tuple, Any, Iterable
 import re
+from typing import Any, Iterable
 
 DELIVERY_PREFIXES = (
     "CDEK",
