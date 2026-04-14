@@ -25,8 +25,8 @@ _counter = itertools.count()
 @dataclass(order=True)
 class WorkItem:
     priority: int
-    sequence: int = field(default_factory=lambda: next(_counter))
     payload: dict = field(compare=False)
+    sequence: int = field(default_factory=lambda: next(_counter))
     enqueue_time: float = field(default_factory=time.time, compare=False)
 
 
