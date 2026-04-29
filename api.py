@@ -9,6 +9,13 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from api_helpers import (
+    MAX_CUSTOM_FIELD_VALUE_LEN,
+    RETRYABLE_STATUS_CODES,
+    compute_retry_delay,
+    trim_text,
+)
+
 load_dotenv()
 
 logger = logging.getLogger("uvicorn")
@@ -25,9 +32,7 @@ CONNECT_TIMEOUT_SECONDS = float(os.getenv("AMO_CONNECT_TIMEOUT_SECONDS", "30"))
 POOL_TIMEOUT_SECONDS = float(os.getenv("AMO_POOL_TIMEOUT_SECONDS", "20"))
 MAX_FETCH_RETRIES = int(os.getenv("AMO_FETCH_RETRIES", "4"))
 MAX_PATCH_RETRIES = int(os.getenv("AMO_PATCH_RETRIES", "4"))
-MAX_CUSTOM_FIELD_VALUE_LEN = 256
 MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("AMO_MIN_REQUEST_INTERVAL_SECONDS", "0.17"))
-RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 HTTP_TIMEOUT = httpx.Timeout(
     timeout=REQUEST_TIMEOUT_SECONDS,
@@ -166,21 +171,6 @@ async def submit_request(method: str, url: str, req_headers: dict, json_body: di
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _compute_retry_delay(attempt: int, retry_after_header: str | None = None) -> float:
-    if retry_after_header:
-        try:
-            return max(1.0, float(retry_after_header))
-        except ValueError:
-            pass
-    return min(30.0, float(2 ** (attempt - 1)))
-
-
-def _trim_text(value: str, max_len: int = 700) -> str:
-    if len(value) <= max_len:
-        return value
-    return f"{value[:max_len]}...<truncated>"
-
-
 def _sanitize_custom_field_value(value: Any, field_id: int, lead_id: Any) -> str:
     value_str = str(value)
     if len(value_str) <= MAX_CUSTOM_FIELD_VALUE_LEN:
@@ -231,7 +221,7 @@ async def get_lead_by_id(lead_id):
             raise
         except httpx.RequestError as exc:
             if attempt < MAX_FETCH_RETRIES:
-                delay = _compute_retry_delay(attempt)
+                delay = compute_retry_delay(attempt)
                 logger.warning(
                     "Request error fetching lead %s on attempt %s/%s (%s). Retrying in %.1fs",
                     lead_id,
@@ -251,7 +241,7 @@ async def get_lead_by_id(lead_id):
         except Exception as exc:
             logger.exception("Unexpected error fetching lead %s on attempt %s", lead_id, attempt)
             if attempt < MAX_FETCH_RETRIES:
-                await asyncio.sleep(_compute_retry_delay(attempt))
+                await asyncio.sleep(compute_retry_delay(attempt))
                 continue
             return None
 
@@ -270,7 +260,7 @@ async def get_lead_by_id(lead_id):
                 return None
 
         if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_FETCH_RETRIES:
-            delay = _compute_retry_delay(attempt, response.headers.get("Retry-After"))
+            delay = compute_retry_delay(attempt, response.headers.get("Retry-After"))
             logger.warning(
                 "AmoCRM status %s for lead %s on fetch attempt %s/%s. Retrying in %.1fs",
                 response.status_code,
@@ -286,7 +276,7 @@ async def get_lead_by_id(lead_id):
             "AmoCRM error %s for lead %s: %s",
             response.status_code,
             lead_id,
-            _trim_text(response.text),
+            trim_text(response.text),
         )
         return None
 
@@ -325,7 +315,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
             raise
         except httpx.RequestError as exc:
             if attempt < MAX_PATCH_RETRIES:
-                delay = _compute_retry_delay(attempt)
+                delay = compute_retry_delay(attempt)
                 logger.warning(
                     "Request error patching lead %s on attempt %s/%s (%s). Retrying in %.1fs",
                     lead_id,
@@ -345,7 +335,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
         except Exception as exc:
             logger.exception("Unexpected error patching lead %s on attempt %s", lead_id, attempt)
             if attempt < MAX_PATCH_RETRIES:
-                await asyncio.sleep(_compute_retry_delay(attempt))
+                await asyncio.sleep(compute_retry_delay(attempt))
                 continue
             return _update_result(ok=False, status_code=None, retryable=True)
 
@@ -365,12 +355,12 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
                 "Failed to update lead %s: %s %s",
                 lead_id,
                 response.status_code,
-                _trim_text(response.text),
+                trim_text(response.text),
             )
             return _update_result(ok=False, status_code=response.status_code, retryable=False)
 
         if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_PATCH_RETRIES:
-            delay = _compute_retry_delay(attempt, response.headers.get("Retry-After"))
+            delay = compute_retry_delay(attempt, response.headers.get("Retry-After"))
             logger.warning(
                 "AmoCRM status %s for lead %s on patch attempt %s/%s. Retrying in %.1fs",
                 response.status_code,
@@ -386,7 +376,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
             "Failed to update lead %s: %s %s",
             lead_id,
             response.status_code,
-            _trim_text(response.text),
+            trim_text(response.text),
         )
         return _update_result(
             ok=False,

@@ -6,13 +6,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from starlette.status import HTTP_200_OK
 
+import amo_service
+import cdek_client
+import telegram_bot
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
     get_nested,
     parse_the_cart_field,
     parse_the_cart_field_2,
 )
-from queue_manager import enqueue_new, init_queue, shutdown_queue
+from queue_manager import enqueue_new, enqueue_waybill, init_queue, shutdown_queue
+from waybill_config import STATUS_CREATE_WAYBILL
 
 
 @asynccontextmanager
@@ -31,7 +35,12 @@ async def lifespan(app):
 
     init_api_pipeline()
     init_queue()
+    await amo_service.warm_pipeline_cache()
+    await cdek_client.init()
+    await telegram_bot.init_telegram_bot()
     yield
+    await telegram_bot.shutdown_telegram_bot()
+    await cdek_client.aclose()
     await shutdown_queue()
     await shutdown_api_pipeline()
 
@@ -77,6 +86,13 @@ async def lead_change(request: Request):
 
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
+
+    status_update = await get_nested(nested, ["leads", "update", "0", "status_id"])
+    status_add = await get_nested(nested, ["leads", "add", "0", "status_id"])
+    incoming_status = status_update if status_update is not None else status_add
+    if lead_id is not None and incoming_status is not None and str(incoming_status) == str(STATUS_CREATE_WAYBILL):
+        logger.info("Lead %s entered STATUS_CREATE_WAYBILL — enqueue waybill", lead_id)
+        enqueue_waybill(lead_id, source="webhook")
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:

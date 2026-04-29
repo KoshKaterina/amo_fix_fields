@@ -34,6 +34,7 @@ _task_queue: asyncio.PriorityQueue[WorkItem] | None = None
 _worker_task: asyncio.Task | None = None
 _retry_tasks: set[asyncio.Task] = set()
 _pending_leads: set[str] = set()
+_pending_waybills: set[str] = set()
 _items_processed: int = 0
 
 
@@ -58,6 +59,7 @@ async def shutdown_queue() -> None:
         task.cancel()
     _retry_tasks.clear()
     _pending_leads.clear()
+    _pending_waybills.clear()
 
     if _task_queue is not None:
         remaining = 0
@@ -98,20 +100,48 @@ def enqueue_retry(payload: dict) -> None:
     _task_queue.put_nowait(WorkItem(priority=PRIORITY_RETRY, payload=payload))
 
 
+def enqueue_waybill(lead_id, source: str = "webhook") -> None:
+    if _task_queue is None:
+        logger.error("Task queue not initialized, dropping waybill for lead %s", lead_id)
+        return
+    key = str(lead_id)
+    if key in _pending_waybills:
+        logger.info("Lead %s waybill already in queue, skipping duplicate", key)
+        return
+    _pending_waybills.add(key)
+    payload = {"_kind": "waybill", "lead_id": lead_id, "source": source}
+    _task_queue.put_nowait(WorkItem(priority=PRIORITY_NEW, payload=payload))
+    logger.info("ENQUEUE waybill lead_id=%s source=%s queue_size=%d", key, source, _task_queue.qsize())
+
+
 async def _worker() -> None:
     global _items_processed
     while True:
         item = await _task_queue.get()
         lead_id = str(item.payload.get("lead_id", ""))
-        _pending_leads.discard(lead_id)
+        kind = item.payload.get("_kind") or "lead_update"
+        if kind == "waybill":
+            _pending_waybills.discard(lead_id)
+        else:
+            _pending_leads.discard(lead_id)
         waited = time.time() - item.enqueue_time
-        logger.info("DEQUEUE lead_id=%s waited=%.1fs queue_remaining=%d", lead_id, waited, _task_queue.qsize())
+        logger.info(
+            "DEQUEUE kind=%s lead_id=%s waited=%.1fs queue_remaining=%d",
+            kind, lead_id, waited, _task_queue.qsize(),
+        )
         try:
             if is_circuit_open():
-                logger.info("Circuit breaker open — dropping update for lead %s", lead_id)
+                logger.info("Circuit breaker open — dropping %s for lead %s", kind, lead_id)
                 continue
 
-            await _process_lead_update(item.payload)
+            if kind == "waybill":
+                from waybill_service import create_waybill_for_lead
+                await create_waybill_for_lead(
+                    item.payload["lead_id"],
+                    source=item.payload.get("source", "webhook"),
+                )
+            else:
+                await _process_lead_update(item.payload)
 
             _items_processed += 1
             if _items_processed % 100 == 0:
