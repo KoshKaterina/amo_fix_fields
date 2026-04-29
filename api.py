@@ -26,7 +26,7 @@ POOL_TIMEOUT_SECONDS = float(os.getenv("AMO_POOL_TIMEOUT_SECONDS", "20"))
 MAX_FETCH_RETRIES = int(os.getenv("AMO_FETCH_RETRIES", "4"))
 MAX_PATCH_RETRIES = int(os.getenv("AMO_PATCH_RETRIES", "4"))
 MAX_CUSTOM_FIELD_VALUE_LEN = 256
-MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("AMO_MIN_REQUEST_INTERVAL_SECONDS", "0.51"))
+MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("AMO_MIN_REQUEST_INTERVAL_SECONDS", "0.17"))
 RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 HTTP_TIMEOUT = httpx.Timeout(
@@ -67,7 +67,7 @@ def _record_success() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sequential API pipeline — one request at a time, 0.51s after each response
+# Sequential API pipeline — one request at a time, 0.17s after each response
 # ---------------------------------------------------------------------------
 
 @dataclass
