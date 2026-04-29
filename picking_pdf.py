@@ -20,7 +20,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
 
+_PROJECT_FONTS = os.path.join(os.path.dirname(__file__), "fonts")
+
 _FONT_CANDIDATES = [
+    (os.path.join(_PROJECT_FONTS, "DejaVuSans.ttf"),
+     os.path.join(_PROJECT_FONTS, "DejaVuSans-Bold.ttf")),
     ("/System/Library/Fonts/Supplemental/Arial.ttf",
      "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
     ("/Library/Fonts/Arial.ttf",

@@ -6,11 +6,6 @@ ENV PYTHONUNBUFFERED=1
 # Set the working directory in the container
 WORKDIR /app
 
-# fonts-dejavu-core: ReportLab нужен TTF с кириллицей для листа подбора
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-dejavu-core \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
 
 # Install any needed packages specified in requirements.txt
