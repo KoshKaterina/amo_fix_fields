@@ -125,7 +125,10 @@ async def shutdown_telegram_bot() -> None:
     global _bot, _dp, _polling_task
     if _dp is not None:
         try:
-            _dp.stop_polling()
+            await _dp.stop_polling()
+        except RuntimeError:
+            # Polling already stopped (crashed or never started)
+            pass
         except Exception:
             logger.exception("dp.stop_polling failed")
     if _polling_task is not None:
