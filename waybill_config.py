@@ -56,6 +56,11 @@ CDEK_CLIENT_SECRET = os.getenv("CDEK_CLIENT_SECRET", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 _raw_chat_id = os.getenv("TG_ALLOWED_CHAT_ID", "")
 TG_ALLOWED_CHAT_ID: int | None = int(_raw_chat_id) if _raw_chat_id else None
+# Прокси для Telegram API (api.telegram.org заблокирован в РФ).
+# Поддерживается HTTP/HTTPS из коробки: http://user:pass@host:port
+# Для SOCKS5 нужен пакет aiohttp_socks + код в telegram_bot.py не активирует
+# его автоматически (см. README).
+TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").strip()
 
 
 _TOTAL_RE = re.compile(

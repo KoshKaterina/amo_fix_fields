@@ -6,11 +6,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
 import waybill_service
-from waybill_config import TG_ALLOWED_CHAT_ID, TG_BOT_TOKEN
+from waybill_config import TG_ALLOWED_CHAT_ID, TG_BOT_TOKEN, TG_PROXY_URL
 
 logger = logging.getLogger("uvicorn")
 
@@ -92,23 +93,86 @@ def _build_dispatcher() -> Dispatcher:
             "в этапе «Сделать накладную»."
         )
 
+    # Catch-all хендлер для диагностики: ловит ВСЕ сообщения, которые не подошли
+    # под предыдущие хендлеры. По логам видно: (а) доходят ли вообще апдейты,
+    # (б) с какого chat_id и какой текст. Регистрируется ПОСЛЕДНИМ.
+    @dp.message()
+    async def on_any_message(message: Message) -> None:
+        logger.info(
+            "TG message received (no handler matched): chat_id=%s expected_chat_id=%s "
+            "from=%s text=%r",
+            message.chat.id,
+            TG_ALLOWED_CHAT_ID,
+            message.from_user.id if message.from_user else None,
+            message.text,
+        )
+
     return dp
 
 
 async def init_telegram_bot() -> None:
     global _bot, _dp, _polling_task
     if not TG_BOT_TOKEN:
-        logger.warning("TG_BOT_TOKEN not set — Telegram bot disabled")
+        logger.warning("⚠ TG_BOT_TOKEN not set in .env — Telegram bot DISABLED")
         return
     if TG_ALLOWED_CHAT_ID is None:
-        logger.warning("TG_ALLOWED_CHAT_ID not set — Telegram bot disabled")
+        logger.warning("⚠ TG_ALLOWED_CHAT_ID not set in .env — Telegram bot DISABLED")
         return
 
-    _bot = Bot(token=TG_BOT_TOKEN)
+    session = _build_session()
+    _bot = Bot(token=TG_BOT_TOKEN, session=session) if session else Bot(token=TG_BOT_TOKEN)
     _dp = _build_dispatcher()
     waybill_service.set_alert_callback(send_alert)
+    # Сначала валидируем токен/сеть синхронно — если getMe упадёт, polling
+    # не стартуем и пишем понятную ошибку. Иначе фоновая задача упадёт молча.
+    try:
+        me = await _bot.get_me()
+    except Exception:
+        logger.exception(
+            "Telegram getMe FAILED — токен невалиден или сеть до api.telegram.org недоступна "
+            "(Telegram заблокирован в РФ — задай TG_PROXY_URL в .env). "
+            "Polling не стартую, бот выключен."
+        )
+        try:
+            await _bot.session.close()
+        except Exception:
+            pass
+        _bot = None
+        _dp = None
+        return
+
     _polling_task = asyncio.create_task(_run_polling())
-    logger.info("Telegram bot started in long-polling mode (chat=%s)", TG_ALLOWED_CHAT_ID)
+    proxy_note = f" via proxy {_redact_proxy(TG_PROXY_URL)}" if TG_PROXY_URL else ""
+    logger.info(
+        "Telegram bot started: @%s (id=%s) polling%s, allowed_chat_id=%s. "
+        "ВАЖНО: Privacy Mode должен быть ВЫКЛЮЧЕН в @BotFather (Bot Settings → "
+        "Group Privacy → Turn off).",
+        me.username, me.id, proxy_note, TG_ALLOWED_CHAT_ID,
+    )
+
+
+def _build_session() -> AiohttpSession | None:
+    if not TG_PROXY_URL:
+        return None
+    if TG_PROXY_URL.startswith(("http://", "https://")):
+        # aiohttp нативно поддерживает HTTP/HTTPS прокси — просто передаём URL
+        return AiohttpSession(proxy=TG_PROXY_URL)
+    if TG_PROXY_URL.startswith("socks"):
+        logger.error(
+            "TG_PROXY_URL=%s — SOCKS proxy не поддержан out-of-the-box. "
+            "Поставь aiohttp_socks и допиши custom connector в _build_session(), "
+            "либо используй HTTP/HTTPS прокси.",
+            _redact_proxy(TG_PROXY_URL),
+        )
+        return None
+    logger.error("TG_PROXY_URL=%s — неизвестный схема прокси", _redact_proxy(TG_PROXY_URL))
+    return None
+
+
+def _redact_proxy(url: str) -> str:
+    """Скрывает user:pass в URL для логов."""
+    import re
+    return re.sub(r"://[^@]+@", "://***:***@", url)
 
 
 async def _run_polling() -> None:

@@ -215,10 +215,10 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     if not order_uuid:
         return await _fail(lead_id, f"СДЭК не вернул UUID: {cdek_resp}", source, current_tags)
 
-    # 7. Polling cdek_number
+    # 7. Polling cdek_number (до 60 секунд)
     cdek_number = None
-    for _ in range(10):
-        await asyncio.sleep(2)
+    for _ in range(20):
+        await asyncio.sleep(3)
         try:
             order_info = await cdek_client.get_order(order_uuid)
         except cdek_client.CdekError:
@@ -227,24 +227,32 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         if cdek_number:
             break
 
-    final_value = str(cdek_number) if cdek_number else order_uuid
+    if not cdek_number:
+        return await _fail(
+            lead_id,
+            f"СДЭК не вернул cdek_number за 60с. UUID заказа: {order_uuid}. "
+            f"Проверьте кабинет СДЭК и впишите номер вручную, либо удалите дубль перед /retry.",
+            source, current_tags,
+        )
+
+    cdek_value = str(cdek_number)
 
     # 8. Записать в AMO + перевести этап + снять тег ошибки
     result = await amo_service.commit_waybill(
-        lead_id, final_value, current_tags,
+        lead_id, cdek_value, current_tags,
         error_tag=TAG_ERROR, target_status=STATUS_WAYBILL_READY,
     )
     if not result.get("ok"):
         critical = (
-            f"КРИТИЧНО: сделка {lead_id}, СДЭК UUID={order_uuid} #{cdek_number or '—'} создан, "
+            f"КРИТИЧНО: сделка {lead_id}, СДЭК UUID={order_uuid} #{cdek_number} создан, "
             f"но AMO не обновлён (status={result.get('status_code')}). Внеси номер вручную."
         )
         logger.error(critical)
         await _alert(critical)
-        return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": final_value, "skipped": False}
+        return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
 
     logger.info("Lead %s waybill created: cdek=%s uuid=%s", lead_id, cdek_number, order_uuid)
-    return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": final_value, "skipped": False}
+    return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}
 
 
 async def _fail(lead_id, reason: str, source: str, current_tags: list[dict]) -> dict:
