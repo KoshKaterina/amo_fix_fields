@@ -27,8 +27,9 @@ from api_helpers import (
 logger = logging.getLogger("uvicorn")
 
 _pipeline_cache: dict[int, int] = {}
-# status_id → {"pipeline_id": int, "name": str, "sort": int}
-_status_info: dict[int, dict] = {}
+# (pipeline_id, status_id) → {"name": str, "sort": int}
+# Ключ — пара, потому что системные статусы 142/143 имеют одинаковый id во ВСЕХ воронках.
+_status_info: dict[tuple[int, int], dict] = {}
 
 
 def _build_url(path: str, params: list[tuple[str, str]] | None = None) -> str:
@@ -157,15 +158,14 @@ async def warm_pipeline_cache() -> None:
         return
     pipelines = (data.get("_embedded") or {}).get("pipelines") or []
     cache: dict[int, int] = {}
-    info: dict[int, dict] = {}
+    info: dict[tuple[int, int], dict] = {}
     for pipe in pipelines:
         pipe_id = pipe.get("id")
         for st in (pipe.get("_embedded") or {}).get("statuses") or []:
             sid = st.get("id")
             if sid is not None and pipe_id is not None:
                 cache[sid] = pipe_id
-                info[sid] = {
-                    "pipeline_id": pipe_id,
+                info[(pipe_id, sid)] = {
                     "name": st.get("name") or "",
                     "sort": st.get("sort") or 0,
                 }
@@ -182,14 +182,14 @@ def get_pipeline_id_for_status(status_id: int) -> int | None:
 
 def resolve_status_id_by_name(pipeline_id: int, name: str) -> int | None:
     name_norm = (name or "").strip().lower()
-    for sid, info in _status_info.items():
-        if info["pipeline_id"] == pipeline_id and info["name"].strip().lower() == name_norm:
+    for (pid, sid), info in _status_info.items():
+        if pid == pipeline_id and info["name"].strip().lower() == name_norm:
             return sid
     return None
 
 
-def get_status_sort(status_id: int) -> int | None:
-    info = _status_info.get(status_id)
+def get_status_sort(status_id: int, pipeline_id: int) -> int | None:
+    info = _status_info.get((pipeline_id, status_id))
     return info["sort"] if info else None
 
 
@@ -309,6 +309,7 @@ async def patch_lead(
     *,
     custom_fields: dict[int, Any] | None = None,
     status_id: int | None = None,
+    pipeline_id: int | None = None,
     tags: list[dict] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
@@ -318,7 +319,9 @@ async def patch_lead(
         ]
     if status_id is not None:
         body["status_id"] = status_id
-        pipe = _pipeline_cache.get(status_id)
+        # Для системных статусов (142/143, общие для всех воронок) воронку
+        # нужно передавать явно — кэш для них неоднозначен.
+        pipe = pipeline_id if pipeline_id is not None else _pipeline_cache.get(status_id)
         if pipe is not None:
             body["pipeline_id"] = pipe
     if tags is not None:

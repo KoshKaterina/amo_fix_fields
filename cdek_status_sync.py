@@ -58,10 +58,18 @@ async def init() -> None:
         await _alert(msg)
         return
 
+    # Системные финальные статусы amoCRM — одинаковые id во всех воронках
+    _SYSTEM_STAGE_IDS = {STAGE_DELIVERED: 142, STAGE_NOT_DELIVERED: 143}
+
     needed = set(CDEK_STATUS_TO_STAGE.values())
     missing: list[str] = []
     for stage_name in needed:
         sid = amo_service.resolve_status_id_by_name(_office_pipeline_id, stage_name)
+        if sid is None:
+            fallback = _SYSTEM_STAGE_IDS.get(stage_name)
+            if fallback is not None and amo_service.get_status_sort(fallback, _office_pipeline_id) is not None:
+                logger.info("CDEK sync: этап «%s» взят по системному id %s", stage_name, fallback)
+                sid = fallback
         if sid is None:
             missing.append(stage_name)
         else:
@@ -235,8 +243,11 @@ async def _move_lead(lead: dict, target_status_id: int, target_stage: str, code:
         return
 
     # Только вперёд по воронке
-    current_sort = amo_service.get_status_sort(int(current_status)) if current_status is not None else None
-    target_sort = amo_service.get_status_sort(target_status_id)
+    current_sort = (
+        amo_service.get_status_sort(int(current_status), _office_pipeline_id)
+        if current_status is not None else None
+    )
+    target_sort = amo_service.get_status_sort(target_status_id, _office_pipeline_id)
     if current_sort is None or target_sort is None or target_sort <= current_sort:
         logger.info(
             "CDEK sync: сделка %s — этап «%s» не дальше текущего (sort %s → %s), пропуск",
@@ -244,7 +255,9 @@ async def _move_lead(lead: dict, target_status_id: int, target_stage: str, code:
         )
         return
 
-    res = await amo_service.patch_lead(lead_id, status_id=target_status_id)
+    res = await amo_service.patch_lead(
+        lead_id, status_id=target_status_id, pipeline_id=_office_pipeline_id,
+    )
     if res.get("ok"):
         logger.info(
             "CDEK sync: сделка %s → «%s» (статус СДЭК %s)", lead_id, target_stage, code,
