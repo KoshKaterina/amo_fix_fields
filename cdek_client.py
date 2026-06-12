@@ -142,6 +142,29 @@ class CdekClient:
                 return uuid
         return None
 
+    async def get_order_by_cdek_number(self, cdek_number: str) -> dict | None:
+        """Возвращает entity заказа (со списком statuses) или None."""
+        data = await self._request("GET", "/orders", params={"cdek_number": cdek_number})
+        entity = data.get("entity")
+        if isinstance(entity, dict):
+            return entity
+        if isinstance(entity, list) and entity:
+            return entity[0]
+        return None
+
+    async def get_webhooks(self) -> list[dict]:
+        data = await self._request("GET", "/webhooks")
+        # СДЭК возвращает либо массив, либо объект с entity
+        if isinstance(data, list):
+            return data
+        entity = data.get("entity")
+        if isinstance(entity, list):
+            return entity
+        return []
+
+    async def add_webhook(self, url: str, type_: str = "ORDER_STATUS") -> dict:
+        return await self._request("POST", "/webhooks", json={"url": url, "type": type_})
+
     async def get_barcodes_batch_pdf(self, order_uuids: list[str], format_: str = "A6") -> bytes:
         if not order_uuids:
             raise CdekError("get_barcodes_batch_pdf: empty uuid list")
@@ -225,3 +248,15 @@ async def find_uuid_by_cdek_number(cdek_number: str) -> str | None:
 
 async def get_barcodes_batch_pdf(order_uuids: list[str], format_: str = "A6") -> bytes:
     return await _ensure().get_barcodes_batch_pdf(order_uuids, format_=format_)
+
+
+async def get_order_by_cdek_number(cdek_number: str) -> dict | None:
+    return await _ensure().get_order_by_cdek_number(cdek_number)
+
+
+async def get_webhooks() -> list[dict]:
+    return await _ensure().get_webhooks()
+
+
+async def add_webhook(url: str, type_: str = "ORDER_STATUS") -> dict:
+    return await _ensure().add_webhook(url, type_=type_)

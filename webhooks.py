@@ -8,6 +8,7 @@ from starlette.status import HTTP_200_OK
 
 import amo_service
 import cdek_client
+import cdek_status_sync
 import telegram_bot
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -38,7 +39,9 @@ async def lifespan(app):
     await amo_service.warm_pipeline_cache()
     await cdek_client.init()
     await telegram_bot.init_telegram_bot()
+    await cdek_status_sync.init()
     yield
+    await cdek_status_sync.shutdown()
     await telegram_bot.shutdown_telegram_bot()
     await cdek_client.aclose()
     await shutdown_queue()
@@ -62,6 +65,22 @@ def insert_nested(data, keys, value):
             cur[key] = {}
         cur = cur[key]
     cur[keys[-1]] = value
+
+
+@app.post("/cdek_status")
+async def cdek_status(request: Request):
+    """Вебхук СДЭК ORDER_STATUS. Отвечаем 200 всегда и быстро —
+    обработка идёт через очередь с низшим приоритетом."""
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("CDEK webhook: невалидный JSON")
+        return {"ok": False}
+    try:
+        cdek_status_sync.handle_webhook_event(payload)
+    except Exception:
+        logger.exception("CDEK webhook: ошибка обработки события")
+    return {"ok": True}
 
 
 @app.post("/lead_change")

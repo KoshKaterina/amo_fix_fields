@@ -11,8 +11,11 @@ from memory import MAX_RETRY_ATTEMPTS
 
 logger = logging.getLogger("uvicorn")
 
+# Новое изменение сделки — всегда первым; всё остальное потом.
 PRIORITY_NEW = 0
+PRIORITY_WAYBILL = 5
 PRIORITY_RETRY = 10
+PRIORITY_CDEK_SYNC = 20
 
 RATE_LIMIT_SECONDS = 3
 ECHO_COOLDOWN_SECONDS = 10
@@ -35,6 +38,7 @@ _worker_task: asyncio.Task | None = None
 _retry_tasks: set[asyncio.Task] = set()
 _pending_leads: set[str] = set()
 _pending_waybills: set[str] = set()
+_pending_cdek_sync: set[str] = set()
 _items_processed: int = 0
 
 
@@ -60,6 +64,7 @@ async def shutdown_queue() -> None:
     _retry_tasks.clear()
     _pending_leads.clear()
     _pending_waybills.clear()
+    _pending_cdek_sync.clear()
 
     if _task_queue is not None:
         remaining = 0
@@ -110,8 +115,25 @@ def enqueue_waybill(lead_id, source: str = "webhook") -> None:
         return
     _pending_waybills.add(key)
     payload = {"_kind": "waybill", "lead_id": lead_id, "source": source}
-    _task_queue.put_nowait(WorkItem(priority=PRIORITY_NEW, payload=payload))
+    _task_queue.put_nowait(WorkItem(priority=PRIORITY_WAYBILL, payload=payload))
     logger.info("ENQUEUE waybill lead_id=%s source=%s queue_size=%d", key, source, _task_queue.qsize())
+
+
+def enqueue_cdek_sync(payload: dict) -> None:
+    """Низший приоритет: перемещение сделки по статусу СДЭК."""
+    if _task_queue is None:
+        logger.error("Task queue not initialized, dropping cdek_sync %s", payload)
+        return
+    key = str(payload.get("lead_id") or payload.get("cdek_number") or payload.get("uuid") or "")
+    if not key:
+        logger.warning("enqueue_cdek_sync: payload без идентификаторов, дроп: %s", payload)
+        return
+    if key in _pending_cdek_sync:
+        logger.info("CDEK sync %s already in queue, skipping duplicate", key)
+        return
+    _pending_cdek_sync.add(key)
+    _task_queue.put_nowait(WorkItem(priority=PRIORITY_CDEK_SYNC, payload={**payload, "_kind": "cdek_sync", "_key": key}))
+    logger.info("ENQUEUE cdek_sync key=%s code=%s queue_size=%d", key, payload.get("code"), _task_queue.qsize())
 
 
 async def _worker() -> None:
@@ -122,6 +144,8 @@ async def _worker() -> None:
         kind = item.payload.get("_kind") or "lead_update"
         if kind == "waybill":
             _pending_waybills.discard(lead_id)
+        elif kind == "cdek_sync":
+            _pending_cdek_sync.discard(str(item.payload.get("_key", "")))
         else:
             _pending_leads.discard(lead_id)
         waited = time.time() - item.enqueue_time
@@ -140,6 +164,9 @@ async def _worker() -> None:
                     item.payload["lead_id"],
                     source=item.payload.get("source", "webhook"),
                 )
+            elif kind == "cdek_sync":
+                from cdek_status_sync import process_sync
+                await process_sync(item.payload)
             else:
                 await _process_lead_update(item.payload)
 

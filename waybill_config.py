@@ -28,6 +28,55 @@ FIELD_EMAIL = 413387
 TAG_ERROR = "ошибка накладной"
 TAG_PACKED = "посылка упакована"
 
+# ---------------------------------------------------------------------------
+# Синхронизация статусов СДЭК → этапы воронки «офис».
+# id этапов резолвятся по названиям при старте (cdek_status_sync.init).
+# ---------------------------------------------------------------------------
+
+STAGE_WAYBILL_READY = "Готова накладная"
+STAGE_SHIPPED = "Посылка отгружена"
+STAGE_IN_TRANSIT = "В пути"
+STAGE_AT_PVZ = "Ожидает в ПВЗ"
+STAGE_DELIVERED = "Успешно реализовано"
+STAGE_NOT_DELIVERED = "Закрыто и не реализовано"
+
+# Этапы, в которых сделки опрашиваются фоновой страховкой
+SYNC_POLL_STAGES = (STAGE_WAYBILL_READY, STAGE_SHIPPED, STAGE_IN_TRANSIT, STAGE_AT_PVZ)
+
+# Код статуса СДЭК → название этапа воронки «офис».
+# Возвратные статусы (RETURNED_*, POSTOMAT_SEIZED, SENT_TO_SENDER_CITY,
+# ACCEPTED_IN_SENDER_CITY) намеренно отсутствуют: по ним сделку не двигаем,
+# ждём финальный NOT_DELIVERED.
+CDEK_STATUS_TO_STAGE = {
+    "ACCEPTED": STAGE_WAYBILL_READY,
+    "CREATED": STAGE_WAYBILL_READY,
+    "RECEIVED_AT_SHIPMENT_WAREHOUSE": STAGE_SHIPPED,
+    "READY_FOR_SHIPMENT_IN_SENDER_CITY": STAGE_SHIPPED,
+    "READY_TO_SHIP_AT_SENDING_OFFICE": STAGE_SHIPPED,
+    "TAKEN_BY_TRANSPORTER_FROM_SENDER_CITY": STAGE_IN_TRANSIT,
+    "SENT_TO_TRANSIT_CITY": STAGE_IN_TRANSIT,
+    "ACCEPTED_IN_TRANSIT_CITY": STAGE_IN_TRANSIT,
+    "ACCEPTED_AT_TRANSIT_WAREHOUSE": STAGE_IN_TRANSIT,
+    "READY_TO_SHIP_IN_TRANSIT_OFFICE": STAGE_IN_TRANSIT,
+    "READY_FOR_SHIPMENT_IN_TRANSIT_CITY": STAGE_IN_TRANSIT,
+    "TAKEN_BY_TRANSPORTER_FROM_TRANSIT_CITY": STAGE_IN_TRANSIT,
+    "SENT_TO_RECIPIENT_CITY": STAGE_IN_TRANSIT,
+    "ACCEPTED_IN_RECIPIENT_CITY": STAGE_IN_TRANSIT,
+    "ACCEPTED_AT_RECIPIENT_CITY_WAREHOUSE": STAGE_IN_TRANSIT,
+    "TAKEN_BY_COURIER": STAGE_IN_TRANSIT,
+    "IN_CUSTOMS_INTERNATIONAL": STAGE_IN_TRANSIT,
+    "SHIPPED_TO_DESTINATION": STAGE_IN_TRANSIT,
+    "PASSED_TO_TRANSIT_CARRIER": STAGE_IN_TRANSIT,
+    "IN_CUSTOMS_LOCAL": STAGE_IN_TRANSIT,
+    "CUSTOMS_COMPLETE": STAGE_IN_TRANSIT,
+    "ACCEPTED_AT_PICK_UP_POINT": STAGE_AT_PVZ,
+    "POSTOMAT_POSTED": STAGE_AT_PVZ,
+    "DELIVERED": STAGE_DELIVERED,
+    "POSTOMAT_RECEIVED": STAGE_DELIVERED,
+    "NOT_DELIVERED": STAGE_NOT_DELIVERED,
+    "INVALID": STAGE_NOT_DELIVERED,
+}
+
 # Тарифы СДЭК — определяются по подстроке в FIELD_ORDER_TOTAL
 TARIFF_MAP = {
     "CDEK: Самовывоз": 136,
@@ -51,6 +100,14 @@ SENDER = {
 CDEK_API_URL = os.getenv("CDEK_API_URL", "https://api.cdek.ru/v2").rstrip("/")
 CDEK_CLIENT_ID = os.getenv("CDEK_CLIENT_ID", "")
 CDEK_CLIENT_SECRET = os.getenv("CDEK_CLIENT_SECRET", "")
+# Публичный HTTPS-URL эндпоинта /cdek_status — для подписки на вебхуки СДЭК.
+# Пусто → подписка не оформляется, работает только фоновый опрос.
+CDEK_WEBHOOK_URL = os.getenv(
+    "CDEK_WEBHOOK_URL",
+    "https://koshkaterina-amo-fix-fields-a7a1.twc1.net/cdek_status",
+).strip()
+# Интервал фонового опроса-страховки, сек (0 → опрос выключен)
+CDEK_SYNC_POLL_INTERVAL_S = int(os.getenv("CDEK_SYNC_POLL_INTERVAL_S", "3600"))
 
 # Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")

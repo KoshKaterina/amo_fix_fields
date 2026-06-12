@@ -27,6 +27,8 @@ from api_helpers import (
 logger = logging.getLogger("uvicorn")
 
 _pipeline_cache: dict[int, int] = {}
+# status_id → {"pipeline_id": int, "name": str, "sort": int}
+_status_info: dict[int, dict] = {}
 
 
 def _build_url(path: str, params: list[tuple[str, str]] | None = None) -> str:
@@ -155,19 +157,40 @@ async def warm_pipeline_cache() -> None:
         return
     pipelines = (data.get("_embedded") or {}).get("pipelines") or []
     cache: dict[int, int] = {}
+    info: dict[int, dict] = {}
     for pipe in pipelines:
         pipe_id = pipe.get("id")
         for st in (pipe.get("_embedded") or {}).get("statuses") or []:
             sid = st.get("id")
             if sid is not None and pipe_id is not None:
                 cache[sid] = pipe_id
+                info[sid] = {
+                    "pipeline_id": pipe_id,
+                    "name": st.get("name") or "",
+                    "sort": st.get("sort") or 0,
+                }
     _pipeline_cache.clear()
     _pipeline_cache.update(cache)
+    _status_info.clear()
+    _status_info.update(info)
     logger.info("Pipeline cache warmed: %s statuses", len(cache))
 
 
 def get_pipeline_id_for_status(status_id: int) -> int | None:
     return _pipeline_cache.get(status_id)
+
+
+def resolve_status_id_by_name(pipeline_id: int, name: str) -> int | None:
+    name_norm = (name or "").strip().lower()
+    for sid, info in _status_info.items():
+        if info["pipeline_id"] == pipeline_id and info["name"].strip().lower() == name_norm:
+            return sid
+    return None
+
+
+def get_status_sort(status_id: int) -> int | None:
+    info = _status_info.get(status_id)
+    return info["sort"] if info else None
 
 
 async def get_lead_full(lead_id: int | str, with_: tuple[str, ...] = ("contacts", "companies")) -> dict | None:
@@ -235,6 +258,17 @@ async def get_leads_by_status(status_id: int, with_: tuple[str, ...] = ("contact
             break
         page += 1
     return leads
+
+
+async def find_leads_by_query(query: str, with_: tuple[str, ...] = ()) -> list[dict]:
+    """Полнотекстовый поиск сделок (query ищет и по значениям custom-полей)."""
+    params: list[tuple[str, str]] = [("query", query), ("limit", "50")]
+    if with_:
+        params.append(("with", ",".join(with_)))
+    data = await _do_get("/api/v4/leads", params)
+    if not data:
+        return []
+    return (data.get("_embedded") or {}).get("leads") or []
 
 
 def get_custom_field_value(entity: dict, field_id: int) -> Any:
