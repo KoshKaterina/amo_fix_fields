@@ -16,6 +16,7 @@ PRIORITY_NEW = 0
 PRIORITY_WAYBILL = 5
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
+PRIORITY_METRIKA_SYNC = 25
 
 RATE_LIMIT_SECONDS = 3
 ECHO_COOLDOWN_SECONDS = 10
@@ -39,6 +40,7 @@ _retry_tasks: set[asyncio.Task] = set()
 _pending_leads: set[str] = set()
 _pending_waybills: set[str] = set()
 _pending_cdek_sync: set[str] = set()
+_pending_metrika_sync: set[str] = set()
 _items_processed: int = 0
 
 
@@ -65,6 +67,7 @@ async def shutdown_queue() -> None:
     _pending_leads.clear()
     _pending_waybills.clear()
     _pending_cdek_sync.clear()
+    _pending_metrika_sync.clear()
 
     if _task_queue is not None:
         remaining = 0
@@ -136,6 +139,23 @@ def enqueue_cdek_sync(payload: dict) -> None:
     logger.info("ENQUEUE cdek_sync key=%s code=%s queue_size=%d", key, payload.get("code"), _task_queue.qsize())
 
 
+def enqueue_metrika_sync(lead_id) -> None:
+    """Низший приоритет: отправка статуса сделки в Яндекс.Метрику."""
+    if _task_queue is None:
+        logger.error("Task queue not initialized, dropping metrika_sync for lead %s", lead_id)
+        return
+    key = str(lead_id)
+    if key in _pending_metrika_sync:
+        logger.info("Lead %s metrika_sync already in queue, skipping duplicate", key)
+        return
+    _pending_metrika_sync.add(key)
+    _task_queue.put_nowait(WorkItem(
+        priority=PRIORITY_METRIKA_SYNC,
+        payload={"_kind": "metrika_sync", "lead_id": lead_id},
+    ))
+    logger.info("ENQUEUE metrika_sync lead_id=%s queue_size=%d", key, _task_queue.qsize())
+
+
 async def _worker() -> None:
     global _items_processed
     while True:
@@ -146,6 +166,8 @@ async def _worker() -> None:
             _pending_waybills.discard(lead_id)
         elif kind == "cdek_sync":
             _pending_cdek_sync.discard(str(item.payload.get("_key", "")))
+        elif kind == "metrika_sync":
+            _pending_metrika_sync.discard(lead_id)
         else:
             _pending_leads.discard(lead_id)
         waited = time.time() - item.enqueue_time
@@ -167,6 +189,9 @@ async def _worker() -> None:
             elif kind == "cdek_sync":
                 from cdek_status_sync import process_sync
                 await process_sync(item.payload)
+            elif kind == "metrika_sync":
+                from metrika_sync import process_sync as metrika_process
+                await metrika_process(item.payload)
             else:
                 await _process_lead_update(item.payload)
 

@@ -10,6 +10,7 @@ from starlette.status import HTTP_200_OK
 import amo_service
 import cdek_client
 import cdek_status_sync
+import metrika_sync
 import telegram_bot
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -17,7 +18,13 @@ from help_function import (
     parse_the_cart_field,
     parse_the_cart_field_2,
 )
-from queue_manager import enqueue_new, enqueue_waybill, init_queue, shutdown_queue
+from queue_manager import (
+    enqueue_metrika_sync,
+    enqueue_new,
+    enqueue_waybill,
+    init_queue,
+    shutdown_queue,
+)
 from waybill_config import STATUS_CREATE_WAYBILL, looks_like_uuid
 
 
@@ -41,7 +48,9 @@ async def lifespan(app):
     await cdek_client.init()
     await telegram_bot.init_telegram_bot()
     await cdek_status_sync.init()
+    await metrika_sync.init()
     yield
+    await metrika_sync.shutdown()
     await cdek_status_sync.shutdown()
     await telegram_bot.shutdown_telegram_bot()
     await cdek_client.aclose()
@@ -138,6 +147,11 @@ async def lead_change(request: Request):
     if lead_id is not None and incoming_status is not None and str(incoming_status) == str(STATUS_CREATE_WAYBILL):
         logger.info("Lead %s entered STATUS_CREATE_WAYBILL — enqueue waybill", lead_id)
         enqueue_waybill(lead_id, source="webhook")
+
+    # Любая смена статуса сделки → проверка для Яндекс.Метрики (воркер решит,
+    # релевантна ли воронка/этап; низший приоритет).
+    if lead_id is not None and incoming_status is not None and metrika_sync.is_enabled():
+        enqueue_metrika_sync(lead_id)
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:

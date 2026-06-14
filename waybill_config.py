@@ -110,6 +110,40 @@ CDEK_WEBHOOK_URL = os.getenv("CDEK_WEBHOOK_URL", f"{PUBLIC_BASE_URL}/cdek_status
 # Интервал фонового опроса-страховки, сек (0 → опрос выключен)
 CDEK_SYNC_POLL_INTERVAL_S = int(os.getenv("CDEK_SYNC_POLL_INTERVAL_S", "3600"))
 
+# ---------------------------------------------------------------------------
+# Яндекс.Метрика CDP — сквозная аналитика (amoCRM → Метрика)
+# ---------------------------------------------------------------------------
+METRIKA_API_URL = os.getenv("METRIKA_API_URL", "https://api-metrika.yandex.net").rstrip("/")
+METRIKA_TOKEN = os.getenv("METRIKA_TOKEN", "").strip()
+# Номер счётчика. Пусто → если в аккаунте один счётчик, подхватим по токену.
+_raw_counter = os.getenv("METRIKA_COUNTER_ID", "").strip()
+METRIKA_COUNTER_ID: int | None = int(_raw_counter) if _raw_counter.isdigit() else None
+
+# Воронки amoCRM
+PIPELINE_CLEVER = 10593102       # [CLEVER] Основная — отдел продаж, ОРИГИНАЛЫ сделок
+PIPELINE_OFFICE = 9421022        # Офис
+PIPELINE_FULFILLMENT = 10997702  # Фулфилмент
+
+# Целевые статусы. 142/143 — системные, общие для всех воронок.
+STATUS_SUCCESS = 142             # Успешно реализовано
+STATUS_CLOSED_LOST = 143         # Закрыто и не реализовано
+FULFILLMENT_DELIVERED = 86476486          # Фулфилмент «09. Доставлено»
+FULFILLMENT_PAYMENT_FORWARDED = 86451330  # Фулфилмент «09.2 Платёж отправлен владельцу»
+
+# Поля сделки для Метрики
+FIELD_YM_CLIENT_ID = 578015          # «id (для метрики)» — ClientID Яндекс.Метрики (_ym_uid)
+FIELD_MOYSKLAD_ORDER_UUID = 576689   # «ID Заказа» (UUID МойСклад) — ключ связки дубликат→оригинал
+# FIELD_PAYMENT_METHOD = 577373 (способ оплаты) уже определён выше
+# FIELD_PHONE = 413385, FIELD_EMAIL = 413387 (контакт) уже определены выше
+
+# Наложка (оплата по факту получения): любой из маркеров в поле «Способ оплаты».
+COD_PAYMENT_MARKERS = ("при получении", "наличны", "эвотор", "наложен")
+
+
+def is_cod_payment(payment_method) -> bool:
+    s = str(payment_method or "").lower()
+    return any(m in s for m in COD_PAYMENT_MARKERS)
+
 # Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 _raw_chat_id = os.getenv("TG_ALLOWED_CHAT_ID", "")
