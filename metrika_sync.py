@@ -18,6 +18,7 @@
 """
 
 import asyncio
+import datetime
 import logging
 import time
 
@@ -42,6 +43,17 @@ from waybill_config import (
 )
 
 logger = logging.getLogger("uvicorn")
+
+# Метрика ждёт даты как LocalDateTime (НЕ unix). Счётчик в МСК.
+_MSK = datetime.timezone(datetime.timedelta(hours=3))
+
+
+def _fmt_dt(ts) -> str | None:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), tz=_MSK).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, OSError):
+        return None
+
 
 _enabled = False
 _counter_id: int | None = None
@@ -166,18 +178,19 @@ async def process_sync(payload: dict) -> None:
     metrika_order_id = canonical.get("id")
     ym = str(_cf(canonical, FIELD_YM_CLIENT_ID) or "").strip()
     contact_id, email, phone = await _contact_info(canonical)
-    if not (ym or email or phone):
+    # Метрике нужен хотя бы один идентификатор клиента (client_uniq_id тоже годится).
+    if not (ym or email or phone or contact_id):
         logger.warning("Metrika: заказ %s без идентификаторов клиента — пропуск", metrika_order_id)
         return
 
     now = int(time.time())
     # дата смены статуса — у триггерящей сделки (для COD это момент доставки в дубликате)
-    event_ts = lead.get("updated_at") or now
+    event_dt = _fmt_dt(lead.get("updated_at") or now)
 
     row: dict = {
         "id": metrika_order_id,
-        "create_date_time": canonical.get("created_at") or now,
-        "update_date_time": event_ts,
+        "create_date_time": _fmt_dt(canonical.get("created_at") or now),
+        "update_date_time": event_dt,
         "order_status": order_status,
         "currency": "RUB",
     }
@@ -190,7 +203,7 @@ async def process_sync(payload: dict) -> None:
     if contact_id:
         row["client_uniq_id"] = contact_id
     if order_status in ("PAID", "CANCELLED"):
-        row["finish_date_time"] = event_ts
+        row["finish_date_time"] = event_dt
     if order_status == "PAID":
         revenue = canonical.get("price") or 0
         if revenue:
