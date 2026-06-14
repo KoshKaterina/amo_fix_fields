@@ -167,7 +167,7 @@ async def lead_change(request: Request):
         and metrika_sync.is_enabled()
         and (incoming_pipeline is None or str(incoming_pipeline) in METRIKA_PIPELINES)
     ):
-        enqueue_metrika_sync(lead_id)
+        enqueue_metrika_sync(lead_id, incoming_status)
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:

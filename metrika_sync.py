@@ -44,6 +44,10 @@ from waybill_config import (
 
 logger = logging.getLogger("uvicorn")
 
+# Ночная сверка: окно и время запуска.
+RECONCILE_DAYS = 14
+NIGHTLY_HOUR_MSK = 1  # 01:00 МСК
+
 # Метрика ждёт даты как LocalDateTime (НЕ unix). Счётчик в МСК.
 _MSK = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -57,6 +61,7 @@ def _fmt_dt(ts) -> str | None:
 
 _enabled = False
 _counter_id: int | None = None
+_nightly_task: asyncio.Task | None = None
 
 
 def is_enabled() -> bool:
@@ -94,10 +99,21 @@ async def init() -> None:
     _enabled = True
     logger.info("Metrika sync включён (counter=%s)", _counter_id)
 
+    global _nightly_task
+    _nightly_task = asyncio.create_task(_nightly_loop())
+    logger.info("Metrika: ночная сверка в %02d:00 МСК, окно %s дн.", NIGHTLY_HOUR_MSK, RECONCILE_DAYS)
+
 
 async def shutdown() -> None:
-    global _enabled
+    global _enabled, _nightly_task
     _enabled = False
+    if _nightly_task is not None:
+        _nightly_task.cancel()
+        try:
+            await _nightly_task
+        except asyncio.CancelledError:
+            pass
+        _nightly_task = None
     await metrika_client.aclose()
     logger.info("Metrika sync stopped")
 
@@ -142,11 +158,12 @@ def _classify(pipeline_id, status_id, cod: bool) -> tuple[str | None, bool]:
     return None, False
 
 
-async def process_sync(payload: dict) -> None:
+async def process_sync(payload: dict, lead: dict | None = None) -> None:
     if not _enabled:
         return
     lead_id = payload["lead_id"]
-    lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
+    if lead is None:
+        lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
     if not lead:
         return
 
@@ -262,3 +279,61 @@ async def _contact_info(lead: dict) -> tuple[int | None, str | None, str | None]
     email = str(email).strip().lower() if email else None
     phone = "".join(ch for ch in str(phone) if ch.isdigit()) if phone else None
     return cid, email, phone
+
+
+# ---------------------------------------------------------------------------
+# Ночная сверка — источник истины. Догоняет пропущенные/задебаунсенные вебхуки.
+# ---------------------------------------------------------------------------
+
+async def reconcile_window(days: int = RECONCILE_DAYS) -> None:
+    """Пересинкивает все сделки 3 воронок, изменённые за последние `days` дней.
+
+    Идемпотентно (upsert по id). Переиспользует process_sync — статусы и резолв
+    считаются той же логикой, что и в realtime.
+    """
+    if not _enabled:
+        return
+    since = int(time.time()) - days * 86400
+    leads_by_id: dict[int, dict] = {}
+    for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+        try:
+            batch = await amo_service.get_leads_updated_since(pipeline, since, with_=("contacts",))
+        except Exception:
+            logger.exception("Metrika reconcile: ошибка выборки воронки %s", pipeline)
+            continue
+        for ld in batch:
+            lid = ld.get("id")
+            if lid is not None:
+                leads_by_id[lid] = ld
+
+    logger.info("Metrika reconcile: %s сделок за %s дн. — старт", len(leads_by_id), days)
+    ok = 0
+    for lid, ld in leads_by_id.items():
+        try:
+            await process_sync({"lead_id": lid}, lead=ld)
+            ok += 1
+        except Exception:
+            logger.exception("Metrika reconcile: ошибка по сделке %s", lid)
+    logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
+
+
+def _seconds_until_next(hour_msk: int) -> float:
+    now = datetime.datetime.now(_MSK)
+    nxt = now.replace(hour=hour_msk, minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += datetime.timedelta(days=1)
+    return (nxt - now).total_seconds()
+
+
+async def _nightly_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next(NIGHTLY_HOUR_MSK))
+        except asyncio.CancelledError:
+            raise
+        try:
+            await reconcile_window(RECONCILE_DAYS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Metrika: ночная сверка упала")

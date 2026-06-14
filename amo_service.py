@@ -319,6 +319,34 @@ async def find_leads_by_query(query: str, with_: tuple[str, ...] = ()) -> list[d
     return (data.get("_embedded") or {}).get("leads") or []
 
 
+async def get_leads_updated_since(
+    pipeline_id: int, since_ts: int, with_: tuple[str, ...] = (), page_limit: int = 250
+) -> list[dict]:
+    """Все сделки воронки, изменённые с момента since_ts (unix). Для ночной сверки."""
+    leads: list[dict] = []
+    page = 1
+    while True:
+        params: list[tuple[str, str]] = [
+            ("filter[pipeline_id]", str(pipeline_id)),
+            ("filter[updated_at][from]", str(int(since_ts))),
+            ("limit", str(page_limit)),
+            ("page", str(page)),
+        ]
+        if with_:
+            params.append(("with", ",".join(with_)))
+        data = await _do_get("/api/v4/leads", params)
+        if not data:
+            break
+        batch = (data.get("_embedded") or {}).get("leads") or []
+        if not batch:
+            break
+        leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        page += 1
+    return leads
+
+
 def get_custom_field_value(entity: dict, field_id: int) -> Any:
     for f in entity.get("custom_fields_values") or []:
         if f.get("field_id") == field_id:
