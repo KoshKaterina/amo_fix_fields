@@ -172,9 +172,12 @@ async def process_sync(payload: dict) -> None:
     if need_resolve:
         canonical = await _resolve_clever(lead)
         if not canonical:
-            await _alert(
-                f"Metrika: не нашёл оригинал в CLEVER для сделки {lead_id} "
-                f"(UUID МойСклад={_cf(lead, FIELD_MOYSKLAD_ORDER_UUID)!r}, статус {order_status}) — пропуск"
+            # Для старых/архивных дублей оригинал в CLEVER может не находиться —
+            # это ожидаемый пропуск, не ошибка. Без алерта, чтобы не спамить TG.
+            logger.warning(
+                "Metrika: не нашёл оригинал в CLEVER для сделки %s "
+                "(UUID МойСклад=%r, статус %s) — пропуск",
+                lead_id, _cf(lead, FIELD_MOYSKLAD_ORDER_UUID), order_status,
             )
             return
     else:
