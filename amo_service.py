@@ -147,6 +147,54 @@ async def _do_patch(path: str, body: dict) -> dict[str, Any]:
     return {"ok": False, "status_code": None, "retryable": True}
 
 
+async def _do_post(path: str, body) -> dict[str, Any]:
+    url = _build_url(path)
+    for attempt in range(1, MAX_PATCH_RETRIES + 1):
+        if is_circuit_open():
+            logger.warning("Circuit breaker open — aborting POST %s", path)
+            return {"ok": False, "status_code": None, "retryable": True}
+        try:
+            response = await submit_request("POST", url, headers, json_body=body)
+        except asyncio.CancelledError:
+            raise
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Request error on POST %s attempt %s/%s (%s)",
+                path, attempt, MAX_PATCH_RETRIES, exc.__class__.__name__,
+            )
+            if attempt < MAX_PATCH_RETRIES:
+                await asyncio.sleep(compute_retry_delay(attempt))
+                continue
+            return {"ok": False, "status_code": None, "retryable": True}
+        except Exception:
+            logger.exception("Unexpected error on POST %s attempt %s", path, attempt)
+            if attempt < MAX_PATCH_RETRIES:
+                await asyncio.sleep(compute_retry_delay(attempt))
+                continue
+            return {"ok": False, "status_code": None, "retryable": True}
+
+        if response.status_code in (200, 201, 204):
+            _record_success()
+            return {"ok": True, "status_code": response.status_code, "retryable": False}
+
+        if response.status_code == 429:
+            _record_429()
+
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_PATCH_RETRIES:
+            delay = compute_retry_delay(attempt, response.headers.get("Retry-After"))
+            await asyncio.sleep(delay)
+            continue
+
+        logger.error("POST %s %s: %s", path, response.status_code, trim_text(response.text))
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "retryable": response.status_code in RETRYABLE_STATUS_CODES,
+        }
+
+    return {"ok": False, "status_code": None, "retryable": True}
+
+
 # ---------------------------------------------------------------------------
 # High-level operations
 # ---------------------------------------------------------------------------
@@ -329,6 +377,12 @@ async def patch_lead(
     if not body:
         return {"ok": True, "status_code": 204, "retryable": False}
     return await _do_patch(f"/api/v4/leads/{lead_id}", body)
+
+
+async def add_note(lead_id: int | str, text: str) -> dict[str, Any]:
+    """Добавляет обычное примечание к сделке."""
+    body = [{"note_type": "common", "params": {"text": text}}]
+    return await _do_post(f"/api/v4/leads/{lead_id}/notes", body)
 
 
 async def add_tag(lead_id: int | str, tag_name: str) -> dict[str, Any]:

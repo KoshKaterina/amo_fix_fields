@@ -19,6 +19,7 @@ from waybill_config import (
     FIELD_PVZ_CODE,
     FIELD_PVZ_CODE_FALLBACK,
     FIELD_SENDER_COMPANY,
+    PUBLIC_BASE_URL,
     SENDER,
     STATUS_CREATE_WAYBILL,
     STATUS_WAYBILL_READY,
@@ -250,6 +251,14 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         logger.error(critical)
         await _alert(critical)
         return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
+
+    # 9. Примечание со ссылкой на скачивание штрихкода СДЭК
+    barcode_url = f"{PUBLIC_BASE_URL}/barcode/{cdek_value}"
+    note_res = await amo_service.add_note(
+        lead_id, f"Штрихкод СДЭК (№{cdek_value}) — скачать/распечатать: {barcode_url}"
+    )
+    if not note_res.get("ok"):
+        logger.warning("Lead %s: не удалось добавить примечание со ссылкой на штрихкод: %s", lead_id, note_res)
 
     logger.info("Lead %s waybill created: cdek=%s uuid=%s", lead_id, cdek_number, order_uuid)
     return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}

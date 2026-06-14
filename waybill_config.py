@@ -100,12 +100,13 @@ SENDER = {
 CDEK_API_URL = os.getenv("CDEK_API_URL", "https://api.cdek.ru/v2").rstrip("/")
 CDEK_CLIENT_ID = os.getenv("CDEK_CLIENT_ID", "")
 CDEK_CLIENT_SECRET = os.getenv("CDEK_CLIENT_SECRET", "")
-# Публичный HTTPS-URL эндпоинта /cdek_status — для подписки на вебхуки СДЭК.
+# Публичный HTTPS-адрес сервиса — для ссылок в примечаниях и подписки на вебхуки.
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL", "https://koshkaterina-amo-fix-fields-a7a1.twc1.net"
+).rstrip("/")
+# HTTPS-URL эндпоинта /cdek_status — для подписки на вебхуки СДЭК.
 # Пусто → подписка не оформляется, работает только фоновый опрос.
-CDEK_WEBHOOK_URL = os.getenv(
-    "CDEK_WEBHOOK_URL",
-    "https://koshkaterina-amo-fix-fields-a7a1.twc1.net/cdek_status",
-).strip()
+CDEK_WEBHOOK_URL = os.getenv("CDEK_WEBHOOK_URL", f"{PUBLIC_BASE_URL}/cdek_status").strip()
 # Интервал фонового опроса-страховки, сек (0 → опрос выключен)
 CDEK_SYNC_POLL_INTERVAL_S = int(os.getenv("CDEK_SYNC_POLL_INTERVAL_S", "3600"))
 

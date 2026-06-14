@@ -4,6 +4,7 @@ import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import Response
 from starlette.status import HTTP_200_OK
 
 import amo_service
@@ -17,7 +18,7 @@ from help_function import (
     parse_the_cart_field_2,
 )
 from queue_manager import enqueue_new, enqueue_waybill, init_queue, shutdown_queue
-from waybill_config import STATUS_CREATE_WAYBILL
+from waybill_config import STATUS_CREATE_WAYBILL, looks_like_uuid
 
 
 @asynccontextmanager
@@ -65,6 +66,31 @@ def insert_nested(data, keys, value):
             cur[key] = {}
         cur = cur[key]
     cur[keys[-1]] = value
+
+
+@app.get("/barcode/{ident}")
+async def barcode(ident: str):
+    """Проксирует штрихкод СДЭК: принимает cdek_number или UUID заказа,
+    ходит в СДЭК с токеном и отдаёт PDF. Ссылку кладём в примечание сделки."""
+    try:
+        if looks_like_uuid(ident):
+            uuid = ident
+        else:
+            uuid = await cdek_client.find_uuid_by_cdek_number(ident)
+        if not uuid:
+            return Response("Заказ СДЭК не найден", status_code=404)
+        pdf = await cdek_client.get_barcodes_batch_pdf([uuid])
+    except cdek_client.CdekError as exc:
+        logger.warning("barcode %s: ошибка СДЭК: %s", ident, exc)
+        return Response(f"Штрихкод недоступен: {exc}", status_code=502)
+    except Exception:
+        logger.exception("barcode %s: неожиданная ошибка", ident)
+        return Response("Внутренняя ошибка", status_code=500)
+    return Response(
+        pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="barcode_{ident}.pdf"'},
+    )
 
 
 @app.post("/cdek_status")
