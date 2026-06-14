@@ -153,6 +153,11 @@ async def process_sync(payload: dict) -> None:
     pipeline_id = lead.get("pipeline_id")
     status_id = lead.get("status_id")
 
+    # Работаем только со сквозным потоком заказа: CLEVER → Офис/Фулфилмент.
+    # Сделки из прочих воронок (опт, отдел продаж и т.п.) игнорируем.
+    if pipeline_id not in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+        return
+
     payment = _cf(lead, FIELD_PAYMENT_METHOD)
     if not str(payment or "").strip():
         logger.info("Metrika: сделка %s без способа оплаты — пропуск", lead_id)
