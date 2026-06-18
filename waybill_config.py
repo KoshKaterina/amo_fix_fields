@@ -168,6 +168,16 @@ def is_cod_payment(payment_method) -> bool:
         return True
     return False
 
+# ---------------------------------------------------------------------------
+# МойСклад API — для ms_status_sync (ведём ФФ-копию по статусу заказа склада).
+# Только чтение. MS_TOKEN — Bearer-токен главного админа МС (тот же, что в
+# проекте woocommerce-sklad). Пусто → ms_status_sync ВЫКЛЮЧЕН (сервис работает).
+# ---------------------------------------------------------------------------
+MS_API_URL = os.getenv("MS_API_URL", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
+MS_TOKEN = os.getenv("MS_TOKEN", "").strip()
+MS_SYNC_POLL_INTERVAL_S = int(os.getenv("MS_SYNC_POLL_INTERVAL_S", "30"))
+MS_SYNC_LOOKBACK_MIN = int(os.getenv("MS_SYNC_LOOKBACK_MIN", "120"))
+
 # Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 _raw_chat_id = os.getenv("TG_ALLOWED_CHAT_ID", "")
