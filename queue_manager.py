@@ -20,8 +20,6 @@ PRIORITY_METRIKA_SYNC = 25
 
 RATE_LIMIT_SECONDS = 3
 ECHO_COOLDOWN_SECONDS = 10
-# Дебаунс Метрики: не пересинкать сделку с тем же статусом чаще, чем раз в N сек.
-METRIKA_DEBOUNCE_SECONDS = 60
 
 lead_last_processed: dict[str, datetime.datetime] = {}
 
@@ -43,8 +41,6 @@ _pending_leads: set[str] = set()
 _pending_waybills: set[str] = set()
 _pending_cdek_sync: set[str] = set()
 _pending_metrika_sync: set[str] = set()
-# lead_id → (status_id, monotonic_ts) последнего поставленного в очередь синка Метрики
-_metrika_recent: dict[str, tuple[str, float]] = {}
 _items_processed: int = 0
 
 
@@ -72,7 +68,6 @@ async def shutdown_queue() -> None:
     _pending_waybills.clear()
     _pending_cdek_sync.clear()
     _pending_metrika_sync.clear()
-    _metrika_recent.clear()
 
     if _task_queue is not None:
         remaining = 0
@@ -147,29 +142,19 @@ def enqueue_cdek_sync(payload: dict) -> None:
 def enqueue_metrika_sync(lead_id, status_id=None) -> None:
     """Низший приоритет: отправка статуса сделки в Яндекс.Метрику.
 
-    Дебаунс: если ту же сделку с тем же статусом уже ставили в очередь
-    < METRIKA_DEBOUNCE_SECONDS назад — пропускаем (гасит шквал повторных
-    вебхуков при массовых перемещениях). Пропущенное добьёт ночная сверка.
+    Здесь — только грубое схлопывание дублей, пока задача ждёт в очереди
+    (_pending_metrika_sync). Тонкий дедуп вынесен в metrika_sync.process_sync:
+    он сравнивает ФАКТИЧЕСКОЕ исходящее состояние заказа и сам гасит echo и
+    перебор этапов (все нетерминальные → один IN_PROGRESS). Параметр status_id
+    сохранён для совместимости вызова из вебхука.
     """
     if _task_queue is None:
         logger.error("Task queue not initialized, dropping metrika_sync for lead %s", lead_id)
         return
     key = str(lead_id)
-
-    if status_id is not None:
-        prev = _metrika_recent.get(key)
-        if prev and prev[0] == str(status_id) and (time.monotonic() - prev[1]) < METRIKA_DEBOUNCE_SECONDS:
-            logger.info("Lead %s metrika_sync debounced (status %s)", key, status_id)
-            return
-
     if key in _pending_metrika_sync:
         logger.info("Lead %s metrika_sync already in queue, skipping duplicate", key)
         return
-
-    if status_id is not None:
-        _metrika_recent[key] = (str(status_id), time.monotonic())
-        if len(_metrika_recent) > 5000:
-            _prune_metrika_recent()
 
     _pending_metrika_sync.add(key)
     _task_queue.put_nowait(WorkItem(
@@ -177,13 +162,6 @@ def enqueue_metrika_sync(lead_id, status_id=None) -> None:
         payload={"_kind": "metrika_sync", "lead_id": lead_id},
     ))
     logger.info("ENQUEUE metrika_sync lead_id=%s queue_size=%d", key, _task_queue.qsize())
-
-
-def _prune_metrika_recent() -> None:
-    cutoff = time.monotonic() - METRIKA_DEBOUNCE_SECONDS
-    stale = [k for k, v in _metrika_recent.items() if v[1] < cutoff]
-    for k in stale:
-        del _metrika_recent[k]
 
 
 async def _worker() -> None:

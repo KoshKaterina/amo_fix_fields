@@ -1,3 +1,4 @@
+import datetime
 import os
 import re
 
@@ -118,6 +119,26 @@ METRIKA_TOKEN = os.getenv("METRIKA_TOKEN", "").strip()
 # Номер счётчика. Пусто → если в аккаунте один счётчик, подхватим по токену.
 _raw_counter = os.getenv("METRIKA_COUNTER_ID", "").strip()
 METRIKA_COUNTER_ID: int | None = int(_raw_counter) if _raw_counter.isdigit() else None
+
+# Гард по дате старта интеграции: заказы, созданные раньше METRIKA_SINCE, не
+# синкаем (отсекает исторические сделки и массовые правки старья). Формат
+# YYYY-MM-DD по МСК. Пусто → гард выключен.
+_raw_since = os.getenv("METRIKA_SINCE", "").strip()
+
+
+def _parse_since_ts(s: str) -> int | None:
+    if not s:
+        return None
+    try:
+        d = datetime.datetime.strptime(s, "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone(datetime.timedelta(hours=3))
+        )
+        return int(d.timestamp())
+    except ValueError:
+        return None
+
+
+METRIKA_SINCE_TS: int | None = _parse_since_ts(_raw_since)
 
 # Воронки amoCRM
 PIPELINE_CLEVER = 10593102       # [CLEVER] Основная — отдел продаж, ОРИГИНАЛЫ сделок

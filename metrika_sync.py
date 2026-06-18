@@ -33,6 +33,7 @@ from waybill_config import (
     FULFILLMENT_DELIVERED,
     FULFILLMENT_PAYMENT_FORWARDED,
     METRIKA_COUNTER_ID,
+    METRIKA_SINCE_TS,
     METRIKA_TOKEN,
     PIPELINE_CLEVER,
     PIPELINE_FULFILLMENT,
@@ -63,9 +64,29 @@ _enabled = False
 _counter_id: int | None = None
 _nightly_task: asyncio.Task | None = None
 
+# Дедуп по исходящему состоянию: id заказа → подпись последней успешно
+# отправленной строки. Гасит повторные отправки ОДНОГО И ТОГО ЖЕ состояния
+# (echo-вебхуки, перебор нетерминальных этапов в CLEVER — все мапятся в
+# IN_PROGRESS). В памяти: после рестарта будет один повторный upsert на заказ —
+# идемпотентно (merge_mode=UPDATE по id). Ночная сверка опирается на тот же стор.
+_last_sent: dict[int, str] = {}
+
 
 def is_enabled() -> bool:
     return _enabled
+
+
+def _row_signature(row: dict) -> str:
+    """Подпись значимого состояния заказа (без волатильных дат) — ключ дедупа отправок."""
+    parts = (
+        row.get("order_status"),
+        row.get("revenue"),
+        row.get("client_ids"),
+        row.get("emails"),
+        row.get("phones"),
+        row.get("client_uniq_id"),
+    )
+    return "|".join("" if p is None else str(p) for p in parts)
 
 
 async def init() -> None:
@@ -114,6 +135,7 @@ async def shutdown() -> None:
         except asyncio.CancelledError:
             pass
         _nightly_task = None
+    _last_sent.clear()
     await metrika_client.aclose()
     logger.info("Metrika sync stopped")
 
@@ -201,6 +223,18 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
         canonical = lead
 
     metrika_order_id = canonical.get("id")
+
+    # Гард по дате старта интеграции: исторические заказы и массовые правки
+    # старья (созданные до METRIKA_SINCE) в Метрику не тащим.
+    if METRIKA_SINCE_TS is not None:
+        created = canonical.get("created_at")
+        if created is not None and int(created) < METRIKA_SINCE_TS:
+            logger.info(
+                "Metrika: заказ %s создан до старта интеграции (created_at=%s) — пропуск",
+                metrika_order_id, created,
+            )
+            return
+
     ym = str(_cf(canonical, FIELD_YM_CLIENT_ID) or "").strip()
     contact_id, email, phone = await _contact_info(canonical)
     # Метрике нужен хотя бы один идентификатор клиента (client_uniq_id тоже годится).
@@ -229,13 +263,27 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
         row["client_uniq_id"] = contact_id
     if order_status in ("PAID", "CANCELLED"):
         row["finish_date_time"] = event_dt
-    if order_status == "PAID":
-        revenue = canonical.get("price") or 0
-        if revenue:
-            row["revenue"] = revenue
+    # revenue пишем ВСЕГДА явно: при PAID — сумма заказа, иначе 0. Это
+    # (а) обнуляет выручку при CANCELLED (правило согласовано), (б) при
+    # merge_mode=UPDATE гарантированно перезаписывает прежнее значение, а не
+    # оставляет «прилипшую» сумму от старого PAID.
+    row["revenue"] = (canonical.get("price") or 0) if order_status == "PAID" else 0
+
+    # Дедуп: не шлём заказ повторно, если его значимое состояние не изменилось
+    # с прошлой успешной отправки (гасит echo и перебор этапов → один IN_PROGRESS).
+    sig = _row_signature(row)
+    if _last_sent.get(metrika_order_id) == sig:
+        logger.info(
+            "Metrika: заказ %s без изменений состояния (%s) — отправку пропускаем",
+            metrika_order_id, order_status,
+        )
+        return
 
     try:
         await metrika_client.upload_simple_order(_counter_id, row)
+        _last_sent[metrika_order_id] = sig
+        if len(_last_sent) > 10000:
+            _last_sent.clear()
         logger.info(
             "Metrika: заказ %s → %s (cod=%s, trigger lead %s)",
             metrika_order_id, order_status, cod, lead_id,

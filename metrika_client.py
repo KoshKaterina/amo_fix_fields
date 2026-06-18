@@ -97,7 +97,11 @@ class MetrikaClient:
             return {}
         data = build_simple_orders_csv(rows)
         url = f"{self._base_url}/cdp/api/v1/counter/{counter_id}/data/simple_orders"
-        params = {"merge_mode": "SAVE", "delimiter_type": "COMMA"}
+        # UPDATE (а не SAVE): мы повторно шлём один и тот же заказ по мере смены
+        # состояния (IN_PROGRESS → PAID → возможно CANCELLED), и нам нужно, чтобы
+        # последняя загрузка перезаписывала статус и revenue по id, а не «прилипала»
+        # к первому значению. См. metrika_sync: revenue шлём всегда явно.
+        params = {"merge_mode": "UPDATE", "delimiter_type": "COMMA"}
         files = {"file": ("orders.csv", data, "text/csv")}
 
         last_err: Exception | None = None
