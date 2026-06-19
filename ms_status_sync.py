@@ -34,6 +34,8 @@ from waybill_config import (
     MS_SYNC_POLL_INTERVAL_S,
     MS_TOKEN,
     PIPELINE_FULFILLMENT,
+    STATUS_CLOSED_LOST,
+    STATUS_SUCCESS,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -155,6 +157,11 @@ def _stage_name(status_id) -> str:
 
 async def _move_copy(copy: dict, target_status_id: int, ms_status_name: str) -> bool:
     cid = copy.get("id")
+    # Финализированные копии не трогаем (Успешно реализовано / Закрыто и не
+    # реализовано) — иначе движение склада «оживляло» бы закрытые сделки,
+    # напр. закрытые вручную дубли с причиной «дубль».
+    if copy.get("status_id") in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
+        return False
     if copy.get("status_id") == target_status_id:
         return False  # уже на месте — идемпотентно
     res = await amo_service.patch_lead(cid, status_id=target_status_id, pipeline_id=PIPELINE_FULFILLMENT)
