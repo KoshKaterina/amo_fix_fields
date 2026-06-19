@@ -178,6 +178,12 @@ MS_TOKEN = os.getenv("MS_TOKEN", "").strip()
 MS_SYNC_POLL_INTERVAL_S = int(os.getenv("MS_SYNC_POLL_INTERVAL_S", "30"))
 MS_SYNC_LOOKBACK_MIN = int(os.getenv("MS_SYNC_LOOKBACK_MIN", "120"))
 
+# Трек-номер: атрибут заказа МойСклад → поле сделки amoCRM. Цель — поле 571657
+# «Трек-номер» (то же, что FIELD_CDEK_ORDER_NUMBER; у ФФ-копий оно пустое,
+# конфликта с CDEK-синком нет — тот пишет в офисные сделки).
+MS_ATTR_TREK = "e25b4e11-2aa4-11f1-0a80-0704003169db"
+FIELD_FF_TREK = 571657
+
 # Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 _raw_chat_id = os.getenv("TG_ALLOWED_CHAT_ID", "")

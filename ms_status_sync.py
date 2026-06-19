@@ -29,7 +29,9 @@ import logging
 import amo_service
 import ms_client
 from waybill_config import (
+    FIELD_FF_TREK,
     FIELD_MOYSKLAD_ORDER_UUID,
+    MS_ATTR_TREK,
     MS_SYNC_LOOKBACK_MIN,
     MS_SYNC_POLL_INTERVAL_S,
     MS_TOKEN,
@@ -173,16 +175,49 @@ async def _move_copy(copy: dict, target_status_id: int, ms_status_name: str) -> 
     return False
 
 
+async def _order_trek(order: dict) -> str | None:
+    """Трек-номер заказа МС. Берём из атрибутов заказа; если список их не вернул —
+    дозапрашиваем заказ целиком."""
+    attrs = order.get("attributes")
+    if attrs is None:
+        full = await ms_client.get(f"entity/customerorder/{order.get('id')}")
+        attrs = (full or {}).get("attributes") or []
+    for a in attrs:
+        if a.get("id") == MS_ATTR_TREK:
+            v = a.get("value")
+            return str(v).strip() if v not in (None, "") else None
+    return None
+
+
+async def _sync_trek(copy: dict, trek: str) -> None:
+    cid = copy.get("id")
+    cur = str(amo_service.get_custom_field_value(copy, FIELD_FF_TREK) or "").strip()
+    if cur == trek:
+        return  # уже совпадает — идемпотентно
+    res = await amo_service.patch_lead(cid, custom_fields={FIELD_FF_TREK: trek})
+    if res.get("ok"):
+        logger.info("MS sync: копия %s трек-номер → %s", cid, trek)
+    else:
+        logger.error("MS sync: трек копии %s не записан: %s", cid, res)
+
+
 async def _process_order(order: dict) -> None:
     oid = order.get("id")
     if not oid:
         return
     name = _ms_state_name.get(_state_uuid(order) or "")
     target = _ff_stage_for(name)
-    if target is None:
-        return  # статус не ведёт ФФ-копию (офисный/системный/не наш)
+    trek = await _order_trek(order)
+    if target is None and not trek:
+        return  # ни этапа, ни трека — нечего синкать
     for copy in await _find_ff_copies(oid):
-        await _move_copy(copy, target, name or "")
+        # финализированные/закрытые (в т.ч. дубли) не трогаем — ни этап, ни трек
+        if copy.get("status_id") in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
+            continue
+        if target is not None:
+            await _move_copy(copy, target, name or "")
+        if trek:
+            await _sync_trek(copy, trek)
 
 
 async def reconcile_order(ms_order_id: str) -> dict:
