@@ -172,6 +172,16 @@ async def lead_change(request: Request):
     ):
         enqueue_metrika_sync(lead_id, incoming_status)
 
+    # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
+    # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).
+    if (
+        lead_id is not None
+        and incoming_status is not None
+        and ms_status_sync.is_enabled()
+        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
+    ):
+        ms_status_sync.push_processing_bg(lead_id, incoming_status)
+
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:
         for updated_field in updates:

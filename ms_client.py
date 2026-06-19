@@ -72,3 +72,43 @@ async def get(path: str, params: dict | None = None, retries: int = 3) -> dict |
             logger.exception("MS GET %s: невалидный JSON", path)
             return None
     return None
+
+
+async def put(path: str, body: dict, retries: int = 3) -> dict | None:
+    """PUT к МС. Используется для простановки статуса заказа (идемпотентно —
+    set state X безопасно ретраить)."""
+    global _last_request
+    if _client is None:
+        logger.error("MS client не инициализирован")
+        return None
+    url = f"{MS_API_URL}/{path.lstrip('/')}"
+    for attempt in range(1, retries + 1):
+        async with _lock:
+            elapsed = time.monotonic() - _last_request
+            if elapsed < _min_interval:
+                await asyncio.sleep(_min_interval - elapsed)
+            _last_request = time.monotonic()
+        try:
+            resp = await _client.put(url, json=body)
+        except asyncio.CancelledError:
+            raise
+        except httpx.RequestError as exc:
+            logger.warning("MS PUT %s ошибка (%s/%s): %s", path, attempt, retries, exc.__class__.__name__)
+            if attempt < retries:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None
+        if resp.status_code == 429:
+            await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
+            continue
+        if resp.status_code >= 500 and attempt < retries:
+            await asyncio.sleep(2 ** attempt)
+            continue
+        if resp.status_code >= 400:
+            logger.error("MS PUT %s → %s: %s", path, resp.status_code, resp.text[:300])
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
+    return None

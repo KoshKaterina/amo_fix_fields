@@ -31,6 +31,7 @@ import ms_client
 from waybill_config import (
     FIELD_FF_TREK,
     FIELD_MOYSKLAD_ORDER_UUID,
+    MS_API_URL,
     MS_ATTR_TREK,
     MS_SYNC_LOOKBACK_MIN,
     MS_SYNC_POLL_INTERVAL_S,
@@ -40,6 +41,9 @@ from waybill_config import (
     STATUS_SUCCESS,
 )
 
+# Имя этапа/статуса «обработка» — единственная точка обратной синхронизации amo→МС.
+PROCESSING_NAME = "00. Обрабатывается"
+
 logger = logging.getLogger("uvicorn")
 _MSK = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -48,6 +52,11 @@ _poll_task: asyncio.Task | None = None
 _ms_state_name: dict[str, str] = {}   # uuid статуса заказа МС → имя
 _seen: dict[str, str] = {}            # id заказа МС → последний обработанный 'updated' (дедуп окна)
 _first_poll = True
+
+# Обратная синхронизация amo→МС — ТОЛЬКО для этапа «00. Обрабатывается».
+_ff_processing_status_id: int | None = None   # id этапа «00. Обрабатывается» в воронке ФФ
+_ms_processing_state_uuid: str | None = None  # uuid статуса «00. Обрабатывается» в МС
+_bg_tasks: set = set()                        # держим ссылки на фоновые задачи amo→МС
 
 
 def is_enabled() -> bool:
@@ -80,13 +89,14 @@ async def init() -> None:
         if s.get("id"):
             _ms_state_name[s["id"]] = (s.get("name") or "").strip()
 
-    # Санити-чек: видим ли этапы ФФ по именам
-    probe = amo_service.resolve_status_id_by_name(PIPELINE_FULFILLMENT, "00. Обрабатывается")
-    if probe is None:
-        logger.warning(
-            "MS sync: в воронке Фулфилмент (%s) не нашёл этап «00. Обрабатывается» — "
-            "проверь имена этапов/кэш воронок", PIPELINE_FULFILLMENT,
-        )
+    # Этап/статус «00. Обрабатывается» — единственная точка обратной синхронизации amo→МС.
+    global _ff_processing_status_id, _ms_processing_state_uuid
+    _ff_processing_status_id = amo_service.resolve_status_id_by_name(PIPELINE_FULFILLMENT, PROCESSING_NAME)
+    _ms_processing_state_uuid = next((u for u, n in _ms_state_name.items() if n == PROCESSING_NAME), None)
+    if _ff_processing_status_id is None:
+        logger.warning("MS sync: в воронке Фулфилмент нет этапа «%s» — проверь имена/кэш", PROCESSING_NAME)
+    if _ms_processing_state_uuid is None:
+        logger.warning("MS sync: в МС нет статуса «%s» — обратная синхр. amo→МС(00) отключена", PROCESSING_NAME)
 
     _enabled = True
     logger.info(
@@ -239,6 +249,59 @@ async def reconcile_order(ms_order_id: str) -> dict:
         "ok": True, "ms_status": name, "target_stage": _stage_name(target) if target else None,
         "copies": [c.get("id") for c in copies], "moved": moved,
     }
+
+
+# ---------------------------------------------------------------------------
+# Обратная синхронизация amo → МС (ТОЛЬКО этап «00. Обрабатывается»)
+# ---------------------------------------------------------------------------
+
+def push_processing_bg(lead_id, status_id) -> None:
+    """Вызов из вебхука /lead_change (должен быть быстрым). Если ФФ-сделку
+    перевели в этап «00. Обрабатывается» — в фоне проставляем «00» заказу в МС.
+    Только этот этап; дальше склад ведёт amo (МС→amo)."""
+    if not _enabled or _ff_processing_status_id is None:
+        return
+    try:
+        if int(status_id) != _ff_processing_status_id:
+            return
+    except (TypeError, ValueError):
+        return
+    t = asyncio.create_task(_push_processing(lead_id))
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+async def _push_processing(lead_id) -> None:
+    try:
+        if _ms_processing_state_uuid is None:
+            return
+        lead = await amo_service.get_lead_full(lead_id, with_=())
+        if not lead or lead.get("pipeline_id") != PIPELINE_FULFILLMENT:
+            return
+        if lead.get("status_id") != _ff_processing_status_id:
+            return  # этап успел измениться — не наш случай
+        uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
+        if not uuid:
+            return
+        order = await ms_client.get(f"entity/customerorder/{uuid}")
+        if not order:
+            return
+        cur = ((order.get("state") or {}).get("meta") or {}).get("href", "").rstrip("/").split("/")[-1]
+        if cur == _ms_processing_state_uuid:
+            return  # уже «00» — идемпотентно (и гасит петлю МС→amo→МС)
+        body = {"state": {"meta": {
+            "href": f"{MS_API_URL}/entity/customerorder/metadata/states/{_ms_processing_state_uuid}",
+            "type": "state", "mediaType": "application/json",
+        }}}
+        res = await ms_client.put(f"entity/customerorder/{uuid}", body)
+        if res is not None:
+            logger.info("MS sync amo→склад: заказ %s (сделка %s) → «%s»", uuid, lead_id, PROCESSING_NAME)
+        else:
+            logger.error("MS sync amo→склад: не удалось проставить «%s» заказу %s", PROCESSING_NAME, uuid)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("MS sync amo→склад: ошибка для сделки %s", lead_id)
 
 
 # ---------------------------------------------------------------------------
