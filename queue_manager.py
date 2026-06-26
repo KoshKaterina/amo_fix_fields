@@ -198,8 +198,18 @@ async def _worker() -> None:
                 from cdek_status_sync import process_sync
                 await process_sync(item.payload)
             elif kind == "metrika_sync":
+                # Метрика и Woo идут ВМЕСТЕ, одним элементом очереди (тот же приоритет),
+                # строго последовательно: сначала Метрика, затем Woo. Ошибка Метрики не
+                # должна лишать Woo попытки — оборачиваем её отдельно.
                 from metrika_sync import process_sync as metrika_process
-                await metrika_process(item.payload)
+                from woo_status_sync import process_sync as woo_process
+                try:
+                    await metrika_process(item.payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("metrika_sync error for lead %s", lead_id)
+                await woo_process(item.payload)
             else:
                 await _process_lead_update(item.payload)
 

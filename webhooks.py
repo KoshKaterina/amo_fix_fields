@@ -13,6 +13,7 @@ import cdek_status_sync
 import metrika_sync
 import ms_status_sync
 import telegram_bot
+import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
     get_nested,
@@ -58,9 +59,11 @@ async def lifespan(app):
     await telegram_bot.init_telegram_bot()
     await cdek_status_sync.init()
     await metrika_sync.init()
+    await woo_status_sync.init()
     await ms_status_sync.init()
     yield
     await ms_status_sync.shutdown()
+    await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
     await cdek_status_sync.shutdown()
     await telegram_bot.shutdown_telegram_bot()

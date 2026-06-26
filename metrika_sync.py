@@ -325,7 +325,14 @@ async def _contact_info(lead: dict) -> tuple[int | None, str | None, str | None]
     email = amo_service.get_custom_field_value(contact, FIELD_EMAIL)
     phone = amo_service.get_custom_field_value(contact, FIELD_PHONE)
     email = str(email).strip().lower() if email else None
+    # Базовая валидация: битый контакт не должен ронять весь заказ. CDP отклоняет
+    # ВСЮ строку с 400, если телефон/email невалидны (напр. тестовое «111»).
+    # Невалидное значение опускаем — заказ уйдёт по остальным идентификаторам.
+    if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
+        email = None
     phone = "".join(ch for ch in str(phone) if ch.isdigit()) if phone else None
+    if phone and not (10 <= len(phone) <= 15):
+        phone = None
     return cid, email, phone
 
 
@@ -355,6 +362,9 @@ async def reconcile_window(days: int = RECONCILE_DAYS) -> None:
                 leads_by_id[lid] = ld
 
     logger.info("Metrika reconcile: %s сделок за %s дн. — старт", len(leads_by_id), days)
+    # Ленивый импорт: woo_status_sync импортирует metrika_sync на уровне модуля,
+    # поэтому здесь — внутри функции, чтобы не было кольцевого импорта.
+    import woo_status_sync
     ok = 0
     for lid, ld in leads_by_id.items():
         try:
@@ -362,6 +372,13 @@ async def reconcile_window(days: int = RECONCILE_DAYS) -> None:
             ok += 1
         except Exception:
             logger.exception("Metrika reconcile: ошибка по сделке %s", lid)
+        # Woo — тем же ночным проходом, последовательно после Метрики (та же сделка
+        # уже в памяти, повторного запроса в amo нет). Своя обработка ошибок.
+        if woo_status_sync.is_enabled():
+            try:
+                await woo_status_sync.process_sync({"lead_id": lid}, lead=ld)
+            except Exception:
+                logger.exception("Woo reconcile: ошибка по сделке %s", lid)
     logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
 
 

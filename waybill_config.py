@@ -18,6 +18,9 @@ FIELD_DELIVERY_ADDRESS = 577311
 FIELD_PAYMENT_METHOD = 577373
 FIELD_SENDER_COMPANY = 577551
 FIELD_PACKAGE_NUMBER = 577415
+# То же поле 577415 — по факту это «Номер заказа на сайте» (= WC order id).
+# Имя FIELD_PACKAGE_NUMBER историческое; для woo-синка используем понятный алиас.
+FIELD_SITE_ORDER_NUMBER = 577415
 FIELD_ORDER_TOTAL = 576703
 FIELD_COMPOSITION = 577313
 
@@ -167,6 +170,30 @@ def is_cod_payment(payment_method) -> bool:
     if "налич" in s and "безнал" not in s:
         return True
     return False
+
+# ---------------------------------------------------------------------------
+# WooCommerce — простановка статуса заказа 'completed' для рефералки (amo → WC).
+# Передаём ТОЛЬКО статус и ТОЛЬКО когда заказ оплачен (PAID по логике Метрики,
+# metrika_sync._classify). Сумму/товары/промежуточные статусы не трогаем.
+# Ключ связки — поле сделки 577415 «Номер заказа на сайте» = WC order id
+# (FIELD_SITE_ORDER_NUMBER). МойСклад не задействован. Идёт ВМЕСТЕ с metrika_sync:
+# тем же элементом очереди (queue_manager) и тем же ночным проходом сверки.
+# ---------------------------------------------------------------------------
+WC_URL = os.getenv("WC_URL", "").rstrip("/")
+WC_CONSUMER_KEY = os.getenv("WC_CONSUMER_KEY", "").strip()
+WC_CONSUMER_SECRET = os.getenv("WC_CONSUMER_SECRET", "").strip()
+# Слаг «выполнен» в WooCommerce (к нему привязана комиссия рефералки).
+WOO_COMPLETED_STATUS = os.getenv("WOO_COMPLETED_STATUS", "completed").strip()
+# Боевой флаг записи в WC. Пусто/false → синк ВЫКЛЮЧЕН даже при заданных WC_*
+# (для dry-run и безопасного выката). Включить: WOO_STATUS_SYNC_ENABLED=true.
+WOO_STATUS_SYNC_ENABLED = os.getenv("WOO_STATUS_SYNC_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# Гард по дате СОЗДАНИЯ заказа (как METRIKA_SINCE): заказы старше не трогаем.
+# Формат YYYY-MM-DD по МСК. Пусто → гард выключен.
+WOO_STATUS_SINCE_TS: int | None = _parse_since_ts(
+    os.getenv("WOO_STATUS_SINCE", "2026-03-30").strip()
+)
 
 # ---------------------------------------------------------------------------
 # МойСклад API — для ms_status_sync (ведём ФФ-копию по статусу заказа склада).
