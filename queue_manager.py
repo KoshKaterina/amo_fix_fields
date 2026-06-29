@@ -41,6 +41,7 @@ _pending_leads: set[str] = set()
 _pending_waybills: set[str] = set()
 _pending_cdek_sync: set[str] = set()
 _pending_metrika_sync: set[str] = set()
+_pending_jivo: set[str] = set()
 _items_processed: int = 0
 
 
@@ -68,6 +69,7 @@ async def shutdown_queue() -> None:
     _pending_waybills.clear()
     _pending_cdek_sync.clear()
     _pending_metrika_sync.clear()
+    _pending_jivo.clear()
 
     if _task_queue is not None:
         remaining = 0
@@ -139,6 +141,26 @@ def enqueue_cdek_sync(payload: dict) -> None:
     logger.info("ENQUEUE cdek_sync key=%s code=%s queue_size=%d", key, payload.get("code"), _task_queue.qsize())
 
 
+def enqueue_jivo(payload: dict) -> None:
+    """Высший приоритет (как новый лид): создание контакта+сделки+примечания
+    из завершённого чата Jivo. Дедуп в очереди по chat_id/контакту, чтобы
+    повторная доставка вебхука Jivo не плодила дубли карточек."""
+    if _task_queue is None:
+        logger.error("Task queue not initialized, dropping jivo event")
+        return
+    key = str(payload.get("chat_id") or payload.get("phone") or payload.get("email") or "")
+    if key and key in _pending_jivo:
+        logger.info("Jivo event %s already in queue, skipping duplicate", key)
+        return
+    if key:
+        _pending_jivo.add(key)
+    _task_queue.put_nowait(WorkItem(
+        priority=PRIORITY_NEW,
+        payload={**payload, "_kind": "jivo", "_jivo_key": key},
+    ))
+    logger.info("ENQUEUE jivo key=%s queue_size=%d", key, _task_queue.qsize())
+
+
 def enqueue_metrika_sync(lead_id, status_id=None) -> None:
     """Низший приоритет: отправка статуса сделки в Яндекс.Метрику.
 
@@ -176,6 +198,8 @@ async def _worker() -> None:
             _pending_cdek_sync.discard(str(item.payload.get("_key", "")))
         elif kind == "metrika_sync":
             _pending_metrika_sync.discard(lead_id)
+        elif kind == "jivo":
+            _pending_jivo.discard(str(item.payload.get("_jivo_key", "")))
         else:
             _pending_leads.discard(lead_id)
         waited = time.time() - item.enqueue_time
@@ -210,6 +234,9 @@ async def _worker() -> None:
                 except Exception:
                     logger.exception("metrika_sync error for lead %s", lead_id)
                 await woo_process(item.payload)
+            elif kind == "jivo":
+                from jivo_service import process_jivo_chat
+                await process_jivo_chat(item.payload)
             else:
                 await _process_lead_update(item.payload)
 

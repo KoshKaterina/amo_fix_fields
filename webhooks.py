@@ -10,6 +10,7 @@ from starlette.status import HTTP_200_OK
 import amo_service
 import cdek_client
 import cdek_status_sync
+import jivo_service
 import metrika_sync
 import ms_status_sync
 import telegram_bot
@@ -21,6 +22,7 @@ from help_function import (
     parse_the_cart_field_2,
 )
 from queue_manager import (
+    enqueue_jivo,
     enqueue_metrika_sync,
     enqueue_new,
     enqueue_waybill,
@@ -130,6 +132,37 @@ async def cdek_status(request: Request):
     except Exception:
         logger.exception("CDEK webhook: ошибка обработки события")
     return {"ok": True}
+
+
+@app.post("/jivo/{token}")
+async def jivo_webhook(token: str, request: Request):
+    """Вебхук Jivo (CRM Settings → CRM Webhooks). На завершение чата с контактом
+    создаём контакт+сделку+примечание в amo — замена связки через Albato.
+    Секрет в пути заменяет отсутствующую у Jivo подпись. Отвечаем быстро
+    {"result":"ok"} (этого Jivo и ждёт), реальная работа — фоном через очередь."""
+    if not jivo_service.secret_ok(token):
+        logger.warning("Jivo webhook: неверный секрет в пути")
+        return Response("forbidden", status_code=403)
+
+    try:
+        event = await request.json()
+    except Exception:
+        logger.warning("Jivo webhook: невалидный JSON")
+        return {"result": "ok"}
+
+    event_name = event.get("event_name") if isinstance(event, dict) else None
+
+    if not jivo_service.is_enabled():
+        logger.info("Jivo webhook: получено '%s', обработка выключена (JIVO_WEBHOOK_ENABLED)", event_name)
+        return {"result": "ok"}
+
+    parsed = jivo_service.parse_event(event)
+    if parsed is None:
+        logger.info("Jivo webhook: '%s' пропущено (не наш тип события / нет контакта)", event_name)
+        return {"result": "ok"}
+
+    enqueue_jivo(parsed)
+    return {"result": "ok"}
 
 
 @app.post("/lead_change")

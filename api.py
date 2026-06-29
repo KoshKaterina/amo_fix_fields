@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from pprint import pprint
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -397,6 +398,133 @@ def create_custom_field(value, id):
         ],
     }
     return new_field
+
+
+# ---------------------------------------------------------------------------
+# Generic create/find helpers (Jivo bridge: контакт + сделка + примечание)
+# Идут через тот же последовательный pipeline (submit_request), что и остальные
+# вызовы amo, с теми же ретраями и общим circuit breaker по 429.
+# ---------------------------------------------------------------------------
+
+async def _request_json(method: str, url: str, body: Any = None, what: str = "") -> Any:
+    """Выполняет GET/POST с ретраями. Возвращает распарсенный JSON (dict/list),
+    {} для пустого 204, либо None при неустранимой ошибке."""
+    for attempt in range(1, MAX_PATCH_RETRIES + 1):
+        try:
+            response = await submit_request(method, url, headers, json_body=body)
+        except asyncio.CancelledError:
+            raise
+        except httpx.RequestError:
+            if attempt < MAX_PATCH_RETRIES:
+                await asyncio.sleep(compute_retry_delay(attempt))
+                continue
+            logger.exception("%s: request error after %s attempts", what, MAX_PATCH_RETRIES)
+            return None
+        except Exception:
+            logger.exception("%s: unexpected error on attempt %s", what, attempt)
+            if attempt < MAX_PATCH_RETRIES:
+                await asyncio.sleep(compute_retry_delay(attempt))
+                continue
+            return None
+
+        if response.status_code in (200, 201, 204):
+            _record_success()
+            if response.status_code == 204 or not response.content:
+                return {}
+            try:
+                return response.json()
+            except ValueError:
+                logger.exception("%s: invalid JSON in response", what)
+                return None
+
+        if response.status_code == 429:
+            _record_429()
+            if is_circuit_open():
+                logger.warning("%s: circuit breaker open — aborting", what)
+                return None
+
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_PATCH_RETRIES:
+            delay = compute_retry_delay(attempt, response.headers.get("Retry-After"))
+            logger.warning(
+                "%s: amo status %s, retry %s/%s in %.1fs",
+                what, response.status_code, attempt, MAX_PATCH_RETRIES, delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        logger.error("%s: failed %s %s", what, response.status_code, trim_text(response.text))
+        return None
+
+    return None
+
+
+async def find_contact_id(query: str) -> int | None:
+    """Ищет контакт по строке (телефон или email). Возвращает id первого
+    совпадения или None. Используется для дедупликации перед созданием."""
+    query = (query or "").strip()
+    if not query:
+        return None
+    url = f"{BASE_URL}/api/v4/contacts?query={quote(query)}&limit=1"
+    data = await _request_json("GET", url, what=f"find_contact[{query}]")
+    if not isinstance(data, dict):
+        return None
+    contacts = (data.get("_embedded") or {}).get("contacts") or []
+    return contacts[0].get("id") if contacts else None
+
+
+async def add_note_to_lead(lead_id: Any, text: str) -> bool:
+    """Добавляет обычное примечание (common) к сделке. True при успехе."""
+    url = f"{BASE_URL}/api/v4/leads/{lead_id}/notes"
+    body = [{"note_type": "common", "params": {"text": str(text)}}]
+    data = await _request_json("POST", url, body=body, what=f"add_note[{lead_id}]")
+    return data is not None
+
+
+async def create_unsorted_lead(
+    lead_name: Any,
+    pipeline_id: int,
+    contact: dict,
+    source_uid: str,
+    page_url: str,
+    created_ts: int,
+    source_name: str = "Jivo онлайн-чат",
+) -> tuple[int | None, int | None]:
+    """Создаёт заявку в «Неразобранное» воронки (system-статус type=1, куда
+    обычный POST /leads нельзя). Контакт передаётся встроенно: либо {"id": ...}
+    для найденного дубля, либо новый dict с PHONE/EMAIL. Возвращает
+    (lead_id, contact_id)."""
+    referer = page_url or f"{BASE_URL}"
+    form = {
+        "source_name": source_name,
+        "source_uid": str(source_uid),
+        "pipeline_id": int(pipeline_id),
+        "created_at": int(created_ts),
+        "_embedded": {
+            "leads": [{"name": str(lead_name)}],
+            "contacts": [contact],
+            "metadata": {
+                "form_id": "jivo_chat",
+                "form_name": source_name,
+                "form_page": referer,
+                "form_sent_at": int(created_ts),
+                "referer": referer,
+                "ip": "0.0.0.0",
+            },
+        },
+    }
+    url = f"{BASE_URL}/api/v4/leads/unsorted/forms"
+    data = await _request_json("POST", url, body=[form], what="create_unsorted")
+    if not isinstance(data, dict):
+        return None, None
+    unsorted = (data.get("_embedded") or {}).get("unsorted") or []
+    if not unsorted:
+        return None, None
+    emb = (unsorted[0].get("_embedded") or {})
+    leads = emb.get("leads") or []
+    contacts = emb.get("contacts") or []
+    lead_id = leads[0].get("id") if leads else None
+    contact_id = contacts[0].get("id") if contacts else None
+    return lead_id, contact_id
 
 
 if __name__ == "__main__":
