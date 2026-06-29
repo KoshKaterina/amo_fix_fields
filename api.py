@@ -499,17 +499,19 @@ async def create_unsorted_lead(
         "source_uid": str(source_uid),
         "pipeline_id": int(pipeline_id),
         "created_at": int(created_ts),
+        # metadata — на ВЕРХНЕМ уровне запроса (внутри _embedded amo даёт 400
+        # FieldMissing), это обязательный блок формы.
+        "metadata": {
+            "form_id": "jivo_chat",
+            "form_name": source_name,
+            "form_page": referer,
+            "form_sent_at": int(created_ts),
+            "referer": referer,
+            "ip": "0.0.0.0",
+        },
         "_embedded": {
             "leads": [{"name": str(lead_name)}],
             "contacts": [contact],
-            "metadata": {
-                "form_id": "jivo_chat",
-                "form_name": source_name,
-                "form_page": referer,
-                "form_sent_at": int(created_ts),
-                "referer": referer,
-                "ip": "0.0.0.0",
-            },
         },
     }
     url = f"{BASE_URL}/api/v4/leads/unsorted/forms"
