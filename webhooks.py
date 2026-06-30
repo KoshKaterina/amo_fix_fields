@@ -150,6 +150,7 @@ async def jivo_webhook(token: str, request: Request):
         logger.warning("Jivo webhook: невалидный JSON")
         return {"result": "ok"}
 
+    jivo_service.log_payload(event)
     event_name = event.get("event_name") if isinstance(event, dict) else None
 
     if not jivo_service.is_enabled():

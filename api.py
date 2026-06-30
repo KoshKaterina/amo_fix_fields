@@ -480,6 +480,78 @@ async def add_note_to_lead(lead_id: Any, text: str) -> bool:
     return data is not None
 
 
+async def create_contact(name: Any, phone: Any, email: Any) -> int | None:
+    """Создаёт контакт с телефоном/email. Возвращает id или None."""
+    custom_fields = []
+    if phone:
+        custom_fields.append({"field_code": "PHONE", "values": [{"value": str(phone), "enum_code": "WORK"}]})
+    if email:
+        custom_fields.append({"field_code": "EMAIL", "values": [{"value": str(email), "enum_code": "WORK"}]})
+    contact: dict[str, Any] = {"name": str(name) if name else (str(phone or email) or "Клиент Jivo")}
+    if custom_fields:
+        contact["custom_fields_values"] = custom_fields
+    url = f"{BASE_URL}/api/v4/contacts"
+    data = await _request_json("POST", url, body=[contact], what="create_contact")
+    if not isinstance(data, dict):
+        return None
+    items = (data.get("_embedded") or {}).get("contacts") or []
+    return items[0].get("id") if items else None
+
+
+async def create_lead_direct(
+    name: Any,
+    pipeline_id: int,
+    status_id: int,
+    responsible_user_id: int | None = None,
+    custom_fields_values: list | None = None,
+    contact_id: int | None = None,
+) -> int | None:
+    """Создаёт сделку напрямую в обычном (type=0) статусе воронки — в обход
+    «Неразобранного» и его автораспределения. Для триажа Jivo: закрыть в 143
+    или сразу назначить ответственного. Возвращает id сделки или None."""
+    lead: dict[str, Any] = {
+        "name": str(name),
+        "pipeline_id": int(pipeline_id),
+        "status_id": int(status_id),
+    }
+    if responsible_user_id:
+        lead["responsible_user_id"] = int(responsible_user_id)
+    if custom_fields_values:
+        lead["custom_fields_values"] = custom_fields_values
+    if contact_id:
+        lead["_embedded"] = {"contacts": [{"id": int(contact_id)}]}
+    url = f"{BASE_URL}/api/v4/leads"
+    data = await _request_json("POST", url, body=[lead], what="create_lead_direct")
+    if not isinstance(data, dict):
+        return None
+    items = (data.get("_embedded") or {}).get("leads") or []
+    return items[0].get("id") if items else None
+
+
+async def create_task(
+    entity_id: int,
+    text: str,
+    responsible_user_id: int | None,
+    complete_till: int,
+    task_type_id: int | None = None,
+    entity_type: str = "leads",
+) -> bool:
+    """Создаёт задачу на сделке (entity_type=leads). complete_till — unix-срок."""
+    task: dict[str, Any] = {
+        "entity_id": int(entity_id),
+        "entity_type": entity_type,
+        "text": str(text),
+        "complete_till": int(complete_till),
+    }
+    if responsible_user_id:
+        task["responsible_user_id"] = int(responsible_user_id)
+    if task_type_id:
+        task["task_type_id"] = int(task_type_id)
+    url = f"{BASE_URL}/api/v4/tasks"
+    data = await _request_json("POST", url, body=[task], what=f"create_task[{entity_id}]")
+    return data is not None
+
+
 async def create_unsorted_lead(
     lead_name: Any,
     pipeline_id: int,
