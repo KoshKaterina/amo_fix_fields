@@ -145,9 +145,46 @@ def _load_site_labels() -> dict:
 JIVO_SITE_LABELS = _load_site_labels()
 
 
+def _load_domain_sites() -> dict:
+    """Подстрока домена → site-ключ. Нужно, когда виджет Jivo ОДИН на оба сайта
+    (один website-канал) — тогда сегмента сайта в URL вебхука нет, и сайт
+    определяем по домену страницы визитёра (page.url). Env JIVO_DOMAIN_SITES."""
+    defaults = {"tangemshop": "tangem"}
+    raw = os.getenv("JIVO_DOMAIN_SITES", "").strip()
+    if not raw:
+        return defaults
+    try:
+        m = json.loads(raw)
+        return {str(k).strip().lower(): str(v).strip().lower() for k, v in m.items() if str(v).strip()}
+    except Exception:
+        logger.error("JIVO_DOMAIN_SITES: невалидный JSON — беру дефолт")
+        return defaults
+
+
+JIVO_DOMAIN_SITES = _load_domain_sites()
+
+
 def resolve_site(site) -> str:
     """Нормализует site из URL к ключу карты; пусто → дефолтный сайт."""
     return (str(site).strip().lower() if site else "") or JIVO_DEFAULT_SITE
+
+
+def _site_from_page_url(page_url) -> str:
+    """Определяет site по домену страницы визитёра ('' если не распознан)."""
+    u = (page_url or "").lower()
+    for needle, site in JIVO_DOMAIN_SITES.items():
+        if needle in u:
+            return site
+    return ""
+
+
+def resolve_site_full(site, page_url) -> str:
+    """Сайт из сегмента URL вебхука (приоритет), иначе по домену page.url,
+    иначе дефолт. Работает и с раздельными каналами, и с одним виджетом на 2 сайта."""
+    resolved = resolve_site(site)
+    if resolved == JIVO_DEFAULT_SITE:
+        return _site_from_page_url(page_url) or resolved
+    return resolved
 
 
 def source_label(site) -> str:
@@ -281,7 +318,7 @@ def parse_event(event: dict, site: str | None = None) -> dict | None:
         "chat_id": _clean(event.get("chat_id")),
         "tags": _extract_tags(event, visitor),
         "agents": _extract_agents(event),
-        "site": resolve_site(site),
+        "site": resolve_site_full(site, page_url),
     }
 
 
