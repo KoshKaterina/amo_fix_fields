@@ -231,7 +231,10 @@ def parse_event(event: dict) -> dict | None:
         "name": name,
         "phone": phone,
         "email": email,
-        "transcript": _format_transcript(messages),
+        # Реальный Webhooks API Jivo отдаёт готовый текст переписки в
+        # plain_messages (в chat.messages[].message текст скрыт) — берём его,
+        # иначе строим из messages (фолбэк/синтетика).
+        "transcript": _clean(event.get("plain_messages")) or _format_transcript(messages),
         "page_url": page_url,
         "chat_id": _clean(event.get("chat_id")),
         "tags": _extract_tags(event, visitor),
