@@ -117,6 +117,47 @@ def _load_agent_map() -> dict:
 
 JIVO_AGENT_MAP = _load_agent_map()
 
+# --- Мультисайт (Jivo на нескольких сайтах: Sunscrypt, Tangemshop) -----------
+# Все сайты ведут в ТУ ЖЕ воронку (CLEVER Основная) и на ТЕХ ЖЕ операторов;
+# различается ТОЛЬКО пометка источника на сделке (тег + префикс в названии).
+# Сайт приходит сегментом в URL вебхука: /jivo/<secret>/<site> — у каждого
+# канала Jivo свой URL. Без сегмента → дефолтный сайт (обратная совместимость
+# с Sunscrypt: его сделки остаются без доп.метки, как раньше).
+JIVO_DEFAULT_SITE = (os.getenv("JIVO_DEFAULT_SITE", "sunscrypt").strip().lower() or "sunscrypt")
+
+
+def _load_site_labels() -> dict:
+    """site-ключ (из URL) → человекочитаемая метка источника. Метку получает
+    только НЕдефолтный сайт (Sunscrypt = базовый, помечать не нужно).
+    Переопределяется env JIVO_SITE_LABELS (JSON {"<site>": "<label>"})."""
+    defaults = {"tangem": "Tangemshop", "tangemshop": "Tangemshop"}
+    raw = os.getenv("JIVO_SITE_LABELS", "").strip()
+    if not raw:
+        return defaults
+    try:
+        m = json.loads(raw)
+        return {str(k).strip().lower(): str(v).strip() for k, v in m.items() if str(v).strip()}
+    except Exception:
+        logger.error("JIVO_SITE_LABELS: невалидный JSON — беру дефолт")
+        return defaults
+
+
+JIVO_SITE_LABELS = _load_site_labels()
+
+
+def resolve_site(site) -> str:
+    """Нормализует site из URL к ключу карты; пусто → дефолтный сайт."""
+    return (str(site).strip().lower() if site else "") or JIVO_DEFAULT_SITE
+
+
+def source_label(site) -> str:
+    """Метка источника для НЕдефолтного сайта; для дефолта (Sunscrypt) — ''."""
+    s = resolve_site(site)
+    if s == JIVO_DEFAULT_SITE:
+        return ""
+    return JIVO_SITE_LABELS.get(s, "")
+
+
 HANDLED_EVENTS = {"chat_finished", "offline_message"}
 
 _TYPE_PREFIX = {
@@ -198,9 +239,10 @@ def _extract_agents(event: dict) -> list:
     return out
 
 
-def parse_event(event: dict) -> dict | None:
+def parse_event(event: dict, site: str | None = None) -> dict | None:
     """Достаёт нужные поля. None — если событие не наше или у посетителя нет
-    ни телефона, ни email («только когда есть контакт»)."""
+    ни телефона, ни email («только когда есть контакт»). site — сайт-источник
+    из URL вебхука (для пометки Tangemshop и т.п.)."""
     if not isinstance(event, dict):
         return None
     event_name = _clean(event.get("event_name"))
@@ -239,17 +281,22 @@ def parse_event(event: dict) -> dict | None:
         "chat_id": _clean(event.get("chat_id")),
         "tags": _extract_tags(event, visitor),
         "agents": _extract_agents(event),
+        "site": resolve_site(site),
     }
 
 
 # --- helpers --------------------------------------------------------------
 
-def _lead_name(name: str) -> str:
+def _lead_name(name: str, site=None) -> str:
+    label = source_label(site)
+    if label:
+        return f"Онлайн-чат Jivo · {label} — {name}"
     return f"Онлайн-чат Jivo — {name}"
 
 
 def _transcript_note(payload: dict) -> str:
-    parts = ["💬 Онлайн-чат Jivo"]
+    label = source_label(payload.get("site"))
+    parts = ["💬 Онлайн-чат Jivo" + (f" · {label}" if label else "")]
     if payload.get("page_url"):
         parts.append(f"Страница: {payload['page_url']}")
     parts.append("")
@@ -308,7 +355,7 @@ async def _create_unsorted(payload: dict, contact_id: int | None, name: str, pho
     contact = _build_contact(name, phone, email, contact_id)
     source_uid = f"jivo-{payload.get('chat_id') or phone or email}"
     lead_id, _ = await api.create_unsorted_lead(
-        lead_name=_lead_name(name),
+        lead_name=_lead_name(name, payload.get("site")),
         pipeline_id=JIVO_PIPELINE_ID,
         contact=contact,
         source_uid=source_uid,
@@ -340,6 +387,9 @@ async def _do_process(payload: dict) -> int | None:
     email = payload.get("email") or ""
     name = payload.get("name") or phone or email or "Клиент Jivo"
     note_text = _transcript_note(payload)
+    # Пометка источника: тег «Jivo» (гейт распределения) + метка сайта (Tangemshop).
+    site = payload.get("site")
+    lead_tags = [t for t in (JIVO_LEAD_TAG, source_label(site)) if t] or None
 
     contact_id = await _dedup_contact(phone, email)
     if contact_id:
@@ -370,10 +420,10 @@ async def _do_process(payload: dict) -> int | None:
         if JIVO_CLOSE_REASON_FIELD and JIVO_CLOSE_REASON_ENUM:
             cf = [{"field_id": JIVO_CLOSE_REASON_FIELD, "values": [{"enum_id": JIVO_CLOSE_REASON_ENUM}]}]
         lead_id = await api.create_lead_direct(
-            name=_lead_name(name), pipeline_id=JIVO_PIPELINE_ID,
+            name=_lead_name(name, site), pipeline_id=JIVO_PIPELINE_ID,
             status_id=JIVO_CLOSE_STATUS_ID, responsible_user_id=JIVO_SERVICE_USER_ID,
             custom_fields_values=cf, contact_id=contact_id,
-            tags=[JIVO_LEAD_TAG] if JIVO_LEAD_TAG else None,
+            tags=lead_tags,
         )
         if not lead_id:
             logger.error("Jivo[close]: сделка не создана")
@@ -397,9 +447,9 @@ async def _do_process(payload: dict) -> int | None:
         logger.error("Jivo[work]: контакт не создан")
         return None
     lead_id = await api.create_lead_direct(
-        name=_lead_name(name), pipeline_id=JIVO_PIPELINE_ID,
+        name=_lead_name(name, site), pipeline_id=JIVO_PIPELINE_ID,
         status_id=JIVO_WORK_STATUS_ID, responsible_user_id=amo_user, contact_id=contact_id,
-        tags=[JIVO_LEAD_TAG] if JIVO_LEAD_TAG else None,
+        tags=lead_tags,
     )
     if not lead_id:
         logger.error("Jivo[work]: сделка не создана")

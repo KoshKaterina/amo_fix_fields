@@ -136,10 +136,24 @@ async def cdek_status(request: Request):
 
 @app.post("/jivo/{token}")
 async def jivo_webhook(token: str, request: Request):
-    """Вебхук Jivo (CRM Settings → CRM Webhooks). На завершение чата с контактом
-    создаём контакт+сделку+примечание в amo — замена связки через Albato.
-    Секрет в пути заменяет отсутствующую у Jivo подпись. Отвечаем быстро
-    {"result":"ok"} (этого Jivo и ждёт), реальная работа — фоном через очередь."""
+    """Вебхук Jivo (канал website → Integration Settings for Developers →
+    Webhooks API). Без сегмента сайта → дефолтный сайт (Sunscrypt)."""
+    return await _handle_jivo(token, None, request)
+
+
+@app.post("/jivo/{token}/{site}")
+async def jivo_webhook_site(token: str, site: str, request: Request):
+    """Тот же вебхук с явным сайтом-источником в пути (/jivo/<secret>/<site>).
+    У каждого канала Jivo (Sunscrypt, Tangemshop) — свой URL → сделка метится
+    источником. Воронка и операторы общие."""
+    return await _handle_jivo(token, site, request)
+
+
+async def _handle_jivo(token: str, site: str | None, request: Request):
+    """На завершение чата с контактом создаём контакт+сделку+примечание в amo —
+    замена связки через Albato. Секрет в пути заменяет отсутствующую у Jivo
+    подпись. Отвечаем быстро {"result":"ok"} (этого Jivo и ждёт), реальная
+    работа — фоном через очередь."""
     if not jivo_service.secret_ok(token):
         logger.warning("Jivo webhook: неверный секрет в пути")
         return Response("forbidden", status_code=403)
@@ -157,11 +171,12 @@ async def jivo_webhook(token: str, request: Request):
         logger.info("Jivo webhook: получено '%s', обработка выключена (JIVO_WEBHOOK_ENABLED)", event_name)
         return {"result": "ok"}
 
-    parsed = jivo_service.parse_event(event)
+    parsed = jivo_service.parse_event(event, site)
     if parsed is None:
         logger.info("Jivo webhook: '%s' пропущено (не наш тип события / нет контакта)", event_name)
         return {"result": "ok"}
 
+    logger.info("Jivo webhook: '%s' принято, сайт=%s", event_name, parsed.get("site"))
     enqueue_jivo(parsed)
     return {"result": "ok"}
 
