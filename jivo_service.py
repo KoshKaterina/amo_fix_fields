@@ -66,8 +66,11 @@ JIVO_LOG_PAYLOAD = _flag("JIVO_LOG_PAYLOAD")
 # Теги-«закрыть» (по тегу сделка закрывается, без тега — в работу). Регистр игнор.
 JIVO_CLOSE_TAGS = {t.strip().lower() for t in os.getenv("JIVO_CLOSE_TAGS", "закрыть,без ответа,не в работу").split(",") if t.strip()}
 JIVO_CLOSE_STATUS_ID = _env_int("JIVO_CLOSE_STATUS_ID", 143)          # Закрыто и не реализовано
-JIVO_WORK_STATUS_ID = _env_int("JIVO_WORK_STATUS_ID", 83537718)       # Взят в работу
+JIVO_WORK_STATUS_ID = _env_int("JIVO_WORK_STATUS_ID", 83537714)       # Новый лид (ХАБ; распределение исключено тегом)
 JIVO_SERVICE_USER_ID = _env_int("JIVO_SERVICE_USER_ID", 11513202)     # Гладков — для закрытых
+# Метка на триажных сделках (оператор уже назначен) → правила распределения
+# «Новый лид» гейтятся «тег ≠ этой метки», чтобы не переназначали ответственного.
+JIVO_LEAD_TAG = os.getenv("JIVO_LEAD_TAG", "Jivo").strip()
 JIVO_CLOSE_REASON_FIELD = _env_int("JIVO_CLOSE_REASON_FIELD", 577623)   # Причина отказа
 JIVO_CLOSE_REASON_ENUM = _env_int("JIVO_CLOSE_REASON_ENUM", 1041147)    # «Пропал»
 JIVO_TASK_HOURS = _env_float("JIVO_TASK_HOURS", 4.0)
@@ -367,6 +370,7 @@ async def _do_process(payload: dict) -> int | None:
             name=_lead_name(name), pipeline_id=JIVO_PIPELINE_ID,
             status_id=JIVO_CLOSE_STATUS_ID, responsible_user_id=JIVO_SERVICE_USER_ID,
             custom_fields_values=cf, contact_id=contact_id,
+            tags=[JIVO_LEAD_TAG] if JIVO_LEAD_TAG else None,
         )
         if not lead_id:
             logger.error("Jivo[close]: сделка не создана")
@@ -392,6 +396,7 @@ async def _do_process(payload: dict) -> int | None:
     lead_id = await api.create_lead_direct(
         name=_lead_name(name), pipeline_id=JIVO_PIPELINE_ID,
         status_id=JIVO_WORK_STATUS_ID, responsible_user_id=amo_user, contact_id=contact_id,
+        tags=[JIVO_LEAD_TAG] if JIVO_LEAD_TAG else None,
     )
     if not lead_id:
         logger.error("Jivo[work]: сделка не создана")

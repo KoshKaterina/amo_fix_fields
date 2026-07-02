@@ -527,10 +527,12 @@ async def create_lead_direct(
     responsible_user_id: int | None = None,
     custom_fields_values: list | None = None,
     contact_id: int | None = None,
+    tags: list | None = None,
 ) -> int | None:
     """Создаёт сделку напрямую в обычном (type=0) статусе воронки — в обход
     «Неразобранного» и его автораспределения. Для триажа Jivo: закрыть в 143
-    или сразу назначить ответственного. Возвращает id сделки или None."""
+    или сразу назначить ответственного. tags — метки (напр. для исключения из
+    распределения). Возвращает id сделки или None."""
     lead: dict[str, Any] = {
         "name": str(name),
         "pipeline_id": int(pipeline_id),
@@ -540,8 +542,13 @@ async def create_lead_direct(
         lead["responsible_user_id"] = int(responsible_user_id)
     if custom_fields_values:
         lead["custom_fields_values"] = custom_fields_values
+    embedded: dict[str, Any] = {}
     if contact_id:
-        lead["_embedded"] = {"contacts": [{"id": int(contact_id)}]}
+        embedded["contacts"] = [{"id": int(contact_id)}]
+    if tags:
+        embedded["tags"] = [{"name": str(t)} for t in tags if str(t).strip()]
+    if embedded:
+        lead["_embedded"] = embedded
     url = f"{BASE_URL}/api/v4/leads"
     data = await _request_json("POST", url, body=[lead], what="create_lead_direct")
     if not isinstance(data, dict):
