@@ -5,7 +5,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from api import add_info_from_ms, get_lead_by_id, is_circuit_open
+from api import add_info_from_ms, get_lead_by_id, is_circuit_open, set_breaker_category
 from help_function import get_custom_field_value, normalize_text
 from memory import MAX_RETRY_ATTEMPTS
 
@@ -14,9 +14,19 @@ logger = logging.getLogger("uvicorn")
 # Новое изменение сделки — всегда первым; всё остальное потом.
 PRIORITY_NEW = 0
 PRIORITY_WAYBILL = 5
+PRIORITY_JIVO = 7          # создание сделки из завершённого чата — фон, НЕ выше waybill/lead
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
 PRIORITY_METRIKA_SYNC = 25
+
+# kind задачи → категория брейкера (изоляция 429 по типу интеграции)
+_CATEGORY_BY_KIND = {
+    "waybill": "waybill",
+    "cdek_sync": "cdek",
+    "metrika_sync": "sync",
+    "jivo": "jivo",
+    "lead_update": "lead",
+}
 
 RATE_LIMIT_SECONDS = 3
 ECHO_COOLDOWN_SECONDS = 10
@@ -155,7 +165,7 @@ def enqueue_jivo(payload: dict) -> None:
     if key:
         _pending_jivo.add(key)
     _task_queue.put_nowait(WorkItem(
-        priority=PRIORITY_NEW,
+        priority=PRIORITY_JIVO,
         payload={**payload, "_kind": "jivo", "_jivo_key": key},
     ))
     logger.info("ENQUEUE jivo key=%s queue_size=%d", key, _task_queue.qsize())
@@ -192,15 +202,18 @@ async def _worker() -> None:
         item = await _task_queue.get()
         lead_id = str(item.payload.get("lead_id", ""))
         kind = item.payload.get("_kind") or "lead_update"
+        category = _CATEGORY_BY_KIND.get(kind, "lead")
+        set_breaker_category(category)
         if kind == "waybill":
             _pending_waybills.discard(lead_id)
         elif kind == "cdek_sync":
             _pending_cdek_sync.discard(str(item.payload.get("_key", "")))
         elif kind == "metrika_sync":
             _pending_metrika_sync.discard(lead_id)
-        elif kind == "jivo":
-            _pending_jivo.discard(str(item.payload.get("_jivo_key", "")))
-        else:
+        elif kind != "jivo":
+            # jivo-пометку снимаем в finally (после обработки) — чтобы повторная
+            # доставка того же chat_id во время обработки схлопывалась, а не
+            # плодила дубль сделки.
             _pending_leads.discard(lead_id)
         waited = time.time() - item.enqueue_time
         logger.info(
@@ -208,8 +221,8 @@ async def _worker() -> None:
             kind, lead_id, waited, _task_queue.qsize(),
         )
         try:
-            if is_circuit_open():
-                logger.info("Circuit breaker open — dropping %s for lead %s", kind, lead_id)
+            if is_circuit_open(category):
+                logger.info("Circuit breaker open [%s] — dropping %s for lead %s", category, kind, lead_id)
                 continue
 
             if kind == "waybill":
@@ -248,6 +261,8 @@ async def _worker() -> None:
         except Exception:
             logger.exception("Unhandled error processing lead %s", item.payload.get("lead_id"))
         finally:
+            if kind == "jivo":
+                _pending_jivo.discard(str(item.payload.get("_jivo_key", "")))
             _task_queue.task_done()
 
 

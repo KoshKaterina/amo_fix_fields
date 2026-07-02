@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 import os
 import time
@@ -42,34 +43,55 @@ HTTP_TIMEOUT = httpx.Timeout(
 )
 
 # ---------------------------------------------------------------------------
-# Global circuit breaker — pauses all outgoing requests when 429s pile up
+# Circuit breaker — ПО КАТЕГОРИЯМ (тип задачи). Всплеск 429 от одной интеграции
+# (jivo / sync-метрика-woo / …) открывает ТОЛЬКО её брейкер; критичные категории
+# (lead / waybill / cdek) продолжают идти. Категорию несёт contextvar, который
+# ставит вызывающий (воркер очереди — по kind задачи). Непомеченные пути (старт,
+# фоновые опросы) идут в бакет "default". Порог/кулдаун — общие.
 # ---------------------------------------------------------------------------
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("AMO_CB_THRESHOLD", "3"))
 CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("AMO_CB_COOLDOWN", "60"))
 
-_consecutive_429s = 0
-_circuit_open_until = 0.0
+_breaker_category: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "amo_breaker_category", default="default"
+)
+# category -> {"consecutive": int, "open_until": float}
+_breakers: dict[str, dict] = {}
 
 
-def is_circuit_open() -> bool:
-    return time.monotonic() < _circuit_open_until
+def set_breaker_category(category: str) -> None:
+    """Пометить текущий async-контекст типом задачи, чтобы 429 и пауза брейкера
+    относились только к этой категории (jivo/lead/waybill/cdek/sync)."""
+    _breaker_category.set(category or "default")
 
 
-def _record_429() -> None:
-    global _consecutive_429s, _circuit_open_until
-    _consecutive_429s += 1
-    if _consecutive_429s >= CIRCUIT_BREAKER_THRESHOLD:
-        _circuit_open_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+def _bstate(category: str | None) -> dict:
+    cat = category or _breaker_category.get()
+    st = _breakers.get(cat)
+    if st is None:
+        st = {"consecutive": 0, "open_until": 0.0}
+        _breakers[cat] = st
+    return st
+
+
+def is_circuit_open(category: str | None = None) -> bool:
+    return time.monotonic() < _bstate(category)["open_until"]
+
+
+def _record_429(category: str | None = None) -> None:
+    cat = category or _breaker_category.get()
+    st = _bstate(cat)
+    st["consecutive"] += 1
+    if st["consecutive"] >= CIRCUIT_BREAKER_THRESHOLD:
+        st["open_until"] = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
         logger.warning(
-            "Circuit breaker OPEN after %s consecutive 429s — pausing all requests for %.0fs",
-            _consecutive_429s,
-            CIRCUIT_BREAKER_COOLDOWN,
+            "Circuit breaker OPEN [%s] after %s consecutive 429s — pausing '%s' for %.0fs",
+            cat, st["consecutive"], cat, CIRCUIT_BREAKER_COOLDOWN,
         )
 
 
-def _record_success() -> None:
-    global _consecutive_429s
-    _consecutive_429s = 0
+def _record_success(category: str | None = None) -> None:
+    _bstate(category)["consecutive"] = 0
 
 
 # ---------------------------------------------------------------------------
