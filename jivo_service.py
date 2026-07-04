@@ -72,7 +72,7 @@ JIVO_SERVICE_USER_ID = _env_int("JIVO_SERVICE_USER_ID", 11513202)     # Глад
 # «Новый лид» гейтятся «тег ≠ этой метки», чтобы не переназначали ответственного.
 JIVO_LEAD_TAG = os.getenv("JIVO_LEAD_TAG", "Jivo").strip()
 JIVO_CLOSE_REASON_FIELD = _env_int("JIVO_CLOSE_REASON_FIELD", 577623)   # Причина отказа
-JIVO_CLOSE_REASON_ENUM = _env_int("JIVO_CLOSE_REASON_ENUM", 1041147)    # «Пропал»
+JIVO_CLOSE_REASON_ENUM = _env_int("JIVO_CLOSE_REASON_ENUM", 1041791)    # «jivo»
 JIVO_TASK_HOURS = _env_float("JIVO_TASK_HOURS", 4.0)
 
 # Идемпотентность (антидубль при повторной доставке вебхука ПОСЛЕ обработки):
