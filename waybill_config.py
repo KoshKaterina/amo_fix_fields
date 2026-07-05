@@ -204,6 +204,10 @@ MS_API_URL = os.getenv("MS_API_URL", "https://api.moysklad.ru/api/remap/1.2").rs
 MS_TOKEN = os.getenv("MS_TOKEN", "").strip()
 MS_SYNC_POLL_INTERVAL_S = int(os.getenv("MS_SYNC_POLL_INTERVAL_S", "30"))
 MS_SYNC_LOOKBACK_MIN = int(os.getenv("MS_SYNC_LOOKBACK_MIN", "120"))
+# Час ночной ПОЛНОЙ сверки ФФ (amo-driven страховка от промахов узкого окна
+# живого опроса: рестарт/деплой/подвисание сервиса дольше lookback теряет
+# изменение статуса МС навсегда). ≠1 (Метрика в 01:00), 0..23 МСК.
+MS_RECONCILE_HOUR_MSK = int(os.getenv("MS_RECONCILE_HOUR_MSK", "2"))
 
 # Трек-номер: атрибут заказа МойСклад → поле сделки amoCRM. Цель — поле 571657
 # «Трек-номер» (то же, что FIELD_CDEK_ORDER_NUMBER; у ФФ-копий оно пустое,

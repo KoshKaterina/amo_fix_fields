@@ -33,6 +33,7 @@ from waybill_config import (
     FIELD_MOYSKLAD_ORDER_UUID,
     MS_API_URL,
     MS_ATTR_TREK,
+    MS_RECONCILE_HOUR_MSK,
     MS_SYNC_LOOKBACK_MIN,
     MS_SYNC_POLL_INTERVAL_S,
     MS_TOKEN,
@@ -49,6 +50,7 @@ _MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 _enabled = False
 _poll_task: asyncio.Task | None = None
+_nightly_task: asyncio.Task | None = None   # ночная полная сверка ФФ (страховка)
 _ms_state_name: dict[str, str] = {}   # uuid статуса заказа МС → имя
 _seen: dict[str, str] = {}            # id заказа МС → последний обработанный 'updated' (дедуп окна)
 _first_poll = True
@@ -105,9 +107,13 @@ async def init() -> None:
     )
     _poll_task = asyncio.create_task(_poll_loop())
 
+    global _nightly_task
+    _nightly_task = asyncio.create_task(_nightly_loop())
+    logger.info("MS sync: ночная полная сверка ФФ в %02d:00 МСК", MS_RECONCILE_HOUR_MSK)
+
 
 async def shutdown() -> None:
-    global _enabled, _poll_task
+    global _enabled, _poll_task, _nightly_task
     _enabled = False
     if _poll_task is not None:
         _poll_task.cancel()
@@ -116,6 +122,13 @@ async def shutdown() -> None:
         except asyncio.CancelledError:
             pass
         _poll_task = None
+    if _nightly_task is not None:
+        _nightly_task.cancel()
+        try:
+            await _nightly_task
+        except asyncio.CancelledError:
+            pass
+        _nightly_task = None
     _seen.clear()
     await ms_client.aclose()
     logger.info("MS sync stopped")
@@ -357,3 +370,65 @@ async def _poll_loop() -> None:
         except Exception:
             logger.exception("MS sync: ошибка фонового опроса")
         await asyncio.sleep(MS_SYNC_POLL_INTERVAL_S)
+
+
+# ---------------------------------------------------------------------------
+# Ночная ПОЛНАЯ сверка (страховка) — amo-driven, не зависит от окна `updated`
+# ---------------------------------------------------------------------------
+# Живой опрос ловит только заказы, изменённые в узком окне (interval+буфер). Если
+# сервис стоял/подвисал/деплоился дольше окна — изменение статуса МС теряется
+# навсегда (первый-проход lookback короче истории). Раз в сутки перебираем ВСЕ
+# открытые ФФ-сделки и подгоняем под текущий статус заказа МС напрямую — это
+# гарантирует итоговую согласованность независимо от промахов живого окна.
+# (У metrika/woo такая ночная сверка есть; у ms её не было — корень рассинхрона.)
+
+async def reconcile_all_ff() -> dict:
+    """Полная сверка воронки Фулфилмент под текущие статусы заказов МС. Идемпотентно."""
+    leads = await amo_service.get_leads_updated_since(PIPELINE_FULFILLMENT, 0)
+    moved = 0
+    for lead in leads:
+        if lead.get("status_id") in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
+            continue  # финализированные (в т.ч. закрытые дубли) не трогаем
+        uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
+        if not uuid:
+            continue
+        try:
+            order = await ms_client.get(f"entity/customerorder/{uuid}")
+            if not order:
+                continue
+            name = _ms_state_name.get(_state_uuid(order) or "")
+            target = _ff_stage_for(name)
+            if target is not None and target != lead.get("status_id"):
+                if await _move_copy(lead, target, name or ""):
+                    moved += 1
+            trek = await _order_trek(order)
+            if trek:
+                await _sync_trek(lead, trek)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MS reconcile: ошибка по сделке %s", lead.get("id"))
+    logger.info("MS reconcile (полная ФФ): двинуто %s из %s сделок", moved, len(leads))
+    return {"total": len(leads), "moved": moved}
+
+
+def _seconds_until_next(hour_msk: int) -> float:
+    now = datetime.datetime.now(_MSK)
+    nxt = now.replace(hour=hour_msk, minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += datetime.timedelta(days=1)
+    return (nxt - now).total_seconds()
+
+
+async def _nightly_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next(MS_RECONCILE_HOUR_MSK))
+        except asyncio.CancelledError:
+            raise
+        try:
+            await reconcile_all_ff()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MS sync: ночная полная сверка упала")
