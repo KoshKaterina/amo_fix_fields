@@ -13,6 +13,7 @@ import cdek_status_sync
 import jivo_service
 import metrika_sync
 import ms_status_sync
+import showroom_tag
 import telegram_bot
 import urgency_tag
 import woo_status_sync
@@ -252,6 +253,10 @@ async def lead_change(request: Request):
             if info["id"] == "577415":
                 lead_name = f'Заказ №{info["values"]["0"]["value"]}'
                 logger.info(f"lead_name: {lead_name}")
+
+        # Автотег «Запись в шоурум»: тип доставки (577315) = самовывоз из офиса
+        # Sunscrypt → вешаем тег (в фоне, идемпотентно). «CDEK: Самовывоз» не триггерит.
+        showroom_tag.maybe_apply_bg(delivery_type, lead_id)
 
         if (
             goods is not None
