@@ -520,6 +520,56 @@ async def create_contact(name: Any, phone: Any, email: Any) -> int | None:
     return items[0].get("id") if items else None
 
 
+async def get_contact(contact_id: Any, with_leads: bool = False) -> dict | None:
+    """Возвращает контакт по id (с custom_fields_values: PHONE/EMAIL и т.п.),
+    либо None. with_leads=True добавляет _embedded.leads[] (id связанных сделок) —
+    для проверки, есть ли у клиента уже открытая сделка."""
+    url = f"{BASE_URL}/api/v4/contacts/{contact_id}"
+    if with_leads:
+        url += "?with=leads"
+    data = await _request_json("GET", url, what=f"get_contact[{contact_id}]")
+    return data if isinstance(data, dict) else None
+
+
+async def get_leads_by_ids(lead_ids) -> list:
+    """Возвращает сделки по списку id (одним запросом, filter[id][]). Нужны
+    status_id/updated_at, чтобы выбрать открытую и самую свежую по работе."""
+    ids = []
+    for i in lead_ids or []:
+        try:
+            ids.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return []
+    params = "&".join(f"filter[id][]={i}" for i in ids)
+    url = f"{BASE_URL}/api/v4/leads?{params}&limit=250"
+    data = await _request_json("GET", url, what="get_leads_by_ids")
+    if not isinstance(data, dict):
+        return []
+    return (data.get("_embedded") or {}).get("leads") or []
+
+
+async def update_contact(
+    contact_id: Any,
+    name: Any = None,
+    custom_fields_values: list | None = None,
+) -> bool:
+    """PATCH контакта: меняет только переданные поля (имя и/или custom fields).
+    Значения multitext (PHONE/EMAIL) заменяются ЦЕЛИКОМ — вызывающий обязан
+    передать полный список values (старые + новые). True при успехе."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = str(name)
+    if custom_fields_values:
+        body["custom_fields_values"] = custom_fields_values
+    if not body:
+        return False
+    url = f"{BASE_URL}/api/v4/contacts/{contact_id}"
+    data = await _request_json("PATCH", url, body=body, what=f"update_contact[{contact_id}]")
+    return data is not None
+
+
 async def create_lead_direct(
     name: Any,
     pipeline_id: int,
