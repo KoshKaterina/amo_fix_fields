@@ -14,6 +14,7 @@ import jivo_service
 import metrika_sync
 import ms_status_sync
 import telegram_bot
+import urgency_tag
 import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -236,6 +237,8 @@ async def lead_change(request: Request):
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:
+        # Автотег «Срочно»: Срочность → «Срочно» → вешаем тег (в фоне, не блокирует).
+        urgency_tag.maybe_apply_bg(updates, lead_id)
         for updated_field in updates:
             info = updates[updated_field]
             if info["id"] == "576703":

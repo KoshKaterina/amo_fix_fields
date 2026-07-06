@@ -23,6 +23,7 @@ FIELD_PACKAGE_NUMBER = 577415
 FIELD_SITE_ORDER_NUMBER = 577415
 FIELD_ORDER_TOTAL = 576703
 FIELD_COMPOSITION = 577313
+FIELD_URGENCY = 578127          # поле «Срочность» (select)
 
 # amoCRM custom field IDs (контакт)
 FIELD_PHONE = 413385
@@ -31,6 +32,11 @@ FIELD_EMAIL = 413387
 # Теги
 TAG_ERROR = "ошибка накладной"
 TAG_PACKED = "посылка упакована"
+
+# Автотег «Срочно»: когда менеджер ставит Срочность = «Срочно» → вешаем тег «Срочно».
+URGENCY_SROCHNO_VALUE = "Срочно"   # enum-метка «Срочно» поля 578127 (enum id 1041803)
+TAG_SROCHNO_ID = 504609           # существующий тег «Срочно»
+TAG_SROCHNO_NAME = "Срочно"
 
 # ---------------------------------------------------------------------------
 # Синхронизация статусов СДЭК → этапы воронки «офис».
