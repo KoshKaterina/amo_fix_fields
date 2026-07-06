@@ -1,13 +1,13 @@
-"""Юнит-тест гейта unmiss_tag (без сети/прода).
+"""Юнит-тест планировщика unmiss_tag (без сети/прода).
 
-Проверяет разбор тегов из вебхука и условие срабатывания: снимаем только когда
-в тегах сделки одновременно «Успешный звонок» И «пропущенный». _apply не вызываем —
-подменяем asyncio.create_task на заглушку, чтобы не трогать amo.
+Реконсиляция (сверка тегов) живёт в _apply и требует amo — её проверяем E2E на
+тест-контакте. Здесь проверяем только гейт планировщика: задача заводится для
+валидного lead_id и НЕ заводится для None. asyncio.create_task подменён заглушкой.
 """
 
 import unmiss_tag
 
-_scheduled: list[bool] = []
+_scheduled: list = []
 
 
 class _FakeTask:
@@ -16,7 +16,7 @@ class _FakeTask:
 
 
 def _fake_create_task(coro):
-    coro.close()  # не исполняем корутину _apply
+    coro.close()  # не исполняем _apply (в нём сеть)
     _scheduled.append(True)
     return _FakeTask()
 
@@ -24,34 +24,14 @@ def _fake_create_task(coro):
 unmiss_tag.asyncio.create_task = _fake_create_task
 
 
-def _fires(tags_wh, lead_id=100) -> bool:
+def _fires(lead_id) -> bool:
     _scheduled.clear()
-    unmiss_tag.maybe_remove_bg(tags_wh, lead_id)
+    unmiss_tag.maybe_remove_bg(lead_id)
     return len(_scheduled) == 1
 
 
-# --- разбор тегов из вебхука ---
-assert unmiss_tag._tag_names(
-    {"0": {"id": 1, "name": "Успешный звонок"}, "1": {"id": 2, "name": "пропущенный"}}
-) == {"успешный звонок", "пропущенный"}
-assert unmiss_tag._tag_names([{"name": "пропущенный"}]) == {"пропущенный"}
-assert unmiss_tag._tag_names(None) == set()
-assert unmiss_tag._tag_names("") == set()
-assert unmiss_tag._tag_names({"0": {"id": 5}}) == set()  # тег без имени
+assert _fires(36503585) is True
+assert _fires(0) is True          # 0 — валидный id (не None)
+assert _fires(None) is False      # нет сделки — не планируем
 
-# --- гейт: оба тега → срабатывает ---
-assert _fires({"0": {"name": "Успешный звонок"}, "1": {"name": "пропущенный"}}) is True
-# регистронезависимо
-assert _fires({"0": {"name": "успешный ЗВОНОК"}, "1": {"name": "  Пропущенный "}}) is True
-# формат list тоже
-assert _fires([{"name": "Успешный звонок"}, {"name": "пропущенный"}]) is True
-
-# --- гейт: НЕ срабатывает ---
-assert _fires({"0": {"name": "Успешный звонок"}}) is False          # нет «пропущенный»
-assert _fires({"0": {"name": "пропущенный"}}) is False              # нет «Успешный звонок»
-assert _fires({"0": {"name": "Срочно"}, "1": {"name": "Горячий"}}) is False
-assert _fires(None) is False
-assert _fires("") is False
-assert _fires({"0": {"name": "Успешный звонок"}, "1": {"name": "пропущенный"}}, lead_id=None) is False
-
-print("unmiss_tag: все тесты гейта прошли")
+print("unmiss_tag: тесты планировщика прошли")

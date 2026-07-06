@@ -207,11 +207,10 @@ async def lead_change(request: Request):
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
 
-    # Автоснятие «пропущенный» при дозвоне: UIS повесил «Успешный звонок» на сделку,
-    # где ещё висит «пропущенный» → снимаем «пропущенный» (со сделки и её контактов).
-    # Вне блока `if updates:` — смена тега может прийти без изменения custom_fields.
-    tags_wh = await get_nested(nested, ["leads", "update", "0", "tags"])
-    unmiss_tag.maybe_remove_bg(tags_wh, lead_id)
+    # Автоснятие «пропущенный» при дозвоне: реконсиляция по дочитыванию (amo не шлёт
+    # теги в вебхук). На любом изменении сделки в фоне сверяем теги: если есть
+    # «Успешный звонок» И «пропущенный» — снимаем «пропущенный» (сделка + контакты).
+    unmiss_tag.maybe_remove_bg(lead_id)
 
     status_update = await get_nested(nested, ["leads", "update", "0", "status_id"])
     status_add = await get_nested(nested, ["leads", "add", "0", "status_id"])
