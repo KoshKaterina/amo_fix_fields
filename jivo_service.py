@@ -355,7 +355,7 @@ def parse_event(event: dict, site: str | None = None) -> dict | None:
     if not isinstance(visitor, dict):
         visitor = {}
 
-    phone = _pick_contact_value(visitor, event, "phone", "phones")
+    phone = _normalize_phone(_pick_contact_value(visitor, event, "phone", "phones"))
     email = _pick_contact_value(visitor, event, "email", "emails")
     if not phone and not email:
         return None
@@ -455,6 +455,22 @@ def _field_value_strings(field: dict | None) -> list:
 
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
+
+
+def _normalize_phone(raw: str) -> str:
+    """Приводит телефон из Jivo к формату с ведущим «+» (Wazzup/телефония ждут
+    E.164 — Jivo же шлёт номер как есть, часто без «+»). Российские
+    8XXXXXXXXXX / 10-значные без кода → +7…; все остальные (в т.ч. зарубежные,
+    длина ≠ 10/11) — просто «+» перед цифрами. Пусто / без цифр — возвращаем
+    как есть (не телефон)."""
+    d = _digits(raw)
+    if not d:
+        return raw
+    if len(d) == 11 and d[0] == "8":
+        d = "7" + d[1:]
+    elif len(d) == 10:
+        d = "7" + d
+    return "+" + d
 
 
 _PLACEHOLDER_NAMES = {"клиент", "гость", "посетитель", "клиент jivo", "no name", "noname", "unknown", "—"}
