@@ -120,6 +120,12 @@ CDEK_WEBHOOK_URL = os.getenv("CDEK_WEBHOOK_URL", f"{PUBLIC_BASE_URL}/cdek_status
 # Интервал фонового опроса-страховки, сек (0 → опрос выключен)
 CDEK_SYNC_POLL_INTERVAL_S = int(os.getenv("CDEK_SYNC_POLL_INTERVAL_S", "3600"))
 
+# Заглушка объявленной стоимости для СДЭК, когда сумма ПРЕДОПЛАЧЕННОГО заказа
+# распарсилась в 0 (замена/гарантия или в поле «Заказ» нет строки «Итого»). СДЭК
+# требует положительный cost; товар уже оплачен, поэтому ставим минимальную
+# ценность вместо ручной правки менеджером (раньше он ставил 1). Настраивается env.
+WAYBILL_ZERO_COST_PLACEHOLDER = int(os.getenv("WAYBILL_ZERO_COST_PLACEHOLDER", "1"))
+
 # ---------------------------------------------------------------------------
 # Яндекс.Метрика CDP — сквозная аналитика (amoCRM → Метрика)
 # ---------------------------------------------------------------------------
@@ -176,6 +182,23 @@ def is_cod_payment(payment_method) -> bool:
     if "налич" in s and "безнал" not in s:
         return True
     return False
+
+
+# Явно распознанная ПРЕДОПЛАТА (онлайн/картой/перевод/крипта/безнал). Крипта —
+# предоплата, как и в kontrol_gate.categorize_payment. Пустой/непонятный способ
+# оплаты сюда НЕ попадает (вернёт False) — это нужно, чтобы при нулевой сумме не
+# считать заказ предоплаченным по умолчанию.
+_PREPAID_TOKENS = (
+    "онлайн", "картой", "на карт", "перевод", "банк", "безнал",
+    "крипт", "crypto", "usdt", "usdc", "tether", "wallet",
+)
+
+
+def is_prepaid_payment(payment_method) -> bool:
+    if is_cod_payment(payment_method):
+        return False
+    s = str(payment_method or "").lower()
+    return any(t in s for t in _PREPAID_TOKENS)
 
 # ---------------------------------------------------------------------------
 # WooCommerce — простановка статуса заказа 'completed' для рефералки (amo → WC).

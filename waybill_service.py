@@ -27,7 +27,10 @@ from waybill_config import (
     TAG_PACKED,
     TARIFF_DOOR,
     TARIFFS_PVZ,
+    WAYBILL_ZERO_COST_PLACEHOLDER,
     extract_pvz_code,
+    is_cod_payment,
+    is_prepaid_payment,
     looks_like_uuid,
     parse_tariff,
     parse_total,
@@ -91,8 +94,40 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         return await _fail(lead_id, "не определён тариф СДЭК (поле 576703)", source, current_tags)
 
     total = parse_total(order_text)
+    used_cost_placeholder = False
     if total <= 0:
-        return await _fail(lead_id, "не распарсена сумма (поле 576703)", source, current_tags)
+        # Сумма заказа распарсилась в 0: нет строки «Итого» в поле «Заказ» (576703)
+        # или она нулевая (замена/гарантия/подарок). Раньше здесь был безусловный
+        # отказ («защита от кривых заказов») — менеджер руками ставил стоимость 1.
+        # Теперь решаем по способу оплаты (поле 577373):
+        if is_cod_payment(payment_method):
+            # Наложенный платёж + 0 ₽ — реально кривой заказ: курьер получит с
+            # клиента 0. Накладную НЕ создаём, сигналим менеджеру (как раньше).
+            return await _fail(
+                lead_id,
+                "сумма заказа 0 при наложенном платеже — курьер получит 0 ₽ с клиента; "
+                "впишите корректную сумму в поле «Заказ» (576703)",
+                source, current_tags,
+            )
+        if is_prepaid_payment(payment_method):
+            # Предоплата: сумма для СДЭК — лишь объявленная ценность (товар уже
+            # оплачен). Подставляем заглушку, чтобы накладная создалась без ручной
+            # правки. Наложки нет → cod_amount останется 0.
+            total = WAYBILL_ZERO_COST_PLACEHOLDER
+            used_cost_placeholder = True
+            logger.warning(
+                "Lead %s: сумма заказа 0 при предоплате (%r) — объявленная ценность СДЭК = заглушка %s",
+                lead_id, payment_method, WAYBILL_ZERO_COST_PLACEHOLDER,
+            )
+        else:
+            # Способ оплаты пустой/не распознан — не считаем заказ предоплаченным
+            # по умолчанию. Держим прежнюю защиту: отказ + сигнал.
+            return await _fail(
+                lead_id,
+                f"сумма заказа 0 и способ оплаты не распознан ({payment_method!r}) — "
+                "укажите способ оплаты и/или сумму в поле «Заказ» (576703)",
+                source, current_tags,
+            )
 
     # 2. Контакт + (опционально) компания
     embedded = lead.get("_embedded") or {}
@@ -252,7 +287,19 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         await _alert(critical)
         return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
 
-    # 9. Примечание со ссылкой на скачивание штрихкода СДЭК
+    # 9. Прозрачность: если объявленная ценность СДЭК проставлена заглушкой —
+    #    примечание в сделку, чтобы офис видел (сумма заказа была 0).
+    if used_cost_placeholder:
+        ph_note = await amo_service.add_note(
+            lead_id,
+            f"Сумма заказа была 0 (предоплата) — объявленная ценность СДЭК проставлена "
+            f"автоматически: {WAYBILL_ZERO_COST_PLACEHOLDER} ₽. Если нужна другая ценность, "
+            f"впишите сумму в поле «Заказ» и пересоздайте накладную.",
+        )
+        if not ph_note.get("ok"):
+            logger.warning("Lead %s: не удалось добавить примечание о заглушке цены: %s", lead_id, ph_note)
+
+    # 10. Примечание со ссылкой на скачивание штрихкода СДЭК
     barcode_url = f"{PUBLIC_BASE_URL}/barcode/{cdek_value}"
     note_res = await amo_service.add_note(
         lead_id, f"Штрихкод СДЭК (№{cdek_value}) — скачать/распечатать: {barcode_url}"
@@ -273,6 +320,12 @@ async def _fail(lead_id, reason: str, source: str, current_tags: list[dict]) -> 
             tag_res = await amo_service.patch_lead(lead_id, tags=new_tags)
             if not tag_res.get("ok"):
                 logger.error("Не удалось пометить сделку %s тегом '%s': %s", lead_id, TAG_ERROR, tag_res)
+    # Причину пишем примечанием в сделку — чтобы менеджер видел, что именно не так,
+    # прямо в карточке (не только тег/алерт в TG). Пишем при любом source; каждая
+    # попытка оставляет свою запись → в карточке остаётся история причин.
+    note_res = await amo_service.add_note(lead_id, f"⚠️ Ошибка создания накладной СДЭК: {reason}")
+    if not note_res.get("ok"):
+        logger.warning("Lead %s: не удалось добавить примечание с причиной ошибки: %s", lead_id, note_res)
     if source != "retry":
         await _alert(f"Сделка {lead_id}: {reason}")
     return {"ok": False, "lead_id": lead_id, "reason": reason, "cdek_number": None, "skipped": False}
