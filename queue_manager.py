@@ -11,10 +11,15 @@ from memory import MAX_RETRY_ATTEMPTS
 
 logger = logging.getLogger("uvicorn")
 
-# Новое изменение сделки — всегда первым; всё остальное потом.
+# Новое изменение сделки (заполнение полей) — всегда первым; остальное потом.
 PRIORITY_NEW = 0
+# Jivo — тот же (первый) приоритет, что и заполнение полей: МОПам нужен лид из
+# чата мгновенно (07.07.2026, жалоба отдела продаж). Было PRIORITY_JIVO=7 (фон,
+# ниже waybill/lead) после аудит-хардненинга 66ecf38 → сделки Jivo застревали
+# за очередью lead_update и приходили с задержкой ~20–30 мин. Возврат к исходному
+# поведению (в 9dd0e93 было PRIORITY_NEW). Тай-брейк с lead_update — FIFO по sequence.
+PRIORITY_JIVO = PRIORITY_NEW
 PRIORITY_WAYBILL = 5
-PRIORITY_JIVO = 7          # создание сделки из завершённого чата — фон, НЕ выше waybill/lead
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
 PRIORITY_METRIKA_SYNC = 25
@@ -152,9 +157,10 @@ def enqueue_cdek_sync(payload: dict) -> None:
 
 
 def enqueue_jivo(payload: dict) -> None:
-    """Высший приоритет (как новый лид): создание контакта+сделки+примечания
-    из завершённого чата Jivo. Дедуп в очереди по chat_id/контакту, чтобы
-    повторная доставка вебхука Jivo не плодила дубли карточек."""
+    """Первый приоритет — тот же, что и заполнение полей (lead_update): создание
+    контакта+сделки+примечания из завершённого чата Jivo идёт наравне с новыми
+    изменениями сделок, без ожидания за waybill/sync. Дедуп в очереди по
+    chat_id/контакту, чтобы повторная доставка вебхука Jivo не плодила дубли."""
     if _task_queue is None:
         logger.error("Task queue not initialized, dropping jivo event")
         return
