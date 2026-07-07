@@ -4,3 +4,13 @@ __pycache__/
 .env
 .env.test
 tg_diagnostic.py
+
+# ad-hoc / one-off probe scripts (investigation only, not part of the service)
+amgroup_*.py
+dp_probe.py
+ms_demand_*.py
+query_ur_egor*.py
+
+# logs & build artifacts
+*.log
+__pycache__/
