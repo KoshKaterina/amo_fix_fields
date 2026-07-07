@@ -3,3 +3,4 @@ python-dotenv~=1.2.1
 fastapi[standard]~=0.123.4
 aiogram~=3.13
 reportlab~=4.2.5
+aiohttp-socks~=0.10.1
