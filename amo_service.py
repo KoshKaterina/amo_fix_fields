@@ -436,6 +436,31 @@ async def remove_tag(lead_id: int | str, tag_name: str, *, lead: dict | None = N
     return await patch_lead(lead_id, tags=new_tags)
 
 
+async def patch_contact(contact_id: int | str, *, tags: list[dict] | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    if tags is not None:
+        body.setdefault("_embedded", {})["tags"] = _tags_payload(tags)
+    if not body:
+        return {"ok": True, "status_code": 204, "retryable": False}
+    return await _do_patch(f"/api/v4/contacts/{contact_id}", body)
+
+
+async def remove_contact_tag(
+    contact_id: int | str, tag_name: str, *, contact: dict | None = None
+) -> dict[str, Any]:
+    """Снять тег с контакта (идемпотентно). Полный набор тегов заменяется целиком,
+    поэтому сохраняем текущие минус снимаемый."""
+    if contact is None:
+        contact = await get_contact_by_id(contact_id)
+    if not contact:
+        return {"ok": False, "status_code": None, "retryable": True}
+    if not has_tag(contact, tag_name):
+        return {"ok": True, "status_code": 200, "retryable": False}
+    name_norm = tag_name.strip().lower()
+    new_tags = [t for t in get_tags(contact) if (t.get("name") or "").strip().lower() != name_norm]
+    return await patch_contact(contact_id, tags=new_tags)
+
+
 def filter_tags_excluding(tags: list[dict], excluded_name: str) -> list[dict]:
     name_norm = (excluded_name or "").strip().lower()
     return [t for t in tags if (t.get("name") or "").strip().lower() != name_norm]
