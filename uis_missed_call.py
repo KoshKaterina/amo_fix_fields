@@ -39,7 +39,7 @@ from api import BASE_URL
 logger = logging.getLogger("uvicorn")
 
 # --- ⚠️ ВРЕМЕННОЕ (уточнить перед закреплением) -------------------------------
-MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya"
+MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya @gladkov_369"
 # Супергруппа ОП «Store [Отдел продаж]», топик РОЗНИЦА
 # (thread_id=2, из ссылки t.me/c/3680811996/2/…). None → General.
 NOTIFY_CHAT_ID = -1003680811996
