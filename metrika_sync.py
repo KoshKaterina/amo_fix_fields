@@ -14,12 +14,20 @@
                            ИЛИ Фулфилмент «09. Доставлено» / «09.2 Платёж отправлен владельцу».
   - Сумма (revenue) пишется только при PAID.
 
-Триггерится вебхуком смены статуса (через очередь, низкий приоритет).
+С 08.07.2026 вебхук НЕ триггерит синк (решение Кати: Метрике/Woo реальное время
+не нужно — Метрика принимает офлайн-конверсии задним числом, Woo-комиссия
+некритична к часам; вебхучный путь давал 51% задач очереди и по 2 GET amo на
+событие). Вместо этого — сверка по расписанию:
+  - интрадей: в METRIKA_INTRADAY_HOURS (МСК, по умолчанию 10,13,16,19,22),
+    окно — с прошлого успешного прохода с перехлёстом 15 мин;
+  - ночная (01:00 МСК): полное окно RECONCILE_DAYS — источник истины.
+Оба прохода гонят Метрику И Woo одним набором сделок (reconcile_window).
 """
 
 import asyncio
 import datetime
 import logging
+import os
 import time
 
 import amo_service
@@ -49,6 +57,16 @@ logger = logging.getLogger("uvicorn")
 RECONCILE_DAYS = 14
 NIGHTLY_HOUR_MSK = 1  # 01:00 МСК
 
+# Интрадей-сверка (замена вебхучного пути, 08.07.2026): часы запуска МСК.
+_intraday_raw = os.getenv("METRIKA_INTRADAY_HOURS", "10,13,16,19,22")
+INTRADAY_HOURS_MSK = sorted(
+    {int(h) % 24 for h in _intraday_raw.split(",") if h.strip().isdigit()}
+)
+# Перехлёст окна: страхует правки, случившиеся во время прошлого прохода.
+INTRADAY_OVERLAP_SECONDS = 900
+# Окно первого интрадей-прохода после рестарта (последний проход неизвестен).
+INTRADAY_FIRST_WINDOW_SECONDS = 4 * 3600
+
 # Метрика ждёт даты как LocalDateTime (НЕ unix). Счётчик в МСК.
 _MSK = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -63,6 +81,13 @@ def _fmt_dt(ts) -> str | None:
 _enabled = False
 _counter_id: int | None = None
 _nightly_task: asyncio.Task | None = None
+_intraday_task: asyncio.Task | None = None
+# Unix-время старта последнего УСПЕШНОГО прохода сверки (любого). Интрадей
+# берёт окно отсюда: упавший/пропущенный проход растягивает следующее окно —
+# дыр не остаётся. В памяти: после рестарта первый проход берёт дефолтное окно.
+_last_reconcile_ts: int | None = None
+# Сверки не должны пересекаться (ночная и интрадей на границе суток и т.п.).
+_reconcile_lock = asyncio.Lock()
 
 # Дедуп по исходящему состоянию: id заказа → подпись последней успешно
 # отправленной строки. Гасит повторные отправки ОДНОГО И ТОГО ЖЕ состояния
@@ -120,21 +145,31 @@ async def init() -> None:
     _enabled = True
     logger.info("Metrika sync включён (counter=%s)", _counter_id)
 
-    global _nightly_task
+    global _nightly_task, _intraday_task
     _nightly_task = asyncio.create_task(_nightly_loop())
     logger.info("Metrika: ночная сверка в %02d:00 МСК, окно %s дн.", NIGHTLY_HOUR_MSK, RECONCILE_DAYS)
+    if INTRADAY_HOURS_MSK:
+        _intraday_task = asyncio.create_task(_intraday_loop())
+        logger.info(
+            "Metrika: интрадей-сверка (Метрика+Woo) в %s МСК — вебхучный путь отключён",
+            ",".join(f"{h:02d}:00" for h in INTRADAY_HOURS_MSK),
+        )
+    else:
+        logger.warning("Metrika: METRIKA_INTRADAY_HOURS пуст — интрадей-сверка выключена, только ночная")
 
 
 async def shutdown() -> None:
-    global _enabled, _nightly_task
+    global _enabled, _nightly_task, _intraday_task
     _enabled = False
-    if _nightly_task is not None:
-        _nightly_task.cancel()
-        try:
-            await _nightly_task
-        except asyncio.CancelledError:
-            pass
-        _nightly_task = None
+    for task in (_nightly_task, _intraday_task):
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    _nightly_task = None
+    _intraday_task = None
     _last_sent.clear()
     await metrika_client.aclose()
     logger.info("Metrika sync stopped")
@@ -340,46 +375,61 @@ async def _contact_info(lead: dict) -> tuple[int | None, str | None, str | None]
 # Ночная сверка — источник истины. Догоняет пропущенные/задебаунсенные вебхуки.
 # ---------------------------------------------------------------------------
 
-async def reconcile_window(days: int = RECONCILE_DAYS) -> None:
-    """Пересинкивает все сделки 3 воронок, изменённые за последние `days` дней.
+async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = None) -> None:
+    """Пересинкивает все сделки 3 воронок, изменённые с since_ts (unix) либо
+    за последние `days` дней, если since_ts не задан.
 
     Идемпотентно (upsert по id). Переиспользует process_sync — статусы и резолв
-    считаются той же логикой, что и в realtime.
+    считаются той же логикой, что и раньше в realtime. Проходы не пересекаются
+    (_reconcile_lock); успешный проход двигает _last_reconcile_ts — от него
+    интрадей берёт следующее окно.
     """
+    global _last_reconcile_ts
     if not _enabled:
         return
-    since = int(time.time()) - days * 86400
-    leads_by_id: dict[int, dict] = {}
-    for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
-        try:
-            batch = await amo_service.get_leads_updated_since(pipeline, since, with_=("contacts",))
-        except Exception:
-            logger.exception("Metrika reconcile: ошибка выборки воронки %s", pipeline)
-            continue
-        for ld in batch:
-            lid = ld.get("id")
-            if lid is not None:
-                leads_by_id[lid] = ld
-
-    logger.info("Metrika reconcile: %s сделок за %s дн. — старт", len(leads_by_id), days)
-    # Ленивый импорт: woo_status_sync импортирует metrika_sync на уровне модуля,
-    # поэтому здесь — внутри функции, чтобы не было кольцевого импорта.
-    import woo_status_sync
-    ok = 0
-    for lid, ld in leads_by_id.items():
-        try:
-            await process_sync({"lead_id": lid}, lead=ld)
-            ok += 1
-        except Exception:
-            logger.exception("Metrika reconcile: ошибка по сделке %s", lid)
-        # Woo — тем же ночным проходом, последовательно после Метрики (та же сделка
-        # уже в памяти, повторного запроса в amo нет). Своя обработка ошибок.
-        if woo_status_sync.is_enabled():
+    async with _reconcile_lock:
+        run_started = int(time.time())
+        since = since_ts if since_ts is not None else run_started - days * 86400
+        leads_by_id: dict[int, dict] = {}
+        fetch_failed = False
+        for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
             try:
-                await woo_status_sync.process_sync({"lead_id": lid}, lead=ld)
+                batch = await amo_service.get_leads_updated_since(pipeline, since, with_=("contacts",))
             except Exception:
-                logger.exception("Woo reconcile: ошибка по сделке %s", lid)
-    logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
+                logger.exception("Metrika reconcile: ошибка выборки воронки %s", pipeline)
+                fetch_failed = True
+                continue
+            for ld in batch:
+                lid = ld.get("id")
+                if lid is not None:
+                    leads_by_id[lid] = ld
+
+        window_h = (run_started - since) / 3600
+        logger.info(
+            "Metrika reconcile: %s сделок за окно %.1f ч — старт", len(leads_by_id), window_h
+        )
+        # Ленивый импорт: woo_status_sync импортирует metrika_sync на уровне модуля,
+        # поэтому здесь — внутри функции, чтобы не было кольцевого импорта.
+        import woo_status_sync
+        ok = 0
+        for lid, ld in leads_by_id.items():
+            try:
+                await process_sync({"lead_id": lid}, lead=ld)
+                ok += 1
+            except Exception:
+                logger.exception("Metrika reconcile: ошибка по сделке %s", lid)
+            # Woo — тем же проходом, последовательно после Метрики (та же сделка
+            # уже в памяти, повторного запроса в amo нет). Своя обработка ошибок.
+            if woo_status_sync.is_enabled():
+                try:
+                    await woo_status_sync.process_sync({"lead_id": lid}, lead=ld)
+                except Exception:
+                    logger.exception("Woo reconcile: ошибка по сделке %s", lid)
+        logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
+        # Двигаем метку только если выборка прошла по всем воронкам: упавшая
+        # воронка не должна выпасть из следующего окна.
+        if not fetch_failed:
+            _last_reconcile_ts = run_started
 
 
 def _seconds_until_next(hour_msk: int) -> float:
@@ -388,6 +438,11 @@ def _seconds_until_next(hour_msk: int) -> float:
     if nxt <= now:
         nxt += datetime.timedelta(days=1)
     return (nxt - now).total_seconds()
+
+
+def _seconds_until_next_of(hours_msk: list[int]) -> float:
+    """До ближайшего из списка часов (МСК)."""
+    return min(_seconds_until_next(h) for h in hours_msk)
 
 
 async def _nightly_loop() -> None:
@@ -402,3 +457,28 @@ async def _nightly_loop() -> None:
             raise
         except Exception:
             logger.exception("Metrika: ночная сверка упала")
+
+
+async def _intraday_loop() -> None:
+    """Интрадей-сверка Метрика+Woo — замена вебхучного пути (08.07.2026).
+
+    Окно — с прошлого успешного прохода минус перехлёст; упавший или
+    пропущенный запуск просто растягивает следующее окно. После рестарта
+    первый проход берёт INTRADAY_FIRST_WINDOW_SECONDS (плюс ночная полная
+    сверка добирает всё в пределах RECONCILE_DAYS)."""
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_of(INTRADAY_HOURS_MSK))
+        except asyncio.CancelledError:
+            raise
+        try:
+            now = int(time.time())
+            if _last_reconcile_ts is not None:
+                since = _last_reconcile_ts - INTRADAY_OVERLAP_SECONDS
+            else:
+                since = now - INTRADAY_FIRST_WINDOW_SECONDS
+            await reconcile_window(since_ts=since)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Metrika: интрадей-сверка упала")

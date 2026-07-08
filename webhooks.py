@@ -27,22 +27,18 @@ from help_function import (
 )
 from queue_manager import (
     enqueue_jivo,
-    enqueue_metrika_sync,
     enqueue_new,
     enqueue_waybill,
     init_queue,
+    queue_stats,
     shutdown_queue,
 )
 from waybill_config import (
-    PIPELINE_CLEVER,
     PIPELINE_FULFILLMENT,
-    PIPELINE_OFFICE,
     STATUS_CREATE_WAYBILL,
     UIS_WEBHOOK_SECRET,
     looks_like_uuid,
 )
-
-METRIKA_PIPELINES = {str(PIPELINE_CLEVER), str(PIPELINE_OFFICE), str(PIPELINE_FULFILLMENT)}
 
 
 @asynccontextmanager
@@ -86,7 +82,9 @@ logger = logging.getLogger("uvicorn")
 
 @app.get("/")
 async def health():
-    return {"status": "ok"}
+    """Здоровье + срез очередей (глубина дорожек, api_queue, последнее ожидание) —
+    чтобы «очередь огромная» была проверяема одним запросом, без чтения логов."""
+    return {"status": "ok", **queue_stats()}
 
 
 def insert_nested(data, keys, value):
@@ -233,18 +231,12 @@ async def lead_change(request: Request):
         logger.info("Lead %s entered STATUS_CREATE_WAYBILL — enqueue waybill", lead_id)
         enqueue_waybill(lead_id, source="webhook")
 
-    # Смена статуса в воронках сквозного потока (CLEVER/Офис/Фулфилмент) →
-    # задача для Яндекс.Метрики (низший приоритет). Прочие воронки не трогаем.
+    # Метрика+Woo вебхуком БОЛЬШЕ НЕ триггерятся (08.07.2026): аналитике реальное
+    # время не нужно, а вебхучный путь давал больше половины задач очереди.
+    # Синк идёт сверкой по расписанию — см. metrika_sync (интрадей + ночная).
     pipeline_update = await get_nested(nested, ["leads", "update", "0", "pipeline_id"])
     pipeline_add = await get_nested(nested, ["leads", "add", "0", "pipeline_id"])
     incoming_pipeline = pipeline_update if pipeline_update is not None else pipeline_add
-    if (
-        lead_id is not None
-        and incoming_status is not None
-        and metrika_sync.is_enabled()
-        and (incoming_pipeline is None or str(incoming_pipeline) in METRIKA_PIPELINES)
-    ):
-        enqueue_metrika_sync(lead_id, incoming_status)
 
     # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
     # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).
