@@ -103,13 +103,26 @@ async def _apply(params: dict) -> None:
         logger.exception("UIS пропущенный: ошибка обработки (call=%s)", params.get("call_session_id"))
 
 
+# Закрытые = системные статусы «успех»/«отказ», общие для ВСЕХ воронок
+# (см. amo_service: 142/143 имеют одинаковый id во всех воронках). Та же логика,
+# что у моста Jivo (_find_open_lead_id).
+_CLOSED_STATUS_IDS = {142, 143}
+
+
 async def _find_lead_id(phone: str):
-    """Best-effort: сделка по телефону для кликабельной ссылки. Нет — None."""
+    """ОТКРЫТУЮ сделку по телефону для ссылки (не закрытую и не случайную —
+    жалоба МОП: ссылка вела на рандомную/старую сделку). Открытая = status_id не
+    из 142/143. Несколько открытых → самую свежую ПО РАБОТЕ (max updated_at,
+    тай-брейк по id). Открытых нет → None (лучше без ссылки, чем на закрытую)."""
     if not phone:
         return None
     try:
         leads = await amo_service.find_leads_by_query(phone)
-        return leads[0]["id"] if leads else None
+        open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
+        if not open_leads:
+            return None
+        best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
+        return best["id"]
     except Exception:
         logger.exception("UIS пропущенный: поиск сделки по телефону не удался")
         return None
