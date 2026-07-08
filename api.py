@@ -34,7 +34,13 @@ CONNECT_TIMEOUT_SECONDS = float(os.getenv("AMO_CONNECT_TIMEOUT_SECONDS", "30"))
 POOL_TIMEOUT_SECONDS = float(os.getenv("AMO_POOL_TIMEOUT_SECONDS", "20"))
 MAX_FETCH_RETRIES = int(os.getenv("AMO_FETCH_RETRIES", "4"))
 MAX_PATCH_RETRIES = int(os.getenv("AMO_PATCH_RETRIES", "4"))
-MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("AMO_MIN_REQUEST_INTERVAL_SECONDS", "0.17"))
+# Минимальный зазор между ОТПРАВКАМИ запросов к amo. Лимит amo = 7 req/s →
+# 1/7 ≈ 0.143с; берём 0.15с с запасом. Схема остаётся строго последовательной
+# (следующий запрос уходит только после ответа на предыдущий — решение Кати,
+# 08.07.2026: параллельная отправка на практике вела к проблемам), поэтому при
+# типичной задержке ответа amo 0.3–1.5с эта пауза на деле не наступает — она
+# лишь страхует от превышения 7/с на аномально быстрых ответах.
+MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("AMO_MIN_REQUEST_INTERVAL_SECONDS", "0.15"))
 
 HTTP_TIMEOUT = httpx.Timeout(
     timeout=REQUEST_TIMEOUT_SECONDS,
@@ -95,7 +101,11 @@ def _record_success(category: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sequential API pipeline — one request at a time, 0.17s after each response
+# Sequential API pipeline — строго по одному запросу за раз (ждём ответ amo
+# перед следующим); зазор MIN_REQUEST_INTERVAL_SECONDS считается от момента
+# ОТПРАВКИ предыдущего запроса, а не от ответа. Раньше пауза 0.17с добавлялась
+# ПОСЛЕ ответа — при задержке amo 0.5–1.5с это резало пропускную до ~1 req/s
+# из разрешённых 7 (разбор 08.07.2026).
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -109,7 +119,17 @@ class ApiRequest:
 
 _api_queue: asyncio.Queue[ApiRequest] | None = None
 _api_worker_task: asyncio.Task | None = None
-_last_response_at: float = 0.0
+_last_sent_at: float = 0.0
+
+
+def api_queue_size() -> int:
+    """Размер внутренней очереди API-пайплайна — для наблюдаемости.
+
+    Это ВТОРАЯ очередь сервиса (первая — task-очереди в queue_manager): сюда
+    сваливаются запросы и от воркеров дорожек, и от фоновых задач (unmiss/
+    urgency/showroom/сверки). До 08.07.2026 её размер не логировался нигде —
+    затор здесь был невидим."""
+    return _api_queue.qsize() if _api_queue is not None else 0
 
 
 def init_api_pipeline() -> None:
@@ -142,15 +162,19 @@ async def shutdown_api_pipeline() -> None:
 
 
 async def _api_worker() -> None:
-    global _last_response_at
+    global _last_sent_at
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         while True:
             req = await _api_queue.get()
             try:
+                # Зазор — от ОТПРАВКИ прошлого запроса. Последовательность
+                # (ждать ответ) обеспечивает сам цикл: await ниже не вернётся,
+                # пока amo не ответит.
                 now = time.monotonic()
-                wait_for = (_last_response_at + MIN_REQUEST_INTERVAL_SECONDS) - now
+                wait_for = (_last_sent_at + MIN_REQUEST_INTERVAL_SECONDS) - now
                 if wait_for > 0:
                     await asyncio.sleep(wait_for)
+                _last_sent_at = time.monotonic()
 
                 if req.method == "GET":
                     response = await client.get(req.url, headers=req.req_headers)
@@ -159,8 +183,6 @@ async def _api_worker() -> None:
                 else:
                     response = await client.request(req.method, req.url, headers=req.req_headers, json=req.json_body)
 
-                _last_response_at = time.monotonic()
-
                 if not req.future.done():
                     req.future.set_result(response)
             except asyncio.CancelledError:
@@ -168,7 +190,6 @@ async def _api_worker() -> None:
                     req.future.set_exception(asyncio.CancelledError())
                 raise
             except Exception as exc:
-                _last_response_at = time.monotonic()
                 if not req.future.done():
                     req.future.set_exception(exc)
             finally:
