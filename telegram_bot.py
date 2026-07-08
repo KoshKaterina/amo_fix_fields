@@ -99,9 +99,10 @@ def _build_dispatcher() -> Dispatcher:
     @dp.message()
     async def on_any_message(message: Message) -> None:
         logger.info(
-            "TG message received (no handler matched): chat_id=%s expected_chat_id=%s "
-            "from=%s text=%r",
+            "TG message received (no handler matched): chat_id=%s thread_id=%s "
+            "expected_chat_id=%s from=%s text=%r",
             message.chat.id,
+            message.message_thread_id,
             TG_ALLOWED_CHAT_ID,
             message.from_user.id if message.from_user else None,
             message.text,
@@ -212,15 +213,28 @@ async def shutdown_telegram_bot() -> None:
     logger.info("Telegram bot stopped")
 
 
-async def send_alert(text: str, parse_mode: str | None = None) -> bool:
-    """Шлёт текст в TG_ALLOWED_CHAT_ID. Возвращает True при успехе.
+async def send_alert(
+    text: str,
+    parse_mode: str | None = None,
+    chat_id: int | None = None,
+    message_thread_id: int | None = None,
+) -> bool:
+    """Шлёт текст в Telegram. Возвращает True при успехе.
+    chat_id — куда слать; None → дефолтный TG_ALLOWED_CHAT_ID (чат /print).
+    message_thread_id — топик супергруппы-форума (None → General).
     parse_mode="HTML" — для кликабельных ссылок (uis_missed_call)."""
-    if _bot is None or TG_ALLOWED_CHAT_ID is None:
+    target = chat_id if chat_id is not None else TG_ALLOWED_CHAT_ID
+    if _bot is None or target is None:
         logger.warning("send_alert suppressed (bot disabled): %s", text)
         return False
     try:
-        await _bot.send_message(chat_id=TG_ALLOWED_CHAT_ID, text=text, parse_mode=parse_mode)
+        await _bot.send_message(
+            chat_id=target,
+            text=text,
+            parse_mode=parse_mode,
+            message_thread_id=message_thread_id,
+        )
         return True
     except Exception:
-        logger.exception("send_alert failed: %s", text)
+        logger.exception("send_alert failed (chat=%s): %s", target, text)
         return False

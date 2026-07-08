@@ -20,11 +20,12 @@ GET на наш /uis/<secret> с нативными макросами:
 Дедуп по call_session_id (защита от ретраев UIS). Работа — в фоне, эндпоинт
 отвечает 200 сразу (UIS ждёт быстрый ответ, иначе ретраит 4 раза).
 
-⚠️ ВРЕМЕННОЕ (тест — заменить перед боевым запуском):
-  • MANAGERS_ON_SHIFT — тестовые хендлы. TODO(before-prod): реальный список МОП /
-    динамика «кто на смене».
-  • Шлём в TG_ALLOWED_CHAT_ID (чат /print) через telegram_bot.send_alert.
-    TODO(before-prod): chat_id чата ОП, когда Саша добавит туда бота.
+Шлём в супергруппу ОП (NOTIFY_CHAT_ID), в топик РОЗНИЦА (NOTIFY_THREAD_ID).
+
+⚠️ ВРЕМЕННОЕ (уточнить перед закреплением):
+  • MANAGERS_ON_SHIFT — фикс.список хендлов. TODO: динамика «кто на смене».
+  • NOTIFY_THREAD_ID сменить топик — взять новый thread_id из логов catch-all
+    (thread_id=… по сообщению в нужном топике).
 """
 
 import asyncio
@@ -37,8 +38,12 @@ from api import BASE_URL
 
 logger = logging.getLogger("uvicorn")
 
-# --- ⚠️ ВРЕМЕННОЕ (тест) ------------------------------------------------------
-MANAGERS_ON_SHIFT = "@egorkonsss @thebarsa1"
+# --- ⚠️ ВРЕМЕННОЕ (уточнить перед закреплением) -------------------------------
+MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya"
+# Супергруппа ОП «Store [Отдел продаж]», топик РОЗНИЦА
+# (thread_id=2, из ссылки t.me/c/3680811996/2/…). None → General.
+NOTIFY_CHAT_ID = -1003680811996
+NOTIFY_THREAD_ID: int | None = 2
 # ------------------------------------------------------------------------------
 
 _bg_tasks: set = set()
@@ -78,9 +83,18 @@ async def _apply(params: dict) -> None:
             logger.info("UIS пропущенный: дубль call_session_id=%s — пропускаю", call_id)
             return
 
-        lead_id = await _find_lead_id(phone)
+        # Ссылку на сделку добираем с таймаутом 5с: не ответил amo вовремя
+        # (медленный API / завал очереди) → шлём БЕЗ ссылки, не задерживая «срочно».
+        try:
+            lead_id = await asyncio.wait_for(_find_lead_id(phone), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("UIS пропущенный: поиск сделки >5с — шлём без ссылки (call=%s)", call_id)
+            lead_id = None
         text = _build_message(phone, name, lead_id)
-        ok = await telegram_bot.send_alert(text, parse_mode="HTML")
+        ok = await telegram_bot.send_alert(
+            text, parse_mode="HTML",
+            chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+        )
         logger.info(
             "UIS пропущенный: алерт %s (тел=%s lead=%s call=%s)",
             "отправлен" if ok else "НЕ отправлен", phone or "—", lead_id or "—", call_id or "—",
