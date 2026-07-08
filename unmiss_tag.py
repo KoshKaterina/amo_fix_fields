@@ -13,27 +13,75 @@ UIS вешает «пропущенный» на СДЕЛКУ и КОНТАКТ 
 звонок» И «пропущенный»; после снятия «пропущенный» повторная сверка = no-op.
 Фоновая работа не блокирует ответ вебхука. Дешёвый short-circuit: если нет
 «Успешный звонок» — сразу выходим (один GET), PATCH не делаем.
+
+Дебаунс (08.07.2026): сверка не чаще раза в UNMISS_DEBOUNCE_SECONDS на сделку.
+Замер за 10.5 ч: 347 сверок (по GET на каждый вебхук) при 0 срабатываний —
+~треть трафика к amo впустую, в основном пачки echo-вебхуков одной правки.
+Дебаунс «с хвостом»: события внутри окна не теряются — планируется ОДНА
+отложенная сверка на конец окна, она видит финальное состояние тегов. Худшая
+задержка снятия тега = UNMISS_DEBOUNCE_SECONDS (было ~10 с).
 """
 
 import asyncio
 import logging
+import os
+import time
 
 import amo_service
 from waybill_config import TAG_MISSED_NAME, TAG_SUCCESS_CALL_NAME
 
 logger = logging.getLogger("uvicorn")
 
+UNMISS_DEBOUNCE_SECONDS = float(os.getenv("UNMISS_DEBOUNCE_SECONDS", "120"))
+
 _bg_tasks: set = set()
+# lead_id → monotonic-время последней сверки; отдельно — сделки, по которым уже
+# ждёт отложенная («хвостовая») сверка.
+_last_check: dict[str, float] = {}
+_tail_scheduled: set[str] = set()
 
 
 def maybe_remove_bg(lead_id) -> None:
-    """На любом изменении сделки — в фоне сверить теги и снять «пропущенный», если
-    дозвонились. Быстрый: планирует фон и сразу возвращает."""
+    """На изменении сделки — в фоне сверить теги и снять «пропущенный», если
+    дозвонились. Быстрый: планирует фон и сразу возвращает. Внутри окна дебаунса
+    повторные вебхуки схлопываются в одну отложенную сверку."""
     if lead_id is None:
         return
-    task = asyncio.create_task(_apply(lead_id))
+    key = str(lead_id)
+    now = time.monotonic()
+    last = _last_check.get(key)
+    if last is not None and now - last < UNMISS_DEBOUNCE_SECONDS:
+        if key not in _tail_scheduled:
+            _tail_scheduled.add(key)
+            _spawn(_tail_apply(key, lead_id, UNMISS_DEBOUNCE_SECONDS - (now - last)))
+        return
+    _last_check[key] = now
+    _cleanup_last_check(now)
+    _spawn(_apply(lead_id))
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
+
+
+async def _tail_apply(key: str, lead_id, delay: float) -> None:
+    """Отложенная сверка на конец окна дебаунса — видит финальное состояние."""
+    try:
+        await asyncio.sleep(max(delay, 0.0))
+    finally:
+        _tail_scheduled.discard(key)
+    _last_check[key] = time.monotonic()
+    await _apply(lead_id)
+
+
+def _cleanup_last_check(now: float) -> None:
+    if len(_last_check) < 5000:
+        return
+    stale = [k for k, v in _last_check.items() if now - v >= UNMISS_DEBOUNCE_SECONDS]
+    for k in stale:
+        del _last_check[k]
 
 
 async def _apply(lead_id) -> None:
