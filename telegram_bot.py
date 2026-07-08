@@ -212,11 +212,15 @@ async def shutdown_telegram_bot() -> None:
     logger.info("Telegram bot stopped")
 
 
-async def send_alert(text: str) -> None:
+async def send_alert(text: str, parse_mode: str | None = None) -> bool:
+    """Шлёт текст в TG_ALLOWED_CHAT_ID. Возвращает True при успехе.
+    parse_mode="HTML" — для кликабельных ссылок (uis_missed_call)."""
     if _bot is None or TG_ALLOWED_CHAT_ID is None:
         logger.warning("send_alert suppressed (bot disabled): %s", text)
-        return
+        return False
     try:
-        await _bot.send_message(chat_id=TG_ALLOWED_CHAT_ID, text=text)
+        await _bot.send_message(chat_id=TG_ALLOWED_CHAT_ID, text=text, parse_mode=parse_mode)
+        return True
     except Exception:
         logger.exception("send_alert failed: %s", text)
+        return False

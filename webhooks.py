@@ -15,6 +15,7 @@ import metrika_sync
 import ms_status_sync
 import showroom_tag
 import telegram_bot
+import uis_missed_call
 import unmiss_tag
 import urgency_tag
 import woo_status_sync
@@ -37,6 +38,7 @@ from waybill_config import (
     PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
     STATUS_CREATE_WAYBILL,
+    UIS_WEBHOOK_SECRET,
     looks_like_uuid,
 )
 
@@ -182,6 +184,18 @@ async def _handle_jivo(token: str, site: str | None, request: Request):
     logger.info("Jivo webhook: '%s' принято, сайт=%s", event_name, parsed.get("site"))
     enqueue_jivo(parsed)
     return {"result": "ok"}
+
+
+@app.get("/uis/{secret}")
+async def uis_missed_call_webhook(secret: str, request: Request):
+    """UIS HTTP-уведомление «Потерянный звонок» → алерт в ТГ отделу продаж.
+    Секрет в пути (простая защита). Отвечаем 200 сразу — UIS ждёт быстрый ответ
+    (иначе ретраит); реальная работа (поиск сделки + отправка) идёт в фоне."""
+    if not UIS_WEBHOOK_SECRET or secret != UIS_WEBHOOK_SECRET:
+        logger.warning("UIS webhook: неверный секрет в пути")
+        return Response("forbidden", status_code=403)
+    uis_missed_call.notify_bg(dict(request.query_params))
+    return {"ok": True}
 
 
 @app.post("/lead_change")

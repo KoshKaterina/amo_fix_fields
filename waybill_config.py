@@ -266,6 +266,10 @@ TG_ALLOWED_CHAT_ID: int | None = int(_raw_chat_id) if _raw_chat_id else None
 # его автоматически (см. README).
 TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").strip()
 
+# Секрет в пути вебхука UIS «Потерянный звонок» (/uis/<secret>) — простая защита
+# от посторонних запросов. Пусто → эндпоинт /uis отвечает 403 (выключен).
+UIS_WEBHOOK_SECRET = os.getenv("UIS_WEBHOOK_SECRET", "").strip()
+
 
 _TOTAL_RE = re.compile(
     r"Итого:\s*([\d\s]+[\d])[.,]\d+\s*(?:руб(?:ль|ля|лей|\.?)|₽)",
