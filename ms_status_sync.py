@@ -385,6 +385,9 @@ async def _poll_loop() -> None:
 async def reconcile_all_ff() -> dict:
     """Полная сверка воронки Фулфилмент под текущие статусы заказов МС. Идемпотентно."""
     leads = await amo_service.get_leads_updated_since(PIPELINE_FULFILLMENT, 0)
+    if leads is None:
+        logger.warning("MS reconcile_all_ff: выборка ФФ-воронки не удалась — проход пропущен")
+        return {"error": "fetch_failed", "moved": 0}
     moved = 0
     for lead in leads:
         if lead.get("status_id") in (STATUS_SUCCESS, STATUS_CLOSED_LOST):

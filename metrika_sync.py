@@ -64,8 +64,6 @@ INTRADAY_HOURS_MSK = sorted(
 )
 # Перехлёст окна: страхует правки, случившиеся во время прошлого прохода.
 INTRADAY_OVERLAP_SECONDS = 900
-# Окно первого интрадей-прохода после рестарта (последний проход неизвестен).
-INTRADAY_FIRST_WINDOW_SECONDS = 4 * 3600
 
 # Метрика ждёт даты как LocalDateTime (НЕ unix). Счётчик в МСК.
 _MSK = datetime.timezone(datetime.timedelta(hours=3))
@@ -278,8 +276,16 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
         return
 
     now = int(time.time())
-    # дата смены статуса — у триггерящей сделки (для COD это момент доставки в дубликате)
-    event_dt = _fmt_dt(lead.get("updated_at") or now)
+    # Время события — у триггерящей сделки (для COD это момент доставки в дубликате).
+    # Для терминальных статусов берём closed_at (amo ставит его при входе в 142/143):
+    # сверка идёт с задержкой до ~3ч, и updated_at к её моменту может быть сдвинут
+    # более поздней правкой сделки — время конверсии уезжало бы (вплоть до соседних
+    # суток). ФФ-этапы 09/09.2 (COD PAID) сделку не закрывают → closed_at там нет,
+    # фолбэк на updated_at — задокументированное ограничение.
+    event_ts = lead.get("updated_at") or now
+    if order_status in ("PAID", "CANCELLED") and lead.get("closed_at"):
+        event_ts = lead["closed_at"]
+    event_dt = _fmt_dt(event_ts)
 
     row: dict = {
         "id": metrika_order_id,
@@ -399,6 +405,13 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
                 logger.exception("Metrika reconcile: ошибка выборки воронки %s", pipeline)
                 fetch_failed = True
                 continue
+            # None = сбой выборки/обрыв пагинации (сеть/429/брейкер): amo_service
+            # НЕ бросает исключений, а возвращает None — иначе fetch_failed была бы
+            # мёртвой веткой и метка окна двигалась бы по непрочитанным данным.
+            if batch is None:
+                logger.warning("Metrika reconcile: выборка воронки %s не удалась — окно не сдвинем", pipeline)
+                fetch_failed = True
+                continue
             for ld in batch:
                 lid = ld.get("id")
                 if lid is not None:
@@ -428,7 +441,12 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
         logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
         # Двигаем метку только если выборка прошла по всем воронкам: упавшая
         # воронка не должна выпасть из следующего окна.
-        if not fetch_failed:
+        if fetch_failed:
+            logger.warning(
+                "Metrika reconcile: были сбои выборки — окно НЕ сдвинуто, "
+                "следующий проход покроет этот интервал повторно"
+            )
+        else:
             _last_reconcile_ts = run_started
 
 
@@ -443,6 +461,23 @@ def _seconds_until_next(hour_msk: int) -> float:
 def _seconds_until_next_of(hours_msk: list[int]) -> float:
     """До ближайшего из списка часов (МСК)."""
     return min(_seconds_until_next(h) for h in hours_msk)
+
+
+def _prev_slot_ts() -> int:
+    """Unix-время ПРЕДЫДУЩЕГО слота общего расписания (интрадей + ночной).
+
+    Окно первого прохода после рестарта: «с предыдущего слота», а не фиксированные
+    N часов — иначе рестарт в длинном ночном зазоре (01:00 → 10:00) оставлял бы
+    дыру покрытия до следующей ночной сверки."""
+    hours = sorted(set(INTRADAY_HOURS_MSK) | {NIGHTLY_HOUR_MSK})
+    now = datetime.datetime.now(_MSK)
+    for days_back in (0, 1):
+        day = now - datetime.timedelta(days=days_back)
+        for h in reversed(hours):
+            cand = day.replace(hour=h, minute=0, second=0, microsecond=0)
+            if cand < now:
+                return int(cand.timestamp())
+    return int((now - datetime.timedelta(days=1)).timestamp())
 
 
 async def _nightly_loop() -> None:
@@ -464,20 +499,17 @@ async def _intraday_loop() -> None:
 
     Окно — с прошлого успешного прохода минус перехлёст; упавший или
     пропущенный запуск просто растягивает следующее окно. После рестарта
-    первый проход берёт INTRADAY_FIRST_WINDOW_SECONDS (плюс ночная полная
-    сверка добирает всё в пределах RECONCILE_DAYS)."""
+    последний проход неизвестен → берём предыдущий слот расписания
+    (_prev_slot_ts; плюс ночная полная сверка добирает всё в пределах
+    RECONCILE_DAYS)."""
     while True:
         try:
             await asyncio.sleep(_seconds_until_next_of(INTRADAY_HOURS_MSK))
         except asyncio.CancelledError:
             raise
         try:
-            now = int(time.time())
-            if _last_reconcile_ts is not None:
-                since = _last_reconcile_ts - INTRADAY_OVERLAP_SECONDS
-            else:
-                since = now - INTRADAY_FIRST_WINDOW_SECONDS
-            await reconcile_window(since_ts=since)
+            base = _last_reconcile_ts if _last_reconcile_ts is not None else _prev_slot_ts()
+            await reconcile_window(since_ts=base - INTRADAY_OVERLAP_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -39,6 +39,10 @@ _bg_tasks: set = set()
 # ждёт отложенная («хвостовая») сверка.
 _last_check: dict[str, float] = {}
 _tail_scheduled: set[str] = set()
+# Взводится на shutdown: спящие хвосты просыпаются и досверяют немедленно,
+# пока API-пайплайн ещё жив — иначе отложенная сверка молча терялась бы при
+# деплое, и тег «пропущенный» на затихшей сделке висел бы навсегда.
+_shutdown_event = asyncio.Event()
 
 
 def maybe_remove_bg(lead_id) -> None:
@@ -67,13 +71,33 @@ def _spawn(coro) -> None:
 
 
 async def _tail_apply(key: str, lead_id, delay: float) -> None:
-    """Отложенная сверка на конец окна дебаунса — видит финальное состояние."""
+    """Отложенная сверка на конец окна дебаунса — видит финальное состояние.
+    На shutdown не ждёт остатка окна, а досверяет сразу (см. _shutdown_event)."""
     try:
-        await asyncio.sleep(max(delay, 0.0))
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=max(delay, 0.0))
+    except asyncio.TimeoutError:
+        pass
     finally:
         _tail_scheduled.discard(key)
     _last_check[key] = time.monotonic()
     await _apply(lead_id)
+
+
+async def shutdown() -> None:
+    """Досверить хвосты дебаунса перед остановкой. Звать из lifespan ДО остановки
+    API-пайплайна (сверкам нужен живой amo-клиент)."""
+    _shutdown_event.set()
+    pending = [t for t in _bg_tasks if not t.done()]
+    if not pending:
+        return
+    done, still_pending = await asyncio.wait(pending, timeout=15)
+    if still_pending:
+        logger.warning(
+            "unmiss: %d фоновых сверок не успели на shutdown (отложенные сделки: %s)",
+            len(still_pending), ", ".join(sorted(_tail_scheduled)) or "—",
+        )
+        for t in still_pending:
+            t.cancel()
 
 
 def _cleanup_last_check(now: float) -> None:

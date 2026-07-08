@@ -161,7 +161,12 @@ def queue_stats() -> dict:
 
 def _alert_bg(key: str, text: str) -> None:
     """TG-алерт с кулдауном по ключу (не чаще раза в QUEUE_ALERT_COOLDOWN_SECONDS),
-    отправка в фоне — не блокирует воркер/монитор."""
+    отправка в фоне — не блокирует воркер/монитор.
+
+    Кулдаун помечается ДО отправки (защита от параллельных алертов одного ключа),
+    но при неудачной доставке (send_alert вернул False / бросил) откатывается —
+    иначе сбой TG-шлюза глушил бы алерты на 30 минут, а весь смысл алертов в том,
+    чтобы затор не оставался невидимым."""
     now = time.monotonic()
     last = _alert_last_sent.get(key)
     if last is not None and now - last < QUEUE_ALERT_COOLDOWN_SECONDS:
@@ -170,11 +175,14 @@ def _alert_bg(key: str, text: str) -> None:
     logger.warning("QUEUE ALERT [%s]: %s", key, text)
 
     async def _send() -> None:
+        ok = False
         try:
             from telegram_bot import send_alert
-            await send_alert(text)
+            ok = await send_alert(text)
         except Exception:
             logger.exception("Queue alert send failed: %s", text)
+        if not ok and _alert_last_sent.get(key) == now:
+            del _alert_last_sent[key]
 
     task = asyncio.create_task(_send())
     _alert_tasks.add(task)

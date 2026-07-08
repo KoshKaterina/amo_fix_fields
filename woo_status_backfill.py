@@ -59,6 +59,9 @@ async def main(limit: int | None, apply: bool, skip_cancelled: bool) -> None:
         leads_by_id: dict[int, dict] = {}
         for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
             batch = await amo_service.get_leads_updated_since(pipeline, since, with_=())
+            if batch is None:
+                print(f"⚠️ Выборка воронки {pipeline} не удалась — скан неполный, прерываю.")
+                return
             if limit:
                 batch = batch[:limit]
             for ld in batch:

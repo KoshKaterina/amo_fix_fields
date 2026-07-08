@@ -321,8 +321,14 @@ async def find_leads_by_query(query: str, with_: tuple[str, ...] = ()) -> list[d
 
 async def get_leads_updated_since(
     pipeline_id: int, since_ts: int, with_: tuple[str, ...] = (), page_limit: int = 250
-) -> list[dict]:
-    """Все сделки воронки, изменённые с момента since_ts (unix). Для ночной сверки."""
+) -> list[dict] | None:
+    """Все сделки воронки, изменённые с момента since_ts (unix). Для сверок.
+
+    Возвращает None при СБОЕ выборки (сеть/429/5xx/открытый брейкер — _do_get
+    вернул None), в т.ч. при обрыве пагинации на любой странице: частичный
+    список нельзя выдавать за полный, иначе сверка сдвинет своё окно по
+    непрочитанным данным. Пустой список = легитимно «ничего не изменилось»
+    (204 → {} — конец пагинации, не ошибка)."""
     leads: list[dict] = []
     page = 1
     while True:
@@ -335,6 +341,12 @@ async def get_leads_updated_since(
         if with_:
             params.append(("with", ",".join(with_)))
         data = await _do_get("/api/v4/leads", params)
+        if data is None:
+            logger.warning(
+                "get_leads_updated_since: сбой выборки (воронка %s, страница %s) — "
+                "частичный результат не отдаём", pipeline_id, page,
+            )
+            return None
         if not data:
             break
         batch = (data.get("_embedded") or {}).get("leads") or []

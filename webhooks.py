@@ -65,6 +65,8 @@ async def lifespan(app):
     await woo_status_sync.init()
     await ms_status_sync.init()
     yield
+    # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
+    await unmiss_tag.shutdown()
     await ms_status_sync.shutdown()
     await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
