@@ -278,6 +278,51 @@ TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").strip()
 # от посторонних запросов. Пусто → эндпоинт /uis отвечает 403 (выключен).
 UIS_WEBHOOK_SECRET = os.getenv("UIS_WEBHOOK_SECRET", "").strip()
 
+# ---------------------------------------------------------------------------
+# Wazzup — приём сообщений WA/TG для SLA-уведомлений «клиент без ответа N мин».
+# Источник направления сообщения (входящее/исходящее) — вебхук Wazzup, где
+# сообщения (messages[]) и статусы доставки (statuses[]) — разные массивы, поэтому
+# служебная запись Wazzup (ошибка WABA-шаблона «SYSTEM WZ») не считается входящим.
+# ---------------------------------------------------------------------------
+WAZZUP_API_URL = os.getenv("WAZZUP_API_URL", "https://api.wazzup24.com/v3").rstrip("/")
+WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY", "").strip()
+# Секрет в пути вебхука Wazzup (/wazzup/<secret>) — простая защита. Пусто → /wazzup 403.
+WAZZUP_WEBHOOK_SECRET = os.getenv("WAZZUP_WEBHOOK_SECRET", "").strip()
+# Полный URL, который прописываем в подписке Wazzup (webhooksUri). По умолчанию —
+# наш публичный адрес + /wazzup/<secret>. Пусто → авто-подписку не оформляем.
+WAZZUP_WEBHOOK_URL = os.getenv(
+    "WAZZUP_WEBHOOK_URL",
+    f"{PUBLIC_BASE_URL}/wazzup/{WAZZUP_WEBHOOK_SECRET}" if WAZZUP_WEBHOOK_SECRET else "",
+).strip()
+# ЗАХАРДКОЖЕНО ВКЛ (решение Кати 09.07): env НЕ читаем, чтобы пустая строка в .env
+# случайно не выключила фичу. Оформление подписки Wazzup на вебхуки при старте
+# (PATCH /v3/webhooks) — реально подписывает только при заданных WAZZUP_API_KEY и
+# WAZZUP_WEBHOOK_URL (Wazzup при установке шлёт тест, ждёт 200).
+WAZZUP_ENSURE_WEBHOOK = True
+
+# ЗАХАРДКОЖЕНО ВКЛ (решение Кати 09.07): приём вебхука + цикл проверки активны.
+# Реальные алерты идут только при наличии ключа/секрета Wazzup и в окне 12–19 МСК.
+WAZZUP_SLA_ENABLED = True
+# Персональный тег ответственного: amo user_id → Telegram @handle. Тегаем
+# ответственного по сделке + WAZZUP_ALWAYS_TAG. Если ответственного не удалось
+# определить за WAZZUP_RESPONSIBLE_TIMEOUT_S (нет сделки / нет хендла в карте) —
+# тегаем всю смену (MANAGERS_ON_SHIFT в tg_recipients). Та же карта — и для
+# пропущенных звонков (uis_missed_call). ⚠️ карту сверять с Катей.
+WAZZUP_TG_HANDLES = {
+    9291546:  "@thebarsa1",    # Игорь Оанча
+    13929334: "@egorkonsss",   # Егор Константинов
+    13946318: "@offf1cer",     # Кирилл Полесский
+    11513202: "@gladkov_369",  # Александр Гладков
+    # Тимофей Мигачёв (13821022) — уволен, в карте не нужен.
+}
+WAZZUP_ALWAYS_TAG = "@gladkov_369"   # кого тегаем всегда вместе с ответственным
+WAZZUP_RESPONSIBLE_TIMEOUT_S = float(os.getenv("WAZZUP_RESPONSIBLE_TIMEOUT_S", "10"))
+
+WAZZUP_SLA_MINUTES = int(os.getenv("WAZZUP_SLA_MINUTES", "30"))       # порог «без ответа», мин
+WAZZUP_SLA_WINDOW_START_H = int(os.getenv("WAZZUP_SLA_WINDOW_START_H", "12"))  # окно, МСК, включительно
+WAZZUP_SLA_WINDOW_END_H = int(os.getenv("WAZZUP_SLA_WINDOW_END_H", "19"))      # окно, МСК, до (не вкл.)
+WAZZUP_SLA_POLL_INTERVAL_S = int(os.getenv("WAZZUP_SLA_POLL_INTERVAL_S", "60"))  # период проверки, сек
+
 
 _TOTAL_RE = re.compile(
     r"Итого:\s*([\d\s]+[\d])[.,]\d+\s*(?:руб(?:ль|ля|лей|\.?)|₽)",

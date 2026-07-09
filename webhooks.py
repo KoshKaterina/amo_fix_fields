@@ -18,6 +18,7 @@ import telegram_bot
 import uis_missed_call
 import unmiss_tag
 import urgency_tag
+import wazzup_sla
 import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -39,6 +40,7 @@ from waybill_config import (
     STATUS_CREATE_WAYBILL,
     STATUS_FF_KONTROL,
     UIS_WEBHOOK_SECRET,
+    WAZZUP_WEBHOOK_SECRET,
     looks_like_uuid,
 )
 
@@ -66,8 +68,10 @@ async def lifespan(app):
     await metrika_sync.init()
     await woo_status_sync.init()
     await ms_status_sync.init()
+    await wazzup_sla.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
+    await wazzup_sla.shutdown()
     await unmiss_tag.shutdown()
     await ms_status_sync.shutdown()
     await woo_status_sync.shutdown()
@@ -197,6 +201,31 @@ async def uis_missed_call_webhook(secret: str, request: Request):
         logger.warning("UIS webhook: неверный секрет в пути")
         return Response("forbidden", status_code=403)
     uis_missed_call.notify_bg(dict(request.query_params))
+    return {"ok": True}
+
+
+@app.post("/wazzup/{secret}")
+async def wazzup_webhook(secret: str, request: Request):
+    """Вебхук Wazzup (messages/statuses) → SLA-таймер «клиент без ответа N мин».
+    Секрет в пути — простая защита. Отвечаем 200 сразу и всегда (Wazzup при
+    ошибке/таймауте ретраит и может отключить вебхук). Тело messages[] обновляет
+    состояние ожиданий; statuses[] (доставка/ошибки) игнорируем. При установке
+    подписки Wazzup шлёт тестовый запрос — на него тоже отвечаем 200."""
+    if not WAZZUP_WEBHOOK_SECRET or secret != WAZZUP_WEBHOOK_SECRET:
+        logger.warning("Wazzup webhook: неверный секрет в пути")
+        return Response("forbidden", status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("Wazzup webhook: невалидный JSON")
+        return {"ok": True}
+    if isinstance(payload, dict) and payload.get("test") is True:
+        logger.info("Wazzup webhook: тестовый запрос — отвечаю 200")
+        return {"ok": True}
+    try:
+        wazzup_sla.handle_webhook(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка обработки")
     return {"ok": True}
 
 

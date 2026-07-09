@@ -35,16 +35,13 @@ from collections import deque
 import amo_service
 import telegram_bot
 from api import BASE_URL
+from tg_recipients import (
+    NOTIFY_CHAT_ID,
+    NOTIFY_THREAD_ID,
+    mentions_for,
+)
 
 logger = logging.getLogger("uvicorn")
-
-# --- ⚠️ ВРЕМЕННОЕ (уточнить перед закреплением) -------------------------------
-MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya @gladkov_369"
-# Супергруппа ОП «Store [Отдел продаж]», топик РОЗНИЦА
-# (thread_id=2, из ссылки t.me/c/3680811996/2/…). None → General.
-NOTIFY_CHAT_ID = -1003680811996
-NOTIFY_THREAD_ID: int | None = 2
-# ------------------------------------------------------------------------------
 
 _bg_tasks: set = set()
 _seen_ids: set = set()
@@ -83,14 +80,15 @@ async def _apply(params: dict) -> None:
             logger.info("UIS пропущенный: дубль call_session_id=%s — пропускаю", call_id)
             return
 
-        # Ссылку на сделку добираем с таймаутом 5с: не ответил amo вовремя
-        # (медленный API / завал очереди) → шлём БЕЗ ссылки, не задерживая «срочно».
+        # Сделку (+ответственного) добираем с таймаутом 5с: не ответил amo вовремя
+        # (медленный API / завал очереди) → шлём БЕЗ ссылки и тегаем всю смену,
+        # не задерживая «срочно».
         try:
-            lead_id = await asyncio.wait_for(_find_lead_id(phone), timeout=5.0)
+            lead_id, responsible_id = await asyncio.wait_for(_find_lead(phone), timeout=5.0)
         except asyncio.TimeoutError:
-            logger.warning("UIS пропущенный: поиск сделки >5с — шлём без ссылки (call=%s)", call_id)
-            lead_id = None
-        text = _build_message(phone, name, lead_id)
+            logger.warning("UIS пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", call_id)
+            lead_id, responsible_id = None, None
+        text = _build_message(phone, name, lead_id, mentions_for(responsible_id))
         ok = await telegram_bot.send_alert(
             text, parse_mode="HTML",
             chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
@@ -109,33 +107,34 @@ async def _apply(params: dict) -> None:
 _CLOSED_STATUS_IDS = {142, 143}
 
 
-async def _find_lead_id(phone: str):
-    """ОТКРЫТУЮ сделку по телефону для ссылки (не закрытую и не случайную —
-    жалоба МОП: ссылка вела на рандомную/старую сделку). Открытая = status_id не
-    из 142/143. Несколько открытых → самую свежую ПО РАБОТЕ (max updated_at,
-    тай-брейк по id). Открытых нет → None (лучше без ссылки, чем на закрытую)."""
+async def _find_lead(phone: str):
+    """(lead_id, responsible_user_id) ОТКРЫТОЙ сделки по телефону (не закрытую и не
+    случайную — жалоба МОП: ссылка вела на рандомную/старую сделку). Открытая =
+    status_id не из 142/143. Несколько открытых → самую свежую ПО РАБОТЕ (max
+    updated_at, тай-брейк по id). Открытых нет → (None, None) (лучше без ссылки и
+    тег смены, чем ссылка на закрытую)."""
     if not phone:
-        return None
+        return None, None
     try:
         leads = await amo_service.find_leads_by_query(phone)
         open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
         if not open_leads:
-            return None
+            return None, None
         best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
-        return best["id"]
+        return best.get("id"), best.get("responsible_user_id")
     except Exception:
         logger.exception("UIS пропущенный: поиск сделки по телефону не удался")
-        return None
+        return None, None
 
 
 def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_message(phone: str, name: str, lead_id) -> str:
+def _build_message(phone: str, name: str, lead_id, mentions: str) -> str:
     lines = [
         "🔴 ПРОПУЩЕННЫЙ звонок — срочно связаться с клиентом",
-        MANAGERS_ON_SHIFT,
+        mentions,
     ]
     if phone:
         lines.append(f"📞 {_esc(phone)}")
