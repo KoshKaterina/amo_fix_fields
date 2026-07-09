@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import time
 from typing import Awaitable, Callable
 
 import cdek_client
@@ -40,6 +42,15 @@ logger = logging.getLogger("uvicorn")
 
 _alert_callback: Callable[[str], Awaitable[None]] | None = None
 
+# Кулдаун на одинаковые waybill-алерты. Без него каждая неудачная попытка создать
+# накладную (сделка застряла в «Сделать накладную» и правится/пересохраняется —
+# триггер стреляет на каждое изменение) слала отдельное сообщение в TG → спам.
+# Ключ = сам текст алерта (= «Сделка N: причина»), поэтому один и тот же затык по
+# одной сделке шумит не чаще раза в кулдаун; критичный алерт с уникальным UUID
+# под дедуп фактически не попадает. По аналогии с queue_manager._alert_bg.
+WAYBILL_ALERT_COOLDOWN_SECONDS = float(os.getenv("WAYBILL_ALERT_COOLDOWN_SECONDS", "1800"))
+_alert_last_sent: dict[str, float] = {}
+
 
 def set_alert_callback(fn: Callable[[str], Awaitable[None]]) -> None:
     global _alert_callback
@@ -50,10 +61,21 @@ async def _alert(text: str) -> None:
     if _alert_callback is None:
         logger.warning("alert callback not set, suppressing: %s", text)
         return
+    now = time.monotonic()
+    last = _alert_last_sent.get(text)
+    if last is not None and now - last < WAYBILL_ALERT_COOLDOWN_SECONDS:
+        logger.info("waybill alert cooldown, suppressing duplicate: %s", text)
+        return
+    # Помечаем ДО отправки (защита от параллельных дублей), но при неудачной
+    # доставке откатываем — иначе сбой TG-шлюза заглушил бы алерт на весь кулдаун.
+    _alert_last_sent[text] = now
     try:
-        await _alert_callback(text)
+        ok = await _alert_callback(text)
     except Exception:
         logger.exception("alert callback failed")
+        ok = False
+    if ok is False and _alert_last_sent.get(text) == now:
+        del _alert_last_sent[text]
 
 
 # ---------------------------------------------------------------------------
