@@ -27,6 +27,7 @@ from help_function import (
 )
 from queue_manager import (
     enqueue_jivo,
+    enqueue_kontrol,
     enqueue_new,
     enqueue_waybill,
     init_queue,
@@ -36,6 +37,7 @@ from queue_manager import (
 from waybill_config import (
     PIPELINE_FULFILLMENT,
     STATUS_CREATE_WAYBILL,
+    STATUS_FF_KONTROL,
     UIS_WEBHOOK_SECRET,
     looks_like_uuid,
 )
@@ -239,6 +241,18 @@ async def lead_change(request: Request):
     pipeline_update = await get_nested(nested, ["leads", "update", "0", "pipeline_id"])
     pipeline_add = await get_nested(nested, ["leads", "add", "0", "pipeline_id"])
     incoming_pipeline = pipeline_update if pipeline_update is not None else pipeline_add
+
+    # Гейт КОНТРОЛЬ: ФФ-сделка зашла на этап «КОНТРОЛЬ» → автопроверка заказа
+    # (подгон полей МС + стоп-поля + наличие) → релиз в «00» или удержание с тегом
+    # «ошибка передачи» и причиной в примечании. Тяжёлая работа — в очереди (LANE_AMO).
+    if (
+        lead_id is not None
+        and incoming_status is not None
+        and str(incoming_status) == str(STATUS_FF_KONTROL)
+        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
+    ):
+        logger.info("Lead %s entered STATUS_FF_KONTROL — enqueue kontrol gate", lead_id)
+        enqueue_kontrol(lead_id, source="webhook")
 
     # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
     # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).
