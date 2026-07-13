@@ -38,7 +38,7 @@ from api import BASE_URL
 from tg_recipients import (
     NOTIFY_CHAT_ID,
     NOTIFY_THREAD_ID,
-    mentions_for,
+    missed_call_mentions,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -88,7 +88,7 @@ async def _apply(params: dict) -> None:
         except asyncio.TimeoutError:
             logger.warning("UIS пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", call_id)
             lead_id, responsible_id = None, None
-        text = _build_message(phone, name, lead_id, mentions_for(responsible_id))
+        text = _build_message(phone, name, lead_id, missed_call_mentions(responsible_id))
         ok = await telegram_bot.send_alert(
             text, parse_mode="HTML",
             chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,

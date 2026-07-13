@@ -20,6 +20,12 @@ NOTIFY_THREAD_ID: int | None = 2
 # ⚠️ ВРЕМЕННОЕ: фикс.список хендлов. TODO: динамика «кто на смене».
 MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya @gladkov_369"
 
+# Доп. тег ТОЛЬКО для алертов о пропущенных звонках (не для wazzup SLA):
+# @thebarsa1 (Игорь) подмешиваем ТОЛЬКО в фолбэке — когда ответственного-МОПа
+# определить не удалось (нет сделки / тех.аккаунт / нет хендла). На живого
+# ответственного (в т.ч. самого Игоря на его сделках) его не добавляем.
+MISSED_CALL_FALLBACK_TAG = "@thebarsa1"
+
 
 def mentions_for(responsible_id) -> str:
     """Строка @-тегов для алерта по ответственному сделки.
@@ -35,3 +41,14 @@ def mentions_for(responsible_id) -> str:
     if WAZZUP_ALWAYS_TAG and WAZZUP_ALWAYS_TAG != handle:
         parts.append(WAZZUP_ALWAYS_TAG)
     return " ".join(parts)
+
+
+def missed_call_mentions(responsible_id) -> str:
+    """Теги для алерта о ПРОПУЩЕННОМ звонке.
+    Ответственный — живой МОП → тегаем только его (mentions_for), Игоря не
+    подмешиваем. Ответственного нет / тех.аккаунт / нет хендла → base == вся
+    смена, тогда дополнительно тегаем @thebarsa1."""
+    base = mentions_for(responsible_id)
+    if base == MANAGERS_ON_SHIFT and MISSED_CALL_FALLBACK_TAG not in base.split():
+        return f"{base} {MISSED_CALL_FALLBACK_TAG}"
+    return base
