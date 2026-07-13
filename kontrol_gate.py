@@ -96,11 +96,20 @@ def categorize_payment(s):
     return None
 
 
+def _line_kop(p):
+    """Сумма позиции в копейках С УЧЁТОМ скидки (как «Сумма» в карточке МС).
+
+    У позиции МС есть скидка в процентах (discount); «Сумма» = цена×кол-во×
+    (1 − скидка/100). Без учёта скидки «Итого к оплате»/«Оценочная» завышались."""
+    disc = p.get("discount") or 0
+    return round(p["price"] * p["quantity"] * (100 - disc) / 100)
+
+
 def compute_desired(positions, category):
     """Желаемые значения производных полей из позиций и категории оплаты (как woo)."""
     goods_kop = services_kop = 0
     for p in positions:
-        line = p["price"] * p["quantity"]
+        line = _line_kop(p)
         if p["type"] == "service":
             services_kop += line
         else:
@@ -166,8 +175,8 @@ async def fetch_positions(order_id):
         a_type = a.get("meta", {}).get("type", "")
         out.append({"id": p["id"], "type": "service" if a_type == "service" else "goods",
                     "name": a.get("name", ""), "price": p.get("price", 0),
-                    "quantity": p.get("quantity", 1), "assortment_id": a.get("id"),
-                    "assortment_type": a_type})
+                    "quantity": p.get("quantity", 1), "discount": p.get("discount", 0),
+                    "assortment_id": a.get("id"), "assortment_type": a_type})
     return out
 
 
