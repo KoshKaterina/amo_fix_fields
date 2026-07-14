@@ -10,6 +10,7 @@ from starlette.status import HTTP_200_OK
 import amo_service
 import cdek_client
 import cdek_status_sync
+import dup_autoclose
 import jivo_service
 import metrika_sync
 import ms_status_sync
@@ -297,6 +298,9 @@ async def lead_change(request: Request):
     if updates:
         # Автотег «Срочно»: Срочность → «Срочно» → вешаем тег (в фоне, не блокирует).
         urgency_tag.maybe_apply_bg(updates, lead_id)
+        # Авто-перенос дубля в ЗИН: если «Причина отказа» стала «Дубль сделки» →
+        # в фоне переводим сделку в 143 (её воронка). Идемпотентно.
+        dup_autoclose.maybe_close_bg(updates, lead_id)
         for updated_field in updates:
             info = updates[updated_field]
             if info["id"] == "576703":
