@@ -14,7 +14,7 @@ import asyncio
 import dup_autoclose
 from waybill_config import (
     DUP_CLOSE_STATUS_ID,
-    DUP_REASON_ENUM_ID,
+    DUP_REASON_ENUM_IDS,
     DUP_REASON_FIELD_ID,
 )
 
@@ -90,18 +90,23 @@ def _run(lead):
     asyncio.run(dup_autoclose._maybe_close(777))
 
 
-# открытая сделка, причина «Дубль сделки» → перевод в 143 в её воронке
-_run(_make_lead(83537714, DUP_REASON_ENUM_ID, pipeline=10593102))
-assert len(_patched) == 1, "должен быть один PATCH"
-assert _patched[0]["status_id"] == DUP_CLOSE_STATUS_ID
-assert _patched[0]["pipeline_id"] == 10593102
+# открытая сделка, КАЖДАЯ мусорная причина из набора → перевод в 143 в её воронке
+for enum_id in DUP_REASON_ENUM_IDS:
+    _run(_make_lead(83537714, enum_id, pipeline=10593102))
+    assert len(_patched) == 1, f"должен быть PATCH для причины {enum_id}"
+    assert _patched[0]["status_id"] == DUP_CLOSE_STATUS_ID
+    assert _patched[0]["pipeline_id"] == 10593102
 
+# набор причин актуален (Дубль/Тест/Обменник/Тех поддержка/Не ЦА)
+assert DUP_REASON_ENUM_IDS == {1041141, 1041163, 1041691, 1041159, 1041161}
+
+_any_junk = next(iter(DUP_REASON_ENUM_IDS))
 # уже закрытая (143) → эхо-защита, не трогаем
-_run(_make_lead(143, DUP_REASON_ENUM_ID))
+_run(_make_lead(143, _any_junk))
 assert _patched == [], "закрытую сделку не двигаем"
 
 # уже закрытая (142) → тоже не трогаем
-_run(_make_lead(142, DUP_REASON_ENUM_ID))
+_run(_make_lead(142, _any_junk))
 assert _patched == [], "успешную сделку не двигаем"
 
 # открытая, но причина иная (не Дубль) → не трогаем
