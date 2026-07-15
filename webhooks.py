@@ -250,14 +250,15 @@ async def lead_change(request: Request):
     lead_id = await get_nested(nested, ["leads", "update", "0", "id"])
     if lead_id is None:
         lead_id = await get_nested(nested, ["leads", "add", "0", "id"])
-        # Анти-дубль на СОЗДАНИИ сделки (заказ побеждает консультацию /
-        # пост-продажный маршрутизатор). Быстрый, реальная работа с задержкой
-        # в фоне. За флагами LEAD_DEDUP_* (см. lead_dedup.py).
-        if lead_id is not None:
-            lead_dedup.maybe_process_bg(lead_id, source="add")
 
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
+
+    # Анти-дубль сделок (заказ побеждает консультацию / пост-продажный
+    # маршрутизатор). Вызывается на ЛЮБОМ вебхуке сделки: amo шлёт add и update
+    # в непредсказуемом порядке, а идемпотентность (TTL-set) и реконсиляция
+    # дочитыванием живут внутри. За флагами LEAD_DEDUP_* (см. lead_dedup.py).
+    lead_dedup.maybe_process_bg(lead_id, source="webhook")
 
     # Автоснятие «пропущенный» при дозвоне: реконсиляция по дочитыванию (amo не шлёт
     # теги в вебхук). На любом изменении сделки в фоне сверяем теги: если есть

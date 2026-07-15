@@ -95,6 +95,11 @@ def _test_contact_ids() -> set:
 
 TEST_CONTACT_IDS = _test_contact_ids()
 
+logger.info(
+    "lead_dedup: init (order_wins=%s, postsale=%s, test_contacts=%s, delay=%ss)",
+    ORDER_WINS_ENABLED, POSTSALE_ENABLED, sorted(TEST_CONTACT_IDS), DELAY_S,
+)
+
 _bg_tasks: set = set()
 _seen: dict[int, float] = {}
 
@@ -184,6 +189,7 @@ async def _process(lead_id: int, source: str) -> None:
             return  # уже закрыта (напр. Jivo-триаж) — не наш случай
         cids = _contact_ids(lead)
         if not cids:
+            logger.info("lead_dedup: сделка %s без контактов — пропуск", lead_id)
             return
 
         # тест-режим: обрабатываем только тест-контакты, пока флаги выключены
@@ -191,6 +197,10 @@ async def _process(lead_id: int, source: str) -> None:
         is_test_contact = any(c in TEST_CONTACT_IDS for c in cids)
         if test_only_mode and not is_test_contact:
             return
+        logger.info(
+            "lead_dedup: обрабатываю сделку %s (site_order=%s, test=%s, src=%s)",
+            lead_id, _is_site_order(lead), is_test_contact, source,
+        )
 
         siblings: list[dict] = []
         for cid in cids[:3]:
