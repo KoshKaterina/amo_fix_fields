@@ -158,21 +158,6 @@ async def _set_responsible(lead_id: int, user_id: int) -> bool:
     return bool(res.get("ok"))
 
 
-async def _close_as_dup(lead_id: int) -> bool:
-    """Закрывает сделку в 143 с причиной «Дубль сделки». Причина — SELECT-поле,
-    ей нужен enum_id, а amo_service.patch_lead умеет только {"value": …}; поэтому
-    прямой PATCH с полным телом (статус + причина одним запросом)."""
-    body = {
-        "status_id": 143,
-        "pipeline_id": PIPELINE_CLEVER,
-        "custom_fields_values": [
-            {"field_id": F_LOSS, "values": [{"enum_id": LOSS_DUP_ENUM}]}
-        ],
-    }
-    res = await amo_service._do_patch(f"/api/v4/leads/{lead_id}", body)  # noqa: SLF001
-    return bool(res.get("ok"))
-
-
 # --- главная точка входа (из webhooks.py) ----------------------------------
 
 def maybe_process_bg(lead_id, *, source: str = "add") -> None:
@@ -266,8 +251,13 @@ async def _order_wins(order: dict, others: list[dict]) -> None:
     resp = cons.get("responsible_user_id")
 
     if cons_status in EARLY_STATUSES:
-        ok = await _close_as_dup(cons_id)
-        if ok:
+        res = await amo_service.patch_lead(
+            cons_id,
+            status_id=143,
+            pipeline_id=PIPELINE_CLEVER,
+            custom_fields={F_LOSS: {"enum_id": LOSS_DUP_ENUM}},
+        )
+        if res.get("ok"):
             await amo_service.add_note(
                 cons_id,
                 f"🤖 Автообъединение: клиент оформил Заказ №{order_no} "
@@ -288,7 +278,7 @@ async def _order_wins(order: dict, others: list[dict]) -> None:
                 order_id, cons_id, resp,
             )
         else:
-            logger.error("lead_dedup[order]: не закрылась консультация %s", cons_id)
+            logger.error("lead_dedup[order]: не закрылась консультация %s: %s", cons_id, res)
     else:
         # продвинутый этап — не рискуем, только пометки
         await amo_service.add_tag(order_id, TAG_MAYBE_DUP)

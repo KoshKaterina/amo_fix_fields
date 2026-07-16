@@ -85,21 +85,11 @@ class _FakeApi:
         return list(_siblings)
 
 
-async def _fake_do_patch_router(path, body):
-    # закрытие консультации в 143 с причиной идёт прямым PATCH — эмулируем как patch
-    if body.get("status_id") == 143:
-        lead_id = int(path.rsplit("/", 1)[-1])
-        calls["patch"].append((lead_id, body))
-        return {"ok": True}
-    calls["resp"].append((path, body))
-    return {"ok": True}
-
-
 lead_dedup.amo_service.get_lead_full = _fake_get_lead_full
 lead_dedup.amo_service.patch_lead = _fake_patch_lead
 lead_dedup.amo_service.add_note = _fake_add_note
 lead_dedup.amo_service.add_tag = _fake_add_tag
-lead_dedup.amo_service._do_patch = _fake_do_patch_router
+lead_dedup.amo_service._do_patch = _fake_do_patch
 import sys
 sys.modules["api"] = _FakeApi  # lead_dedup импортирует api лениво внутри функции
 
