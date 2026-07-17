@@ -338,6 +338,34 @@ WAZZUP_SLA_WINDOW_START_H = int(os.getenv("WAZZUP_SLA_WINDOW_START_H", "12"))  #
 WAZZUP_SLA_WINDOW_END_H = int(os.getenv("WAZZUP_SLA_WINDOW_END_H", "19"))      # окно, МСК, до (не вкл.)
 WAZZUP_SLA_POLL_INTERVAL_S = int(os.getenv("WAZZUP_SLA_POLL_INTERVAL_S", "60"))  # период проверки, сек
 
+# ---------------------------------------------------------------------------
+# Ozon Pay: счёт СБП из amo — замена виджета int2_ozonpay (MAG-285).
+# createPayment (payType=SBP), режим «самостоятельная интеграция» — тот же,
+# что у плагина сайта sunscrypt-sbp, и ключи ТЕ ЖЕ (ЛК Ozon Pay → Магазины →
+# Интеграция). Суммы Ozon и МойСклад обе в копейках.
+# ---------------------------------------------------------------------------
+# Мастер-флаг: без "1" вебхук не ставит счета в очередь (безопасный выкат).
+OZON_INVOICE_ENABLED = os.getenv("OZON_INVOICE_ENABLED", "").strip() == "1"
+OZON_PAY_API_URL = os.getenv("OZON_PAY_API_URL", "https://payapi.ozon.ru").rstrip("/")
+OZON_PAY_ACCESS_KEY = os.getenv("OZON_PAY_ACCESS_KEY", "").strip()
+OZON_PAY_SECRET_KEY = os.getenv("OZON_PAY_SECRET_KEY", "").strip()
+# Ссылка живёт сутки (дефолт Ozon 600с=10мин — протухнет раньше, чем клиент откроет).
+OZON_INVOICE_TTL_S = int(os.getenv("OZON_INVOICE_TTL_S", "86400"))
+OZON_INVOICE_REDIRECT_URL = os.getenv("OZON_INVOICE_REDIRECT_URL", "https://sunscrypt.ru/").strip()
+
+# CLEVER Основная, схема «тех-этап» (17.07.2026): менеджер двигает сделку в
+# «Оплата запрошена» (НОВЫЙ тех-этап 87280230, без DP-автоматики) → мы создаём
+# счёт, пишем ссылку в 577617 и ОДНИМ атомарным PATCH переводим сделку в
+# «Ссылка отправлена» (бывший «Оплата запрошена» 83537866) — там штатные боты
+# (7173) шлют шаблон с уже заполненным полем. Ошибка счёта → сделка остаётся
+# висеть на тех-этапе с тегом (видно в воронке).
+PIPELINE_CLEVER_MAIN = 10593102
+STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
+STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
+STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)
+FIELD_PAYMENT_LINK = 577617           # «Ссылка для оплаты»
+TAG_INVOICE_ERROR = "ошибка счёта"
+
 
 _TOTAL_RE = re.compile(
     r"Итого:\s*([\d\s]+[\d])[.,]\d+\s*(?:руб(?:ль|ля|лей|\.?)|₽)",

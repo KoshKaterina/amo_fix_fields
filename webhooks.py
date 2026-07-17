@@ -14,6 +14,7 @@ import dup_autoclose
 import jivo_service
 import metrika_sync
 import ms_status_sync
+import ozon_invoice
 import showroom_tag
 import telegram_bot
 import uis_missed_call
@@ -28,6 +29,7 @@ from help_function import (
     parse_the_cart_field_2,
 )
 from queue_manager import (
+    enqueue_invoice,
     enqueue_jivo,
     enqueue_kontrol,
     enqueue_new,
@@ -37,9 +39,11 @@ from queue_manager import (
     shutdown_queue,
 )
 from waybill_config import (
+    PIPELINE_CLEVER_MAIN,
     PIPELINE_FULFILLMENT,
     STATUS_CREATE_WAYBILL,
     STATUS_FF_KONTROL,
+    STATUS_PAYMENT_REQUESTED,
     UIS_WEBHOOK_SECRET,
     WAZZUP_WEBHOOK_SECRET,
     looks_like_uuid,
@@ -69,11 +73,13 @@ async def lifespan(app):
     await metrika_sync.init()
     await woo_status_sync.init()
     await ms_status_sync.init()
+    ozon_invoice.init()
     await wazzup_sla.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
     await unmiss_tag.shutdown()
+    await ozon_invoice.aclose()
     await ms_status_sync.shutdown()
     await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
@@ -293,6 +299,21 @@ async def lead_change(request: Request):
         and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
     ):
         ms_status_sync.push_processing_bg(lead_id, incoming_status)
+
+    # Счёт СБП (MAG-285): сделка зашла на тех-этап «Оплата запрошена» (CLEVER
+    # Основная) → создаём платёжную ссылку Ozon из суммы заказа МС и одним PATCH
+    # пишем её в 577617 + переводим сделку в «Ссылка отправлена», где штатные
+    # боты шлют шаблон. Обработчик перечитывает сделку (гейт по воронке/этапу
+    # повторяется там). Мастер-флаг OZON_INVOICE_ENABLED.
+    if (
+        lead_id is not None
+        and incoming_status is not None
+        and str(incoming_status) == str(STATUS_PAYMENT_REQUESTED)
+        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_CLEVER_MAIN))
+        and ozon_invoice.is_enabled()
+    ):
+        logger.info("Lead %s entered STATUS_PAYMENT_REQUESTED — enqueue ozon invoice", lead_id)
+        enqueue_invoice(lead_id, source="webhook")
 
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:

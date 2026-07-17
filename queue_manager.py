@@ -22,6 +22,7 @@ PRIORITY_NEW = 0
 PRIORITY_JIVO = PRIORITY_NEW
 PRIORITY_WAYBILL = 5
 PRIORITY_KONTROL = PRIORITY_WAYBILL  # гейт КОНТРОЛЬ→00 — та же дорожка(LANE_AMO)/приоритет, что автонакладные
+PRIORITY_INVOICE = PRIORITY_WAYBILL  # счёт СБП «Оплата запрошена» — клиент ЖДЁТ ссылку, путь клиентский
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
 PRIORITY_METRIKA_SYNC = 25
@@ -44,6 +45,7 @@ LANES = (LANE_AMO, LANE_SYNC, LANE_CDEK)
 _CATEGORY_BY_KIND = {
     "waybill": "waybill",
     "kontrol": "kontrol",
+    "ozon_invoice": "invoice",
     "cdek_sync": "cdek",
     "metrika_sync": "sync",
     "jivo": "jivo",
@@ -84,6 +86,7 @@ _alert_tasks: set[asyncio.Task] = set()
 _pending_leads: dict[str, dict] = {}
 _pending_waybills: set[str] = set()
 _pending_kontrol: set[str] = set()
+_pending_invoice: set[str] = set()
 _pending_cdek_sync: set[str] = set()
 _pending_metrika_sync: set[str] = set()
 _pending_jivo: set[str] = set()
@@ -130,6 +133,7 @@ async def shutdown_queue() -> None:
     _pending_leads.clear()
     _pending_waybills.clear()
     _pending_kontrol.clear()
+    _pending_invoice.clear()
     _pending_cdek_sync.clear()
     _pending_metrika_sync.clear()
     _pending_jivo.clear()
@@ -279,6 +283,27 @@ def enqueue_waybill(lead_id, source: str = "webhook") -> None:
     )
 
 
+def enqueue_invoice(lead_id, source: str = "webhook") -> None:
+    """Счёт СБП (MAG-285): сделка зашла на «Оплата запрошена» (CLEVER Основная)
+    → создать платёжную ссылку Ozon из суммы заказа МС, записать в 577617 и
+    запустить salesbot с шаблоном. Дорожка LANE_AMO, приоритет клиентский.
+    Дедуп по lead_id, пока задача ждёт в очереди."""
+    if not _queues:
+        logger.error("Task queue not initialized, dropping invoice for lead %s", lead_id)
+        return
+    key = str(lead_id)
+    if key in _pending_invoice:
+        logger.info("Lead %s invoice already in queue, skipping duplicate", key)
+        return
+    _pending_invoice.add(key)
+    payload = {"_kind": "ozon_invoice", "lead_id": lead_id, "source": source}
+    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_INVOICE, payload=payload))
+    logger.info(
+        "ENQUEUE invoice lead_id=%s source=%s lane=%s queue_size=%d",
+        key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
+    )
+
+
 def enqueue_kontrol(lead_id, source: str = "webhook") -> None:
     """Гейт КОНТРОЛЬ: ФФ-сделка зашла на этап «КОНТРОЛЬ» → автопроверка заказа
     (подгон полей МС, стоп-поля, наличие) и релиз в «00» или удержание с тегом
@@ -384,6 +409,8 @@ async def _worker(lane: str) -> None:
             _pending_waybills.discard(lead_id)
         elif kind == "kontrol":
             _pending_kontrol.discard(lead_id)
+        elif kind == "ozon_invoice":
+            _pending_invoice.discard(lead_id)
         elif kind == "cdek_sync":
             _pending_cdek_sync.discard(str(item.payload.get("_key", "")))
         elif kind == "metrika_sync":
@@ -423,6 +450,12 @@ async def _worker(lane: str) -> None:
                 await process_kontrol_lead(
                     item.payload["lead_id"],
                     apply=True,
+                    source=item.payload.get("source", "webhook"),
+                )
+            elif kind == "ozon_invoice":
+                from ozon_invoice import process_invoice_lead
+                await process_invoice_lead(
+                    item.payload["lead_id"],
                     source=item.payload.get("source", "webhook"),
                 )
             elif kind == "cdek_sync":
@@ -495,7 +528,12 @@ async def _process_lead_update(payload: dict) -> None:
 
     current_goods = await get_custom_field_value(current_info, 577313)
     current_delivery_type = await get_custom_field_value(current_info, 577315)
-    current_delivery_address = await get_custom_field_value(current_info, 577311)
+    current_delivery_address = await get_custom_field_value(current_info, 576719)
+    # 576719 «Адрес получателя» заполняет сайт при создании (и туда же кладёт код ПВЗ
+    # для тарифов постамат/склад-ПВЗ). МС-адрес пишем ТОЛЬКО когда поле пустое, чтобы
+    # не затереть значение сайта/код ПВЗ. Ранее МС-адрес жил в отдельном 577311 (удалён).
+    if current_delivery_address and str(current_delivery_address).strip():
+        delivery_address = None
     current_promo_type = await get_custom_field_value(current_info, 570661)
     current_comment = await get_custom_field_value(current_info, 577753)
 
