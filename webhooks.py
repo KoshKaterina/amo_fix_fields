@@ -236,6 +236,24 @@ async def wazzup_webhook(secret: str, request: Request):
     return {"ok": True}
 
 
+@app.post("/ozon_notify")
+async def ozon_notify(request: Request):
+    """Вебхук Ozon Pay о статусе платежа (notificationUrl наших СБП-счетов из
+    amo, MAG-285 этап 2). Аутентификация — подпись requestSign в теле (обе
+    боевые формулы плагина сайта); невалидная подпись просто игнорируется.
+    Отвечаем 200 быстро, обработка (перевод сделки в «Оплата получена») — фоном."""
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("ozon_notify: невалидный JSON")
+        return {"ok": True}
+    try:
+        ozon_invoice.handle_notification_bg(payload)
+    except Exception:
+        logger.exception("ozon_notify: ошибка постановки обработки")
+    return {"ok": True}
+
+
 @app.post("/lead_change")
 async def lead_change(request: Request):
     form = await request.form()

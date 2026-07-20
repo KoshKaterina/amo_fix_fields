@@ -239,4 +239,62 @@ assert res == "skipped-link-present", res
 assert not _ozon_calls and not _patches and not _alerts and not _tags
 print("✓ ссылка уже в поле: второй платёж не создаём, ручную ссылку уважаем")
 
+# ═══ Этап 2: вебхук факта оплаты ════════════════════════════════════════════
+
+def _notif(ext="amo-777001-123", status="Completed", amount="759000", sign=True):
+    d = {"extTransactionID": ext, "status": status, "amount": amount,
+         "currencyCode": "643", "operationType": "Payment", "paymentMethod": "SBP"}
+    if sign:
+        import hashlib as _h
+        d["requestSign"] = _h.sha256(
+            f"{ozon_invoice.OZON_PAY_ACCESS_KEY}|||{ext}|{amount}|643|{ozon_invoice.OZON_PAY_NOTIFICATION_SECRET_KEY}".encode()
+        ).hexdigest()
+    return d
+
+ozon_invoice.OZON_PAY_ACCESS_KEY = "AK-test"
+ozon_invoice.OZON_PAY_NOTIFICATION_SECRET_KEY = "NS-test"
+
+# ── 11) подпись: валидная self-формула проходит, битая — нет ────────────────
+assert ozon_invoice.verify_notification(_notif()) is True
+bad = _notif(); bad["requestSign"] = "0" * 64
+assert ozon_invoice.verify_notification(bad) is False
+assert ozon_invoice.verify_notification({"requestSign": ""}) is False
+print("✓ вебхук: подпись self-формулы проверяется, битая отклоняется")
+
+# ── 12) Completed + сделка на «Ссылка отправлена» → перевод в «Оплата получена» ─
+_reset(); ozon_invoice._paid_recent.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+res = run(ozon_invoice._handle_notification(_notif()))
+assert res == "moved", res
+assert _patches and _patches[0].get("status_id") == ozon_invoice.STATUS_PAYMENT_RECEIVED, _patches
+assert any("Оплата подтверждена" in n[1] and "7590 ₽" in n[1] for n in _notes), _notes
+print("✓ Completed: сделка со «Ссылка отправлена» уехала в «Оплата получена» + примечание")
+
+# ── 13) Completed, но менеджер уже перевёл сам → только примечание ──────────
+_reset(); ozon_invoice._paid_recent.clear()
+_install_mocks(_lead(status=142))
+res = run(ozon_invoice._handle_notification(_notif()))
+assert res == "noted", res
+assert not [p for p in _patches if p.get("status_id")], _patches
+assert any("не двигаю" in n[1] for n in _notes), _notes
+print("✓ Completed по уже переведённой сделке: примечание, этап не трогаем")
+
+# ── 14) повторный вебхук того же extId → дедуп ──────────────────────────────
+_reset(); ozon_invoice._paid_recent.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+r1 = run(ozon_invoice._handle_notification(_notif()))
+r2 = run(ozon_invoice._handle_notification(_notif()))
+assert r1 == "moved" and r2 == "skipped-duplicate", (r1, r2)
+assert len([p for p in _patches if p.get("status_id")]) == 1
+print("✓ ретрай вебхука: один перевод, дубль скипнут")
+
+# ── 15) не наш extId / не Completed / битая подпись → игнор без действий ────
+_reset(); ozon_invoice._paid_recent.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+assert run(ozon_invoice._handle_notification(_notif(ext="site-order-1"))) == "ignored-foreign"
+assert run(ozon_invoice._handle_notification(_notif(status="Rejected"))) == "ignored-status"
+assert run(ozon_invoice._handle_notification(bad)) == "ignored-bad-sign"
+assert not _patches and not _notes and not _alerts
+print("✓ чужой extId, Rejected и битая подпись: полный игнор")
+
 print("\nozon_invoice: все тесты прошли")

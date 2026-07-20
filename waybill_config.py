@@ -352,6 +352,11 @@ OZON_PAY_SECRET_KEY = os.getenv("OZON_PAY_SECRET_KEY", "").strip()
 # Ссылка живёт сутки (дефолт Ozon 600с=10мин — протухнет раньше, чем клиент откроет).
 OZON_INVOICE_TTL_S = int(os.getenv("OZON_INVOICE_TTL_S", "86400"))
 OZON_INVOICE_REDIRECT_URL = os.getenv("OZON_INVOICE_REDIRECT_URL", "https://sunscrypt.ru/").strip()
+# Секрет подписи УВЕДОМЛЕНИЙ Ozon (отдельный от secretKey, ЛК Ozon Pay; тот же,
+# что у плагина сайта). Задан → в createPayment передаём notificationUrl
+# (PUBLIC_BASE_URL/ozon_notify) и по вебхуку «Completed» сами двигаем сделку в
+# «Оплата получена». Пусто → вебхук-факт оплаты выключен (MVP-поведение).
+OZON_PAY_NOTIFICATION_SECRET_KEY = os.getenv("OZON_PAY_NOTIFICATION_SECRET_KEY", "").strip()
 
 # CLEVER Основная, схема «тех-этап» (17.07.2026): менеджер двигает сделку в
 # «Оплата запрошена» (НОВЫЙ тех-этап 87280230, без DP-автоматики) → мы создаём
