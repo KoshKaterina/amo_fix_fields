@@ -33,6 +33,7 @@ import ms_client
 import telegram_bot
 import tg_recipients
 from waybill_config import (
+    FIELD_INVOICE_OTHER_AMOUNT,
     FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_PAYMENT_LINK,
     OZON_INVOICE_ENABLED,
@@ -75,6 +76,29 @@ async def aclose() -> None:
     if _client is not None:
         await _client.aclose()
         _client = None
+
+
+def _parse_other_amount(raw) -> tuple[int | None, str]:
+    """Поле «Другая сумма» (578141, text): пусто → override нет; иначе число
+    В РУБЛЯХ («15 398,50», «15398.5», «15398 ₽») → копейки. Мусор или сумма
+    меньше 1 ₽ — ошибка: менеджер явно хотел другую сумму, молча игнорировать
+    и выставить счёт на сумму заказа нельзя."""
+    s = str(raw or "").strip()
+    if not s:
+        return None, ""
+    cleaned = (
+        s.replace("\xa0", "").replace(" ", "")
+        .replace("₽", "").replace("р.", "").replace("руб.", "").replace("руб", "")
+        .replace(",", ".")
+    )
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None, f"не разобрать число из {s!r}"
+    kopecks = int(round(value * 100))
+    if kopecks < 100:
+        return None, f"сумма меньше 1 ₽: {s!r}"
+    return kopecks, ""
 
 
 def _sign_create_payment(ext_id: str, access_key: str, secret_key: str) -> str:
@@ -194,16 +218,29 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
                     detail=f"поле «ID Заказа» (576689) пусто или не UUID: {ms_uuid!r}")
         return "failed-no-ms-order"
 
+    # «Другая сумма» (578141): заполнено → счёт на неё, а не на сумму заказа.
+    # Нечитаемое значение — честная ошибка менеджеру (не молчать и не подменять).
+    other_kopecks, other_err = _parse_other_amount(
+        amo_service.get_custom_field_value(lead, FIELD_INVOICE_OTHER_AMOUNT)
+    )
+    if other_err:
+        await _fail(lead, "Поле «Другая сумма» заполнено, но не читается - счёт не создан",
+                    detail=f"{other_err}. Исправьте сумму или очистите поле.")
+        return "failed-other-amount"
+
     order = await ms_client.get(f"entity/customerorder/{ms_uuid}")
     if not order:
         await _fail(lead, "МойСклад не отдал заказ - счёт не создан",
                     detail=f"customerorder/{ms_uuid}")
         return "failed-ms-fetch"
 
-    kopecks = int(round(float(order.get("sum") or 0)))
+    if other_kopecks is not None:
+        kopecks = other_kopecks
+    else:
+        kopecks = int(round(float(order.get("sum") or 0)))
     if kopecks <= 0:
         await _fail(lead, "Сумма заказа МС = 0 - счёт не создан",
-                    detail=f"заказ МС {order.get('name')}")
+                    detail=f"заказ МС {order.get('name')}. Либо укажите сумму в поле «Другая сумма».")
         return "failed-zero-sum"
 
     ext_id = f"amo-{lead_id}-{int(time.time())}"
@@ -228,9 +265,10 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
 
     rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
+    src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {order.get('name')}"
     await amo_service.add_note(
         lead_id,
-        f"Счёт СБП создан автоматически: {rub_str} ₽ (заказ МС {order.get('name')}), действителен "
+        f"Счёт СБП создан автоматически: {rub_str} ₽ ({src}), действителен "
         f"{OZON_INVOICE_TTL_S // 3600} ч.\n{pay_link}\nextId {ext_id}"
         + (f"\npaymentId {payment_id}" if payment_id else ""),
     )

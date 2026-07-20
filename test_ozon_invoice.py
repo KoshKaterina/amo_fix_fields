@@ -46,12 +46,14 @@ _alerts: list = []
 _ozon_calls: list = []
 
 
-def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None):
+def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None, other=None):
     cf = []
     if uuid is not None:
         cf.append({"field_id": FIELD_MOYSKLAD_ORDER_UUID, "values": [{"value": uuid}]})
     if link is not None:
         cf.append({"field_id": FIELD_PAYMENT_LINK, "values": [{"value": link}]})
+    if other is not None:
+        cf.append({"field_id": ozon_invoice.FIELD_INVOICE_OTHER_AMOUNT, "values": [{"value": other}]})
     return {
         "id": LEAD_ID,
         "name": "Заказ №4242",
@@ -199,6 +201,33 @@ assert res == "failed-zero-sum", res
 assert not _ozon_calls and not _patches
 assert any("Сумма заказа МС = 0" in a for a in _alerts), _alerts
 print("✓ сумма 0: счёт не создаём, менеджеру ошибка")
+
+# ── 8) «Другая сумма»: парсер рублей → копейки ──────────────────────────────
+for raw, want in [("20000", 2000000), ("15 398,50", 1539850), ("15398.5 ₽", 1539850), ("", None), (None, None)]:
+    got, err = ozon_invoice._parse_other_amount(raw)
+    assert got == want and err == "", (raw, got, err)
+for raw in ["тыща", "0", "0,5"]:
+    got, err = ozon_invoice._parse_other_amount(raw)
+    assert got is None and err, (raw, got, err)
+print("✓ парсер «Другой суммы»: рубли→копейки, пробелы/запятые/₽, мусор и <1 ₽ = ошибка")
+
+# ── 9) «Другая сумма» задана → счёт на неё, не на сумму заказа ──────────────
+_reset()
+_install_mocks(_lead(other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000, _ozon_calls
+assert "Другая сумма" in _notes[0][1] and "2500 ₽" in _notes[0][1], _notes
+print("✓ «Другая сумма» 2 500 → счёт на 250000 коп., источник в примечании")
+
+# ── 10) «Другая сумма» мусор → ошибка менеджеру, счёт не создаём ────────────
+_reset()
+_install_mocks(_lead(other="約тыща"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "failed-other-amount", res
+assert not _ozon_calls and not _patches
+assert any("Другая сумма" in a for a in _alerts), _alerts
+print("✓ мусор в «Другой сумме»: счёт не создан, менеджеру понятная ошибка")
 
 # ── 7) 577617 уже заполнено → скип (update_lead приходит на ЛЮБУЮ правку) ───
 # Кейс 20.07: менеджер вписал ссылку руками, сделка стоит на тех-этапе —
