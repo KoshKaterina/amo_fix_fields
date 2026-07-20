@@ -46,10 +46,12 @@ _alerts: list = []
 _ozon_calls: list = []
 
 
-def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU):
+def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None):
     cf = []
     if uuid is not None:
         cf.append({"field_id": FIELD_MOYSKLAD_ORDER_UUID, "values": [{"value": uuid}]})
+    if link is not None:
+        cf.append({"field_id": FIELD_PAYMENT_LINK, "values": [{"value": link}]})
     return {
         "id": LEAD_ID,
         "name": "Заказ №4242",
@@ -197,5 +199,15 @@ assert res == "failed-zero-sum", res
 assert not _ozon_calls and not _patches
 assert any("Сумма заказа МС = 0" in a for a in _alerts), _alerts
 print("✓ сумма 0: счёт не создаём, менеджеру ошибка")
+
+# ── 7) 577617 уже заполнено → скип (update_lead приходит на ЛЮБУЮ правку) ───
+# Кейс 20.07: менеджер вписал ссылку руками, сделка стоит на тех-этапе —
+# следующий вебхук не должен плодить второй платёж.
+_reset()
+_install_mocks(_lead(link="https://qr.nspk.ru/MANUAL"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-link-present", res
+assert not _ozon_calls and not _patches and not _alerts and not _tags
+print("✓ ссылка уже в поле: второй платёж не создаём, ручную ссылку уважаем")
 
 print("\nozon_invoice: все тесты прошли")

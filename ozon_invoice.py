@@ -177,6 +177,17 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         )
         return "skipped-moved"
 
+    # Гейт от дублей: вебхук подписан на update_lead и приходит на ЛЮБОЕ изменение
+    # сделки (не только смену этапа), а status_id в нём — просто текущий этап.
+    # Стоило Гладкову 20.07 вписать ссылку в поле руками — код создал второй
+    # платёж. Правило: 577617 уже заполнено → счёт НЕ создаём (уважаем и ручную
+    # ссылку переходного периода). Нужна новая ссылка → очистить поле, любое
+    # изменение сделки на тех-этапе создаст свежую.
+    existing_link = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_LINK) or "").strip()
+    if existing_link:
+        logger.info("Lead %s: 577617 уже заполнено (%.40s…) — счёт не создаём", lead_id, existing_link)
+        return "skipped-link-present"
+
     ms_uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
     if not looks_like_uuid(ms_uuid):
         await _fail(lead, "Нет заказа в МС - невозможно создать оплату",
