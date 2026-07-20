@@ -109,10 +109,19 @@ async def _create_payment(ext_id: str, amount_kopecks: int) -> tuple[str | None,
         data = resp.json()
     except ValueError:
         return None, "", "Ozon вернул невалидный JSON"
+    details = data.get("paymentDetails") or {}
+    payment_id = str(details.get("paymentId") or "")
     pay_link = (data.get("order") or {}).get("payLink")
-    payment_id = str((data.get("paymentDetails") or {}).get("paymentId") or "")
     if not pay_link:
-        return None, payment_id, f"в ответе Ozon нет order.payLink: {str(data)[:200]}"
+        # Платёж «без заказа» (наш случай): Ozon отдаёт order=None, а готовая
+        # ссылка лежит в paymentDetails.sbp.payload (https://qr.nspk.ru/…) —
+        # на телефоне открывает приложение банка, на десктопе QR. Подтверждено
+        # боевым ответом 20.07.2026 (сделка 36515681).
+        payload = (details.get("sbp") or {}).get("payload")
+        if isinstance(payload, str) and payload.startswith("http"):
+            pay_link = payload
+    if not pay_link:
+        return None, payment_id, f"в ответе Ozon нет ни order.payLink, ни sbp.payload: {str(data)[:300]}"
     return pay_link, payment_id, ""
 
 

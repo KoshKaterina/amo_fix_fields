@@ -110,6 +110,26 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# ── 0a) _create_payment: платёж «без заказа» → ссылка из sbp.payload ────────
+# Боевой ответ Ozon 20.07.2026: order=None, ссылка в paymentDetails.sbp.payload.
+class _FakeResp:
+    status_code = 200
+    text = ""
+    def json(self):
+        return {"order": None, "paymentDetails": {
+            "paymentId": "pid-1", "type": "SBP", "status": "PAYMENT_NEW",
+            "sbp": {"payload": "https://qr.nspk.ru/TEST123"}}}
+
+class _FakeClient:
+    async def post(self, url, json=None):
+        return _FakeResp()
+
+ozon_invoice._client = _FakeClient()
+link, pid, err = asyncio.run(ozon_invoice._create_payment("ext-x", 1000))
+assert link == "https://qr.nspk.ru/TEST123" and pid == "pid-1" and err == "", (link, pid, err)
+ozon_invoice._client = None
+print("✓ платёж без заказа: ссылка берётся из paymentDetails.sbp.payload")
+
 # ── 0) подпись createPayment: формула из боевого плагина ────────────────────
 sig = ozon_invoice._sign_create_payment("ext1", "AK", "SK")
 assert sig == hashlib.sha256(b"ext1AKSK").hexdigest(), sig
