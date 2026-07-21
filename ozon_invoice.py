@@ -36,6 +36,7 @@ import ms_client
 import telegram_bot
 import tg_recipients
 from waybill_config import (
+    FIELD_INVOICE_BY_CARD,
     FIELD_INVOICE_OTHER_AMOUNT,
     FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_PAYMENT_LINK,
@@ -107,23 +108,37 @@ def _parse_other_amount(raw) -> tuple[int | None, str]:
     return kopecks, ""
 
 
+def _is_checked(raw) -> bool:
+    """amo checkbox: заполнено → True/"1"/"on"/"true"; пусто/False/0 → нет."""
+    if raw is True:
+        return True
+    return str(raw or "").strip().lower() in ("1", "on", "true", "yes")
+
+
 def _sign_create_payment(ext_id: str, access_key: str, secret_key: str) -> str:
     """Подпись createPayment: SHA-256 hex от extId+accessKey+secretKey без
     разделителей (формула подтверждена боевым плагином sunscrypt-sbp)."""
     return hashlib.sha256(f"{ext_id}{access_key}{secret_key}".encode()).hexdigest()
 
 
-async def _create_payment(ext_id: str, amount_kopecks: int) -> tuple[str | None, str, str]:
-    """POST /v1/createPayment (payType=SBP). Возвращает (payLink, paymentId, err).
+async def _create_payment(ext_id: str, amount_kopecks: int, by_card: bool = False) -> tuple[str | None, str, str]:
+    """POST /v1/createPayment. Возвращает (payLink, paymentId, err).
+
+    by_card=False (СБП): payType=SBP без заказа → прямая ссылка qr.nspk.ru.
+    by_card=True (оплата картой): создаём платёж ВМЕСТЕ с заказом Ozon → ссылка
+    order.item.payLink ведёт на checkout.ozon.ru (страница выбора: карта/СБП/
+    Ozon Карта). У Ozon нет «прямой только-карты» ссылки — карта только через
+    эту страницу (проверено доке + живой ссылкой 21.07.2026).
 
     Без автоповторов: повторный POST после неясного сбоя может создать второй
     счёт клиенту — при ошибке честно отдаём её менеджеру (fail-путь)."""
     if _client is None:
         return None, "", "httpx-клиент Ozon не инициализирован"
+    amount = {"currencyCode": "643", "value": str(amount_kopecks)}
     body = {
         "accessKey": OZON_PAY_ACCESS_KEY,
         "payType": "SBP",
-        "amount": {"currencyCode": "643", "value": str(amount_kopecks)},
+        "amount": amount,
         "extId": ext_id,
         "redirectUrl": OZON_INVOICE_REDIRECT_URL,
         "ttl": OZON_INVOICE_TTL_S,
@@ -134,6 +149,20 @@ async def _create_payment(ext_id: str, amount_kopecks: int) -> tuple[str | None,
         # и сделка сама уедет в «Оплата получена». notificationUrl per-payment —
         # сайтовые платежи продолжают ходить на URL сайта, не пересекаемся.
         body["notificationUrl"] = f"{PUBLIC_BASE_URL}/ozon_notify"
+    if by_card:
+        # Сокращённый заказ (формат смока v0.6.1, боевой). order в подпись НЕ
+        # входит. expiresAt = ttl, чек не формируем (состава нет).
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + OZON_INVOICE_TTL_S))
+        body["order"] = {
+            "extId": ext_id.replace("amo-", "ord-", 1),
+            "amount": amount,
+            "paymentAlgorithm": "PAY_ALGO_SMS",
+            "mode": "MODE_SHORTENED",
+            "expiresAt": expires_at,
+            "successUrl": OZON_INVOICE_REDIRECT_URL,
+            "failUrl": OZON_INVOICE_REDIRECT_URL,
+            "enableFiscalization": False,
+        }
     try:
         resp = await _client.post(f"{OZON_PAY_API_URL}/v1/createPayment", json=body)
     except httpx.RequestError as exc:
@@ -146,12 +175,17 @@ async def _create_payment(ext_id: str, amount_kopecks: int) -> tuple[str | None,
         return None, "", "Ozon вернул невалидный JSON"
     details = data.get("paymentDetails") or {}
     payment_id = str(details.get("paymentId") or "")
-    pay_link = (data.get("order") or {}).get("payLink")
+    order = data.get("order") or {}
+    if by_card:
+        # Оплата картой: ссылка на checkout.ozon.ru (order.item.payLink).
+        pay_link = (order.get("item") or {}).get("payLink") or order.get("payLink")
+        if not pay_link:
+            return None, payment_id, f"оплата картой: в ответе Ozon нет order.item.payLink: {str(data)[:300]}"
+        return pay_link, payment_id, ""
+    # СБП: order=None, готовая ссылка в paymentDetails.sbp.payload (qr.nspk.ru).
+    # Подтверждено боевым ответом 20.07.2026 (сделка 36515681).
+    pay_link = order.get("payLink")
     if not pay_link:
-        # Платёж «без заказа» (наш случай): Ozon отдаёт order=None, а готовая
-        # ссылка лежит в paymentDetails.sbp.payload (https://qr.nspk.ru/…) —
-        # на телефоне открывает приложение банка, на десктопе QR. Подтверждено
-        # боевым ответом 20.07.2026 (сделка 36515681).
         payload = (details.get("sbp") or {}).get("payload")
         if isinstance(payload, str) and payload.startswith("http"):
             pay_link = payload
@@ -254,8 +288,12 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
                     detail=f"заказ МС {order.get('name')}. Либо укажите сумму в поле «Другая сумма».")
         return "failed-zero-sum"
 
+    # «Оплата картой» (578145): галочка → ссылка на checkout.ozon.ru (выбор
+    # способа с картой); пусто → прямой СБП.
+    by_card = _is_checked(amo_service.get_custom_field_value(lead, FIELD_INVOICE_BY_CARD))
+
     ext_id = f"amo-{lead_id}-{int(time.time())}"
-    pay_link, payment_id, err = await _create_payment(ext_id, kopecks)
+    pay_link, payment_id, err = await _create_payment(ext_id, kopecks, by_card=by_card)
     if not pay_link:
         await _fail(lead, "Ozon не создал счёт - ссылки нет", detail=err)
         return "failed-ozon"
@@ -277,14 +315,15 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
     src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {order.get('name')}"
+    kind = "Счёт (оплата картой, страница выбора Ozon)" if by_card else "Счёт СБП"
     await amo_service.add_note(
         lead_id,
-        f"Счёт СБП создан автоматически: {rub_str} ₽ ({src}), действителен "
+        f"{kind} создан автоматически: {rub_str} ₽ ({src}), действителен "
         f"{OZON_INVOICE_TTL_S // 3600} ч.\n{pay_link}\nextId {ext_id}"
         + (f"\npaymentId {payment_id}" if payment_id else ""),
     )
-    logger.info("Lead %s: СБП-счёт создан (%s коп., extId %s), сделка → «Ссылка отправлена»",
-                lead_id, kopecks, ext_id)
+    logger.info("Lead %s: счёт создан (%s коп., by_card=%s, extId %s), сделка → «Ссылка отправлена»",
+                lead_id, kopecks, by_card, ext_id)
     return "created"
 
 

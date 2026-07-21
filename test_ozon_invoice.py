@@ -46,7 +46,7 @@ _alerts: list = []
 _ozon_calls: list = []
 
 
-def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None, other=None):
+def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None, other=None, by_card=None):
     cf = []
     if uuid is not None:
         cf.append({"field_id": FIELD_MOYSKLAD_ORDER_UUID, "values": [{"value": uuid}]})
@@ -54,6 +54,8 @@ def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=U
         cf.append({"field_id": FIELD_PAYMENT_LINK, "values": [{"value": link}]})
     if other is not None:
         cf.append({"field_id": ozon_invoice.FIELD_INVOICE_OTHER_AMOUNT, "values": [{"value": other}]})
+    if by_card is not None:
+        cf.append({"field_id": ozon_invoice.FIELD_INVOICE_BY_CARD, "values": [{"value": by_card}]})
     return {
         "id": LEAD_ID,
         "name": "Заказ №4242",
@@ -89,10 +91,11 @@ def _install_mocks(lead, *, order_sum=1234500, ozon_ok=True, patch_ok=True):
         _alerts.append(text)
         return True
 
-    async def fake_create_payment(ext_id, kopecks):
-        _ozon_calls.append((ext_id, kopecks))
+    async def fake_create_payment(ext_id, kopecks, by_card=False):
+        _ozon_calls.append((ext_id, kopecks, by_card))
         if ozon_ok:
-            return f"https://payment.ozon.ru/link/{ext_id}", "pay-id-1", ""
+            base = "https://checkout.ozon.ru/order/" if by_card else "https://qr.nspk.ru/"
+            return f"{base}{ext_id}", "pay-id-1", ""
         return None, "", "Ozon HTTP 400: bad"
 
     amo_service.get_lead_full = fake_get_lead_full
@@ -134,6 +137,26 @@ assert link == "https://qr.nspk.ru/TEST123" and pid == "pid-1" and err == "", (l
 ozon_invoice._client = None
 print("✓ платёж без заказа: ссылка берётся из paymentDetails.sbp.payload")
 
+# ── 0a-card: by_card → заказ в теле, ссылка из order.item.payLink ───────────
+_card_bodies = []
+class _FakeRespCard:
+    status_code = 200
+    text = ""
+    def json(self):
+        return {"order": {"item": {"payLink": "https://checkout.ozon.ru/order/xyz"}},
+                "paymentDetails": {"paymentId": "pid-2", "sbp": {"payload": "https://qr.nspk.ru/IGNORED"}}}
+class _FakeClientCard:
+    async def post(self, url, json=None):
+        _card_bodies.append(json)
+        return _FakeRespCard()
+ozon_invoice._client = _FakeClientCard()
+link, pid, err = asyncio.run(ozon_invoice._create_payment("amo-9-1", 1000, by_card=True))
+assert link == "https://checkout.ozon.ru/order/xyz" and pid == "pid-2" and err == "", (link, pid, err)
+assert "order" in _card_bodies[0] and _card_bodies[0]["order"]["mode"] == "MODE_SHORTENED", _card_bodies
+assert _card_bodies[0]["order"]["extId"] == "ord-9-1", _card_bodies  # amo-→ord- в extId заказа
+ozon_invoice._client = None
+print("✓ by_card: заказ MODE_SHORTENED в теле, ссылка из order.item.payLink (не sbp)")
+
 # ── 0) подпись createPayment: формула из боевого плагина ────────────────────
 sig = ozon_invoice._sign_create_payment("ext1", "AK", "SK")
 assert sig == hashlib.sha256(b"ext1AKSK").hexdigest(), sig
@@ -149,7 +172,7 @@ assert len(_ozon_calls) == 1 and _ozon_calls[0][1] == 1234500, _ozon_calls
 assert _ozon_calls[0][0].startswith(f"amo-{LEAD_ID}-"), _ozon_calls
 assert len(_patches) == 1, _patches
 p = _patches[0]
-assert p["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://payment.ozon.ru/"), p
+assert p["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://qr.nspk.ru/"), p
 assert p.get("status_id") == STATUS_LINK_SENT and p.get("pipeline_id") == PIPELINE_CLEVER_MAIN, p
 assert len(_notes) == 1 and "12345 ₽" in _notes[0][1] and "01234" in _notes[0][1], _notes
 assert not _tags and not _alerts, "успех не должен алертить"
@@ -181,7 +204,7 @@ res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
 assert res == "failed-patch", res
 assert len(_ozon_calls) == 1
 assert any("вручную" in a for a in _alerts), _alerts
-assert any("https://payment.ozon.ru/" in n[1] for n in _notes), "ссылка должна уйти менеджеру в примечание"
+assert any("https://qr.nspk.ru/" in n[1] for n in _notes), "ссылка должна уйти менеджеру в примечание"
 print("✓ PATCH упал: сделка не переведена, ссылка отдана менеджеру")
 
 # ── 5) TTL-дедуп: второй вебхук той же смены этапа не создаёт второй счёт ───
@@ -228,6 +251,31 @@ assert res == "failed-other-amount", res
 assert not _ozon_calls and not _patches
 assert any("Другая сумма" in a for a in _alerts), _alerts
 print("✓ мусор в «Другой сумме»: счёт не создан, менеджеру понятная ошибка")
+
+# ── 10a) _is_checked: форматы amo checkbox ─────────────────────────────────
+for raw in (True, "1", "on", "true", "YES"):
+    assert ozon_invoice._is_checked(raw) is True, raw
+for raw in (False, "", "0", None, "off"):
+    assert ozon_invoice._is_checked(raw) is False, raw
+print("✓ _is_checked: True/1/on/true — да; False/пусто/0/off — нет")
+
+# ── 10b) галочка «Оплата картой» → счёт с заказом, ссылка checkout ──────────
+_reset()
+_install_mocks(_lead(by_card="1"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][2] is True, _ozon_calls  # by_card проброшен
+assert _patches[0]["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://checkout.ozon.ru/"), _patches
+assert any("оплата картой" in n[1] for n in _notes), _notes
+print("✓ «Оплата картой»: счёт с заказом, ссылка checkout.ozon.ru, примечание про карту")
+
+# ── 10c) галочка не стоит → чистый СБП (by_card=False, ссылка qr) ───────────
+_reset()
+_install_mocks(_lead())
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created" and _ozon_calls[0][2] is False, _ozon_calls
+assert _patches[0]["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://qr.nspk.ru/"), _patches
+print("✓ без галочки: чистый СБП, прямая ссылка qr.nspk.ru")
 
 # ── 7) 577617 уже заполнено → скип (update_lead приходит на ЛЮБУЮ правку) ───
 # Кейс 20.07: менеджер вписал ссылку руками, сделка стоит на тех-этапе —
