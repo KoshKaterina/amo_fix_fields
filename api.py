@@ -337,7 +337,7 @@ async def add_info_from_ms(goods, delivery_type, delivery_address, comment, prom
         )
     if delivery_address:
         custom_fields.append(
-            create_custom_field(_sanitize_custom_field_value(delivery_address, 577311, lead_id), 577311)
+            create_custom_field(_sanitize_custom_field_value(delivery_address, 576719, lead_id), 576719)
         )
     if comment:
         custom_fields.append(create_custom_field(_sanitize_custom_field_value(comment, 577753, lead_id), 577753))

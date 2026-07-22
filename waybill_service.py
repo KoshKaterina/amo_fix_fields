@@ -249,7 +249,7 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         order["delivery_point"] = pvz
     elif tariff == TARIFF_DOOR:
         if not delivery_address:
-            return await _fail(lead_id, "пустой адрес доставки (поле 577311)", source, current_tags)
+            return await _fail(lead_id, "пустой адрес доставки (поле 576719)", source, current_tags)
         order["to_location"] = {
             "address": delivery_address,
             "country_code": "RU",

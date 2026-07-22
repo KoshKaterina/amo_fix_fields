@@ -18,7 +18,11 @@ STATUS_FF_PROCESSING = 86450946   # «00. Обрабатывается»
 FIELD_CDEK_ORDER_NUMBER = 571657
 FIELD_PVZ_CODE = 576719
 FIELD_PVZ_CODE_FALLBACK = 572209
-FIELD_DELIVERY_ADDRESS = 577311
+# 576719 «Адрес получателя» — единое поле, которое заполняет сайт/МС: для курьера
+# (тариф «дверь») здесь адрес, для ПВЗ/постамата — код пункта. То же поле, что
+# FIELD_PVZ_CODE; семантика выбирается по тарифу. Старое 577311 «Адрес получателя
+# (арх)» больше не заполняется — накладную из него читать нельзя.
+FIELD_DELIVERY_ADDRESS = 576719
 FIELD_PAYMENT_METHOD = 577373
 FIELD_SENDER_COMPANY = 577551
 FIELD_PACKAGE_NUMBER = 577415
