@@ -18,7 +18,7 @@
   2. проверяем стоп-поля (если не заполнить нечем — оставляем в КОНТРОЛЕ):
      телефон контрагента; ≥1 товарная позиция; распознаваемый способ оплаты;
      для курьера — адрес доставки, для ПВЗ/постамата — Код ПВЗ;
-  3. проверяем физ. остаток товаров по складу ЭРМС_Основной (≥ заказанного);
+  3. проверяем физ. остаток товаров по складу Sunscrypt Основной (≥ заказанного);
   4. если стоп-полей и дефицита нет — переносим копию в «00. Обрабатывается»
      и ставим заказу в МС статус «00» (релиз в комплектацию).
 
@@ -60,8 +60,8 @@ PROCESSING_STATUS = STATUS_FF_PROCESSING  # «00. Обрабатывается»
 # же причиной (напр. эхо-вебхук от простановки тега) не плодит дубли примечаний.
 _last_error_reason: dict[str, str] = {}
 
-# ── склад для проверки наличия (ЭРМС_Основной) ──────────────
-STOCK_STORE_ID = "ee6f138f-5ce7-11f1-0a80-17a900213ca9"
+# ── склад для проверки наличия (Sunscrypt Основной; до ухода с ФФ 07.2026 — ЭРМС_Основной) ──
+STOCK_STORE_ID = "0e5a2b05-c413-11ee-0a80-13fd002f63f9"
 
 # ── доп-поля заказа МС (из entity/customerorder/metadata/attributes) ──
 A_PAYMENT_METHOD = "33735877-ba29-11f0-0a80-1737003bc63e"   # «Способ оплаты» (string)
@@ -394,7 +394,7 @@ async def process_kontrol_lead(lead_id, *, apply=True, source="webhook") -> dict
     if plan and not plan.get("skip") and apply:
         order = await ms_client.get(f"entity/customerorder/{uu}", {"expand": "agent,state,salesChannel"})
 
-    # 2-3) стоп-поля + наличие на складе ЭРМС_Основной
+    # 2-3) стоп-поля + наличие на складе Sunscrypt Основной
     stock = await stock_map([p["assortment_id"] for p in positions if p["type"] == "goods" and p["assortment_id"]])
     blk = blockers(order, positions, stock)
     if blk:
@@ -411,7 +411,7 @@ async def process_kontrol_lead(lead_id, *, apply=True, source="webhook") -> dict
                                      pipeline_id=PIPELINE_FULFILLMENT, tags=new_tags)
         await _set_ms_state00(uu)
         await amo_service.add_note(lead_id, "✅ Гейт КОНТРОЛЬ пройден автоматически: поля подогнаны, "
-                                            "товары в наличии (ЭРМС_Основной) → «00. Обрабатывается».")
+                                            "товары в наличии (Sunscrypt Основной) → «00. Обрабатывается».")
         _last_error_reason.pop(key, None)
     return {"action": "released", "reason": None}
 

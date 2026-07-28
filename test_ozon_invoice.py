@@ -16,6 +16,7 @@ telegram_bot.send_alert и _create_payment внутри модуля; чисты
 import asyncio
 import hashlib
 import sys
+import time
 import types
 
 # --- стаб aiogram-зависимого telegram_bot (как в test_wazzup_sla) ---
@@ -38,6 +39,10 @@ from waybill_config import (  # noqa: E402
 
 UU = "0e5a2b05-aaaa-bbbb-cccc-0123456789ab"
 LEAD_ID = 777001
+
+# Оригинал функции, которую _install_mocks подменяет: нижние тесты проверяют
+# НАСТОЯЩЕЕ поведение (сборка тела запроса в Ozon), а не мок.
+_REAL_CREATE_PAYMENT = ozon_invoice._create_payment
 
 _patches: list = []
 _notes: list = []
@@ -91,8 +96,8 @@ def _install_mocks(lead, *, order_sum=1234500, ozon_ok=True, patch_ok=True):
         _alerts.append(text)
         return True
 
-    async def fake_create_payment(ext_id, kopecks, by_card=False):
-        _ozon_calls.append((ext_id, kopecks, by_card))
+    async def fake_create_payment(ext_id, kopecks, by_card=False, ms_order_name=""):
+        _ozon_calls.append((ext_id, kopecks, by_card, ms_order_name))
         if ozon_ok:
             base = "https://checkout.ozon.ru/order/" if by_card else "https://qr.nspk.ru/"
             return f"{base}{ext_id}", "pay-id-1", ""
@@ -344,5 +349,165 @@ assert run(ozon_invoice._handle_notification(_notif(status="Rejected"))) == "ign
 assert run(ozon_invoice._handle_notification(bad)) == "ignored-bad-sign"
 assert not _patches and not _notes and not _alerts
 print("✓ чужой extId, Rejected и битая подпись: полный игнор")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Правки 28.07.2026: читаемый номер заказа, матчинг по extOrderID, сверка.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── 16) order.extId начинается с номера заказа МС (глаза офиса) ─────────────
+# Прежний «ord-36522883-…» нёс id сделки amo — офис не мог сматчить поступление.
+_card_bodies.clear()
+ozon_invoice._create_payment = _REAL_CREATE_PAYMENT  # тесты выше подменили её моком
+ozon_invoice._client = _FakeClientCard()
+run(ozon_invoice._create_payment("amo-9-1", 1000, by_card=True, ms_order_name="05740"))
+assert _card_bodies[0]["order"]["extId"] == "05740_amo-9-1", _card_bodies
+# extId САМОГО платежа не трогаем — на нём держится дедуп и разбор вебхука.
+assert _card_bodies[0]["extId"] == "amo-9-1", _card_bodies
+_card_bodies.clear()
+run(ozon_invoice._create_payment("amo-9-2", 1000, by_card=True))  # номера МС нет
+assert _card_bodies[0]["order"]["extId"] == "ord-9-2", _card_bodies  # старое поведение
+ozon_invoice._client = None
+print("✓ номер заказа: «05740_amo-9-1» для офиса, без номера МС — прежний ord-")
+
+# ── 17) lead_id вытаскивается из обоих форматов extId ───────────────────────
+cases = {
+    "amo-36523057-1785242820": 36523057,          # extId платежа
+    "05740_amo-36523057-1785242820": 36523057,    # новый extId заказа
+    "ord-36522883-1785232770": 36522883,          # старый extId заказа
+}
+for raw, expected in cases.items():
+    got, ts = ozon_invoice._lead_and_ts_from_ext(raw)
+    assert got == expected, (raw, got)
+    assert ts and ts > 1_000_000_000, (raw, ts)
+assert ozon_invoice._lead_and_ts_from_ext("18134_cde25f9d") == (None, None)  # счёт сайта — чужой
+assert ozon_invoice._lead_and_ts_from_ext("", None) == (None, None)
+print("✓ lead_id из extId: платёж, новый заказ, старый ord-; счёт сайта не наш")
+
+# ── 18) вебхук картой: наш id только в extOrderID → сделку находим ──────────
+_reset(); ozon_invoice._paid_recent.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+card_notif = dict(_notif())
+card_notif["extTransactionID"] = "ozon-internal-xyz"   # не наш платёж
+card_notif["extOrderID"] = "05740_amo-777001-1785242820"
+card_notif["requestSign"] = hashlib.sha256(
+    f"{ozon_invoice.OZON_PAY_ACCESS_KEY}|||ozon-internal-xyz|"
+    f"{card_notif['amount']}|{card_notif['currencyCode']}|"
+    f"{ozon_invoice.OZON_PAY_NOTIFICATION_SECRET_KEY}".encode()
+).hexdigest()
+res = run(ozon_invoice._handle_notification(card_notif))
+assert res == "moved", res
+assert [p for p in _patches if p.get("status_id") == ozon_invoice.STATUS_PAYMENT_RECEIVED], _patches
+print("✓ вебхук картой: сделка найдена по extOrderID, а не только по платежу")
+
+# ── 19) getPaymentDetails: подпись и разбор статуса ─────────────────────────
+sig = ozon_invoice._sign_get_details("pay-1")
+assert sig == hashlib.sha256(
+    f"pay-1{ozon_invoice.OZON_PAY_ACCESS_KEY}{ozon_invoice.OZON_PAY_SECRET_KEY}".encode()
+).hexdigest(), sig
+
+class _RespDetails:
+    status_code = 200
+    text = ""
+    def __init__(self, payload):
+        self._payload = payload
+    def json(self):
+        return self._payload
+
+class _ClientDetails:
+    def __init__(self, payload):
+        self._payload = payload
+        self.bodies = []
+    async def post(self, url, json=None):
+        self.bodies.append((url, json))
+        return _RespDetails(self._payload)
+
+# статус лежит в paymentDetails — как у боевого ответа Ozon
+ozon_invoice._client = _ClientDetails({"paymentDetails": {"status": "Completed", "amount": {"value": "1000"}}})
+status, kopecks, err = run(ozon_invoice.get_payment_status("pay-1"))
+assert (status, kopecks, err) == ("Completed", 1000, ""), (status, kopecks, err)
+# статуса нет вовсе → честная ошибка, а не «молча не оплачено»
+ozon_invoice._client = _ClientDetails({"whatever": 1})
+status, _, err = run(ozon_invoice.get_payment_status("pay-1"))
+assert status == "" and err, (status, err)
+ozon_invoice._client = None
+print("✓ getPaymentDetails: подпись id+ключи, статус из paymentDetails, пустой ответ = ошибка")
+
+# ── 20) сверка: оплаченный счёт двигает сделку без всякого вебхука ──────────
+# Ровно случай Яны и теста 28.07: деньги прошли, уведомление не пришло.
+_reset(); ozon_invoice._paid_recent.clear(); ozon_invoice._stale_alerted.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+
+_stuck = _lead(status=STATUS_LINK_SENT)
+_stuck["custom_fields_values"].append(
+    {"field_id": FIELD_PAYMENT_LINK, "values": [{"value": "https://checkout.ozon.ru/order/abc"}]}
+)
+
+async def fake_by_status(status_id, with_=("contacts",), page_limit=50):
+    return [_stuck] if status_id == STATUS_LINK_SENT else []
+
+async def fake_notes(lead_id, limit=100):
+    return [{"created_at": int(time.time()) - 300, "params": {"text":
+             "Счёт (оплата картой, страница выбора Ozon) создан автоматически: 10 ₽\n"
+             "https://checkout.ozon.ru/order/abc\n"
+             "extId amo-777001-1785242820\npaymentId 019fa8c3-9ed2-7eca-99d0-b9a314ad5563"}}]
+
+async def fake_status_completed(payment_id):
+    assert payment_id == "019fa8c3-9ed2-7eca-99d0-b9a314ad5563", payment_id
+    return "Completed", 1000, ""
+
+amo_service.get_leads_by_status = fake_by_status
+amo_service.get_lead_notes = fake_notes
+ozon_invoice.get_payment_status = fake_status_completed
+
+res = run(ozon_invoice._reconcile_once())
+assert "moved=1" in res, res
+assert [p for p in _patches if p.get("status_id") == ozon_invoice.STATUS_PAYMENT_RECEIVED], _patches
+assert any("сверка" in n[1] for n in _notes), _notes
+# второй проход не должен двигать повторно
+_patches.clear()
+run(ozon_invoice._reconcile_once())
+assert not [p for p in _patches if p.get("status_id")], _patches
+print("✓ сверка: оплаченный счёт уводит сделку в «Оплата получена», повтор не дублирует")
+
+# ── 21) сверка: висит без оплаты дольше порога → один алерт ─────────────────
+_reset(); ozon_invoice._paid_recent.clear(); ozon_invoice._stale_alerted.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+
+async def fake_notes_old(lead_id, limit=100):
+    return [{"created_at": int(time.time()) - 3 * 3600, "params": {"text":
+             "Счёт СБП создан автоматически: 10 ₽\nextId amo-777001-1\npaymentId pay-old"}}]
+
+async def fake_status_pending(payment_id):
+    return "PAYMENT_NEW", None, ""
+
+amo_service.get_lead_notes = fake_notes_old
+ozon_invoice.get_payment_status = fake_status_pending
+
+run(ozon_invoice._reconcile_once())
+assert not [p for p in _patches if p.get("status_id")], _patches
+assert len(_alerts) == 1 and "без оплаты" in _alerts[0], _alerts
+run(ozon_invoice._reconcile_once())          # второй проход — молчим
+assert len(_alerts) == 1, _alerts
+print("✓ сверка: зависший счёт — один алерт в ТГ, сделку не трогаем")
+
+# ── 22) сверка: счёта нет (ссылка пустая) → Ozon не дёргаем ────────────────
+_reset(); ozon_invoice._stale_alerted.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+_no_link = _lead(status=STATUS_LINK_SENT)
+
+async def fake_by_status_nolink(status_id, with_=("contacts",), page_limit=50):
+    return [_no_link] if status_id == STATUS_LINK_SENT else []
+
+_asked = []
+
+async def fake_status_spy(payment_id):
+    _asked.append(payment_id)
+    return "Completed", 1000, ""
+
+amo_service.get_leads_by_status = fake_by_status_nolink
+ozon_invoice.get_payment_status = fake_status_spy
+res = run(ozon_invoice._reconcile_once())
+assert "checked=0" in res and not _asked, (res, _asked)
+print("✓ сверка: сделка без выставленного счёта пропускается, Ozon не дёргаем")
 
 print("\nozon_invoice: все тесты прошли")

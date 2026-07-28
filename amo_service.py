@@ -425,6 +425,15 @@ async def add_note(lead_id: int | str, text: str) -> dict[str, Any]:
     return await _do_post(f"/api/v4/leads/{lead_id}/notes", body)
 
 
+async def get_lead_notes(lead_id: int | str, limit: int = 100) -> list[dict]:
+    """Примечания сделки (свежие в конце). Нужны реконсиляции оплат: paymentId
+    Ozon живёт только в тексте примечания «Счёт … создан автоматически»."""
+    data = await _do_get(f"/api/v4/leads/{lead_id}/notes", [("limit", str(limit))])
+    if not data:
+        return []
+    return (data.get("_embedded") or {}).get("notes") or []
+
+
 async def add_tag(lead_id: int | str, tag_name: str) -> dict[str, Any]:
     lead = await get_lead_full(lead_id, with_=())
     if not lead:
