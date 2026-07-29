@@ -40,9 +40,10 @@ from waybill_config import (  # noqa: E402
 UU = "0e5a2b05-aaaa-bbbb-cccc-0123456789ab"
 LEAD_ID = 777001
 
-# Оригинал функции, которую _install_mocks подменяет: нижние тесты проверяют
-# НАСТОЯЩЕЕ поведение (сборка тела запроса в Ozon), а не мок.
+# Оригиналы функций, которые тесты выше подменяют моками: нижние тесты
+# проверяют НАСТОЯЩЕЕ поведение (сборка тела запроса в Ozon), а не мок.
 _REAL_CREATE_PAYMENT = ozon_invoice._create_payment
+_REAL_GET_PAYMENT_STATUS = ozon_invoice.get_payment_status
 
 _patches: list = []
 _notes: list = []
@@ -449,11 +450,15 @@ async def fake_notes(lead_id, limit=100):
     return [{"created_at": int(time.time()) - 300, "params": {"text":
              "Счёт (оплата картой, страница выбора Ozon) создан автоматически: 10 ₽\n"
              "https://checkout.ozon.ru/order/abc\n"
-             "extId amo-777001-1785242820\npaymentId 019fa8c3-9ed2-7eca-99d0-b9a314ad5563"}}]
+             "extId amo-777001-1785242820\npaymentId 019fa8c3-9ed2-7eca-99d0-b9a314ad5563\n"
+             "orderExtId 05748_amo-777001-1785242820"}}]
 
-async def fake_status_completed(payment_id):
+async def fake_status_completed(payment_id, ext_id="", order_ext_id=""):
     assert payment_id == "019fa8c3-9ed2-7eca-99d0-b9a314ad5563", payment_id
-    return "Completed", 1000, ""
+    # сверка обязана прокинуть оба extId — без них карта не ищется
+    assert ext_id == "amo-777001-1785242820", ext_id
+    assert order_ext_id == "05748_amo-777001-1785242820", order_ext_id
+    return "PAYMENT_COMPLETED", 1000, ""
 
 amo_service.get_leads_by_status = fake_by_status
 amo_service.get_lead_notes = fake_notes
@@ -477,7 +482,7 @@ async def fake_notes_old(lead_id, limit=100):
     return [{"created_at": int(time.time()) - 3 * 3600, "params": {"text":
              "Счёт СБП создан автоматически: 10 ₽\nextId amo-777001-1\npaymentId pay-old"}}]
 
-async def fake_status_pending(payment_id):
+async def fake_status_pending(payment_id, ext_id="", order_ext_id=""):
     return "PAYMENT_NEW", None, ""
 
 amo_service.get_lead_notes = fake_notes_old
@@ -500,14 +505,102 @@ async def fake_by_status_nolink(status_id, with_=("contacts",), page_limit=50):
 
 _asked = []
 
-async def fake_status_spy(payment_id):
+async def fake_status_spy(payment_id, ext_id="", order_ext_id=""):
     _asked.append(payment_id)
-    return "Completed", 1000, ""
+    return "PAYMENT_COMPLETED", 1000, ""
 
 amo_service.get_leads_by_status = fake_by_status_nolink
 ozon_invoice.get_payment_status = fake_status_spy
 res = run(ozon_invoice._reconcile_once())
 assert "checked=0" in res and not _asked, (res, _asked)
 print("✓ сверка: сделка без выставленного счёта пропускается, Ozon не дёргаем")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Итерация 2 (по логам прода 28.07): боевая форма ответа + поиск по extId.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── 23) боевая форма ответа: статус лежит в items[0] ───────────────────────
+# Дословно из лога прода: {'items': [{'status': 'PAYMENT_REJECTED', ...}]}.
+# Прежний парсер искал статус в paymentDetails и отдавал «не распознан».
+real = {"items": [{"transactionUid": "019f941d-cd5a-760d-9f53-f9b1b8bb0c8f",
+                   "extId": "amo-36519747-1784896408",
+                   "status": "PAYMENT_REJECTED",
+                   "amount": {"currencyCode": "643", "value": "1297900"}}]}
+assert ozon_invoice._extract_status(real) == ("PAYMENT_REJECTED", 1297900)
+assert ozon_invoice._extract_status({"items": []}) == ("", None)   # платежа Ozon не знает
+# старые формы всё ещё понимаем
+assert ozon_invoice._extract_status({"paymentDetails": {"status": "Completed"}})[0] == "Completed"
+print("✓ разбор ответа: статус из items[0], пустой items = платежа нет, старые формы живы")
+
+# ── 24) словарь статусов: PAYMENT_* и Completed ────────────────────────────
+for ok in ("Completed", "PAYMENT_COMPLETED", "payment_completed", " PAID "):
+    assert ozon_invoice.is_paid_status(ok), ok
+for bad in ("PAYMENT_REJECTED", "PAYMENT_NEW", "", "Pending", "PAYMENT_CANCELLED"):
+    assert not ozon_invoice.is_paid_status(bad), bad
+print("✓ статусы: Completed и PAYMENT_COMPLETED = оплачен, REJECTED/NEW/пусто = нет")
+
+# ── 25) карта: по paymentId пусто → спрашиваем по extId заказа ─────────────
+_asked_bodies = []
+
+class _ClientChain:
+    async def post(self, url, json=None):
+        _asked_bodies.append(json)
+        # по id и по extId платежа Ozon отвечает пустотой (как на проде),
+        # находится только по extId ЗАКАЗА
+        if json.get("extId") == "05748_amo-777001-1785242820":
+            return _RespDetails({"items": [{"status": "PAYMENT_COMPLETED",
+                                            "amount": {"value": "1000"}}]})
+        return _RespDetails({"items": []})
+
+ozon_invoice.get_payment_status = _REAL_GET_PAYMENT_STATUS  # тесты 20-22 подменили её моком
+ozon_invoice._client = _ClientChain()
+status, kopecks, err = run(ozon_invoice.get_payment_status(
+    "019fa8c3-pay", "amo-777001-1785242820", "05748_amo-777001-1785242820"))
+assert (status, kopecks, err) == ("PAYMENT_COMPLETED", 1000, ""), (status, kopecks, err)
+assert [b.get("id") or b.get("extId") for b in _asked_bodies] == [
+    "019fa8c3-pay", "amo-777001-1785242820", "05748_amo-777001-1785242820"], _asked_bodies
+# подпись пересчитывается под КАЖДЫЙ искомый идентификатор
+assert _asked_bodies[-1]["requestSign"] == hashlib.sha256(
+    f"05748_amo-777001-1785242820{ozon_invoice.OZON_PAY_ACCESS_KEY}"
+    f"{ozon_invoice.OZON_PAY_SECRET_KEY}".encode()).hexdigest()
+ozon_invoice._client = None
+print("✓ карта: пусто по платежу → ищем по extId заказа, подпись под каждый id")
+
+# ── 26) нигде не нашли → честная ошибка, сделку не трогаем ─────────────────
+class _ClientEmpty:
+    async def post(self, url, json=None):
+        return _RespDetails({"items": []})
+
+ozon_invoice._client = _ClientEmpty()
+status, _, err = run(ozon_invoice.get_payment_status("p", "e", "o"))
+assert status == "" and "не найден" in err, (status, err)
+ozon_invoice._client = None
+print("✓ платёж не найден ни по одному id: ошибка, а не «не оплачен»")
+
+# ── 27) orderExtId живёт в примечании и читается сверкой ───────────────────
+assert ozon_invoice.build_order_ext_id("amo-9-1", "05748") == "05748_amo-9-1"
+assert ozon_invoice.build_order_ext_id("amo-9-1", "") == "ord-9-1"
+
+async def notes_with_order(lead_id, limit=100):
+    return [{"created_at": 1785242820, "params": {"text":
+             "Счёт (оплата картой, страница выбора Ozon) создан автоматически: 10 ₽\n"
+             "extId amo-777001-1785242820\npaymentId pid-1\n"
+             "orderExtId 05748_amo-777001-1785242820"}}]
+
+amo_service.get_lead_notes = notes_with_order
+pid, ext, order_ext, _ = run(ozon_invoice._payment_ref(777001))
+# extId платежа НЕ должен подмениться номером заказа из orderExtId
+assert (pid, ext, order_ext) == ("pid-1", "amo-777001-1785242820",
+                                 "05748_amo-777001-1785242820"), (pid, ext, order_ext)
+
+async def notes_old_format(lead_id, limit=100):
+    return [{"created_at": 1785242820, "params": {"text":
+             "Счёт СБП создан автоматически: 10 ₽\nextId amo-777001-1785242820\npaymentId pid-2"}}]
+
+amo_service.get_lead_notes = notes_old_format
+pid, ext, order_ext, _ = run(ozon_invoice._payment_ref(777001))
+# у старых счетов orderExtId в примечании нет — восстанавливаем прежнюю форму
+assert order_ext == "ord-777001-1785242820", order_ext
+print("✓ orderExtId: пишется для карты, extId платежа не подменяется, старые счета восстанавливаются")
 
 print("\nozon_invoice: все тесты прошли")

@@ -121,6 +121,12 @@ def _is_checked(raw) -> bool:
     return str(raw or "").strip().lower() in ("1", "on", "true", "yes")
 
 
+def build_order_ext_id(ext_id: str, ms_order_name: str) -> str:
+    """extId заказа Ozon для оплаты картой. Одна формула на два места: тело
+    createPayment и примечание в сделке (оттуда его берёт сверка)."""
+    return f"{ms_order_name}_{ext_id}" if ms_order_name else ext_id.replace("amo-", "ord-", 1)
+
+
 def _sign_create_payment(ext_id: str, access_key: str, secret_key: str) -> str:
     """Подпись createPayment: SHA-256 hex от extId+accessKey+secretKey без
     разделителей (формула подтверждена боевым плагином sunscrypt-sbp)."""
@@ -170,9 +176,7 @@ async def _create_payment(
         # extId заказа: «<номер МС>_<extId платежа>». Префикс — для глаз офиса,
         # хвост «amo-<lead>-<ts>» оставляем как есть: по нему вебхук и находит
         # сделку (_LEAD_IN_EXT_RE ищет вхождение, а не совпадение целиком).
-        order_ext_id = ext_id.replace("amo-", "ord-", 1)
-        if ms_order_name:
-            order_ext_id = f"{ms_order_name}_{ext_id}"
+        order_ext_id = build_order_ext_id(ext_id, ms_order_name)
         body["order"] = {
             "extId": order_ext_id,
             "amount": amount,
@@ -338,11 +342,15 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
     src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {order.get('name')}"
     kind = "Счёт (оплата картой, страница выбора Ozon)" if by_card else "Счёт СБП"
+    # orderExtId пишем только для карты: по нему сверка ищет оплату, когда Ozon
+    # не знает нашего платежа (order-флоу заводит внутри заказа свой).
+    order_ext_id = build_order_ext_id(ext_id, str(order.get("name") or "").strip()) if by_card else ""
     await amo_service.add_note(
         lead_id,
         f"{kind} создан автоматически: {rub_str} ₽ ({src}), действителен "
         f"{OZON_INVOICE_TTL_S // 3600} ч.\n{pay_link}\nextId {ext_id}"
-        + (f"\npaymentId {payment_id}" if payment_id else ""),
+        + (f"\npaymentId {payment_id}" if payment_id else "")
+        + (f"\norderExtId {order_ext_id}" if order_ext_id else ""),
     )
     logger.info("Lead %s: счёт создан (%s коп., by_card=%s, extId %s), сделка → «Ссылка отправлена»",
                 lead_id, kopecks, by_card, ext_id)
@@ -373,7 +381,10 @@ _LEAD_IN_EXT_RE = re.compile(r"(?:amo|ord)-(\d+)-(\d+)")
 # paymentId и extId из примечания «Счёт … создан автоматически» — другого места,
 # где живёт paymentId, у нас нет (поле в amo под него не заводили).
 _NOTE_PAYMENT_RE = re.compile(r"paymentId\s+(\S+)")
-_NOTE_EXT_RE = re.compile(r"extId\s+(\S+)")
+# «extId» ловим ТОЛЬКО как отдельное слово: иначе оно же совпадёт внутри
+# «orderExtId» и подменит extId платежа номером заказа.
+_NOTE_EXT_RE = re.compile(r"(?<![A-Za-z])extId\s+(\S+)")
+_NOTE_ORDER_EXT_RE = re.compile(r"orderExtId\s+(\S+)")
 
 # Идемпотентность вебхука: Ozon может ретраить уведомление — повторный
 # Completed по тому же extId в окне не должен дублировать перевод/примечания.
@@ -521,60 +532,97 @@ async def _handle_notification(data: dict) -> str:
 # Реконсиляция: сами спрашиваем Ozon по висящим счетам.
 # ---------------------------------------------------------------------------
 
-def _sign_get_details(payment_id: str) -> str:
-    """Подпись getPaymentDetails: id + accessKey + secretKey (ТЗ §6.1, та же
-    формула в боевом плагине сайта — active_resolve)."""
-    return hashlib.sha256(f"{payment_id}{OZON_PAY_ACCESS_KEY}{OZON_PAY_SECRET_KEY}".encode()).hexdigest()
+def _sign_get_details(value: str) -> str:
+    """Подпись getPaymentDetails: <искомый id> + accessKey + secretKey
+    (ТЗ §6.1, та же формула в боевом плагине сайта — active_resolve)."""
+    return hashlib.sha256(f"{value}{OZON_PAY_ACCESS_KEY}{OZON_PAY_SECRET_KEY}".encode()).hexdigest()
 
 
-async def get_payment_status(payment_id: str) -> tuple[str, int | None, str]:
-    """POST /v1/getPaymentDetails → (status, amount_kopecks|None, err).
-
-    Схема ответа у Ozon плавает — статус ищем в тех же местах, что и плагин
-    сайта. Не нашли → возвращаем ошибку И логируем сырой ответ: при карте это
-    единственный способ увидеть, как выглядит оплаченный order-флоу."""
+async def _details_request(key: str, value: str) -> tuple[dict | None, str]:
+    """Один POST /v1/getPaymentDetails по ключу «id» или «extId»."""
     if _client is None:
-        return "", None, "httpx-клиент Ozon не инициализирован"
-    body = {
-        "id": payment_id,
-        "accessKey": OZON_PAY_ACCESS_KEY,
-        "requestSign": _sign_get_details(payment_id),
-    }
+        return None, "httpx-клиент Ozon не инициализирован"
+    body = {key: value, "accessKey": OZON_PAY_ACCESS_KEY, "requestSign": _sign_get_details(value)}
     try:
         resp = await _client.post(f"{OZON_PAY_API_URL}/v1/getPaymentDetails", json=body)
     except httpx.RequestError as exc:
-        return "", None, f"сеть/таймаут Ozon: {exc.__class__.__name__}"
+        return None, f"сеть/таймаут Ozon: {exc.__class__.__name__}"
     if resp.status_code >= 400:
-        return "", None, f"Ozon HTTP {resp.status_code}: {resp.text[:200]}"
+        return None, f"Ozon HTTP {resp.status_code}: {resp.text[:200]}"
     try:
-        data = resp.json()
+        return resp.json(), ""
     except ValueError:
-        return "", None, "Ozon вернул невалидный JSON"
+        return None, "Ozon вернул невалидный JSON"
 
-    details = data.get("paymentDetails") or {}
-    payment = data.get("payment") or {}
-    order = data.get("order") or {}
-    status = (data.get("status") or details.get("status")
-              or payment.get("status") or order.get("status") or "")
-    amount_raw = (data.get("amount") or details.get("amount")
-                  or payment.get("amount") or order.get("amount"))
+
+def _extract_status(data: dict) -> tuple[str, int | None]:
+    """(status, amount_kopecks) из ответа. Боевая форма (лог прода 28.07.2026):
+    {"items":[{"status":"PAYMENT_REJECTED","amount":{"value":"1297900"},…}]}.
+    Пустой items = такого платежа Ozon не знает. Прочие формы (плоский status,
+    paymentDetails) оставлены фолбэком — схема у Ozon плавает."""
+    items = data.get("items")
+    node = items[0] if isinstance(items, list) and items else {}
+    if not node:
+        details = data.get("paymentDetails") or {}
+        payment = data.get("payment") or {}
+        order = data.get("order") or {}
+        node = details or payment or order or data
+
+    status = node.get("status") or ""
+    amount_raw = node.get("amount")
     if isinstance(amount_raw, dict):
         amount_raw = amount_raw.get("value")
     try:
         kopecks = int(round(float(amount_raw))) if amount_raw is not None else None
     except (TypeError, ValueError):
         kopecks = None
-
-    if not status:
-        logger.warning("ozon сверка: статус не распознан в ответе getPaymentDetails: %s", str(data)[:400])
-        return "", kopecks, "статус не распознан"
-    return str(status), kopecks, ""
+    return str(status), kopecks
 
 
-async def _payment_ref(lead_id) -> tuple[str, str, int | None]:
-    """(payment_id, ext_id, когда выставлен счёт) из свежего примечания сделки."""
+def is_paid_status(status: str) -> bool:
+    """Оплачен ли. Словарь статусов getPaymentDetails отличается от вебхука
+    (там «Completed», здесь «PAYMENT_*»), поэтому принимаем обе формы. Всё
+    незнакомое считаем НЕоплаченным и логируем — лучше не двинуть сделку, чем
+    объявить оплаченной неоплаченную."""
+    return status.strip().upper() in {
+        "COMPLETED", "PAYMENT_COMPLETED", "PAYMENT_COMPLETE",
+        "SUCCESS", "PAYMENT_SUCCESS", "PAID", "PAYMENT_PAID",
+    }
+
+
+async def get_payment_status(
+    payment_id: str, ext_id: str = "", order_ext_id: str = "",
+) -> tuple[str, int | None, str]:
+    """POST /v1/getPaymentDetails → (status, amount_kopecks|None, err).
+
+    Спрашиваем по очереди: paymentId → extId платежа → extId ЗАКАЗА. Так надо
+    из-за карты: живой тест 28.07.2026 показал, что по нашему paymentId Ozon
+    отвечает пустым items — «карточный» платёж он заводит внутри заказа сам, а
+    наш остаётся пустышкой. Первый ответ со статусом побеждает; что именно
+    сработало — видно в логе (это и есть разведка по order-флоу)."""
+    tried: list[str] = []
+    for key, value in (("id", payment_id), ("extId", ext_id), ("extId", order_ext_id)):
+        if not value or value in tried:
+            continue
+        tried.append(value)
+        data, err = await _details_request(key, value)
+        if err:
+            return "", None, err
+        status, kopecks = _extract_status(data or {})
+        if status:
+            logger.info("ozon сверка: статус %r по %s=%s", status, key, value)
+            return status, kopecks, ""
+        logger.info("ozon сверка: по %s=%s платёж не найден: %s", key, value, str(data)[:300])
+    return "", None, "платёж не найден ни по paymentId, ни по extId"
+
+
+async def _payment_ref(lead_id) -> tuple[str, str, str, int | None]:
+    """(payment_id, ext_id платежа, ext_id ЗАКАЗА, когда выставлен счёт) из
+    свежего примечания сделки. extId заказа нужен для карты: по paymentId
+    Ozon там отвечает пустотой. У старых счетов его в примечании нет —
+    восстанавливаем прежнюю форму «ord-<lead>-<ts>» из extId платежа."""
     notes = await amo_service.get_lead_notes(lead_id)
-    payment_id = ext_id = ""
+    payment_id = ext_id = order_ext_id = ""
     created_at = None
     for note in notes:  # свежие в конце — побеждает последнее совпадение
         text = ((note.get("params") or {}).get("text")) or ""
@@ -582,12 +630,16 @@ async def _payment_ref(lead_id) -> tuple[str, str, int | None]:
             continue
         match_payment = _NOTE_PAYMENT_RE.search(text)
         match_ext = _NOTE_EXT_RE.search(text)
+        match_order = _NOTE_ORDER_EXT_RE.search(text)
         if match_payment:
             payment_id = match_payment.group(1)
         if match_ext:
             ext_id = match_ext.group(1)
+        order_ext_id = match_order.group(1) if match_order else ""
         created_at = note.get("created_at")
-    return payment_id, ext_id, created_at
+    if not order_ext_id and ext_id.startswith("amo-"):
+        order_ext_id = ext_id.replace("amo-", "ord-", 1)
+    return payment_id, ext_id, order_ext_id, created_at
 
 
 async def _stale_alert(lead: dict, created_at: int | None, status: str) -> None:
@@ -623,7 +675,7 @@ async def _reconcile_once() -> str:
                 continue  # счёта нет — сверять нечего (менеджер ещё не запросил оплату)
 
             lead_id = lead.get("id")
-            payment_id, ext_id, created_at = await _payment_ref(lead_id)
+            payment_id, ext_id, order_ext_id, created_at = await _payment_ref(lead_id)
             if not payment_id:
                 # Счёт выставлен руками/старым виджетом — paymentId неизвестен.
                 continue
@@ -631,12 +683,12 @@ async def _reconcile_once() -> str:
                 continue
 
             checked += 1
-            status, kopecks, err = await get_payment_status(payment_id)
+            status, kopecks, err = await get_payment_status(payment_id, ext_id, order_ext_id)
             if err:
                 logger.warning("ozon сверка: lead %s paymentId %s — %s", lead_id, payment_id, err)
                 continue
 
-            if status != "Completed":
+            if not is_paid_status(status):
                 await _stale_alert(lead, created_at, status)
                 continue
 
