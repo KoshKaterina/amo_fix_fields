@@ -70,7 +70,13 @@ _TTL_SECONDS = 12 * 3600
 # Ограничение длины сниппета клиентского текста в алерте.
 _SNIPPET_MAX = 160
 
+# Подписка на вебхук: пауза перед первой попыткой (uvicorn должен успеть начать
+# слушать порт — Wazzup проверяет наш URL синхронно) и сколько раз пробуем.
+_SUB_FIRST_DELAY_S = 10
+_SUB_ATTEMPTS = 5
+
 _loop_task: asyncio.Task | None = None
+_sub_task: asyncio.Task | None = None
 _enabled = False
 
 
@@ -157,7 +163,7 @@ def _snippet(text) -> str:
 # ---------------------------------------------------------------------------
 
 async def init() -> None:
-    global _loop_task, _enabled
+    global _loop_task, _sub_task, _enabled
     if not WAZZUP_SLA_ENABLED:
         logger.info("Wazzup SLA: ВЫКЛЮЧЕН (WAZZUP_SLA_ENABLED пуст/false)")
         return
@@ -165,7 +171,11 @@ async def init() -> None:
         logger.warning("Wazzup SLA: NOTIFY_CHAT_ID не задан — алерты некуда слать, ВЫКЛЮЧЕН")
         return
     _enabled = True
-    await _maybe_ensure_webhook_subscription()
+    # Подписку оформляем ФОНОМ и с задержкой, а не здесь: Wazzup в ответ на PATCH
+    # сразу дёргает наш webhooksUri и ждёт 200. init() зовётся из startup-хука,
+    # когда uvicorn ещё не принимает соединения → проверка Wazzup упирается в
+    # closed port и подписка падает с WEBHOOKS_REQUEST_NOT_VALID (ловили 31.07.2026).
+    _sub_task = asyncio.create_task(_ensure_subscription_later())
     _loop_task = asyncio.create_task(_poll_loop())
     logger.info(
         "Wazzup SLA: включён — порог %s мин, окно %02d:00–%02d:00 МСК, опрос %s сек",
@@ -174,52 +184,79 @@ async def init() -> None:
     )
 
 
-async def _maybe_ensure_webhook_subscription() -> None:
+async def _ensure_subscription_later() -> None:
+    """Оформляет подписку после того, как сервер начал слушать порт: ждём
+    _SUB_FIRST_DELAY_S, дальше до _SUB_ATTEMPTS попыток с растущей паузой.
+    Идемпотентно — если webhooksUri уже наш, первая же попытка выходит успехом."""
+    delay = _SUB_FIRST_DELAY_S
+    for attempt in range(1, _SUB_ATTEMPTS + 1):
+        await asyncio.sleep(delay)
+        try:
+            if await _maybe_ensure_webhook_subscription():
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Wazzup SLA: попытка %s подписки упала", attempt)
+        logger.warning("Wazzup SLA: подписка не встала с попытки %s/%s", attempt, _SUB_ATTEMPTS)
+        delay = min(delay * 2, 120)
+    logger.error("Wazzup SLA: подписка вебхука так и НЕ оформлена — вебхуки Wazzup к нам не пойдут")
+
+
+async def _maybe_ensure_webhook_subscription() -> bool:
     """Прописывает наш webhooksUri в аккаунте Wazzup (PATCH /v3/webhooks),
-    подписка messagesAndStatuses. Гейт WAZZUP_ENSURE_WEBHOOK (по умолчанию выкл) —
-    боевой, перезаписывает webhooksUri аккаунта. Идемпотентно: если уже наш —
-    ничего не меняем. Ошибку логируем, но фичу не валим."""
+    подписка messagesAndStatuses. Гейт WAZZUP_ENSURE_WEBHOOK — боевой,
+    перезаписывает webhooksUri аккаунта. Идемпотентно: если уже наш — ничего не
+    меняем. Ошибку логируем, но фичу не валим.
+
+    True — подписка стоит (наша), False — не оформлена (см. лог)."""
     if not WAZZUP_ENSURE_WEBHOOK:
         logger.info("Wazzup SLA: авто-подписка вебхука выключена (WAZZUP_ENSURE_WEBHOOK) — прописать вручную")
-        return
+        return True  # осознанный ручной режим — ретраить нечего
     if not (WAZZUP_API_KEY and WAZZUP_WEBHOOK_URL):
         logger.warning("Wazzup SLA: нет WAZZUP_API_KEY/WAZZUP_WEBHOOK_URL — подписку не оформляю")
-        return
+        return True  # без ключа ретраи бессмысленны
     headers = {"Authorization": f"Bearer {WAZZUP_API_KEY}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             cur = await client.get(f"{WAZZUP_API_URL}/webhooks", headers=headers)
             if cur.status_code == 200 and (cur.json() or {}).get("webhooksUri") == WAZZUP_WEBHOOK_URL:
                 logger.info("Wazzup SLA: webhooksUri уже наш — подписка не менялась")
-                return
+                return True
             body = {
                 "webhooksUri": WAZZUP_WEBHOOK_URL,
                 "subscriptions": {
                     "messagesAndStatuses": True,
                     "contactsAndDealsCreation": False,
                     "channelsUpdates": False,
-                    "templateStatus": False,
+                    # имя поля по факту ответа GET /v3/webhooks (не templateStatus)
+                    "wabaTemplatesStatus": False,
                 },
             }
             r = await client.patch(f"{WAZZUP_API_URL}/webhooks", headers=headers, json=body)
             if r.status_code in (200, 201, 204):
                 logger.info("Wazzup SLA: подписка вебхука оформлена (messagesAndStatuses)")
-            else:
-                logger.warning("Wazzup SLA: подписка вебхука не удалась: HTTP %s %s", r.status_code, r.text[:300])
+                return True
+            logger.warning("Wazzup SLA: подписка вебхука не удалась: HTTP %s %s", r.status_code, r.text[:300])
+            return False
     except Exception:
         logger.exception("Wazzup SLA: ошибка оформления подписки вебхука")
+        return False
 
 
 async def shutdown() -> None:
-    global _loop_task, _enabled
+    global _loop_task, _sub_task, _enabled
     _enabled = False
-    if _loop_task is not None:
-        _loop_task.cancel()
+    for name in ("_loop_task", "_sub_task"):
+        task = globals().get(name)
+        if task is None:
+            continue
+        task.cancel()
         try:
-            await _loop_task
+            await task
         except asyncio.CancelledError:
             pass
-        _loop_task = None
+        globals()[name] = None
     logger.info("Wazzup SLA stopped")
 
 
