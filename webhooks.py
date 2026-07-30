@@ -14,6 +14,7 @@ import dup_autoclose
 import jivo_service
 import metrika_sync
 import ms_status_sync
+import office_transfer
 import ozon_invoice
 import showroom_tag
 import telegram_bot
@@ -33,17 +34,21 @@ from queue_manager import (
     enqueue_jivo,
     enqueue_kontrol,
     enqueue_new,
+    enqueue_office_transfer,
     enqueue_waybill,
     init_queue,
     queue_stats,
     shutdown_queue,
 )
 from waybill_config import (
+    OFFICE_TRANSFER_ENABLED,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_FULFILLMENT,
+    STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
     STATUS_FF_KONTROL,
     STATUS_PAYMENT_REQUESTED,
+    STATUS_SUCCESS,
     UIS_WEBHOOK_SECRET,
     WAZZUP_WEBHOOK_SECRET,
     looks_like_uuid,
@@ -75,10 +80,12 @@ async def lifespan(app):
     await ms_status_sync.init()
     ozon_invoice.init()
     await wazzup_sla.init()
+    await office_transfer.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
     await unmiss_tag.shutdown()
+    await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
     await ms_status_sync.shutdown()
     await woo_status_sync.shutdown()
@@ -307,6 +314,21 @@ async def lead_change(request: Request):
     ):
         logger.info("Lead %s entered STATUS_FF_KONTROL — enqueue kontrol gate", lead_id)
         enqueue_kontrol(lead_id, source="webhook")
+
+    # Office Transfer: сделка [CLEVER] Основная зашла в УР(142)/ЗНР(143) →
+    # вместо нативного копирования (F5-виджет/«Создать сделку») переносим ЭТУ
+    # ЖЕ сделку в целевую воронку/этап (office_transfer.py). Мастер-флаг
+    # OFFICE_TRANSFER_ENABLED + флаг конкретного правила (там же) — по умолчанию
+    # выключено, включает Тиана по мере отключения нативной автоматики.
+    if (
+        OFFICE_TRANSFER_ENABLED
+        and lead_id is not None
+        and incoming_status is not None
+        and str(incoming_status) in (str(STATUS_SUCCESS), str(STATUS_CLOSED_LOST))
+        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_CLEVER_MAIN))
+    ):
+        logger.info("Lead %s entered %s in CLEVER — enqueue office_transfer", lead_id, incoming_status)
+        enqueue_office_transfer(lead_id, source="webhook")
 
     # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
     # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).

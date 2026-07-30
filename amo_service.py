@@ -368,6 +368,21 @@ def get_custom_field_value(entity: dict, field_id: int) -> Any:
     return None
 
 
+def get_custom_field_enum_id(entity: dict, field_id: int) -> int | None:
+    """enum_id значения select-поля (НЕ текстовая метка — та может быть
+    переименована). См. dup_autoclose._reason_enum_id, тот же паттерн, вынесен
+    сюда как общий хелпер для остальных select-полей (office_transfer и т.д.)."""
+    for f in entity.get("custom_fields_values") or []:
+        if f.get("field_id") == field_id:
+            values = f.get("values") or []
+            if values and values[0].get("enum_id") is not None:
+                try:
+                    return int(values[0]["enum_id"])
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
 def get_tags(entity: dict) -> list[dict]:
     return ((entity.get("_embedded") or {}).get("tags")) or []
 
@@ -399,6 +414,7 @@ async def patch_lead(
     status_id: int | None = None,
     pipeline_id: int | None = None,
     tags: list[dict] | None = None,
+    responsible_user_id: int | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
     if custom_fields:
@@ -414,9 +430,35 @@ async def patch_lead(
             body["pipeline_id"] = pipe
     if tags is not None:
         body.setdefault("_embedded", {})["tags"] = _tags_payload(tags)
+    if responsible_user_id is not None:
+        body["responsible_user_id"] = responsible_user_id
     if not body:
         return {"ok": True, "status_code": 204, "retryable": False}
     return await _do_patch(f"/api/v4/leads/{lead_id}", body)
+
+
+_user_name_cache: dict[int, str] = {}
+
+
+async def get_user_name(user_id: int | str) -> str | None:
+    """Имя пользователя amo по id, с кэшем в памяти процесса (пользователи
+    меняются редко — по образцу warm_pipeline_cache). Нужен office_transfer'у,
+    чтобы записать в поле «Ответственный МОП» ЧЕЛОВЕКОЧИТАЕМОЕ имя прежнего
+    ответственного перед тем, как перезаписать responsible_user_id."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    cached = _user_name_cache.get(uid)
+    if cached is not None:
+        return cached
+    data = await _do_get(f"/api/v4/users/{uid}")
+    if not data:
+        return None
+    name = data.get("name")
+    if name:
+        _user_name_cache[uid] = name
+    return name
 
 
 async def add_note(lead_id: int | str, text: str) -> dict[str, Any]:

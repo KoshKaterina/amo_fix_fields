@@ -58,7 +58,10 @@ DELIVERY_SHOWROOM_MARKER = "самовывоз из офиса"
 # реализовано» (143) в своей воронке. Работает во всех воронках.
 # Включено всегда (хардкод, без env — по решению Кати 14.07).
 DUP_AUTOCLOSE_ENABLED = True
-DUP_REASON_FIELD_ID = 577623      # поле «Причина отказа» (select)
+DUP_REASON_FIELD_ID = 577623      # поле «Причина отказа» (select) — ⚠️ имя устарело,
+                                   # живое название поля в amoCRM «Причина ЗИН» (сверено
+                                   # live 30.07.2026); тот же field_id переиспользует
+                                   # office_transfer.py, см. REASON_WAITLIST/REASON_ACADEMY ниже
 DUP_REASON_ENUM_IDS = {           # значения-триггеры (enum id → смысл):
     1041141,                      #   Дубль сделки
     1041163,                      #   Тест
@@ -395,6 +398,87 @@ OZON_RECONCILE_INTERVAL_S = int(os.getenv("OZON_RECONCILE_INTERVAL_S", "180"))
 # @ответственного. Чтобы про застрявшую оплату узнавали мы, а не клиент.
 # 0 = алерт выключен.
 OZON_STALE_ALERT_MIN = int(os.getenv("OZON_STALE_ALERT_MIN", "40"))
+
+# ---------------------------------------------------------------------------
+# Office Transfer (30.07.2026): УР(142)/ЗНР(143) в [CLEVER] Основная переносятся
+# (PATCH pipeline_id+status_id той же сделки) в целевую воронку/этап вместо
+# нативного копирования F5-виджетом/«Создать сделку» — см. office_transfer.py.
+# Решение Кати: без ретроактивности (не трогаем сделки, уже висевшие в УР/ЗНР
+# до включения), рулим поэтапно по мере отключения нативной автоматики.
+# ---------------------------------------------------------------------------
+# Мастер-флаг, OFF по умолчанию.
+OFFICE_TRANSFER_ENABLED = os.getenv("OFFICE_TRANSFER_ENABLED", "").strip() == "1"
+
+# Свой флаг на каждое правило (независимо от мастер-флага — оба должны быть
+# включены), чтобы включать по одному по мере отключения нативки в Digital Funnel.
+OFFICE_TRANSFER_RULE_UR_DELIVERY = os.getenv("OFFICE_TRANSFER_RULE_UR_DELIVERY", "").strip() == "1"
+OFFICE_TRANSFER_RULE_UR_PICKUP = os.getenv("OFFICE_TRANSFER_RULE_UR_PICKUP", "").strip() == "1"
+OFFICE_TRANSFER_RULE_UR_WAYBILL = os.getenv("OFFICE_TRANSFER_RULE_UR_WAYBILL", "").strip() == "1"
+OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER", "").strip() == "1"
+OFFICE_TRANSFER_RULE_UR_FULFILLMENT = os.getenv("OFFICE_TRANSFER_RULE_UR_FULFILLMENT", "").strip() == "1"
+OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
+OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
+
+# Cutover-граница (unix ts): события ДО неё игнорируются везде (вебхук и
+# reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии
+# фича не должна включаться на проде (задать перед первым боевым включением).
+OFFICE_TRANSFER_SINCE_TS = int(os.getenv("OFFICE_TRANSFER_SINCE_TS", "0"))
+
+# Периодическая reconciliation-проверка (страховка от зависания amo API):
+# пересматривает сделки, недавно вошедшие в 142/143, но ещё не перенесённые.
+# 0 = фоновый проход выключен (только вебхук).
+OFFICE_TRANSFER_RECONCILE_INTERVAL_S = int(os.getenv("OFFICE_TRANSFER_RECONCILE_INTERVAL_S", "120"))
+
+# Сделка не переносится дольше N минут → один алерт в ТГ (дедуп, снимается при
+# успехе). 0 = алерт выключен.
+OFFICE_TRANSFER_STALE_ALERT_MIN = int(os.getenv("OFFICE_TRANSFER_STALE_ALERT_MIN", "30"))
+
+# Поля сделки
+FIELD_DELIVERY_TYPE = 577315       # Тип доставки (text) — используется и в showroom_tag.py как литерал
+FIELD_APPLICATION_TYPE = 577671    # Тип заявки (select)
+FIELD_ORDER_WAREHOUSE = 576723     # Склад заказа (select)
+FIELD_FORMER_RESPONSIBLE = 578151  # Ответственный МОП (text) — прежний ответственный,
+                                    # пишем ТОЛЬКО при переносе в Офис (не в другие воронки)
+
+# 577671 «Тип заявки» — enum_id
+APPLICATION_TYPE_ORDER = 1041237     # Заказ
+APPLICATION_TYPE_PREORDER = 1041239  # Предзаказ
+
+# 576723 «Склад заказа» — enum_id, нужные для office-transfer (у поля есть и другие значения)
+WAREHOUSE_SUNSCRYPT_MAIN = 1040201    # Sunscrypt Основной
+WAREHOUSE_SUNSCRYPT_OPENED = 1040207  # Sunscrypt Вскрытые
+WAREHOUSE_ERMS_MAIN = 1041653         # ЭРМС_Основной
+OFFICE_TRANSFER_WAREHOUSES = {WAREHOUSE_SUNSCRYPT_MAIN, WAREHOUSE_SUNSCRYPT_OPENED}
+
+# 577623 (= DUP_REASON_FIELD_ID выше, живое имя «Причина ЗИН») — доп. enum_id для office-transfer
+REASON_WAITLIST = 1041245  # Лист ожидания
+REASON_ACADEMY = 1041243   # Академия
+
+# Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
+DELIVERY_COURIER_MOSCOW_MARKER = "курьером по москве"
+DELIVERY_CDEK_MARKERS = ("cdek", "сдэк")
+
+# Целевые этапы воронки Офис (PIPELINE_OFFICE уже определена ниже)
+STATUS_OFFICE_DELIVERY = 75426826       # «Оформить доставку» (Достависта)
+STATUS_OFFICE_PICKUP = 75426862         # «Самовывоз»
+STATUS_OFFICE_PREORDER_PAID = 83953914  # «Предзаказ оплачен»
+# «Сделать накладную» — уже есть как STATUS_CREATE_WAYBILL (75426822)
+
+# Целевая воронка «Лист ожидания»
+PIPELINE_WAITLIST = 10611934
+STATUS_WAITLIST = 83669950  # «Лист ожидания»
+
+# Целевая воронка «Академия»
+PIPELINE_ACADEMY = 8642410
+STATUS_ACADEMY_FIRST_CONTACT = 70070966  # «Первичный контакт»
+
+# Ответственный при переносе в Офис — Екатерина Зубалий. ⚠️ id 13962422 — деактивированный
+# дубль аккаунта (is_active=false, сверено live 30.07.2026) — НЕ использовать.
+RESPONSIBLE_OFFICE_MANAGER_USER_ID = 13963494
+
+# Тег зависшего/неудавшегося переноса. Информационный — НЕ блокирует повторные
+# попытки reconciliation (по образцу TAG_KONTROL_ERROR).
+TAG_OFFICE_TRANSFER_ERROR = "ошибка переноса в офис"
 
 
 _TOTAL_RE = re.compile(

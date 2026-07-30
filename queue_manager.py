@@ -50,6 +50,7 @@ _CATEGORY_BY_KIND = {
     "metrika_sync": "sync",
     "jivo": "jivo",
     "lead_update": "lead",
+    "office_transfer": "office_transfer",
 }
 
 RATE_LIMIT_SECONDS = 3
@@ -86,6 +87,7 @@ _alert_tasks: set[asyncio.Task] = set()
 _pending_leads: dict[str, dict] = {}
 _pending_waybills: set[str] = set()
 _pending_kontrol: set[str] = set()
+_pending_office_transfer: set[str] = set()
 _pending_invoice: set[str] = set()
 _pending_cdek_sync: set[str] = set()
 _pending_metrika_sync: set[str] = set()
@@ -133,6 +135,7 @@ async def shutdown_queue() -> None:
     _pending_leads.clear()
     _pending_waybills.clear()
     _pending_kontrol.clear()
+    _pending_office_transfer.clear()
     _pending_invoice.clear()
     _pending_cdek_sync.clear()
     _pending_metrika_sync.clear()
@@ -325,6 +328,30 @@ def enqueue_kontrol(lead_id, source: str = "webhook") -> None:
     )
 
 
+def enqueue_office_transfer(lead_id, source: str = "webhook") -> None:
+    """Перенос УР(142)/ЗНР(143) сделки [CLEVER] Основная в целевую воронку
+    (office_transfer.py). Приоритет PRIORITY_NEW (наивысший, тот же, что
+    заполнение полей) — по прямому требованию задачи «первый приоритет в
+    очереди»: зависшая сделка блокирует хэндофф ответственного и дальнейшую
+    обработку (ФФ-гейт, реф.комиссия и т.д.), выше по цене простоя, чем
+    внутренние операционные задачи (kontrol/waybill/invoice, приоритет 5).
+    Дедуп по lead_id, пока задача ждёт в очереди."""
+    if not _queues:
+        logger.error("Task queue not initialized, dropping office_transfer for lead %s", lead_id)
+        return
+    key = str(lead_id)
+    if key in _pending_office_transfer:
+        logger.info("Lead %s office_transfer already in queue, skipping duplicate", key)
+        return
+    _pending_office_transfer.add(key)
+    payload = {"_kind": "office_transfer", "lead_id": lead_id, "source": source}
+    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_NEW, payload=payload))
+    logger.info(
+        "ENQUEUE office_transfer lead_id=%s source=%s lane=%s queue_size=%d",
+        key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
+    )
+
+
 def enqueue_cdek_sync(payload: dict) -> None:
     """Отдельная дорожка cdek: перемещение сделки по статусу СДЭК не встаёт
     в общую очередь и не тормозит клиентский путь (и наоборот)."""
@@ -409,6 +436,8 @@ async def _worker(lane: str) -> None:
             _pending_waybills.discard(lead_id)
         elif kind == "kontrol":
             _pending_kontrol.discard(lead_id)
+        elif kind == "office_transfer":
+            _pending_office_transfer.discard(lead_id)
         elif kind == "ozon_invoice":
             _pending_invoice.discard(lead_id)
         elif kind == "cdek_sync":
@@ -450,6 +479,12 @@ async def _worker(lane: str) -> None:
                 await process_kontrol_lead(
                     item.payload["lead_id"],
                     apply=True,
+                    source=item.payload.get("source", "webhook"),
+                )
+            elif kind == "office_transfer":
+                from office_transfer import process_office_transfer
+                await process_office_transfer(
+                    item.payload["lead_id"],
                     source=item.payload.get("source", "webhook"),
                 )
             elif kind == "ozon_invoice":
