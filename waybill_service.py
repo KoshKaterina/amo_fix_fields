@@ -30,6 +30,7 @@ from waybill_config import (
     TARIFF_DOOR,
     TARIFFS_PVZ,
     WAYBILL_ZERO_COST_PLACEHOLDER,
+    build_cdek_item_name,
     extract_pvz_code,
     is_cod_payment,
     is_prepaid_payment,
@@ -139,6 +140,7 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     payment_method = amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD)
     sender_company = amo_service.get_custom_field_value(lead, FIELD_SENDER_COMPANY)
     package_number = amo_service.get_custom_field_value(lead, FIELD_PACKAGE_NUMBER)
+    composition = amo_service.get_custom_field_value(lead, FIELD_COMPOSITION)
 
     tariff = parse_tariff(order_text)
     if not tariff:
@@ -228,7 +230,12 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         cod_amount = total
 
     # 4. Сборка тела заказа
-    lead_name = lead.get("name") or f"#{lead_id}"
+    # Наименование товара — из состава заказа (577313), а НЕ имя сделки: СДЭК требует
+    # описание того, что в отгрузке (Катя, 31.07.2026). Количество живёт в тексте
+    # наименования, а не в amount: у СДЭК cost и payment считаются ЗА ЕДИНИЦУ, а мы
+    # кладём всю сумму заказа одной позицией — amount > 1 умножил бы и наложку, и
+    # объявленную ценность.
+    item_name = build_cdek_item_name(composition)
     order: dict = {
         "tariff_code": tariff,
         "sender": {
@@ -252,7 +259,7 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
                 "items": [
                     {
                         "ware_key": "-",
-                        "name": lead_name,
+                        "name": item_name,
                         "payment": {"value": cod_amount},
                         "cost": total,
                         "weight": 200,

@@ -5,7 +5,6 @@
 """
 
 import os
-import re
 from collections import Counter
 from datetime import datetime
 from io import BytesIO
@@ -19,6 +18,8 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
+
+from waybill_config import parse_composition_items
 
 _PROJECT_FONTS = os.path.join(os.path.dirname(__file__), "fonts")
 
@@ -52,23 +53,14 @@ def register_fonts() -> None:
     )
 
 
-_ITEM_RE = re.compile(
-    r"(.+?),\s*(\d+)\s*шт,\s*[\d\s]+[.,]\d+\s*руб(?:ль|ля|лей|\.?)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
 def parse_items(text: str | None) -> list[tuple[str, int]]:
-    if not text:
-        return []
-    normalized = re.sub(r"\s+", " ", text)
-    items = []
-    for m in _ITEM_RE.finditer(normalized):
-        name = m.group(1).strip(" ,;\n")
-        count = int(m.group(2))
-        if name:
-            items.append((name, count))
-    return items
+    """Позиции состава для блока «Итого к сборке».
+
+    Раньше здесь был свой регэксп, который требовал «шт» и терял заказы вида
+    «YubiKey 5 NFC, 1 , 6 990.00 рублей» — 24 из 699 живых сделок воронки Офис
+    (срез 31.07.2026). Теперь парсер общий с накладной СДЭК, один на всех.
+    """
+    return parse_composition_items(text)
 
 
 def _html(text: str | None) -> str:

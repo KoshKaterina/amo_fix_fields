@@ -516,6 +516,67 @@ def parse_tariff(order_text: str | None) -> int | None:
     return None
 
 
+# --- Наименование товара в накладной СДЭК -----------------------------------
+# СДЭК требует, чтобы в накладной было расписано, что именно едет: что за товар и
+# как называется (требование СДЭК, Катя 31.07.2026, MAG-303). Раньше в items[].name
+# уходило имя сделки amo — «Заказ №18180», «Онлайн-чат Jivo — Амира», «Сделка по
+# звонку с +7925…»: для СДЭК это не описание товара. Теперь имя собирается из поля
+# «Состав заказа» (577313): «Аппаратный кошелёк <наименования>».
+CDEK_ITEM_NAME_PREFIX = "Аппаратный кошелёк"
+# У СДЭК на items[].name лимит 255 символов. Живой максимум по 699 сделкам воронки
+# Офис (срез 31.07.2026) — 186 символов, но запас нужен: заказы бывают на 6 позиций.
+CDEK_ITEM_NAME_MAX_LEN = 250
+
+# Строка состава: «Tangem 2.0 (3 карты), 1 шт, 7 590.00 рублей».
+# «шт» есть не всегда — у части заказов «…, 1 , 7 590.00 рублей» (24 из 699 живых
+# сделок на 31.07.2026), поэтому в шаблоне оно опционально. Регэксп листа сборки
+# (picking_pdf.parse_items) строже и эти 24 заказа не видит.
+_COMPOSITION_ITEM_RE = re.compile(
+    r"(.+?),\s*(\d+)\s*(?:шт)?\s*,\s*[\d\s]+[.,]\d+\s*руб(?:ль|ля|лей|\.?)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_composition_items(composition: str | None) -> list[tuple[str, int]]:
+    """[(наименование, количество)] из поля «Состав заказа» (577313)."""
+    if not composition:
+        return []
+    normalized = re.sub(r"\s+", " ", composition)
+    items: list[tuple[str, int]] = []
+    for m in _COMPOSITION_ITEM_RE.finditer(normalized):
+        name = m.group(1).strip(" ,;\n")
+        if name:
+            items.append((name, int(m.group(2))))
+    return items
+
+
+def build_cdek_item_name(composition: str | None) -> str:
+    """Наименование товара для накладной СДЭК.
+
+    «Аппаратный кошелёк Keystone 3 Pro» — одна позиция;
+    «Аппаратный кошелёк YubiKey 5 NFC, 4 шт» — количество больше одного;
+    «Аппаратный кошелёк A; B; C» — несколько позиций (23% заказов);
+    «Аппаратный кошелёк» — состав пуст или не распознан (имя сделки не подставляем
+    никогда: клиентское ФИО и номер заказа в накладной СДЭК не нужны).
+    """
+    parts = [
+        f"{name}, {qty} шт" if qty > 1 else name
+        for name, qty in parse_composition_items(composition)
+    ]
+    if not parts:
+        return CDEK_ITEM_NAME_PREFIX
+
+    full = f"{CDEK_ITEM_NAME_PREFIX} {'; '.join(parts)}"
+    if len(full) <= CDEK_ITEM_NAME_MAX_LEN:
+        return full
+
+    trimmed = full[: CDEK_ITEM_NAME_MAX_LEN - 1]
+    cut = trimmed.rfind(";")
+    if cut > len(CDEK_ITEM_NAME_PREFIX):
+        trimmed = trimmed[:cut]
+    return trimmed.rstrip(" ,;") + "…"
+
+
 _PVZ_RE = re.compile(r"[A-Z]{2,}\d+")
 
 
