@@ -18,6 +18,11 @@ CRM) сбрасывает таймер. Компромисс: если мене�
 сообщения), Wazzup исходящего не увидит → придёт лишний алерт. Учёт «Успешного
 звонка» — возможная доработка, не MVP.
 
+«Ответ не требуется»: перед отправкой алерт сверяется с amo — если Wazzup-беседа
+(talk) контакта, актуальная для этого ожидания, уже закрыта (менеджер нажал
+«Ответ не требуется» / «Завершить беседу»), алерт не шлём и ожидание снимаем.
+Проверка fail-open: amo недоступен или контакт не найден → шлём как раньше.
+
 Состояние — in-memory (персиста в проекте нет): при рестарте ожидания теряются,
 это приемлемо (алерт — про «прямо сейчас», а не исторический долг). Записи чистятся
 по TTL, чтобы словарь не рос.
@@ -299,6 +304,14 @@ async def _sweep(threshold_s: int) -> None:
 
     for key, st in due:
         try:
+            # «Ответ не требуется»: беседа закрыта в amo → алерт не нужен.
+            if await _talk_closed_safe(st):
+                _pending.pop(key, None)
+                logger.info(
+                    "Wazzup SLA: беседа %s закрыта в amo («Ответ не требуется») — алерт не шлём",
+                    st["chat_id"],
+                )
+                continue
             lead_id, responsible_id = await _resolve_lead_safe(st["chat_id"])
             mentions = mentions_for(responsible_id)
             text = _build_message(st, lead_id, mentions)
@@ -349,6 +362,57 @@ async def _resolve_lead(chat_id: str):
         return None, None
     best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
     return best.get("id"), best.get("responsible_user_id")
+
+
+_WZ_TALK_ORIGIN_PREFIX = "com.wazzup24"
+# Зазор при сопоставлении беседы с ожиданием: updated_at беседы мог встать чуть
+# раньше, чем вебхук Wazzup дошёл до нас и мы записали wall_since.
+_TALK_MATCH_SLACK_S = 300
+
+
+async def _talk_closed_safe(st: dict) -> bool:
+    """True — беседа этого ожидания уже закрыта в amo (кнопка «Ответ не требуется» /
+    «Завершить беседу») → алерт не нужен, ожидание снимаем. Fail-open: контакт или
+    беседа не нашлись, не успели за WAZZUP_RESPONSIBLE_TIMEOUT_S, amo упал →
+    False, алерт идёт как раньше (лучше лишний алерт, чем молча потерянный)."""
+    try:
+        return await asyncio.wait_for(_talk_closed(st), timeout=WAZZUP_RESPONSIBLE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Wazzup SLA: не успели проверить беседу в amo за %sс — шлём алерт (беседа %s)",
+            WAZZUP_RESPONSIBLE_TIMEOUT_S, st.get("chat_id"),
+        )
+        return False
+    except Exception:
+        logger.exception("Wazzup SLA: проверка беседы в amo упала (беседа %s) — шлём алерт", st.get("chat_id"))
+        return False
+
+
+async def _talk_closed(st: dict) -> bool:
+    """Ищет контакт по chat_id (для WhatsApp это телефон), берёт его Wazzup-беседы,
+    актуальные для этого ожидания (updated_at не раньше клиентского сообщения).
+    Все такие беседы закрыты → True. Хоть одна in_work → False (клиент ждёт)."""
+    chat_id = st.get("chat_id") or ""
+    if not chat_id:
+        return False
+    since_ts = int(st["wall_since"].timestamp()) - _TALK_MATCH_SLACK_S
+    contacts = await amo_service.find_contacts_by_query(chat_id)
+    for contact in contacts[:3]:
+        contact_id = contact.get("id")
+        if not contact_id:
+            continue
+        talks = await amo_service.get_talks_by_contact(contact_id)
+        recent = [
+            t for t in talks
+            if str(t.get("origin") or "").startswith(_WZ_TALK_ORIGIN_PREFIX)
+            and (t.get("updated_at") or t.get("created_at") or 0) >= since_ts
+        ]
+        if not recent:
+            continue
+        if any(t.get("is_in_work") or t.get("status") == "in_work" for t in recent):
+            return False
+        return True
+    return False
 
 
 def _esc(s: str) -> str:

@@ -394,10 +394,30 @@ TAG_INVOICE_ERROR = "ошибка счёта"
 # карту, и любой потерянный вебхук СБП (сеть моргнула, рестарт контейнера).
 # 0 = выключить фоновый опрос.
 OZON_RECONCILE_INTERVAL_S = int(os.getenv("OZON_RECONCILE_INTERVAL_S", "180"))
-# Счёт выставлен, а оплаты нет дольше N минут → один алерт в ТГ ОП с
+# Пересылка вебхуков Wazzup в панель team.sunscrypt.ru (wazzup_forward.py, го Кати
+# 31.07.2026): тексты WA/TG сохраняет ПАНЕЛЬ (таблица wazzup_message), мы только
+# пересылаем. Пустой токен → пересылка выключена (в лог — предупреждение).
+TEAM_INGEST_URL = os.getenv(
+    "TEAM_INGEST_URL", "https://team.sunscrypt.ru/api/ingest/wazzup"
+).strip()
+TEAM_INGEST_TOKEN = os.getenv("TEAM_INGEST_TOKEN", "").strip()
+
+# Счёт выставлен, а оплаты нет дольше N минут → напоминание в ТГ ОП с
 # @ответственного. Чтобы про застрявшую оплату узнавали мы, а не клиент.
-# 0 = алерт выключен.
-OZON_STALE_ALERT_MIN = int(os.getenv("OZON_STALE_ALERT_MIN", "40"))
+# 0 = напоминания выключены. Час — договорённость встречи с Сашей 30.07.2026
+# (было 40 минут, порог никем не обсуждался).
+OZON_STALE_ALERT_MIN = int(os.getenv("OZON_STALE_ALERT_MIN", "60"))
+# Рабочее окно напоминаний, МСК. Без него они уходили ночью: инцидент
+# 31.07.2026, сообщения в 00:11 и 00:14. Совпадает с окном Wazzup SLA.
+OZON_ALERT_WINDOW_START_H = int(os.getenv("OZON_ALERT_WINDOW_START_H", "12"))
+OZON_ALERT_WINDOW_END_H = int(os.getenv("OZON_ALERT_WINDOW_END_H", "19"))
+# Час вечернего напоминания: первое уходит через OZON_STALE_ALERT_MIN, второе
+# вечером того же дня, дальше каждый вечер, пока счёт не оплатят (встреча 30.07).
+OZON_STALE_EVENING_H = int(os.getenv("OZON_STALE_EVENING_H", "18"))
+# Трое суток без оплаты → отдельно руководителю. Пустой чат = эскалация молчит:
+# тегать Сашу в общем чате ОП нельзя, ему нужен свой (решение встречи 30.07.2026).
+OZON_STALE_ESCALATE_DAYS = float(os.getenv("OZON_STALE_ESCALATE_DAYS", "3"))
+OZON_STALE_ESCALATE_CHAT_ID = os.getenv("OZON_STALE_ESCALATE_CHAT_ID", "").strip()
 
 # ---------------------------------------------------------------------------
 # Office Transfer (30.07.2026): УР(142)/ЗНР(143) в [CLEVER] Основная переносятся

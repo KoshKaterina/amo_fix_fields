@@ -23,6 +23,7 @@ Ozon оба в копейках, 1:1) → ОДНИМ атомарным PATCH п
 """
 
 import asyncio
+import datetime
 import hashlib
 import hmac
 import logging
@@ -48,7 +49,12 @@ from waybill_config import (
     OZON_PAY_NOTIFICATION_SECRET_KEY,
     OZON_PAY_SECRET_KEY,
     OZON_RECONCILE_INTERVAL_S,
+    OZON_ALERT_WINDOW_END_H,
+    OZON_ALERT_WINDOW_START_H,
     OZON_STALE_ALERT_MIN,
+    OZON_STALE_ESCALATE_CHAT_ID,
+    OZON_STALE_ESCALATE_DAYS,
+    OZON_STALE_EVENING_H,
     PIPELINE_CLEVER_MAIN,
     PUBLIC_BASE_URL,
     STATUS_LINK_SENT,
@@ -61,6 +67,8 @@ from waybill_config import (
 logger = logging.getLogger("uvicorn")
 
 AMO_LEAD_URL = "https://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{}"
+
+_MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 # Дедуп-окно: повторные вебхуки одной смены этапа схлопываются, повторный
 # вход в этап позже окна — легитимный новый счёт.
@@ -394,8 +402,20 @@ _paid_recent: dict[str, float] = {}
 _notify_tasks: set = set()
 
 # Сделки, по которым уже кричали «оплаты нет» — чтобы алерт был один, а не
-# каждый цикл. Живёт в памяти процесса: после рестарта допустимо повторить.
-_stale_alerted: set[int] = set()
+# каждый цикл. Память процесса — только быстрый кэш: после пересборки контейнера
+# она пуста, и раньше это давало повторный алерт по тому же счёту (инцидент
+# 31.07.2026: два одинаковых сообщения с разницей в один такт цикла). Настоящая
+# отметка живёт в примечании сделки — см. _NOTE_STALE_RE.
+# Здесь: сделка → когда ей писали в этом процессе. Страхует те несколько минут,
+# пока свежее примечание ещё не видно в выдаче /notes.
+_stale_alerted: dict[int, float] = {}
+# Не писать по одной сделке чаще, чем раз в этот срок, что бы ни решила лесенка.
+_STALE_MIN_GAP_S = 3600.0
+
+# Маркер отправленного напоминания в примечании сделки. Переживает рестарт,
+# виден менеджеру в карточке и не требует ни тома, ни своей базы.
+_STALE_NOTE_MARK = "Напоминание о неоплаченном счёте отправлено"
+_NOTE_STALE_RE = re.compile(re.escape(_STALE_NOTE_MARK))
 
 _reconcile_task: asyncio.Task | None = None
 
@@ -616,16 +636,20 @@ async def get_payment_status(
     return "", None, "платёж не найден ни по paymentId, ни по extId"
 
 
-async def _payment_ref(lead_id) -> tuple[str, str, str, int | None]:
-    """(payment_id, ext_id платежа, ext_id ЗАКАЗА, когда выставлен счёт) из
-    свежего примечания сделки. extId заказа нужен для карты: по paymentId
-    Ozon там отвечает пустотой. У старых счетов его в примечании нет —
+async def _payment_ref(lead_id) -> tuple[str, str, str, int | None, int | None]:
+    """(payment_id, ext_id платежа, ext_id ЗАКАЗА, когда выставлен счёт, когда
+    последний раз напоминали) из примечаний сделки. extId заказа нужен для карты:
+    по paymentId Ozon там отвечает пустотой. У старых счетов его в примечании нет —
     восстанавливаем прежнюю форму «ord-<lead>-<ts>» из extId платежа."""
     notes = await amo_service.get_lead_notes(lead_id)
     payment_id = ext_id = order_ext_id = ""
     created_at = None
+    last_alert_at = None
     for note in notes:  # свежие в конце — побеждает последнее совпадение
         text = ((note.get("params") or {}).get("text")) or ""
+        if _NOTE_STALE_RE.search(text):
+            last_alert_at = note.get("created_at")
+            continue
         if "создан автоматически" not in text:
             continue
         match_payment = _NOTE_PAYMENT_RE.search(text)
@@ -639,27 +663,110 @@ async def _payment_ref(lead_id) -> tuple[str, str, str, int | None]:
         created_at = note.get("created_at")
     if not order_ext_id and ext_id.startswith("amo-"):
         order_ext_id = ext_id.replace("amo-", "ord-", 1)
-    return payment_id, ext_id, order_ext_id, created_at
+    return payment_id, ext_id, order_ext_id, created_at, last_alert_at
 
 
-async def _stale_alert(lead: dict, created_at: int | None, status: str) -> None:
-    """Счёт выставлен, оплаты нет дольше порога → один алерт в ТГ ОП."""
+def _human_age(minutes: float) -> str:
+    """«9157 мин» человек не читает. Даём «6 дн 8 ч», «3 ч 20 мин», «45 мин».
+
+    Требование Саши со встречи 30.07.2026: возраст счёта в человеческих часах.
+    """
+    total = int(minutes)
+    if total < 60:
+        return f"{total} мин"
+    hours, mins = divmod(total, 60)
+    if hours < 24:
+        return f"{hours} ч {mins} мин" if mins else f"{hours} ч"
+    days, hours = divmod(hours, 24)
+    return f"{days} дн {hours} ч" if hours else f"{days} дн"
+
+
+def _in_alert_window(now: datetime.datetime | None = None) -> bool:
+    """Рабочее окно алертов, МСК. Без него напоминания приходили ночью
+    (инцидент 31.07.2026: сообщения в 00:11 и 00:14)."""
+    now = now or datetime.datetime.now(_MSK)
+    return OZON_ALERT_WINDOW_START_H <= now.hour < OZON_ALERT_WINDOW_END_H
+
+
+def _stale_due(age_min: float, last_alert_at: int | None,
+               now: datetime.datetime | None = None) -> str:
+    """Пора ли напоминать и какой ступенью. '' = не пора.
+
+    Лесенка со встречи 30.07.2026 + правило Кати от 31.07.2026: первое
+    напоминание через час, дальше НЕ ЧАЩЕ РАЗА В СУТКИ и только вечером.
+    Раньше в день выставления счёта могло уйти два сообщения (первое + вечернее);
+    Катя: «слишком много прилетает, не чаще одного раза в день».
+    """
+    now = now or datetime.datetime.now(_MSK)
+    if age_min < OZON_STALE_ALERT_MIN:
+        return ""
+    if last_alert_at is None:
+        return "first"       # первое — как только счёт перевисел порог
+    last = datetime.datetime.fromtimestamp(float(last_alert_at), _MSK)
+    if last.date() == now.date():
+        return ""            # сегодня по этой сделке уже писали — сутки молчим
+    if now.hour < OZON_STALE_EVENING_H:
+        return ""            # повторы уходят вечером, днём не дёргаем
+    return "evening"
+
+
+async def _stale_alert(lead: dict, created_at: int | None, status: str,
+                       last_alert_at: int | None = None) -> None:
+    """Счёт выставлен, оплаты нет дольше порога → напоминание в ТГ ОП.
+
+    Отметка об отправке кладётся примечанием в сделку, поэтому переживает
+    пересборку контейнера. Вне рабочего окна молчим и ждём следующего прохода.
+    """
     if OZON_STALE_ALERT_MIN <= 0 or not created_at:
         return
     age_min = (time.time() - float(created_at)) / 60
-    if age_min < OZON_STALE_ALERT_MIN:
-        return
     lead_id = lead.get("id")
-    if lead_id in _stale_alerted:
+    step = _stale_due(age_min, last_alert_at)
+    if not step:
         return
-    _stale_alerted.add(lead_id)
+    if time.time() - _stale_alerted.get(lead_id, 0.0) < _STALE_MIN_GAP_S:
+        return               # уже слали в этом процессе, примечание ещё не осело
+    if not _in_alert_window():
+        return
+
+    rejected = str(status or "").upper() == "PAYMENT_REJECTED"
+    head = ("❌ Оплата отклонена, счёт не оплачен" if rejected
+            else "⏳ Счёт висит без оплаты")
+    age_days = age_min / 1440
+    escalate = age_days >= OZON_STALE_ESCALATE_DAYS
+
     mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    tail = "" if rejected else " (статус Ozon: {})".format(status or "неизвестен")
+    title = lead.get("name") or "сделка {}".format(lead_id)
+    text = (
+        f"{head} {_human_age(age_min)}{tail}\n"
+        f"{title}\n"
+        f"{AMO_LEAD_URL.format(lead_id)}\n{mentions}"
+    )
     await telegram_bot.send_alert(
-        f"⏳ Счёт висит без оплаты {int(age_min)} мин (статус Ozon: {status or 'неизвестен'})\n"
-        f"{lead.get('name') or f'сделка {lead_id}'}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
+        text,
         chat_id=tg_recipients.NOTIFY_CHAT_ID,
         message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
     )
+    _stale_alerted[lead_id] = time.time()
+    try:
+        await amo_service.add_note(
+            lead_id, f"{_STALE_NOTE_MARK} ({_human_age(age_min)} без оплаты)")
+    except Exception:
+        logger.exception("ozon: не удалось записать отметку о напоминании (lead %s)", lead_id)
+
+    # Трое суток без оплаты → отдельно руководителю (решение встречи 30.07.2026).
+    # Пока чат Саши не заведён, OZON_STALE_ESCALATE_CHAT_ID пуст и эскалация молчит:
+    # тегать его в общем чате нельзя, это прямо оговорено.
+    if escalate and OZON_STALE_ESCALATE_CHAT_ID:
+        await telegram_bot.send_alert(
+            f"🚨 Счёт без оплаты {_human_age(age_min)}\n"
+            f"{title}\n{AMO_LEAD_URL.format(lead_id)}",
+            chat_id=OZON_STALE_ESCALATE_CHAT_ID,
+        )
+    elif escalate:
+        logger.info("ozon: сделка %s висит %s — эскалация не настроена "
+                    "(OZON_STALE_ESCALATE_CHAT_ID пуст)", lead_id, _human_age(age_min))
 
 
 async def _reconcile_once() -> str:
@@ -675,7 +782,7 @@ async def _reconcile_once() -> str:
                 continue  # счёта нет — сверять нечего (менеджер ещё не запросил оплату)
 
             lead_id = lead.get("id")
-            payment_id, ext_id, order_ext_id, created_at = await _payment_ref(lead_id)
+            payment_id, ext_id, order_ext_id, created_at, last_alert_at = await _payment_ref(lead_id)
             if not payment_id:
                 # Счёт выставлен руками/старым виджетом — paymentId неизвестен.
                 continue
@@ -689,7 +796,7 @@ async def _reconcile_once() -> str:
                 continue
 
             if not is_paid_status(status):
-                await _stale_alert(lead, created_at, status)
+                await _stale_alert(lead, created_at, status, last_alert_at)
                 continue
 
             _seen_paid(ext_id or payment_id)
@@ -698,7 +805,7 @@ async def _reconcile_once() -> str:
             marker = f"extId {ext_id}" if ext_id else f"paymentId {payment_id}"
             if await _mark_paid(lead, rub_str, marker, "сверка") == "moved":
                 moved += 1
-                _stale_alerted.discard(lead_id)
+                _stale_alerted.pop(lead_id, None)
 
     logger.info("Ozon сверка: проверено счетов %s, переведено сделок %s", checked, moved)
     return f"checked={checked} moved={moved}"

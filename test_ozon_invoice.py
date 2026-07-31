@@ -474,16 +474,24 @@ run(ozon_invoice._reconcile_once())
 assert not [p for p in _patches if p.get("status_id")], _patches
 print("✓ сверка: оплаченный счёт уводит сделку в «Оплата получена», повтор не дублирует")
 
-# ── 21) сверка: висит без оплаты дольше порога → один алерт ─────────────────
+# ── 21) сверка: висит без оплаты дольше порога → одно напоминание ───────────
+# Окно алертов подменяем: тест не должен зависеть от времени суток, когда его
+# запустили (до фикса 31.07.2026 окна не было вовсе и алерты уходили ночью).
 _reset(); ozon_invoice._paid_recent.clear(); ozon_invoice._stale_alerted.clear()
 _install_mocks(_lead(status=STATUS_LINK_SENT))
+
+_REAL_IN_WINDOW = ozon_invoice._in_alert_window
+ozon_invoice._in_alert_window = lambda now=None: True
+
 
 async def fake_notes_old(lead_id, limit=100):
     return [{"created_at": int(time.time()) - 3 * 3600, "params": {"text":
              "Счёт СБП создан автоматически: 10 ₽\nextId amo-777001-1\npaymentId pay-old"}}]
 
+
 async def fake_status_pending(payment_id, ext_id="", order_ext_id=""):
     return "PAYMENT_NEW", None, ""
+
 
 amo_service.get_lead_notes = fake_notes_old
 ozon_invoice.get_payment_status = fake_status_pending
@@ -491,9 +499,40 @@ ozon_invoice.get_payment_status = fake_status_pending
 run(ozon_invoice._reconcile_once())
 assert not [p for p in _patches if p.get("status_id")], _patches
 assert len(_alerts) == 1 and "без оплаты" in _alerts[0], _alerts
+assert "3 ч" in _alerts[0], f"возраст должен быть человеческим: {_alerts[0]!r}"
+assert "180 мин" not in _alerts[0], f"сырые минуты вернулись: {_alerts[0]!r}"
 run(ozon_invoice._reconcile_once())          # второй проход — молчим
 assert len(_alerts) == 1, _alerts
-print("✓ сверка: зависший счёт — один алерт в ТГ, сделку не трогаем")
+print("✓ сверка: зависший счёт — одно напоминание, возраст человеческий, сделку не трогаем")
+
+# ── 21б) ночью не пишем вообще ──────────────────────────────────────────────
+_reset(); ozon_invoice._paid_recent.clear(); ozon_invoice._stale_alerted.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+amo_service.get_lead_notes = fake_notes_old
+ozon_invoice.get_payment_status = fake_status_pending
+ozon_invoice._in_alert_window = lambda now=None: False
+run(ozon_invoice._reconcile_once())
+assert _alerts == [], f"вне рабочего окна сообщений быть не должно: {_alerts}"
+ozon_invoice._in_alert_window = _REAL_IN_WINDOW
+print("✓ сверка: вне рабочего окна напоминание не уходит (инцидент 31.07.2026)")
+
+# ── 21в) отклонённая оплата подписана иначе, чем «просто не платят» ─────────
+_reset(); ozon_invoice._paid_recent.clear(); ozon_invoice._stale_alerted.clear()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+amo_service.get_lead_notes = fake_notes_old
+ozon_invoice._in_alert_window = lambda now=None: True
+
+
+async def fake_status_rejected(payment_id, ext_id="", order_ext_id=""):
+    return "PAYMENT_REJECTED", None, ""
+
+
+ozon_invoice.get_payment_status = fake_status_rejected
+run(ozon_invoice._reconcile_once())
+assert len(_alerts) == 1, _alerts
+assert "Оплата отклонена" in _alerts[0], _alerts
+ozon_invoice._in_alert_window = _REAL_IN_WINDOW
+print("✓ сверка: PAYMENT_REJECTED = «оплата отклонена», а не «клиент не платит»")
 
 # ── 22) сверка: счёта нет (ссылка пустая) → Ozon не дёргаем ────────────────
 _reset(); ozon_invoice._stale_alerted.clear()
@@ -588,7 +627,7 @@ async def notes_with_order(lead_id, limit=100):
              "orderExtId 05748_amo-777001-1785242820"}}]
 
 amo_service.get_lead_notes = notes_with_order
-pid, ext, order_ext, _ = run(ozon_invoice._payment_ref(777001))
+pid, ext, order_ext, _, _ = run(ozon_invoice._payment_ref(777001))
 # extId платежа НЕ должен подмениться номером заказа из orderExtId
 assert (pid, ext, order_ext) == ("pid-1", "amo-777001-1785242820",
                                  "05748_amo-777001-1785242820"), (pid, ext, order_ext)
@@ -598,9 +637,42 @@ async def notes_old_format(lead_id, limit=100):
              "Счёт СБП создан автоматически: 10 ₽\nextId amo-777001-1785242820\npaymentId pid-2"}}]
 
 amo_service.get_lead_notes = notes_old_format
-pid, ext, order_ext, _ = run(ozon_invoice._payment_ref(777001))
+pid, ext, order_ext, _, _ = run(ozon_invoice._payment_ref(777001))
 # у старых счетов orderExtId в примечании нет — восстанавливаем прежнюю форму
 assert order_ext == "ord-777001-1785242820", order_ext
 print("✓ orderExtId: пишется для карты, extId платежа не подменяется, старые счета восстанавливаются")
+
+# --- частота напоминаний: не чаще раза в сутки (правило Кати, 31.07.2026) -----
+import datetime as _dt
+
+_MSK = ozon_invoice._MSK
+_H = ozon_invoice.OZON_STALE_EVENING_H
+
+
+def _at(day, hour, minute=0):
+    return _dt.datetime(2026, 8, day, hour, minute, tzinfo=_MSK)
+
+
+def _ts(day, hour, minute=0):
+    return int(_at(day, hour, minute).timestamp())
+
+
+due = ozon_invoice._stale_due
+порог = ozon_invoice.OZON_STALE_ALERT_MIN
+
+# счёт моложе порога — молчим
+assert due(порог - 1, None, _at(3, 13)) == ""
+# перевисел порог, ещё не писали — первое напоминание
+assert due(порог + 1, None, _at(3, 13)) == "first"
+# писали сегодня утром — вечером того же дня ВТОРОЕ НЕ уходит
+assert due(600, _ts(3, 12), _at(3, _H)) == ""
+assert due(600, _ts(3, 12), _at(3, 23)) == ""
+# на следующий день вечером — одно напоминание
+assert due(2000, _ts(3, 12), _at(4, _H)) == "evening"
+# но днём следующего дня ещё рано
+assert due(2000, _ts(3, 12), _at(4, _H - 1)) == ""
+# и второе за те же сутки не уходит
+assert due(2000, _ts(4, _H), _at(4, _H + 1)) == ""
+print(f"✓ частота: первое через {порог} мин, дальше не чаще раза в сутки и только с {_H}:00")
 
 print("\nozon_invoice: все тесты прошли")

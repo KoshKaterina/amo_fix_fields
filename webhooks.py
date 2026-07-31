@@ -22,6 +22,7 @@ import uis_missed_call
 import unmiss_tag
 import urgency_tag
 import wazzup_sla
+import wazzup_forward
 import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -80,10 +81,12 @@ async def lifespan(app):
     await ms_status_sync.init()
     ozon_invoice.init()
     await wazzup_sla.init()
+    await wazzup_forward.init()
     await office_transfer.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
+    await wazzup_forward.shutdown()
     await unmiss_tag.shutdown()
     await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
@@ -240,6 +243,12 @@ async def wazzup_webhook(secret: str, request: Request):
         wazzup_sla.handle_webhook(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка обработки")
+    # Пересылка текстов в панель (wazzup_message) — независимо от SLA-обработки:
+    # упавший таймер не должен терять сообщение (источник невосполним).
+    try:
+        wazzup_forward.enqueue(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка пересылки в панель")
     return {"ok": True}
 
 

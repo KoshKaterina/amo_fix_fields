@@ -20,7 +20,8 @@ def _stub(name, **attrs):
 if "dotenv" not in sys.modules:
     _stub("dotenv", load_dotenv=lambda *a, **k: None)
 _stub("telegram_bot", send_alert=None)
-_stub("amo_service", find_leads_by_query=None)
+_stub("amo_service", find_leads_by_query=None,
+      find_contacts_by_query=None, get_talks_by_contact=None)
 _stub("api", BASE_URL="https://amo.example")
 _stub("httpx", AsyncClient=object)
 # tg_recipients НЕ стабим — он тянет только waybill_config (реальную карту хендлов),
@@ -43,6 +44,7 @@ def _msg(chat_id="79990000000", is_echo=False, status=None, text="привет",
 
 _ORIG_IN_WINDOW = W._in_window
 _ORIG_RESOLVE = W._resolve_lead_safe
+_ORIG_TALK_CLOSED = W._talk_closed_safe
 
 
 def setup_function(_=None):
@@ -50,6 +52,7 @@ def setup_function(_=None):
     # восстановить всё, что sweep-тесты могли подменить
     W._in_window = _ORIG_IN_WINDOW
     W._resolve_lead_safe = _ORIG_RESOLVE
+    W._talk_closed_safe = _ORIG_TALK_CLOSED
 
 
 def test_inbound_starts_timer():
@@ -127,6 +130,11 @@ def test_sweep_marks_alerted_and_dedups(monkeypatch=None):
     W._resolve_lead_safe = fake_resolve
     W._in_window = lambda now=None: True  # форсим окно
 
+    async def fake_talk_open(st):
+        return False  # беседа не закрыта — обычный путь алерта
+
+    W._talk_closed_safe = fake_talk_open
+
     # клиент написал «давно» (сдвигаем waiting_since назад на 40 мин)
     W.handle_webhook({"messages": [_msg(is_echo=False, text="где заказ?")]})
     st = next(iter(W._pending.values()))
@@ -182,6 +190,88 @@ def test_mentions_igor_and_kirill():
 def test_mentions_unknown_falls_back_to_shift():
     assert T.mentions_for(None) == T.MANAGERS_ON_SHIFT
     assert T.mentions_for(999999) == T.MANAGERS_ON_SHIFT  # не наш МОП → вся смена
+
+
+# --- «Ответ не требуется»: беседа закрыта в amo → алерт не нужен -------------
+
+def _talk(status="closed", origin="com.wazzup24.wz", updated_at=0):
+    return {"talk_id": 1, "status": status, "is_in_work": status == "in_work",
+            "origin": origin, "updated_at": updated_at}
+
+
+def _st_waiting():
+    return {"chat_id": "79990000000", "wall_since": W._now_msk()}
+
+
+def _set_amo(contacts, talks):
+    async def fake_contacts(q, limit=10):
+        return contacts
+
+    async def fake_talks(cid):
+        return talks
+
+    W.amo_service.find_contacts_by_query = fake_contacts
+    W.amo_service.get_talks_by_contact = fake_talks
+
+
+def test_sweep_skips_alert_when_talk_closed():
+    """Менеджер нажал «Ответ не требуется» → алерта нет, ожидание снято."""
+    W._pending.clear()
+    sent = []
+
+    async def fake_send(text, **kw):
+        sent.append(text)
+        return True
+
+    async def fake_closed(st):
+        return True
+
+    W.telegram_bot.send_alert = fake_send
+    W._talk_closed_safe = fake_closed
+    W._in_window = lambda now=None: True
+
+    W.handle_webhook({"messages": [_msg(is_echo=False)]})
+    st = next(iter(W._pending.values()))
+    st["waiting_since"] -= 40 * 60
+    asyncio.run(W._sweep(threshold_s=30 * 60))
+    assert len(sent) == 0, "беседа закрыта — алерт не шлём"
+    assert len(W._pending) == 0, "ожидание должно сняться"
+
+
+def test_talk_closed_true_when_recent_wazzup_talk_closed():
+    now_ts = int(W._now_msk().timestamp())
+    _set_amo([{"id": 1}], [_talk(status="closed", updated_at=now_ts)])
+    assert asyncio.run(W._talk_closed(_st_waiting())) is True
+
+
+def test_talk_in_work_means_alert():
+    now_ts = int(W._now_msk().timestamp())
+    _set_amo([{"id": 1}], [_talk(status="in_work", updated_at=now_ts),
+                           _talk(status="closed", updated_at=now_ts)])
+    assert asyncio.run(W._talk_closed(_st_waiting())) is False
+
+
+def test_talk_closed_ignores_old_and_foreign_talks():
+    """Старые беседы (до клиентского сообщения) и не-Wazzup origin не считаются:
+    актуальных Wazzup-бесед нет → fail-open, алерт идёт."""
+    now_ts = int(W._now_msk().timestamp())
+    old = now_ts - 3 * 3600
+    _set_amo([{"id": 1}], [_talk(status="closed", updated_at=old),
+                           _talk(status="closed", origin="com.amocrm.mail", updated_at=now_ts)])
+    assert asyncio.run(W._talk_closed(_st_waiting())) is False
+
+
+def test_talk_closed_no_contacts_fail_open():
+    _set_amo([], [])
+    assert asyncio.run(W._talk_closed(_st_waiting())) is False
+
+
+def test_talk_closed_safe_swallows_errors():
+    async def boom(q, limit=10):
+        raise RuntimeError("amo down")
+
+    W.amo_service.find_contacts_by_query = boom
+    assert asyncio.run(W._talk_closed_safe(_st_waiting())) is False
 
 
 if __name__ == "__main__":
