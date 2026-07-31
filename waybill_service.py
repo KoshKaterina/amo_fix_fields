@@ -79,6 +79,35 @@ async def _alert(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Разбор отказа СДЭК
+# ---------------------------------------------------------------------------
+
+def _extract_reject_reason(order_info: dict) -> str | None:
+    """Причина отказа СДЭК по заказу, если запрос на создание отклонён (state=INVALID).
+
+    Пример: 'Некорректный телефон получателя' — заказ в кабинете остаётся пустышкой
+    без cdek_number, реального отправления нет, дубль удалять не нужно.
+    Возвращает None, пока заказ ещё обрабатывается или создан успешно.
+
+    Принимает ВЕСЬ ответ GET /orders/{uuid}: requests лежат рядом с entity,
+    а не внутри неё (проверено на живых заказах 29.07.2026).
+    """
+    requests = order_info.get("requests") or (order_info.get("entity") or {}).get("requests") or []
+    for req in requests:
+        if (req.get("type") or "").upper() != "CREATE":
+            continue
+        if (req.get("state") or "").upper() != "INVALID":
+            continue
+        messages = []
+        for err in req.get("errors") or []:
+            msg = (err.get("message") or "").strip() or (err.get("code") or "").strip()
+            if msg and msg not in messages:
+                messages.append(msg)
+        return "; ".join(messages) or "причина не указана"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Создание накладной для одной сделки
 # ---------------------------------------------------------------------------
 
@@ -273,19 +302,35 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     if not order_uuid:
         return await _fail(lead_id, f"СДЭК не вернул UUID: {cdek_resp}", source, current_tags)
 
-    # 7. Polling cdek_number (до 60 секунд)
+    # 7. Polling cdek_number (до 60 секунд).
+    #    СДЭК валидирует заказ асинхронно: сразу после POST он висит ACCEPTED, а через
+    #    пару секунд либо получает номер, либо падает в INVALID с причиной в requests[].errors.
+    #    Отказ ловим сразу — иначе офис минуту ждёт и получает бесполезное "не вернул номер".
     cdek_number = None
+    reject_reason = None
     for _ in range(20):
         await asyncio.sleep(3)
         try:
             order_info = await cdek_client.get_order(order_uuid)
         except cdek_client.CdekError:
             continue
-        cdek_number = (order_info.get("entity") or {}).get("cdek_number")
+        entity = order_info.get("entity") or {}
+        cdek_number = entity.get("cdek_number")
         if cdek_number:
+            break
+        reject_reason = _extract_reject_reason(order_info)
+        if reject_reason:
             break
 
     if not cdek_number:
+        if reject_reason:
+            return await _fail(
+                lead_id,
+                f"СДЭК отклонил заказ: {reject_reason}. Отправление НЕ создано, "
+                f"в кабинете удалять нечего — исправьте данные и повторите /retry. "
+                f"UUID заказа: {order_uuid}.",
+                source, current_tags,
+            )
         return await _fail(
             lead_id,
             f"СДЭК не вернул cdek_number за 60с. UUID заказа: {order_uuid}. "
