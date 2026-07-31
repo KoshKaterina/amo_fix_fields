@@ -187,6 +187,12 @@ def test_mentions_igor_and_kirill():
     assert T.mentions_for(13946318) == "@offf1cer @gladkov_369"   # Кирилл
 
 
+def test_mentions_artem_b2b():
+    # ОПТ-сделки не должны падать в фолбэк «вся розничная смена» (MAG-жалоба
+    # Тианы 31.07.2026: пропуск на сделке Артёма тегал офицера/Егора/Катю).
+    assert T.mentions_for(13822630) == "@sunscryptb2b @gladkov_369"
+
+
 def test_mentions_unknown_falls_back_to_shift():
     assert T.mentions_for(None) == T.MANAGERS_ON_SHIFT
     assert T.mentions_for(999999) == T.MANAGERS_ON_SHIFT  # не наш МОП → вся смена
