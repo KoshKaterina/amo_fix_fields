@@ -413,6 +413,19 @@ assert res == "moved", res
 print("✓ cutover-гейт: SINCE_TS=0 (не задан) — гейт выключен")
 
 
+# ── 6в) гейт «уже переносилась»: 578151 заполнен → повторный вход в УР не трогаем ──
+
+_reset()
+lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+             delivery_text="Доставка курьером по Москве")
+lead["custom_fields_values"].append(_cf(FIELD_FORMER_RESPONSIBLE, value="Оанча Игорь"))
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "skipped-already-transferred", res
+assert not _patches and not _tags and not _alerts
+print("✓ гейт повторного переноса: 578151 заполнен → сделка стоит в УР, не трогаем")
+
+
 # ── 7) правило «Почта России» → Офис/«Сделать накладную» (Катя 31.07.2026) ──
 
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,

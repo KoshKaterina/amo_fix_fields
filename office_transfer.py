@@ -417,6 +417,16 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
             _clear_fail(lead_id)
             return "skipped-pre-cutover"
 
+    if str(amo_service.get_custom_field_value(lead, FIELD_FORMER_RESPONSIBLE) or "").strip():
+        # 578151 «Ответственный МОП» заполнен = сделку УЖЕ переносили. Повторный
+        # вход в УР/ЗНР не переносим (решение Кати 31.07.2026: возвращённые в
+        # УР ОП оригиналы должны СТОЯТЬ там для статистики, пока их копии
+        # доживают в Офисе; и вообще катание туда-обратно - аномалия, а не
+        # повод возить сделку по воронкам второй раз).
+        logger.info("office_transfer %s: 578151 заполнен (уже переносилась) — скип", lead_id)
+        _clear_fail(lead_id)
+        return "skipped-already-transferred"
+
     target = _match_rules(lead, status_id)
     if target is None:
         if status_id == STATUS_SUCCESS:
