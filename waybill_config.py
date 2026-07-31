@@ -418,6 +418,7 @@ OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER",
 OFFICE_TRANSFER_RULE_UR_FULFILLMENT = os.getenv("OFFICE_TRANSFER_RULE_UR_FULFILLMENT", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
+OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").strip() == "1"
 
 # Cutover-граница (unix ts): события ДО неё игнорируются везде (вебхук и
 # reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии
@@ -457,6 +458,7 @@ REASON_ACADEMY = 1041243   # Академия
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
 DELIVERY_COURIER_MOSCOW_MARKER = "курьером по москве"
 DELIVERY_CDEK_MARKERS = ("cdek", "сдэк")
+DELIVERY_RUSSIAN_POST_MARKER = "почта россии"
 
 # Целевые этапы воронки Офис (PIPELINE_OFFICE уже определена ниже)
 STATUS_OFFICE_DELIVERY = 75426826       # «Оформить доставку» (Достависта)
@@ -479,6 +481,14 @@ RESPONSIBLE_OFFICE_MANAGER_USER_ID = 13963494
 # Тег зависшего/неудавшегося переноса. Информационный — НЕ блокирует повторные
 # попытки reconciliation (по образцу TAG_KONTROL_ERROR).
 TAG_OFFICE_TRANSFER_ERROR = "ошибка переноса в офис"
+
+# Теги-сигналы «автоперенос невозможен, нужен человек» (решение Кати 31.07.2026,
+# анализ 90 дней: на 1816 УР — 6 заказов с пустым «Типом доставки», 7 мусорных
+# без заказа, 2 с битыми полями). Тег = дедуп ТГ-алерта (переживает рестарт).
+# Менеджер дозаполнил поля → вебхук на обновление сделки повторит матчинг,
+# сделка переносится штатно, тег снимается.
+TAG_NO_DELIVERY = "доставка не заполнена"        # Заказ + склад на месте, «Тип доставки» пуст
+TAG_BAD_FILL = "заказ заполнен некорректно"      # нет типа заявки/склада, чужой склад, нераспознанная доставка
 
 
 _TOTAL_RE = re.compile(

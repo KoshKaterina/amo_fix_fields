@@ -73,6 +73,7 @@ from waybill_config import (
     APPLICATION_TYPE_PREORDER,
     DELIVERY_CDEK_MARKERS,
     DELIVERY_COURIER_MOSCOW_MARKER,
+    DELIVERY_RUSSIAN_POST_MARKER,
     DELIVERY_SHOWROOM_MARKER,
     DUP_REASON_FIELD_ID,
     FIELD_APPLICATION_TYPE,
@@ -85,6 +86,7 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_UR_FULFILLMENT,
     OFFICE_TRANSFER_RULE_UR_PICKUP,
     OFFICE_TRANSFER_RULE_UR_PREORDER,
+    OFFICE_TRANSFER_RULE_UR_POST,
     OFFICE_TRANSFER_RULE_UR_WAYBILL,
     OFFICE_TRANSFER_RULE_ZNR_ACADEMY,
     OFFICE_TRANSFER_RULE_ZNR_WAITLIST,
@@ -109,6 +111,8 @@ from waybill_config import (
     STATUS_SUCCESS,
     STATUS_WAITLIST,
     TAG_OFFICE_TRANSFER_ERROR,
+    TAG_BAD_FILL,
+    TAG_NO_DELIVERY,
     WAREHOUSE_ERMS_MAIN,
 )
 
@@ -136,9 +140,13 @@ def _reason_enum(lead: dict) -> int | None:
 
 
 # ════════════════ матчеры правил — каждый: сделка → (pipeline_id, status_id) | None ════════════════
+# ignore_flags=True — «теневой» матчинг без учёта флагов правил: нужен _no_match_ur,
+# чтобы в переходный период (правила включаются по одному) не алертить «заказ
+# заполнен некорректно» по нормальным сделкам, чьё правило просто ещё выключено
+# (их пока ведёт нативная автоматика Digital Funnel).
 
-def _match_ur_delivery(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_UR_DELIVERY:
+def _match_ur_delivery(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_DELIVERY:
         return None
     if _application_type(lead) != APPLICATION_TYPE_ORDER:
         return None
@@ -149,8 +157,8 @@ def _match_ur_delivery(lead: dict) -> tuple[int, int] | None:
     return (PIPELINE_OFFICE, STATUS_OFFICE_DELIVERY)
 
 
-def _match_ur_pickup(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_UR_PICKUP:
+def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_PICKUP:
         return None
     if _application_type(lead) != APPLICATION_TYPE_ORDER:
         return None
@@ -161,8 +169,8 @@ def _match_ur_pickup(lead: dict) -> tuple[int, int] | None:
     return (PIPELINE_OFFICE, STATUS_OFFICE_PICKUP)
 
 
-def _match_ur_waybill(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_UR_WAYBILL:
+def _match_ur_waybill(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_WAYBILL:
         return None
     if _application_type(lead) != APPLICATION_TYPE_ORDER:
         return None
@@ -174,16 +182,34 @@ def _match_ur_waybill(lead: dict) -> tuple[int, int] | None:
     return (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL)
 
 
-def _match_ur_preorder(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_UR_PREORDER:
+def _match_ur_post(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Почта России → Офис/«Сделать накладную» (решение Кати 31.07.2026: пока в
+    общий этап отправки, воронку переработают позже). Вебхук автонакладной на
+    этом этапе для почты отработает БЕЗОПАСНО: parse_tariff не найдёт тариф СДЭК
+    в поле 576703 → тег + алерт «не определён тариф» — ожидаемый сигнал офису
+    оформить почтовую отправку руками, а не баг (сверено по коду waybill_service
+    31.07.2026: нераспознанный тариф = _fail без создания накладной)."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_POST:
+        return None
+    if _application_type(lead) != APPLICATION_TYPE_ORDER:
+        return None
+    if _warehouse(lead) not in OFFICE_TRANSFER_WAREHOUSES:
+        return None
+    if DELIVERY_RUSSIAN_POST_MARKER not in _delivery_text(lead):
+        return None
+    return (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL)
+
+
+def _match_ur_preorder(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_PREORDER:
         return None
     if _application_type(lead) != APPLICATION_TYPE_PREORDER:
         return None
     return (PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID)
 
 
-def _match_ur_fulfillment(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_UR_FULFILLMENT:
+def _match_ur_fulfillment(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_FULFILLMENT:
         return None
     if _application_type(lead) != APPLICATION_TYPE_ORDER:
         return None
@@ -196,21 +222,22 @@ _UR_RULES = (
     _match_ur_delivery,
     _match_ur_pickup,
     _match_ur_waybill,
+    _match_ur_post,
     _match_ur_preorder,
     _match_ur_fulfillment,
 )
 
 
-def _match_znr_waitlist(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_ZNR_WAITLIST:
+def _match_znr_waitlist(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_WAITLIST:
         return None
     if _reason_enum(lead) != REASON_WAITLIST:
         return None
     return (PIPELINE_WAITLIST, STATUS_WAITLIST)
 
 
-def _match_znr_academy(lead: dict) -> tuple[int, int] | None:
-    if not OFFICE_TRANSFER_RULE_ZNR_ACADEMY:
+def _match_znr_academy(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_ACADEMY:
         return None
     if _reason_enum(lead) != REASON_ACADEMY:
         return None
@@ -223,10 +250,10 @@ _ZNR_RULES = (
 )
 
 
-def _match_rules(lead: dict, status_id: int) -> tuple[int, int] | None:
+def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False) -> tuple[int, int] | None:
     rules = _UR_RULES if status_id == STATUS_SUCCESS else _ZNR_RULES if status_id == STATUS_CLOSED_LOST else ()
     for fn in rules:
-        target = fn(lead)
+        target = fn(lead, ignore_flags=ignore_flags)
         if target is not None:
             return target
     return None
@@ -276,6 +303,76 @@ async def _fail(lead: dict, reason: str) -> None:
     await _stale_alert(lead, state)
 
 
+# УР-сделки без правила: дедуп ТГ-алертов в памяти процесса (поверх тега
+# на сделке, который переживает рестарт).
+_fill_alerted: set[int] = set()
+
+
+async def _notify_fill_problem(lead: dict, tag: str, note: str, alert: str, outcome: str) -> str:
+    """УР-сделка не подошла ни под одно правило — автоперенос невозможен, дело в
+    заполнении полей, само не рассосётся (решение Кати 31.07.2026: сигналим
+    человеку, НЕ переносим наугад). Тег + примечание + ТГ-алерт СРАЗУ, без
+    порога ожидания. Дедуп: тег на сделке + set в памяти. Менеджер дозаполнит
+    поля → amo пришлёт вебхук на обновление сделки (условие в webhooks.py
+    срабатывает и по ТЕКУЩЕМУ статусу 142 в leads[update]) → матчинг
+    повторится, сделка переносится штатно, тег снимается в диспетчере."""
+    lead_id = int(lead.get("id"))
+    if lead_id in _fill_alerted or any(
+        (t.get("name") or "") == tag for t in amo_service.get_tags(lead)
+    ):
+        return "skipped-already-alerted"
+    _fill_alerted.add(lead_id)
+    logger.warning("office_transfer %s: %s", lead_id, outcome)
+    await amo_service.add_tag(lead_id, tag)
+    await amo_service.add_note(lead_id, note)
+    mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    await telegram_bot.send_alert(
+        f"⚠️ {alert}\n{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
+        chat_id=tg_recipients.NOTIFY_CHAT_ID,
+        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+    )
+    return outcome
+
+
+async def _no_match_ur(lead: dict) -> str:
+    """Классификация УР-сделки без правила (паттерны из анализа 90 дней,
+    решения Кати 31.07.2026). Сначала «теневой» матчинг без флагов: сделка,
+    которая подошла бы под ещё выключенное правило, — не проблема заполнения,
+    её пока ведёт нативная автоматика — молчим. Дальше два случая:
+    «Заказ + склад на месте, а Тип доставки пуст» (менеджеру достаточно
+    дозаполнить одно поле) и «всё остальное» (нет типа заявки/склада,
+    чужой склад, нераспознанная доставка вроде «мэйлру»)."""
+    if _match_rules(lead, STATUS_SUCCESS, ignore_flags=True) is not None:
+        logger.info(
+            "office_transfer %s: подошла бы под выключенное правило — ведёт нативка, молчим",
+            lead.get("id"),
+        )
+        return "no-match-rule-disabled"
+    lead_id = lead.get("id")
+    app = _application_type(lead)
+    wh = _warehouse(lead)
+    if (app == APPLICATION_TYPE_ORDER
+            and wh in OFFICE_TRANSFER_WAREHOUSES
+            and not _delivery_text(lead).strip()):
+        return await _notify_fill_problem(
+            lead, TAG_NO_DELIVERY,
+            "⚠️ Автоперенос: в сделке не заполнен «Тип доставки» — она осталась в УР. "
+            "Заполните поле — перенос отработает сам.",
+            f"Сделка {lead_id} в УР без «Типа доставки» — автоперенос не знает, куда "
+            f"её вести. Дозаполните поле.",
+            "no-match-no-delivery",
+        )
+    return await _notify_fill_problem(
+        lead, TAG_BAD_FILL,
+        "⚠️ Автоперенос: заказ заполнен некорректно (тип заявки/склад/доставка не "
+        "дают определить маршрут) — сделка осталась в УР. Поправьте поля — "
+        "перенос отработает сам.",
+        f"Сделка {lead_id} в УР заполнена некорректно (тип заявки/склад/доставка) — "
+        f"автоперенос стоит. Поправьте поля.",
+        "no-match-bad-fill",
+    )
+
+
 async def process_office_transfer(lead_id, source: str = "webhook") -> str:
     """Обработчик очереди (LANE_AMO) / reconciliation. Возвращает исход
     строкой (лог/тесты). Всегда дочитывает сделку заново — состояние могло
@@ -283,7 +380,7 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
     if not OFFICE_TRANSFER_ENABLED:
         return "disabled"
 
-    lead = await amo_service.get_lead_full(lead_id, with_=())
+    lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
     if not lead:
         logger.warning("office_transfer %s: сделка не прочиталась", lead_id)
         return "failed-lead-read"
@@ -302,8 +399,31 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
 
     target = _match_rules(lead, status_id)
     if target is None:
+        if status_id == STATUS_SUCCESS:
+            return await _no_match_ur(lead)
+        # ЗНР без «Листа ожидания»/«Академии» остаётся в CLEVER — норма, молчим.
         return "no-match"
     target_pipeline_id, target_status_id = target
+
+    # PAID/CANCELLED ДО переноса (мина «копирование→перенос», фикс 31.07.2026):
+    # Метрика и Woo классифицируют предоплату по состоянию «CLEVER/142», а
+    # после PATCH сделка в нём больше не появится — сверка по расписанию его
+    # уже не застанет. Прогоняем оба синка по ещё-старому состоянию сейчас.
+    # Ошибка синка НЕ блокирует перенос: в metrika_sync теперь есть страховочная
+    # сетка (Офис/142 и ФФ дают PAID и для предоплаты, резолв умеет «сделка
+    # сама себе оригинал») — доловит при закрытии целевой воронки.
+    # Импорты ленивые — по образцу reconcile_window (кольцо woo↔metrika).
+    import metrika_sync
+    import woo_status_sync
+    try:
+        await metrika_sync.process_sync({"lead_id": lead_id}, lead=lead)
+    except Exception:
+        logger.exception("office_transfer %s: Метрика-синк до переноса упал", lead_id)
+    if woo_status_sync.is_enabled():
+        try:
+            await woo_status_sync.process_sync({"lead_id": lead_id}, lead=lead)
+        except Exception:
+            logger.exception("office_transfer %s: Woo-синк до переноса упал", lead_id)
 
     patch_kwargs: dict = {"pipeline_id": target_pipeline_id, "status_id": target_status_id}
     if target_pipeline_id == PIPELINE_OFFICE:
@@ -327,6 +447,12 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         lead_id, status_id, target_pipeline_id, target_status_id, source,
     )
     _clear_fail(lead_id)
+    # Сделка уехала штатно — снимаем сигналы проблем заполнения, если висели
+    # (менеджер дозаполнил поля после алерта — тег больше не актуален).
+    _fill_alerted.discard(int(lead.get("id")))
+    for _tag in (TAG_NO_DELIVERY, TAG_BAD_FILL):
+        if any((t.get("name") or "") == _tag for t in amo_service.get_tags(lead)):
+            await amo_service.remove_tag(lead_id, _tag, lead=lead)
 
     if target_pipeline_id == PIPELINE_FULFILLMENT and target_status_id == STATUS_FF_KONTROL:
         # Страховка: не проверено live, шлёт ли amo свежий /lead_change вебхук

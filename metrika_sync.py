@@ -203,9 +203,18 @@ def _classify(pipeline_id, status_id, cod: bool) -> tuple[str | None, bool]:
             return "IN_PROGRESS", False
         return None, False
 
-    if cod and pipeline_id == PIPELINE_OFFICE and status_id == STATUS_SUCCESS:
+    # До 31.07.2026 два условия ниже требовали cod=True: предоплата закрывалась
+    # PAID'ом в CLEVER/142 (копия оставалась там навсегда), а в Офисе/ФФ жили
+    # только копии, где ждать надо было именно наложку. С переходом на ПЕРЕНОС
+    # (office_transfer) предоплаченная сделка тоже уезжает из CLEVER и закрывается
+    # в Офисе/ФФ — PAID на закрытии нужен для всех способов оплаты. Основной
+    # захват предоплаты — синк ДО переноса в office_transfer; это страховочная
+    # сетка (поля заполнили позже / синк в момент переноса упал). Для старых
+    # не-cod копий даст повторный PAID по оригиналу — безопасно: Метрика делает
+    # upsert по id заказа, Woo completed→completed идемпотентен.
+    if pipeline_id == PIPELINE_OFFICE and status_id == STATUS_SUCCESS:
         return "PAID", True
-    if cod and pipeline_id == PIPELINE_FULFILLMENT and status_id in (
+    if pipeline_id == PIPELINE_FULFILLMENT and status_id in (
         FULFILLMENT_DELIVERED,
         FULFILLMENT_PAYMENT_FORWARDED,
     ):
@@ -344,7 +353,12 @@ async def _resolve_clever(dup_lead: dict) -> dict | None:
             _cf(cand, FIELD_MOYSKLAD_ORDER_UUID) or ""
         ).strip() == uuid:
             return cand
-    return None
+    # Сиблинга-оригинала в CLEVER нет. До 31.07.2026 здесь был return None
+    # («старьё/архив — пропуск»). С переходом на ПЕРЕНОС (office_transfer)
+    # это штатный случай: сделка САМА и есть оригинал, переехавший из CLEVER, —
+    # UUID МойСклад у неё на руках, она canonical. Побочно чинит старых
+    # сирот-копий (оригинал в архиве): раньше молча выпадали из Метрики/Woo.
+    return dup_lead
 
 
 async def _contact_info(lead: dict) -> tuple[int | None, str | None, str | None]:
