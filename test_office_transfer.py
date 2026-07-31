@@ -384,6 +384,36 @@ print("✓ reconciliation: окно не раньше OFFICE_TRANSFER_SINCE_TS (
 office_transfer.OFFICE_TRANSFER_SINCE_TS = 0
 
 
+# ── 6б) cutover-гейт ВЕБХУК-пути: старые закрытые сделки не трогаем (31.07.2026) ──
+
+office_transfer.OFFICE_TRANSFER_SINCE_TS = 1_700_000_000
+_reset()
+lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+             delivery_text="Доставка курьером по Москве")
+lead["closed_at"] = 1_699_999_999  # вход в УР ДО cutover
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "skipped-pre-cutover", res
+assert not _patches and not _tags and not _alerts
+print("✓ cutover-гейт: закрытая до включения сделка не переносится (даже вебхуком)")
+
+lead["closed_at"] = 1_700_000_001  # свежий вход ПОСЛЕ cutover
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+print("✓ cutover-гейт: вход после включения переносится штатно")
+
+office_transfer.OFFICE_TRANSFER_SINCE_TS = 0
+_reset()
+lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+             delivery_text="Доставка курьером по Москве")
+lead["closed_at"] = 1_600_000_000
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+print("✓ cutover-гейт: SINCE_TS=0 (не задан) — гейт выключен")
+
+
 # ── 7) правило «Почта России» → Офис/«Сделать накладную» (Катя 31.07.2026) ──
 
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,

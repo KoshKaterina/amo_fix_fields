@@ -397,6 +397,22 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         _clear_fail(lead_id)
         return "skipped-not-applicable"
 
+    if OFFICE_TRANSFER_SINCE_TS:
+        closed_at = int(lead.get("closed_at") or 0)
+        if closed_at and closed_at < OFFICE_TRANSFER_SINCE_TS:
+            # «Без ретроактивности» и для ВЕБХУК-пути (31.07.2026): reconciliation
+            # фильтрует по окну событий, а вебхук прилетает на ЛЮБОЕ обновление
+            # старой закрытой сделки (примечание, правка поля) — без этого гейта
+            # УР/ЗНР-архив уезжал бы в Офис при первом же касании. closed_at
+            # обновляется при переоткрытии → свежий вход в 142/143 легитимно
+            # пройдёт (новый closed_at уже после cutover).
+            logger.info(
+                "office_transfer %s: closed_at=%s < cutover=%s — скип (ретро)",
+                lead_id, closed_at, OFFICE_TRANSFER_SINCE_TS,
+            )
+            _clear_fail(lead_id)
+            return "skipped-pre-cutover"
+
     target = _match_rules(lead, status_id)
     if target is None:
         if status_id == STATUS_SUCCESS:
