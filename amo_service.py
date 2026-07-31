@@ -319,6 +319,24 @@ async def find_leads_by_query(query: str, with_: tuple[str, ...] = ()) -> list[d
     return (data.get("_embedded") or {}).get("leads") or []
 
 
+async def find_contacts_by_query(query: str, limit: int = 10) -> list[dict]:
+    """Полнотекстовый поиск контактов (query ищет и по телефонам)."""
+    data = await _do_get("/api/v4/contacts", [("query", query), ("limit", str(limit))])
+    if not data:
+        return []
+    return (data.get("_embedded") or {}).get("contacts") or []
+
+
+async def get_talks_by_contact(contact_id: int | str) -> list[dict]:
+    """Беседы (talks) контакта. У беседы: status in_work/closed, is_in_work,
+    origin (com.wazzup24* — каналы Wazzup), updated_at. Закрытие беседы в amo
+    (кнопка «Ответ не требуется» / «Завершить») переводит её в closed."""
+    data = await _do_get("/api/v4/talks", [("filter[contact_id]", str(contact_id))])
+    if not data:
+        return []
+    return (data.get("_embedded") or {}).get("talks") or []
+
+
 async def get_leads_updated_since(
     pipeline_id: int, since_ts: int, with_: tuple[str, ...] = (), page_limit: int = 250
 ) -> list[dict] | None:
