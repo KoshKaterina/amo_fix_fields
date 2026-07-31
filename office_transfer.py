@@ -106,7 +106,6 @@ from waybill_config import (
     STATUS_CREATE_WAYBILL,
     STATUS_FF_KONTROL,
     STATUS_OFFICE_DELIVERY,
-    STATUS_OFFICE_PICKUP,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_SUCCESS,
     STATUS_WAITLIST,
@@ -158,6 +157,11 @@ def _match_ur_delivery(lead: dict, *, ignore_flags: bool = False) -> tuple[int, 
 
 
 def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Самовывоз → сразу УР Офиса, НЕ рабочий этап «Самовывоз» (решение Кати
+    31.07.2026): МОП бросает сделку в УР ОП только когда клиент уже пришёл в
+    офис, оплатил и забрал товар — выдача состоялась, в Офисе делать нечего,
+    сделка закрывается. Этап «Самовывоз» при нативном копировании был
+    формальностью (копии закрывались в УР той же минутой)."""
     if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_PICKUP:
         return None
     if _application_type(lead) != APPLICATION_TYPE_ORDER:
@@ -166,7 +170,7 @@ def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, in
         return None
     if DELIVERY_SHOWROOM_MARKER not in _delivery_text(lead):
         return None
-    return (PIPELINE_OFFICE, STATUS_OFFICE_PICKUP)
+    return (PIPELINE_OFFICE, STATUS_SUCCESS)
 
 
 def _match_ur_waybill(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
@@ -563,7 +567,7 @@ async def _reconcile_loop() -> None:
 # скроенные (флаг=off) цели.
 _RULE_TARGETS = (
     (OFFICE_TRANSFER_RULE_UR_DELIVERY, PIPELINE_OFFICE, STATUS_OFFICE_DELIVERY, "УР→Офис/Оформить доставку"),
-    (OFFICE_TRANSFER_RULE_UR_PICKUP, PIPELINE_OFFICE, STATUS_OFFICE_PICKUP, "УР→Офис/Самовывоз"),
+    (OFFICE_TRANSFER_RULE_UR_PICKUP, PIPELINE_OFFICE, STATUS_SUCCESS, "УР→Офис/УР (самовывоз: выдан на месте)"),
     (OFFICE_TRANSFER_RULE_UR_WAYBILL, PIPELINE_OFFICE, STATUS_CREATE_WAYBILL, "УР→Офис/Сделать накладную"),
     (OFFICE_TRANSFER_RULE_UR_PREORDER, PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID, "УР→Офис/Предзаказ оплачен"),
     (OFFICE_TRANSFER_RULE_UR_FULFILLMENT, PIPELINE_FULFILLMENT, STATUS_FF_KONTROL, "УР→Фулфилмент/КОНТРОЛЬ"),

@@ -37,7 +37,6 @@ from waybill_config import (
     STATUS_CREATE_WAYBILL,
     STATUS_FF_KONTROL,
     STATUS_OFFICE_DELIVERY,
-    STATUS_OFFICE_PICKUP,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_SUCCESS,
     STATUS_WAITLIST,
@@ -116,7 +115,7 @@ print("✓ УР-1 Достависта: матчинг верный")
 # УР-2 Самовывоз (дискриминатор «из офиса» против «CDEK: Самовывоз»)
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_OPENED,
              delivery_text="Самовывоз из офиса Sunscrypt")
-assert office_transfer._match_ur_pickup(lead) == (PIPELINE_OFFICE, STATUS_OFFICE_PICKUP)
+assert office_transfer._match_ur_pickup(lead) == (PIPELINE_OFFICE, STATUS_SUCCESS), "самовывоз = сразу УР Офиса (Катя 31.07)"
 lead2 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_OPENED,
               delivery_text="CDEK: Самовывоз")
 assert office_transfer._match_ur_pickup(lead2) is None
