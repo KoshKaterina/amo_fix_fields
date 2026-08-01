@@ -346,6 +346,37 @@ WAZZUP_SLA_WINDOW_END_H = int(os.getenv("WAZZUP_SLA_WINDOW_END_H", "19"))      #
 WAZZUP_SLA_POLL_INTERVAL_S = int(os.getenv("WAZZUP_SLA_POLL_INTERVAL_S", "60"))  # период проверки, сек
 
 # ---------------------------------------------------------------------------
+# Контроль ДОСТАВКИ Wazzup (01.08.2026, просьба Кати). Не путать с SLA выше:
+# там таймер про молчание менеджера, здесь — про то, что сообщение не дошло до
+# клиента, хотя интерфейс нарисовал «отправлено». Модуль wazzup_delivery.
+# ---------------------------------------------------------------------------
+# ЗАХАРДКОЖЕНО ВКЛ, как WAZZUP_SLA_ENABLED: пустая строка в .env не должна
+# случайно погасить контроль.
+WAZZUP_DELIVERY_ENABLED = True
+# Сколько ждём delivered, прежде чем считать «отправлено» враньём.
+WAZZUP_UNDELIVERED_MINUTES = int(os.getenv("WAZZUP_UNDELIVERED_MINUTES", "15"))
+WAZZUP_DELIVERY_POLL_INTERVAL_S = int(os.getenv("WAZZUP_DELIVERY_POLL_INTERVAL_S", "60"))
+# Каналы, где таймер «sent без delivered» имеет смысл. У Telegram Personal
+# delivered не приходит вообще (срез 31.07: 15 исходящих, delivered — ноль),
+# там sent висит до прочтения → таймер дал бы ложные алерты. Ошибки (error)
+# ловятся на ВСЕХ каналах независимо от этого списка.
+WAZZUP_UNDELIVERED_CHAT_TYPES = {
+    s.strip().lower()
+    for s in os.getenv("WAZZUP_UNDELIVERED_CHAT_TYPES", "whatsapp,wapi").split(",")
+    if s.strip()
+}
+# Куда слать. Пусто → технический чат (TG_ALLOWED_CHAT_ID, тот же, куда /print и
+# сторож). Решение Кати 01.08: менеджеров и чат ОП пока не трогаем.
+_raw_delivery_chat = os.getenv("WAZZUP_DELIVERY_CHAT_ID", "").strip()
+WAZZUP_DELIVERY_CHAT_ID: int | None = int(_raw_delivery_chat) if _raw_delivery_chat else None
+_raw_delivery_thread = os.getenv("WAZZUP_DELIVERY_THREAD_ID", "").strip()
+WAZZUP_DELIVERY_THREAD_ID: int | None = int(_raw_delivery_thread) if _raw_delivery_thread else None
+# Антиспам на случай массового сбоя: больше BURST_MAX алертов за окно — дальше
+# одна сводная строка вместо лавины.
+WAZZUP_DELIVERY_BURST_MAX = int(os.getenv("WAZZUP_DELIVERY_BURST_MAX", "8"))
+WAZZUP_DELIVERY_BURST_WINDOW_S = int(os.getenv("WAZZUP_DELIVERY_BURST_WINDOW_S", "600"))
+
+# ---------------------------------------------------------------------------
 # Ozon Pay: счёт СБП из amo — замена виджета int2_ozonpay (MAG-285).
 # createPayment (payType=SBP), режим «самостоятельная интеграция» — тот же,
 # что у плагина сайта sunscrypt-sbp, и ключи ТЕ ЖЕ (ЛК Ozon Pay → Магазины →

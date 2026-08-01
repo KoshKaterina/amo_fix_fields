@@ -24,6 +24,7 @@ import unmiss_tag
 import urgency_tag
 import wazzup_sla
 import wazzup_forward
+import wazzup_delivery
 import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -83,11 +84,13 @@ async def lifespan(app):
     ozon_invoice.init()
     await wazzup_sla.init()
     await wazzup_forward.init()
+    await wazzup_delivery.init()
     await office_transfer.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
     await wazzup_forward.shutdown()
+    await wazzup_delivery.shutdown()
     await unmiss_tag.shutdown()
     await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
@@ -224,11 +227,11 @@ async def uis_missed_call_webhook(secret: str, request: Request):
 
 @app.post("/wazzup/{secret}")
 async def wazzup_webhook(secret: str, request: Request):
-    """Вебхук Wazzup (messages/statuses) → SLA-таймер «клиент без ответа N мин».
-    Секрет в пути — простая защита. Отвечаем 200 сразу и всегда (Wazzup при
-    ошибке/таймауте ретраит и может отключить вебхук). Тело messages[] обновляет
-    состояние ожиданий; statuses[] (доставка/ошибки) игнорируем. При установке
-    подписки Wazzup шлёт тестовый запрос — на него тоже отвечаем 200."""
+    """Вебхук Wazzup (messages/statuses) → три независимых потребителя:
+    SLA-таймер «клиент без ответа N мин», контроль доставки «сообщение не дошло»
+    и пересылка текстов в панель. Секрет в пути — простая защита. Отвечаем 200
+    сразу и всегда (Wazzup при ошибке/таймауте ретраит и может отключить вебхук).
+    При установке подписки Wazzup шлёт тестовый запрос — на него тоже 200."""
     if not WAZZUP_WEBHOOK_SECRET or secret != WAZZUP_WEBHOOK_SECRET:
         logger.warning("Wazzup webhook: неверный секрет в пути")
         return Response("forbidden", status_code=403)
@@ -244,7 +247,13 @@ async def wazzup_webhook(secret: str, request: Request):
         wazzup_sla.handle_webhook(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка обработки")
-    # Пересылка текстов в панель (wazzup_message) — независимо от SLA-обработки:
+    # Контроль доставки (statuses[] + status в messages[]) — отдельно от SLA:
+    # тот про молчание менеджера, этот про то, что сообщение не дошло до клиента.
+    try:
+        wazzup_delivery.handle_webhook(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка контроля доставки")
+    # Пересылка текстов в панель (wazzup_message) — независимо от остальных:
     # упавший таймер не должен терять сообщение (источник невосполним).
     try:
         wazzup_forward.enqueue(payload)
