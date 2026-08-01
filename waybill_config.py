@@ -375,6 +375,12 @@ WAZZUP_DELIVERY_THREAD_ID: int | None = int(_raw_delivery_thread) if _raw_delive
 # одна сводная строка вместо лавины.
 WAZZUP_DELIVERY_BURST_MAX = int(os.getenv("WAZZUP_DELIVERY_BURST_MAX", "8"))
 WAZZUP_DELIVERY_BURST_WINDOW_S = int(os.getenv("WAZZUP_DELIVERY_BURST_WINDOW_S", "600"))
+# Вечерняя сводка «отправлено / дошло / упало» по каналам, час МСК. Цифры даёт
+# панель (GET /api/ingest/wazzup/daily) — у неё вся история, а счётчики в памяти
+# интеграции обнуляются на каждом деплое. Пусто → сводку не шлём.
+_raw_summary_hour = os.getenv("WAZZUP_SUMMARY_HOUR_MSK", "20").strip()
+WAZZUP_SUMMARY_HOUR_MSK_ENABLED = bool(_raw_summary_hour)
+WAZZUP_SUMMARY_HOUR_MSK = int(_raw_summary_hour) if _raw_summary_hour else 20
 
 # ---------------------------------------------------------------------------
 # Ozon Pay: счёт СБП из amo — замена виджета int2_ozonpay (MAG-285).

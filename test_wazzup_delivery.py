@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Подменяем telegram_bot до импорта модуля: в тестах aiogram не нужен.
 _sent: list[dict] = []
+_notes: list[tuple] = []
 
 
 def _install_stubs():
@@ -37,6 +38,16 @@ def _install_stubs():
 _install_stubs()
 
 import wazzup_delivery  # noqa: E402
+import amo_service  # noqa: E402
+
+
+async def _fake_add_note(lead_id, text):
+    """Примечания в живой amo из тестов не пишем — ловим вызов."""
+    _notes.append((lead_id, text))
+    return {}
+
+
+amo_service.add_note = _fake_add_note
 
 
 # --- фикстуры-тела вебхуков (прод, 31.07.2026) ------------------------------
@@ -124,6 +135,7 @@ wazzup_delivery._resolve_lead_safe = _fake_resolve_lead
 
 def _reset():
     _sent.clear()
+    _notes.clear()
     wazzup_delivery._tracked.clear()
     wazzup_delivery._enabled = True
     wazzup_delivery._burst_window_start = 0.0
@@ -257,6 +269,78 @@ def test_ttl_cleans_up():
     _run(wazzup_delivery._sweep(threshold_s=60))
     assert wazzup_delivery._tracked == {}
     assert _sent == [], "протухшая запись чистится молча, без алерта"
+
+
+# --- примечание в сделку ----------------------------------------------------
+
+def test_error_writes_note_to_lead():
+    _reset()
+    _run(_handle(ERROR_TEMPLATE))
+    assert len(_notes) == 1, "ошибка доставки должна лечь примечанием в сделку"
+    lead_id, text = _notes[0]
+    assert lead_id == 12345
+    assert "НЕ доставлено клиенту" in text
+    assert "UNKNOWN_ERROR" in text
+    assert "Что делать" in text
+    assert "<b>" not in text, "лента amo HTML не рендерит — примечание плейн-текстом"
+
+
+def test_stuck_does_not_write_note():
+    """Примечание — только про подтверждённую недоставку. «Висит sent» ещё может дойти."""
+    _reset()
+    _run(_handle(OUT_SENT_WA))
+    wazzup_delivery._tracked["wa-sent-1"]["sent_mono"] -= 10_000
+    _run(wazzup_delivery._sweep(threshold_s=60))
+    assert _notes == []
+
+
+def test_note_written_even_when_chat_muted():
+    """Антиспам глушит ТГ, но не сделку: менеджер должен узнать про своего клиента."""
+    _reset()
+
+    async def run_all():
+        for i in range(wazzup_delivery.WAZZUP_DELIVERY_BURST_MAX + 3):
+            m = dict(ERROR_TEMPLATE["messages"][0])
+            m["messageId"] = f"muted-{i}"
+            await _handle({"messages": [m]})
+
+    _run(run_all())
+    assert len(_notes) == wazzup_delivery.WAZZUP_DELIVERY_BURST_MAX + 3
+    assert len(_sent) == wazzup_delivery.WAZZUP_DELIVERY_BURST_MAX + 1
+
+
+# --- вечерняя сводка --------------------------------------------------------
+
+DAILY = {
+    "hours": 24, "outbound": 49, "inbound": 47,
+    "by_channel": {
+        "whatsapp": {"read": 31, "delivered": 5, "error": 4, "inbound": 15},
+        "telegram": {"read": 13, "sent": 2, "inbound": 32},
+    },
+    "errors": {"UNKNOWN_ERROR": 2, "BAD_CONTACT": 1, "24_HOURS_EXCEEDED": 1},
+    "delivery_delay_median_s": 4.2,
+}
+
+
+def test_summary_text():
+    text = wazzup_delivery._build_summary(DAILY)
+    assert "Доставка Wazzup за сутки" in text
+    assert "Исходящих 49" in text
+    assert "ошибок 4" in text
+    assert "UNKNOWN_ERROR — 2" in text
+    assert "4 сек" in text
+
+
+def test_summary_without_errors():
+    text = wazzup_delivery._build_summary({**DAILY, "errors": {}, "delivery_delay_median_s": None})
+    assert "Ошибок доставки не было" in text
+    assert "пока не посчитать" in text
+
+
+def test_human_delay():
+    assert wazzup_delivery._human_delay(12) == "12 сек"
+    assert wazzup_delivery._human_delay(150) == "2.5 мин"
+    assert wazzup_delivery._human_delay(7200) == "2.0 ч"
 
 
 if __name__ == "__main__":

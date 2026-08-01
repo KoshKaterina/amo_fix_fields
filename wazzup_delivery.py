@@ -39,10 +39,14 @@ import asyncio
 import datetime
 import logging
 
+import httpx
+
 import amo_service
 import telegram_bot
 from api import BASE_URL
 from waybill_config import (
+    TEAM_INGEST_TOKEN,
+    TEAM_INGEST_URL,
     WAZZUP_DELIVERY_BURST_MAX,
     WAZZUP_DELIVERY_BURST_WINDOW_S,
     WAZZUP_DELIVERY_CHAT_ID,
@@ -50,6 +54,8 @@ from waybill_config import (
     WAZZUP_DELIVERY_POLL_INTERVAL_S,
     WAZZUP_DELIVERY_THREAD_ID,
     WAZZUP_RESPONSIBLE_TIMEOUT_S,
+    WAZZUP_SUMMARY_HOUR_MSK,
+    WAZZUP_SUMMARY_HOUR_MSK_ENABLED,
     WAZZUP_UNDELIVERED_CHAT_TYPES,
     WAZZUP_UNDELIVERED_MINUTES,
 )
@@ -254,10 +260,100 @@ async def _poll_loop() -> None:
         try:
             await asyncio.sleep(WAZZUP_DELIVERY_POLL_INTERVAL_S)
             await _sweep(threshold)
+            await _maybe_daily_summary()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Wazzup доставка: ошибка в цикле проверки")
+
+
+# --- вечерняя сводка --------------------------------------------------------
+# Дата (МСК), за которую сводку уже отправили: один раз в сутки, без персиста.
+# Рестарт в час сводки → возможен повтор; дубль сводки безобиднее пропуска.
+_summary_sent_for: str = ""
+
+
+async def _maybe_daily_summary() -> None:
+    if not WAZZUP_SUMMARY_HOUR_MSK_ENABLED:
+        return
+    global _summary_sent_for
+    now = _now_msk()
+    if now.hour != WAZZUP_SUMMARY_HOUR_MSK:
+        return
+    day = now.date().isoformat()
+    if _summary_sent_for == day:
+        return
+    _summary_sent_for = day
+    try:
+        data = await _fetch_daily()
+        if data is None:
+            logger.warning("Wazzup доставка: сводка не собрана — панель не ответила")
+            return
+        await _send(_build_summary(data))
+        logger.info("Wazzup доставка: вечерняя сводка отправлена за %s", day)
+    except Exception:
+        logger.exception("Wazzup доставка: вечерняя сводка не отправилась")
+
+
+async def _fetch_daily() -> dict | None:
+    """Сводку считает панель (у неё вся история), мы только рисуем текст.
+    Свои счётчики в памяти не держим: они обнуляются на каждом деплое."""
+    if not (TEAM_INGEST_URL and TEAM_INGEST_TOKEN):
+        return None
+    url = TEAM_INGEST_URL.rstrip("/") + "/daily"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(
+                url,
+                headers={"X-Ingest-Token": TEAM_INGEST_TOKEN},
+                params={"hours": 24},
+            )
+        if r.status_code != 200:
+            logger.warning("Wazzup доставка: сводка — панель ответила %s", r.status_code)
+            return None
+        return r.json()
+    except Exception:
+        logger.exception("Wazzup доставка: запрос сводки в панель упал")
+        return None
+
+
+def _build_summary(d: dict) -> str:
+    lines = ["📊 <b>Доставка Wazzup за сутки</b>"]
+    lines.append(f"Исходящих {d.get('outbound', 0)}, входящих {d.get('inbound', 0)}")
+
+    for chan, statuses in sorted((d.get("by_channel") or {}).items()):
+        parts = []
+        for key, label in (("delivered", "дошло"), ("read", "прочитано"),
+                           ("sent", "висит sent"), ("error", "ошибок")):
+            if statuses.get(key):
+                parts.append(f"{label} {statuses[key]}")
+        if parts:
+            lines.append(f"💬 {_esc(chan)}: " + ", ".join(parts))
+
+    errors = d.get("errors") or {}
+    if errors:
+        lines.append("⚠️ Причины ошибок:")
+        for code, n in sorted(errors.items(), key=lambda kv: -kv[1]):
+            hint = _ERROR_HINTS.get(code, "")
+            lines.append(f"  • {_esc(code)} — {n}" + (f" ({_esc(hint)})" if hint else ""))
+    else:
+        lines.append("✅ Ошибок доставки не было")
+
+    delay = d.get("delivery_delay_median_s")
+    if delay is not None:
+        lines.append(f"⏱ Медиана «отправлено → доставлено»: {_human_delay(delay)}")
+    else:
+        lines.append("⏱ Задержку пока не посчитать: нет пар «отправлено → доставлено» за сутки")
+    return "\n".join(lines)
+
+
+def _human_delay(seconds: float) -> str:
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.0f} сек"
+    if s < 3600:
+        return f"{s / 60:.1f} мин"
+    return f"{s / 3600:.1f} ч"
 
 
 async def _sweep(threshold_s: int) -> None:
@@ -297,6 +393,14 @@ async def _alert(message_id: str, info: dict, reason: str, error: dict | None) -
     info["alerted"] = True
     try:
         allowed, first_suppressed = _burst_allow()
+        lead_id, _ = await _resolve_lead_safe(info.get("chat_id") or info.get("contact_phone") or "")
+
+        # Примечание в сделку пишем ДО антиспама и независимо от него (го Кати
+        # 01.08): чат можно приглушить, а менеджер должен увидеть в своей сделке,
+        # что клиент сообщения не получил. Заглушка антиспама режет только ТГ.
+        if reason == "error" and lead_id:
+            await _note_in_lead_safe(lead_id, info, error)
+
         if not allowed:
             if first_suppressed:
                 await _send(
@@ -305,7 +409,7 @@ async def _alert(message_id: str, info: dict, reason: str, error: dict | None) -
                     f"Дальше в этом окне молчу, чтобы не залить чат: подробности в панели и логе."
                 )
             return
-        lead_id, _ = await _resolve_lead_safe(info.get("chat_id") or info.get("contact_phone") or "")
+
         await _send(_build_message(info, reason, error, lead_id))
         logger.info(
             "Wazzup доставка: алерт (%s) по сообщению %s, беседа %s",
@@ -322,6 +426,59 @@ async def _send(text: str) -> bool:
         chat_id=WAZZUP_DELIVERY_CHAT_ID,          # None → технический чат по умолчанию
         message_thread_id=WAZZUP_DELIVERY_THREAD_ID,
     )
+
+
+async def _note_in_lead_safe(lead_id, info: dict, error: dict | None) -> None:
+    """Примечание в сделку: «клиент этого сообщения не получил».
+
+    Зачем отдельно от ТГ-алерта: алерт видит только технический чат, а работать
+    с клиентом дальше менеджеру — он должен найти причину в своей же карточке.
+
+    Best-effort: amo лёг или сделка не открылась → пишем в лог и живём дальше,
+    ТГ-алерт от этого не страдает (он уходит следующей строкой)."""
+    try:
+        await asyncio.wait_for(
+            amo_service.add_note(lead_id, _build_note(info, error)),
+            timeout=WAZZUP_RESPONSIBLE_TIMEOUT_S,
+        )
+        logger.info("Wazzup доставка: примечание о недоставке в сделке %s", lead_id)
+    except asyncio.TimeoutError:
+        logger.warning("Wazzup доставка: примечание в сделку %s не успело за %sс",
+                       lead_id, WAZZUP_RESPONSIBLE_TIMEOUT_S)
+    except Exception:
+        logger.exception("Wazzup доставка: примечание в сделку %s не записалось", lead_id)
+
+
+def _build_note(info: dict, error: dict | None) -> str:
+    """Текст примечания. Без HTML: лента amo его не рендерит, а показывает как есть.
+    Первая строка — суть, дальше причина и что делать."""
+    chan = info.get("chat_type") or "мессенджер"
+    lines = [f"⚠️ Сообщение НЕ доставлено клиенту ({chan})"]
+
+    code = str((error or {}).get("error") or "").strip()
+    hint = _ERROR_HINTS.get(code, "")
+    if code:
+        lines.append(f"Причина: {code}" + (f" — {hint}" if hint else ""))
+    if code in _NOTE_ADVICE:
+        lines.append(_NOTE_ADVICE[code])
+
+    author = info.get("author_name") or ""
+    if author:
+        lines.append("Отправляла автоматика amo" if author.lower() == "admin" else f"Отправлял: {author}")
+    if info.get("text"):
+        lines.append(f"Текст: «{info['text']}»")
+    lines.append("Запись сделал контроль доставки Wazzup (amo_fix_fields).")
+    return "\n".join(lines)
+
+
+# Что делать менеджеру — только там, где совет однозначный. Молчим, если действие
+# неочевидно: пустой совет лучше вредного.
+_NOTE_ADVICE = {
+    "24_HOURS_EXCEEDED": "Что делать: написать шаблоном или связаться другим каналом.",
+    "BAD_CONTACT": "Что делать: проверить номер и написать в Telegram либо позвонить.",
+    "UNKNOWN_ERROR": "Что делать: отправить сообщение повторно; если снова упадёт — сказать Кате.",
+    "NOT_ENOUGH_MONEY": "Что делать: сообщить Кате, на канале кончились деньги.",
+}
 
 
 def _burst_allow() -> tuple[bool, bool]:
