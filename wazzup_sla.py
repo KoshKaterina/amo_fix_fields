@@ -52,8 +52,8 @@ from waybill_config import (
 # Адресат и логика тега ответственного — общие с пропущенными звонками.
 from tg_recipients import (
     NOTIFY_CHAT_ID,
-    NOTIFY_THREAD_ID,
     mentions_for,
+    route_for,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -315,9 +315,10 @@ async def _sweep(threshold_s: int) -> None:
             lead_id, responsible_id = await _resolve_lead_safe(st["chat_id"])
             mentions = mentions_for(responsible_id)
             text = _build_message(st, lead_id, mentions)
+            chat_id, thread_id = route_for(responsible_id)
             ok = await telegram_bot.send_alert(
                 text, parse_mode="HTML",
-                chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+                chat_id=chat_id, message_thread_id=thread_id,
             )
             st["alerted"] = True
             logger.info(

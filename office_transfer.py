@@ -281,13 +281,15 @@ async def _stale_alert(lead: dict, state: dict) -> None:
         return
     state["alerted"] = True
     lead_id = lead.get("id")
-    mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    responsible_id = lead.get("responsible_user_id")
+    mentions = tg_recipients.mentions_for(responsible_id)
+    chat_id, thread_id = tg_recipients.route_for(responsible_id)
     await telegram_bot.send_alert(
         f"🚨 Сделка {lead_id} застряла в УР/ЗНР дольше {int(age_min)} мин, "
         f"автоперенос не удался — нужна ручная проверка.\n"
         f"{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
     )
 
 
@@ -329,11 +331,13 @@ async def _notify_fill_problem(lead: dict, tag: str, note: str, alert: str, outc
     logger.warning("office_transfer %s: %s", lead_id, outcome)
     await amo_service.add_tag(lead_id, tag)
     await amo_service.add_note(lead_id, note)
-    mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    responsible_id = lead.get("responsible_user_id")
+    mentions = tg_recipients.mentions_for(responsible_id)
+    chat_id, thread_id = tg_recipients.route_for(responsible_id)
     await telegram_bot.send_alert(
         f"⚠️ {alert}\n{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
     )
     return outcome
 

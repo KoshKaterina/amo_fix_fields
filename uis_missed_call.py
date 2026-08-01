@@ -20,12 +20,13 @@ GET на наш /uis/<secret> с нативными макросами:
 Дедуп по call_session_id (защита от ретраев UIS). Работа — в фоне, эндпоинт
 отвечает 200 сразу (UIS ждёт быстрый ответ, иначе ретраит 4 раза).
 
-Шлём в супергруппу ОП (NOTIFY_CHAT_ID), в топик РОЗНИЦА (NOTIFY_THREAD_ID).
+Куда слать — решает tg_recipients.route_for() по ответственному сделки:
+по умолчанию супергруппа ОП / топик РОЗНИЦА, сделки ОПТ — в свою группу.
 
 ⚠️ ВРЕМЕННОЕ (уточнить перед закреплением):
   • MANAGERS_ON_SHIFT — фикс.список хендлов. TODO: динамика «кто на смене».
-  • NOTIFY_THREAD_ID сменить топик — взять новый thread_id из логов catch-all
-    (thread_id=… по сообщению в нужном топике).
+  • Сменить чат/топик — правится в tg_recipients (NOTIFY_* и TG_OPT_CHAT_ID);
+    новый thread_id видно в логах catch-all по сообщению в нужном топике.
 """
 
 import asyncio
@@ -36,9 +37,8 @@ import amo_service
 import telegram_bot
 from api import BASE_URL
 from tg_recipients import (
-    NOTIFY_CHAT_ID,
-    NOTIFY_THREAD_ID,
     missed_call_mentions,
+    route_for,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -89,9 +89,10 @@ async def _apply(params: dict) -> None:
             logger.warning("UIS пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", call_id)
             lead_id, responsible_id = None, None
         text = _build_message(phone, name, lead_id, missed_call_mentions(responsible_id))
+        chat_id, thread_id = route_for(responsible_id)
         ok = await telegram_bot.send_alert(
             text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+            chat_id=chat_id, message_thread_id=thread_id,
         )
         logger.info(
             "UIS пропущенный: алерт %s (тел=%s lead=%s call=%s)",

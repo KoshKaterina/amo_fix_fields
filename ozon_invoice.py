@@ -237,11 +237,13 @@ async def _fail(lead: dict, reason: str, detail: str = "") -> None:
         note += f"\n{detail}"
     await amo_service.add_tag(lead_id, TAG_INVOICE_ERROR)
     await amo_service.add_note(lead_id, note)
-    mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    responsible_id = lead.get("responsible_user_id")
+    mentions = tg_recipients.mentions_for(responsible_id)
+    chat_id, thread_id = tg_recipients.route_for(responsible_id)
     await telegram_bot.send_alert(
         f"⚠️ {reason}\n{name}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
     )
 
 
@@ -735,7 +737,8 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
     age_days = age_min / 1440
     escalate = age_days >= OZON_STALE_ESCALATE_DAYS
 
-    mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    responsible_id = lead.get("responsible_user_id")
+    mentions = tg_recipients.mentions_for(responsible_id)
     tail = "" if rejected else " (статус Ozon: {})".format(status or "неизвестен")
     title = lead.get("name") or "сделка {}".format(lead_id)
     text = (
@@ -743,10 +746,11 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
         f"{title}\n"
         f"{AMO_LEAD_URL.format(lead_id)}\n{mentions}"
     )
+    chat_id, thread_id = tg_recipients.route_for(responsible_id)
     await telegram_bot.send_alert(
         text,
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
     )
     _stale_alerted[lead_id] = time.time()
     try:

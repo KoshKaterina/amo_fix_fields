@@ -192,6 +192,70 @@ def test_mentions_unknown_falls_back_to_shift():
     assert T.mentions_for(999999) == T.MANAGERS_ON_SHIFT  # не наш МОП → вся смена
 
 
+def test_mentions_artem_b2b():
+    # ОПТ-сделки не должны падать в фолбэк «вся розничная смена».
+    assert T.mentions_for(13822630) == "@sunscryptb2b @gladkov_369"
+
+
+# --- Маршрут алерта: ОПТ отдельно от розницы --------------------------------
+
+def _with_opt_route(chat, thread):
+    """Подменяет настройки группы ОПТ на время одного теста."""
+    saved = (T.OPT_CHAT_ID, T.OPT_THREAD_ID)
+    T.OPT_CHAT_ID, T.OPT_THREAD_ID = chat, thread
+    return saved
+
+
+def _restore_opt_route(saved):
+    T.OPT_CHAT_ID, T.OPT_THREAD_ID = saved
+
+
+def test_route_retail_goes_to_default():
+    saved = _with_opt_route(-1009999999999, 7)
+    try:
+        assert T.route_for(13929334) == (T.NOTIFY_CHAT_ID, T.NOTIFY_THREAD_ID)  # Егор
+        assert T.route_for(None) == (T.NOTIFY_CHAT_ID, T.NOTIFY_THREAD_ID)
+        assert T.route_for(999999) == (T.NOTIFY_CHAT_ID, T.NOTIFY_THREAD_ID)
+    finally:
+        _restore_opt_route(saved)
+
+
+def test_route_artem_goes_to_opt():
+    saved = _with_opt_route(-1009999999999, 7)
+    try:
+        assert T.route_for(13822630) == (-1009999999999, 7)
+        assert T.route_for("13822630") == (-1009999999999, 7)  # id строкой из amo
+    finally:
+        _restore_opt_route(saved)
+
+
+def test_route_opt_without_thread():
+    # Обычная группа (не форум) — thread None, шлём в General.
+    saved = _with_opt_route(-1009999999999, None)
+    try:
+        assert T.route_for(13822630) == (-1009999999999, None)
+    finally:
+        _restore_opt_route(saved)
+
+
+def test_route_falls_back_when_opt_not_configured():
+    # id группы ОПТ не задан → алерт идёт в общий чат, а не теряется.
+    saved = _with_opt_route(None, None)
+    try:
+        assert T.route_for(13822630) == (T.NOTIFY_CHAT_ID, T.NOTIFY_THREAD_ID)
+    finally:
+        _restore_opt_route(saved)
+
+
+def test_route_survives_garbage_responsible():
+    saved = _with_opt_route(-1009999999999, 7)
+    try:
+        assert T.route_for("не число") == (T.NOTIFY_CHAT_ID, T.NOTIFY_THREAD_ID)
+        assert T.route_for({}) == (T.NOTIFY_CHAT_ID, T.NOTIFY_THREAD_ID)
+    finally:
+        _restore_opt_route(saved)
+
+
 # --- «Ответ не требуется»: беседа закрыта в amo → алерт не нужен -------------
 
 def _talk(status="closed", origin="com.wazzup24.wz", updated_at=0):
