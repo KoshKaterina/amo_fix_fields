@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import datetime
 import os
 import sys
 import types
@@ -132,11 +133,18 @@ async def _fake_resolve_lead(query):
 
 wazzup_delivery._resolve_lead_safe = _fake_resolve_lead
 
+# Настоящие «часы» модуля: тесты дайджеста подменяют их на фиксированный час.
+_real_now_msk = wazzup_delivery._now_msk
+
 
 def _reset():
     _sent.clear()
     _notes.clear()
     wazzup_delivery._tracked.clear()
+    wazzup_delivery._stuck_pending.clear()
+    wazzup_delivery._stuck_overflow = 0
+    wazzup_delivery._stuck_digest_sent_for = ""
+    wazzup_delivery._now_msk = _real_now_msk
     wazzup_delivery._enabled = True
     wazzup_delivery._burst_window_start = 0.0
     wazzup_delivery._burst_count = 0
@@ -164,7 +172,7 @@ def test_error_alerts_immediately():
     _run(_handle(ERROR_TEMPLATE))
     assert len(_sent) == 1, "ошибка доставки должна дать ровно один алерт"
     text = _sent[0]["text"]
-    assert "НЕ доставлено" in text
+    assert "НЕ отправлено" in text
     assert "UNKNOWN_ERROR" in text
     assert "Суров Никита Денисович" in text
     assert "79775703378" in text
@@ -197,17 +205,40 @@ def test_status_error_without_message():
     assert "закончились деньги" in _sent[0]["text"]
 
 
-# --- «отправлено, но не доставлено» -----------------------------------------
+# --- «отправлено, но доставки нет» → вечерний дайджест ------------------
 
-def test_stuck_sent_alerts_after_threshold():
+def test_stuck_sent_goes_to_digest_not_to_chat():
+    """Главное правило (Катя 02.08.2026): висяк не звенит сразу."""
     _reset()
     _run(_handle(OUT_SENT_WA))
     assert "wa-sent-1" in wazzup_delivery._tracked
     # состарим запись и прогоним sweep
     wazzup_delivery._tracked["wa-sent-1"]["sent_mono"] -= 10_000
     _run(wazzup_delivery._sweep(threshold_s=60))
-    assert len(_sent) == 1
-    assert "висит «отправлено»" in _sent[0]["text"]
+    assert _sent == [], "висяк в чат сразу не шлём"
+    assert "wa-sent-1" in wazzup_delivery._stuck_pending
+    assert wazzup_delivery._stuck_pending["wa-sent-1"]["lead_id"] == 12345
+
+
+def test_stuck_queued_once():
+    _reset()
+    _run(_handle(OUT_SENT_WA))
+    wazzup_delivery._tracked["wa-sent-1"]["sent_mono"] -= 10_000
+    _run(wazzup_delivery._sweep(threshold_s=60))
+    _run(wazzup_delivery._sweep(threshold_s=60))
+    assert len(wazzup_delivery._stuck_pending) == 1
+
+
+def test_late_delivery_removes_from_digest():
+    """Ради этого висяки и ждут вечера: дошло позже — в список не попадает."""
+    _reset()
+    _run(_handle(OUT_SENT_WA))
+    wazzup_delivery._tracked["wa-sent-1"]["sent_mono"] -= 10_000
+    _run(wazzup_delivery._sweep(threshold_s=60))
+    _run(_handle({"statuses": [{"messageId": "wa-sent-1", "status": "delivered"}]}))
+    assert wazzup_delivery._stuck_pending == {}
+    assert wazzup_delivery._tracked == {}
+    assert _sent == []
 
 
 def test_delivered_cancels_timer():
@@ -215,9 +246,9 @@ def test_delivered_cancels_timer():
     _run(_handle(OUT_SENT_WA))
     _run(_handle({"statuses": [{"messageId": "wa-sent-1", "status": "delivered"}]}))
     assert "wa-sent-1" not in wazzup_delivery._tracked
-    wazzup_delivery._tracked.clear()
     _run(wazzup_delivery._sweep(threshold_s=0))
     assert _sent == [], "доставленное сообщение алертить нельзя"
+    assert wazzup_delivery._stuck_pending == {}
 
 
 def test_telegram_sent_is_not_tracked():
@@ -269,6 +300,90 @@ def test_ttl_cleans_up():
     _run(wazzup_delivery._sweep(threshold_s=60))
     assert wazzup_delivery._tracked == {}
     assert _sent == [], "протухшая запись чистится молча, без алерта"
+
+
+# --- вечерний дайджест висяков ----------------------------------------------
+
+class _FakeMsk:
+    """Подменяем «сейчас» по МСК: дайджест смотрит на час."""
+
+    def __init__(self, hour, day=2):
+        self._dt = datetime.datetime(2026, 8, day, hour, 5, tzinfo=wazzup_delivery._MSK)
+
+    def __call__(self):
+        return self._dt
+
+
+def _queue_stuck(message_id="wa-sent-1", payload=OUT_SENT_WA):
+    """Кладёт исходящее в очередь дайджеста через настоящий sweep."""
+    _run(_handle(payload))
+    wazzup_delivery._tracked[message_id]["sent_mono"] -= 10_000
+    _run(wazzup_delivery._sweep(threshold_s=60))
+
+
+def test_digest_silent_before_its_hour():
+    _reset()
+    _queue_stuck()
+    wazzup_delivery._now_msk = _FakeMsk(wazzup_delivery.WAZZUP_STUCK_DIGEST_HOUR_MSK - 1)
+    _run(wazzup_delivery._maybe_stuck_digest())
+    assert _sent == [], "до часа дайджеста молчим"
+    assert len(wazzup_delivery._stuck_pending) == 1
+
+
+def test_digest_sends_at_its_hour():
+    _reset()
+    _queue_stuck()
+    wazzup_delivery._now_msk = _FakeMsk(wazzup_delivery.WAZZUP_STUCK_DIGEST_HOUR_MSK)
+    _run(wazzup_delivery._maybe_stuck_digest())
+    assert len(_sent) == 1
+    text = _sent[0]["text"]
+    assert "Отправлено, но в Wazzup не помечено как доставлено: 1" in text
+    assert "Егор Константинов" in text
+    assert "Заказ собран" in text
+    assert "/leads/detail/12345" in text
+    assert wazzup_delivery._stuck_pending == {}, "очередь чистится после отправки"
+
+
+def test_digest_once_per_day():
+    _reset()
+    _queue_stuck()
+    wazzup_delivery._now_msk = _FakeMsk(wazzup_delivery.WAZZUP_STUCK_DIGEST_HOUR_MSK)
+    _run(wazzup_delivery._maybe_stuck_digest())
+    # новый висяк в тот же час — ждёт завтрашнего дайджеста, а не второго сегодня
+    wazzup_delivery._stuck_pending["wa-sent-2"] = {
+        "sent_at_msk": "18:07", "contact_name": "Клиент", "chat_id": "79001234568",
+        "author_name": "Егор Константинов", "text": "ещё одно",
+    }
+    _run(wazzup_delivery._maybe_stuck_digest())
+    assert len(_sent) == 1, "второй раз за те же сутки дайджест не шлём"
+
+
+def test_digest_silent_when_nothing_stuck():
+    _reset()
+    wazzup_delivery._now_msk = _FakeMsk(wazzup_delivery.WAZZUP_STUCK_DIGEST_HOUR_MSK)
+    _run(wazzup_delivery._maybe_stuck_digest())
+    assert _sent == [], "пустой день — без «всё хорошо» в чат"
+
+
+def test_digest_trims_long_list():
+    _reset()
+    items = [
+        {"sent_at_msk": "11:1%d" % (i % 10), "contact_name": f"Клиент {i}",
+         "chat_id": f"7900000000{i}", "author_name": "Егор Константинов", "text": "тест"}
+        for i in range(wazzup_delivery.WAZZUP_STUCK_DIGEST_MAX_LINES + 7)
+    ]
+    text = wazzup_delivery._build_stuck_digest(items, overflow=3)
+    assert f"как доставлено: {len(items)}" in text
+    assert "…и ещё 10 — смотреть в панели" in text, "7 обрезанных + 3 не влезших в очередь"
+
+
+def test_digest_marks_automation():
+    _reset()
+    text = wazzup_delivery._build_stuck_digest([
+        {"sent_at_msk": "09:30", "contact_name": "Клиент", "chat_id": "79001234567",
+         "author_name": "Admin", "text": "Ваш заказ"}
+    ])
+    assert "автоматика amo" in text
 
 
 # --- примечание в сделку ----------------------------------------------------

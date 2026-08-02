@@ -382,6 +382,19 @@ _raw_summary_hour = os.getenv("WAZZUP_SUMMARY_HOUR_MSK", "20").strip()
 WAZZUP_SUMMARY_HOUR_MSK_ENABLED = bool(_raw_summary_hour)
 WAZZUP_SUMMARY_HOUR_MSK = int(_raw_summary_hour) if _raw_summary_hour else 20
 
+# Дайджест «висит sent, доставки нет» — час МСК (решение Кати 02.08.2026).
+# Раньше каждое такое сообщение било в чат через 15 минут; важен сам факт
+# отправки, а не скорость доставки, поэтому копим за день и шлём ОДНИМ списком.
+# Ошибки отправки (error) этого не касаются — они уходят сразу, как и раньше.
+# Пусто → дайджест не шлём (и «висяки» тогда не всплывают нигде, кроме панели).
+_raw_stuck_hour = os.getenv("WAZZUP_STUCK_DIGEST_HOUR_MSK", "18").strip()
+WAZZUP_STUCK_DIGEST_ENABLED = bool(_raw_stuck_hour)
+WAZZUP_STUCK_DIGEST_HOUR_MSK = int(_raw_stuck_hour) if _raw_stuck_hour else 18
+# Сколько строк печатаем в дайджесте; остальные сворачиваем в «и ещё N».
+WAZZUP_STUCK_DIGEST_MAX_LINES = int(os.getenv("WAZZUP_STUCK_DIGEST_MAX_LINES", "30"))
+# Потолок очереди в памяти, чтобы сутки молчания не съели процесс.
+WAZZUP_STUCK_QUEUE_MAX = int(os.getenv("WAZZUP_STUCK_QUEUE_MAX", "500"))
+
 # ---------------------------------------------------------------------------
 # Ozon Pay: счёт СБП из amo — замена виджета int2_ozonpay (MAG-285).
 # createPayment (payType=SBP), режим «самостоятельная интеграция» — тот же,

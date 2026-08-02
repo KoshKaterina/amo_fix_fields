@@ -6,13 +6,17 @@ Wazzup кивает на amo. Разведка 01.08 показала, что г
 присылает нам статус доставки, мы его просто выбрасывали (`wazzup_sla` явно
 игнорирует statuses[] — там таймер про ДРУГОЕ, про молчание менеджера).
 
-Ловим два разных случая:
+Ловим два разных случая, и срочность у них РАЗНАЯ (уточнение Кати 02.08.2026:
+«важно именно отправлено, а не доставлено»):
 
   1. `error` — Wazzup честно говорит «не доставлено» и называет причину
-     (UNKNOWN_ERROR, BAD_CONTACT, 24_HOURS_EXCEEDED). Приходит сразу, тем же
-     dateTime, что и само сообщение → алерт мгновенный, без таймера.
+     (UNKNOWN_ERROR, BAD_CONTACT, 24_HOURS_EXCEEDED). Сообщение не ушло, тут
+     нужны руки менеджера → алерт мгновенный, без таймера, плюс примечание
+     в сделку.
   2. `sent`, который так и не стал `delivered` за WAZZUP_UNDELIVERED_MINUTES —
-     «ушло в никуда». Здесь нужен таймер и состояние.
+     ушло, но подтверждения нет. Дёргать по каждому смысла нет: копим за день
+     и в WAZZUP_STUCK_DIGEST_HOUR_MSK (18:00 МСК) шлём ОДНИМ списком. Дошло
+     позже — тихо убираем из списка, до вечера ещё есть время.
 
 ⚠️ Случай 2 считаем ТОЛЬКО по каналам из WAZZUP_UNDELIVERED_CHAT_TYPES
 (по умолчанию whatsapp/wapi). Причина фактическая: в срезе за 31.07 у Telegram
@@ -54,6 +58,10 @@ from waybill_config import (
     WAZZUP_DELIVERY_POLL_INTERVAL_S,
     WAZZUP_DELIVERY_THREAD_ID,
     WAZZUP_RESPONSIBLE_TIMEOUT_S,
+    WAZZUP_STUCK_DIGEST_ENABLED,
+    WAZZUP_STUCK_DIGEST_HOUR_MSK,
+    WAZZUP_STUCK_DIGEST_MAX_LINES,
+    WAZZUP_STUCK_QUEUE_MAX,
     WAZZUP_SUMMARY_HOUR_MSK,
     WAZZUP_SUMMARY_HOUR_MSK_ENABLED,
     WAZZUP_UNDELIVERED_CHAT_TYPES,
@@ -66,9 +74,17 @@ _MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 # messageId → сведения об исходящем, ждущем доставки.
 #   sent_mono    : monotonic, когда мы узнали о сообщении (для таймера)
+#   sent_at_msk  : «ЧЧ:ММ» МСК для человека в дайджесте
 #   chat_type / chat_id / contact_name / author_name / text / msg_type
-#   alerted      : алерт по этому сообщению уже ушёл (не дублируем)
+#   alerted      : алерт (или постановка в дайджест) по нему уже был
 _tracked: dict[str, dict] = {}
+
+# messageId → то же самое, но уже отложенное в вечерний дайджест «висит sent».
+# Отдельно от _tracked: там записи чистит TTL через 6 часов, а утренний висяк
+# должен дожить до 18:00. Доставка, пришедшая позже, убирает запись отсюда.
+_stuck_pending: dict[str, dict] = {}
+# Сколько висяков не влезло в очередь (потолок WAZZUP_STUCK_QUEUE_MAX).
+_stuck_overflow: int = 0
 
 # Сколько держим запись без развязки (доставки/ошибки), прежде чем забыть.
 _TTL_SECONDS = 6 * 3600
@@ -110,9 +126,10 @@ async def init() -> None:
     _enabled = True
     _loop_task = asyncio.create_task(_poll_loop())
     logger.info(
-        "Wazzup доставка: включена — ошибки сразу, «sent без delivered» через %s мин "
-        "(каналы %s), опрос %s сек, чат %s",
+        "Wazzup доставка: включена — ошибки сразу, «sent без delivered» копим "
+        "с %s мин в дайджест на %s:00 МСК (каналы %s), опрос %s сек, чат %s",
         WAZZUP_UNDELIVERED_MINUTES,
+        WAZZUP_STUCK_DIGEST_HOUR_MSK if WAZZUP_STUCK_DIGEST_ENABLED else "выкл",
         ",".join(sorted(WAZZUP_UNDELIVERED_CHAT_TYPES)) or "—",
         WAZZUP_DELIVERY_POLL_INTERVAL_S,
         WAZZUP_DELIVERY_CHAT_ID if WAZZUP_DELIVERY_CHAT_ID is not None else "технический (по умолчанию)",
@@ -178,17 +195,18 @@ def _handle_messages(messages) -> None:
             "text": _snippet(m.get("text")),
             "alerted": info.get("alerted", False),
             "sent_mono": info.get("sent_mono") or _monotonic(),
+            "sent_at_msk": info.get("sent_at_msk") or _now_msk().strftime("%H:%M"),
         })
         status = str(m.get("status") or "").lower()
 
         if status == "error":
             err = m.get("error") if isinstance(m.get("error"), dict) else {}
             _tracked[message_id] = info
-            _alert_bg(message_id, info, reason="error", error=err)
+            _alert_bg(message_id, info, error=err)
             continue
 
         if status in _OK_STATUSES:
-            _tracked.pop(message_id, None)
+            _forget(message_id)
             continue
 
         # sent (или статуса ещё нет) — ждём развязки, но только там, где
@@ -209,7 +227,9 @@ def _handle_statuses(statuses) -> None:
             continue
 
         if status in _OK_STATUSES:
-            _tracked.pop(message_id, None)
+            # Дошло — даже если мы уже положили сообщение в вечерний дайджест.
+            # Ради этого висяки и ждут до 18:00: доставка часто приходит позже.
+            _forget(message_id)
             continue
 
         if status == "error":
@@ -228,10 +248,18 @@ def _handle_statuses(statuses) -> None:
                     "text": "",
                     "alerted": False,
                     "sent_mono": _monotonic(),
+                    "sent_at_msk": _now_msk().strftime("%H:%M"),
                 }
                 _tracked[message_id] = info
             err = s.get("error") if isinstance(s.get("error"), dict) else {}
-            _alert_bg(message_id, info, reason="error", error=err)
+            _alert_bg(message_id, info, error=err)
+
+
+def _forget(message_id: str) -> None:
+    """Сообщение развязалось (delivered/read) — убираем его и из ожидания,
+    и из очереди на вечерний дайджест."""
+    _tracked.pop(message_id, None)
+    _stuck_pending.pop(message_id, None)
 
 
 def _is_outbound(m: dict) -> bool:
@@ -251,7 +279,7 @@ def _snippet(text) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Таймер «отправлено, но не доставлено»
+# Очередь «отправлено, но не доставлено» → вечерний дайджест
 # ---------------------------------------------------------------------------
 
 async def _poll_loop() -> None:
@@ -260,6 +288,7 @@ async def _poll_loop() -> None:
         try:
             await asyncio.sleep(WAZZUP_DELIVERY_POLL_INTERVAL_S)
             await _sweep(threshold)
+            await _maybe_stuck_digest()
             await _maybe_daily_summary()
         except asyncio.CancelledError:
             raise
@@ -357,6 +386,12 @@ def _human_delay(seconds: float) -> str:
 
 
 async def _sweep(threshold_s: int) -> None:
+    """Переводит созревшие «висит sent» в очередь на вечерний дайджест.
+
+    В чат отсюда НИЧЕГО не уходит (решение Кати 02.08.2026). Сразу дёргаем
+    только на ошибке отправки — это делает обработчик вебхука.
+    """
+    global _stuck_overflow
     now_mono = _monotonic()
     due: list[tuple[str, dict]] = []
     for message_id, info in list(_tracked.items()):
@@ -368,23 +403,105 @@ async def _sweep(threshold_s: int) -> None:
             due.append((message_id, info))
 
     for message_id, info in due:
-        await _alert(message_id, info, reason="stuck", error=None)
+        # Помечаем сразу: второй раз в очередь то же сообщение не кладём.
+        info["alerted"] = True
+        if len(_stuck_pending) >= WAZZUP_STUCK_QUEUE_MAX:
+            _stuck_overflow += 1
+            continue
+        # Сделку ищем здесь, а не в 18:00: висяки приходят по одному в течение
+        # дня, и amo не получит полсотни запросов залпом в час дайджеста.
+        lead_id, _ = await _resolve_lead_safe(
+            info.get("chat_id") or info.get("contact_phone") or ""
+        )
+        _stuck_pending[message_id] = {**info, "lead_id": lead_id}
+
+
+# Дата (МСК), за которую дайджест уже ушёл. Без персиста, как и вечерняя сводка.
+_stuck_digest_sent_for: str = ""
+
+
+async def _maybe_stuck_digest() -> None:
+    """Раз в сутки, в WAZZUP_STUCK_DIGEST_HOUR_MSK, отдаём накопленные висяки
+    одним сообщением. Пусто → молчим: чат не должен звенеть ради «всё дошло»."""
+    if not WAZZUP_STUCK_DIGEST_ENABLED:
+        return
+    global _stuck_digest_sent_for, _stuck_overflow
+    now = _now_msk()
+    if now.hour != WAZZUP_STUCK_DIGEST_HOUR_MSK:
+        return
+    day = now.date().isoformat()
+    if _stuck_digest_sent_for == day:
+        return
+    _stuck_digest_sent_for = day
+
+    items = list(_stuck_pending.values())
+    overflow = _stuck_overflow
+    # Чистим ДО отправки: упавший телеграм не должен превратить эти же висяки
+    # в завтрашний дайджест задним числом.
+    _stuck_pending.clear()
+    _stuck_overflow = 0
+    if not items:
+        logger.info("Wazzup доставка: висяков за %s нет, дайджест не шлём", day)
+        return
+    try:
+        await _send(_build_stuck_digest(items, overflow))
+        logger.info("Wazzup доставка: дайджест висяков за %s — %s шт", day, len(items))
+    except Exception:
+        logger.exception("Wazzup доставка: дайджест висяков не отправился")
+
+
+def _build_stuck_digest(items: list[dict], overflow: int = 0) -> str:
+    """Список «ушло, а подтверждения так и нет» за день.
+
+    Формулировка мягкая намеренно: часть таких сообщений клиент получает, просто
+    Wazzup не присылает delivered. Это повод посмотреть, а не ЧП.
+    """
+    lines = [
+        f"⏱ <b>Отправлено, но в Wazzup не помечено как доставлено: {len(items)}</b>",
+        f"За сегодня, ждали больше {WAZZUP_UNDELIVERED_MINUTES} мин. "
+        f"Ошибки отправки сюда не входят — по ним алерт приходил сразу.",
+        "",
+    ]
+
+    shown = items[:WAZZUP_STUCK_DIGEST_MAX_LINES]
+    for it in shown:
+        when = it.get("sent_at_msk") or "—"
+        who = it.get("contact_name") or it.get("chat_id") or it.get("contact_phone") or "—"
+        head = f"• {when} · {_esc(str(who))}"
+        ident = it.get("chat_id") or it.get("contact_phone") or ""
+        if ident and ident != who:
+            head += f" · {_esc(str(ident))}"
+        author = it.get("author_name") or ""
+        if author:
+            head += f" · {'автоматика amo' if author.lower() == 'admin' else _esc(author)}"
+        if it.get("lead_id"):
+            head += f' · <a href="{BASE_URL}/leads/detail/{it["lead_id"]}">сделка</a>'
+        lines.append(head)
+        if it.get("text"):
+            lines.append(f"   «{_esc(it['text'])}»")
+
+    hidden = len(items) - len(shown) + max(0, overflow)
+    if hidden > 0:
+        lines.append(f"…и ещё {hidden} — смотреть в панели")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Алерт
+# Алерт про ошибку отправки — сразу
 # ---------------------------------------------------------------------------
 
-def _alert_bg(message_id: str, info: dict, reason: str, error: dict | None) -> None:
+def _alert_bg(message_id: str, info: dict, error: dict | None) -> None:
     """Алерт из обработчика вебхука — фоном, чтобы не задерживать ответ Wazzup."""
     try:
-        asyncio.get_running_loop().create_task(_alert(message_id, info, reason, error))
+        asyncio.get_running_loop().create_task(_alert(message_id, info, error))
     except RuntimeError:
         # Нет живого цикла (тесты, синхронный вызов) — молча пропускаем.
         logger.debug("Wazzup доставка: нет event loop, алерт %s не отправлен", message_id)
 
 
-async def _alert(message_id: str, info: dict, reason: str, error: dict | None) -> None:
+async def _alert(message_id: str, info: dict, error: dict | None) -> None:
+    """Алерт только про подтверждённую ошибку отправки: сообщение не ушло.
+    «Висит sent» сюда больше не попадает — его собирает вечерний дайджест."""
     if info.get("alerted"):
         return
     # Помечаем СРАЗУ и запись НЕ удаляем: Wazzup спокойно шлёт тот же вебхук
@@ -398,7 +515,7 @@ async def _alert(message_id: str, info: dict, reason: str, error: dict | None) -
         # Примечание в сделку пишем ДО антиспама и независимо от него (го Кати
         # 01.08): чат можно приглушить, а менеджер должен увидеть в своей сделке,
         # что клиент сообщения не получил. Заглушка антиспама режет только ТГ.
-        if reason == "error" and lead_id:
+        if lead_id:
             await _note_in_lead_safe(lead_id, info, error)
 
         if not allowed:
@@ -410,10 +527,10 @@ async def _alert(message_id: str, info: dict, reason: str, error: dict | None) -
                 )
             return
 
-        await _send(_build_message(info, reason, error, lead_id))
+        await _send(_build_message(info, error, lead_id))
         logger.info(
-            "Wazzup доставка: алерт (%s) по сообщению %s, беседа %s",
-            reason, message_id, info.get("chat_id") or "—",
+            "Wazzup доставка: алерт об ошибке по сообщению %s, беседа %s",
+            message_id, info.get("chat_id") or "—",
         )
     except Exception:
         logger.exception("Wazzup доставка: не смогла отправить алерт %s", message_id)
@@ -534,13 +651,8 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_message(info: dict, reason: str, error: dict | None, lead_id) -> str:
-    if reason == "error":
-        lines = ["🚫 <b>Сообщение НЕ доставлено</b>"]
-    else:
-        lines = [
-            f"⏱ <b>Сообщение висит «отправлено» {WAZZUP_UNDELIVERED_MINUTES}+ мин</b> — доставки нет"
-        ]
+def _build_message(info: dict, error: dict | None, lead_id) -> str:
+    lines = ["🚫 <b>Сообщение НЕ отправлено</b>"]
 
     chan = info.get("chat_type") or ""
     who = info.get("contact_name") or ""
