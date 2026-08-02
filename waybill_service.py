@@ -52,6 +52,15 @@ _alert_callback: Callable[[str], Awaitable[None]] | None = None
 WAYBILL_ALERT_COOLDOWN_SECONDS = float(os.getenv("WAYBILL_ALERT_COOLDOWN_SECONDS", "1800"))
 _alert_last_sent: dict[str, float] = {}
 
+# Защита ТОЛЬКО от initial-стирания поля 571657 сторонним МойСклад-виджетом
+# amgroup сразу после создания накладной (разбор 01.08.2026, сделка 36526319:
+# поле стёрлось через 16с после записи). Никакой периодической/часовой
+# проверки намеренно нет — поле 571657, пустое ПОЗЖЕ (не сразу после этой
+# записи), может быть намеренно очищено оператором для пересоздания накладной
+# (см. cdek.md: «если поле уже заполнено — накладная не пересоздаётся») —
+# такое трогать нельзя, это не баг, а осознанный /retry.
+TREK_VERIFY_DELAY_S = float(os.getenv("TREK_VERIFY_DELAY_S", "60"))
+
 
 def set_alert_callback(fn: Callable[[str], Awaitable[None]]) -> None:
     global _alert_callback
@@ -361,6 +370,8 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         await _alert(critical)
         return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
 
+    asyncio.create_task(_verify_trek_after_delay(lead_id, cdek_value))
+
     # 9. Прозрачность: если объявленная ценность СДЭК проставлена заглушкой —
     #    примечание в сделку, чтобы офис видел (сумма заказа была 0).
     if used_cost_placeholder:
@@ -383,6 +394,90 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
 
     logger.info("Lead %s waybill created: cdek=%s uuid=%s", lead_id, cdek_number, order_uuid)
     return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}
+
+
+async def _last_field_clear_actor(lead_id, field_id: int) -> int | None:
+    """created_by последнего события «поле обнулено» (value_after=[]) для этого
+    поля на сделке. amoCRM кодирует роботов/API как created_by=0 и живых
+    пользователей — их реальным numeric id (проверено эмпирически на этой же
+    сделке 36526319: ручная правка поля 572499 показала created_by=13929334,
+    а не 0). None — если подходящее событие не нашлось (не должно случаться,
+    раз поле реально пусто, но перестраховываемся, а не гадаем)."""
+    params = [
+        ("filter[entity]", "lead"),
+        ("filter[entity_id]", str(lead_id)),
+        ("filter[type]", f"custom_field_{field_id}_value_changed"),
+        ("limit", "100"),
+    ]
+    d = await amo_service._do_get("/api/v4/events", params)
+    events = ((d or {}).get("_embedded") or {}).get("events") or []
+    cleared = [e for e in events if not (e.get("value_after") or [])]
+    if not cleared:
+        return None
+    latest = max(cleared, key=lambda e: e.get("created_at") or 0)
+    return latest.get("created_by")
+
+
+async def _verify_trek_after_delay(lead_id, cdek_value: str) -> None:
+    """Перечитывает сделку через TREK_VERIFY_DELAY_S после записи трек-номера;
+    если поле 571657 снова пусто — сверяет, КТО его обнулил (см.
+    _last_field_clear_actor), и восстанавливает ТОЛЬКО его (без статуса/тегов),
+    только если это сделал робот/интеграция (created_by=0), а не человек. Гард
+    против намеренной ручной очистки под /retry (см. cdek.md: «если поле уже
+    заполнено — накладная не пересоздаётся» — оператор мог специально обнулить
+    поле, чтобы форсировать пересоздание, и это восстанавливать нельзя).
+    Значение для восстановления уже известно (мы сами его записали секунды
+    назад) — не гадаем по примечаниям/CDEK API. Разбор 01.08.2026, сделка
+    36526319: поле стёрлось через 16с после записи — сторонний МойСклад-виджет
+    (amgroup), не наш код."""
+    await asyncio.sleep(TREK_VERIFY_DELAY_S)
+    try:
+        lead = await amo_service.get_lead_full(lead_id, with_=())
+    except Exception:
+        logger.exception("Lead %s: post-commit trek verify failed to fetch lead", lead_id)
+        return
+    if not lead:
+        return
+    current = amo_service.get_custom_field_value(lead, FIELD_CDEK_ORDER_NUMBER)
+    if current:
+        return
+
+    try:
+        actor = await _last_field_clear_actor(lead_id, FIELD_CDEK_ORDER_NUMBER)
+    except Exception:
+        logger.exception("Lead %s: не удалось определить, кто очистил поле 571657", lead_id)
+        actor = None
+
+    if actor is None:
+        await _alert(
+            f"⚠️ Сделка {lead_id}: трек-номер СДЭК {cdek_value} пропал из поля 571657 через "
+            f"{TREK_VERIFY_DELAY_S:.0f}с после записи, но не удалось определить, кто его очистил — "
+            f"НЕ восстанавливаю автоматически, проверь вручную."
+        )
+        return
+    if actor != 0:
+        logger.info(
+            "Lead %s: поле 571657 очистил пользователь %s (не бот) — не трогаю, похоже на намеренный /retry",
+            lead_id, actor,
+        )
+        return
+
+    logger.warning(
+        "Lead %s: трек %s пропал из поля 571657 в течение %.0fс после записи (стёр бот/интеграция) — восстанавливаю",
+        lead_id, cdek_value, TREK_VERIFY_DELAY_S,
+    )
+    res = await amo_service.patch_lead(lead_id, custom_fields={FIELD_CDEK_ORDER_NUMBER: cdek_value})
+    if res.get("ok"):
+        await _alert(
+            f"⚠️ Сделка {lead_id}: трек-номер СДЭК {cdek_value} пропал из amo через "
+            f"{TREK_VERIFY_DELAY_S:.0f}с после создания накладной (стёрто ботом/интеграцией) — "
+            f"восстановлен автоматически."
+        )
+    else:
+        await _alert(
+            f"КРИТИЧНО: сделка {lead_id}, трек {cdek_value} пропал из amo и НЕ восстановился "
+            f"автоматически ({res}). Внеси номер вручную."
+        )
 
 
 async def _fail(lead_id, reason: str, source: str, current_tags: list[dict]) -> dict:
