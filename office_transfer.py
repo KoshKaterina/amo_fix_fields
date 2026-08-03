@@ -66,6 +66,7 @@ import logging
 import time
 
 import amo_service
+import migration_freeze
 import tg_recipients
 import telegram_bot
 from waybill_config import (
@@ -388,6 +389,12 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
     if not lead:
         logger.warning("office_transfer %s: сделка не прочиталась", lead_id)
         return "failed-lead-read"
+
+    # Окно миграции воронок: перенесённую сделку дальше не тащим. Проверка тут,
+    # а не только в вебхуке, — иначе reconciliation (раз в 2 минуты) подберёт её
+    # по событию входа в 142/143. Сделка уже на руках, лишнего запроса нет.
+    if await migration_freeze.skip(lead_id, "office_transfer", lead=lead):
+        return "skipped-migration-freeze"
 
     status_id = int(lead.get("status_id") or 0)
     pipeline_id = int(lead.get("pipeline_id") or 0)

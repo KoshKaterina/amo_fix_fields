@@ -495,6 +495,17 @@ OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").str
 # фича не должна включаться на проде (задать перед первым боевым включением).
 OFFICE_TRANSFER_SINCE_TS = int(os.getenv("OFFICE_TRANSFER_SINCE_TS", "0"))
 
+# ═══ Заморозка на время миграции воронок (решение Кати 03.08.2026) ═══
+# Скрипт переноса вешает каждой перенесённой сделке тег MIGRATION_FREEZE_TAG.
+# Пока идёт окно [FROM, TO], наши обработчики такие сделки игнорируют:
+# office_transfer, Метрика, Woo, гейт КОНТРОЛЬ, «Причина→ЗИН». После окна тег
+# остаётся (менеджеру видно, откуда сделка), блокировка снимается — работают
+# как с обычными. Подробности и границы применимости — migration_freeze.py.
+# Пустой тег или TO=0 → механизм выключен целиком.
+MIGRATION_FREEZE_TAG = os.getenv("MIGRATION_FREEZE_TAG", "").strip()
+MIGRATION_FREEZE_FROM_TS = int(os.getenv("MIGRATION_FREEZE_FROM_TS", "0"))
+MIGRATION_FREEZE_TO_TS = int(os.getenv("MIGRATION_FREEZE_TO_TS", "0"))
+
 # Периодическая reconciliation-проверка (страховка от зависания amo API):
 # пересматривает сделки, недавно вошедшие в 142/143, но ещё не перенесённые.
 # 0 = фоновый проход выключен (только вебхук).

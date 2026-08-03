@@ -14,6 +14,7 @@ import cdek_status_sync
 import dup_autoclose
 import jivo_service
 import metrika_sync
+import migration_freeze
 import ms_status_sync
 import office_transfer
 import ozon_invoice
@@ -321,6 +322,14 @@ async def lead_change(request: Request):
 
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
+
+    # Миграция воронок (03.08.2026): сделка с тегом «перенесено из старой
+    # воронки» в окне переноса — не наша забота. Выходим ДО всех обработчиков,
+    # иначе перенос старой сделки в 142 читается как свежая продажа: перенос в
+    # Офис/ФФ, конверсия в Метрику, Woo-заказ в completed. Вне окна проверка
+    # стоит ноль (сравнение времени), сделку не дочитываем.
+    if lead_id is not None and await migration_freeze.skip(lead_id, "lead_change"):
+        return {"status": "skipped-migration-freeze"}
 
     # Автоснятие «пропущенный» при дозвоне: реконсиляция по дочитыванию (amo не шлёт
     # теги в вебхук). На любом изменении сделки в фоне сверяем теги: если есть

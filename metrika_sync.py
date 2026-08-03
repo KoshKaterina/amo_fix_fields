@@ -31,6 +31,7 @@ import os
 import time
 
 import amo_service
+import migration_freeze
 import metrika_client
 from waybill_config import (
     FIELD_EMAIL,
@@ -230,6 +231,12 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     if lead is None:
         lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
     if not lead:
+        return
+
+    # Окно миграции воронок: перенос старой сделки в 142 — не конверсия.
+    # Проверка нужна и здесь: сверка по расписанию берёт сделки по updated_at,
+    # мимо вебхука.
+    if await migration_freeze.skip(lead_id, "Metrika", lead=lead):
         return
 
     pipeline_id = lead.get("pipeline_id")

@@ -33,6 +33,7 @@ import time
 import logging
 
 import amo_service
+import migration_freeze
 import ms_client
 from api import init_api_pipeline, shutdown_api_pipeline
 from waybill_config import (
@@ -368,6 +369,11 @@ async def process_kontrol_lead(lead_id, *, apply=True, source="webhook") -> dict
     if not lead:
         logger.warning("КОНТРОЛЬ %s: сделка не получена", lead_id)
         return {"action": "skip", "reason": "сделка не получена"}
+
+    # Окно миграции воронок: перенесённую сделку через гейт не гоняем — она
+    # попала на этап переносом, а не боевым путём заказа.
+    if await migration_freeze.skip(lead_id, "КОНТРОЛЬ", lead=lead):
+        return {"action": "skip", "reason": "окно миграции"}
 
     # Событийный вход: сверяемся, что сделка ВСЁ ЕЩЁ в КОНТРОЛЕ ФФ (человек мог увести).
     # Это же гасит петлю: перенос в «00» и простановка тега не возвращают сюда.

@@ -35,6 +35,7 @@ import logging
 import httpx
 
 import amo_service
+import sla_filter
 import telegram_bot
 from api import BASE_URL
 from waybill_config import (
@@ -119,6 +120,17 @@ def handle_webhook(payload: dict) -> None:
             # Ответили (оператор/бот/CRM) → снимаем ожидание.
             if _pending.pop(key, None) is not None:
                 logger.info("Wazzup SLA: ответ по беседе %s — ожидание снято", chat_id)
+            continue
+
+        # Закрывашка (реакция, «спасибо», «да, всё верно») НОВОЕ ожидание не
+        # запускает. Уже идущее — НЕ снимаем: если клиент спросил, ответа не
+        # получил и следом написал «спасибо», вопрос всё равно висит.
+        closing, reason = sla_filter.is_closing_message(m)
+        if closing and key not in _pending:
+            logger.info(
+                "Wazzup SLA: беседа %s — сообщение не требует ответа (%s), таймер не запускаю",
+                chat_id, reason,
+            )
             continue
 
         # Входящее от клиента. Таймер считаем от ПЕРВОГО неотвеченного сообщения:

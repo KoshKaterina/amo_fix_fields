@@ -25,6 +25,7 @@ CLEVER по UUID МойСклад).
 import logging
 
 import amo_service
+import migration_freeze
 import metrika_sync
 import woo_client
 from waybill_config import (
@@ -150,6 +151,10 @@ async def resolve_target(payload: dict, lead: dict | None = None) -> dict | None
 
 async def process_sync(payload: dict, lead: dict | None = None) -> None:
     if not _enabled:
+        return
+    # Окно миграции воронок: перенос старой сделки в 142 не должен закрывать
+    # заказ на сайте (а через него — считать реферальную комиссию).
+    if await migration_freeze.skip(payload.get("lead_id"), "Woo", lead=lead):
         return
     target = await resolve_target(payload, lead)
     if not target:
