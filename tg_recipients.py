@@ -12,9 +12,9 @@
 
 from waybill_config import WAZZUP_ALWAYS_TAG, WAZZUP_TG_HANDLES
 
-# Супергруппа ОП «Store [Отдел продаж]», топик РОЗНИЦА (thread 2). None → General.
+# Супергруппа ОП «Store [Отдел продаж]», топик УВЕДОМЛЕНИЯ (thread 10479). None → General.
 NOTIFY_CHAT_ID = -1003680811996
-NOTIFY_THREAD_ID: int | None = 2
+NOTIFY_THREAD_ID: int | None = 10479
 
 # Вся смена — фолбэк, когда ответственного-МОПа определить не удалось.
 # ⚠️ ВРЕМЕННОЕ: фикс.список хендлов. TODO: динамика «кто на смене».
