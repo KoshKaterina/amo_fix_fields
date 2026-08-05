@@ -14,6 +14,7 @@ import cdek_status_sync
 import dup_autoclose
 import jivo_service
 import metrika_sync
+import migration_freeze
 import ms_status_sync
 import office_transfer
 import ozon_invoice
@@ -44,6 +45,7 @@ from queue_manager import (
     shutdown_queue,
 )
 from waybill_config import (
+    KONTROL_GATE_ENABLED,
     OFFICE_TRANSFER_ENABLED,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_FULFILLMENT,
@@ -322,6 +324,27 @@ async def lead_change(request: Request):
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
 
+    # Массовый прогон миграции: гасим ТОЛЬКО его собственный поток (воронка-источник
+    # и заходы в 142/143 основной), не читая сделку. Накладные, счета и новые заказы
+    # идут дальше штатно. Разбор воронки/этапа — ниже, поэтому берём их тут же.
+    _bulk_pipe = await get_nested(nested, ["leads", "update", "0", "pipeline_id"])
+    if _bulk_pipe is None:
+        _bulk_pipe = await get_nested(nested, ["leads", "add", "0", "pipeline_id"])
+    _bulk_status = await get_nested(nested, ["leads", "update", "0", "status_id"])
+    if _bulk_status is None:
+        _bulk_status = await get_nested(nested, ["leads", "add", "0", "status_id"])
+    if migration_freeze.bulk_skip(_bulk_pipe, _bulk_status):
+        logger.info("lead_change: сделка %s — массовый прогон миграции, пропускаем", lead_id)
+        return {"status": "skipped-migration-bulk"}
+
+    # Миграция воронок (03.08.2026): сделка с тегом «перенесено из старой
+    # воронки» в окне переноса — не наша забота. Выходим ДО всех обработчиков,
+    # иначе перенос старой сделки в 142 читается как свежая продажа: перенос в
+    # Офис/ФФ, конверсия в Метрику, Woo-заказ в completed. Вне окна проверка
+    # стоит ноль (сравнение времени), сделку не дочитываем.
+    if lead_id is not None and await migration_freeze.skip(lead_id, "lead_change"):
+        return {"status": "skipped-migration-freeze"}
+
     # Автоснятие «пропущенный» при дозвоне: реконсиляция по дочитыванию (amo не шлёт
     # теги в вебхук). На любом изменении сделки в фоне сверяем теги: если есть
     # «Успешный звонок» И «пропущенный» — снимаем «пропущенный» (сделка + контакты).
@@ -345,7 +368,8 @@ async def lead_change(request: Request):
     # (подгон полей МС + стоп-поля + наличие) → релиз в «00» или удержание с тегом
     # «ошибка передачи» и причиной в примечании. Тяжёлая работа — в очереди (LANE_AMO).
     if (
-        lead_id is not None
+        KONTROL_GATE_ENABLED
+        and lead_id is not None
         and incoming_status is not None
         and str(incoming_status) == str(STATUS_FF_KONTROL)
         and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))

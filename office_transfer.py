@@ -66,6 +66,7 @@ import logging
 import time
 
 import amo_service
+import migration_freeze
 import tg_recipients
 import telegram_bot
 from waybill_config import (
@@ -389,6 +390,12 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         logger.warning("office_transfer %s: сделка не прочиталась", lead_id)
         return "failed-lead-read"
 
+    # Окно миграции воронок: перенесённую сделку дальше не тащим. Проверка тут,
+    # а не только в вебхуке, — иначе reconciliation (раз в 2 минуты) подберёт её
+    # по событию входа в 142/143. Сделка уже на руках, лишнего запроса нет.
+    if await migration_freeze.skip(lead_id, "office_transfer", lead=lead):
+        return "skipped-migration-freeze"
+
     status_id = int(lead.get("status_id") or 0)
     pipeline_id = int(lead.get("pipeline_id") or 0)
     if pipeline_id != PIPELINE_CLEVER_MAIN or status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
@@ -542,6 +549,17 @@ _reconcile_task: asyncio.Task | None = None
 async def _reconcile_once() -> str:
     global _last_reconcile_ts
     now = int(time.time())
+
+    # Массовый прогон миграции: проход НЕ делаем. Иначе reconcile находит по
+    # событиям каждую перенесённую сделку и дочитывает её, чтобы увидеть тег, —
+    # на боевом прогоне 04.08 это 537 дочитываний за 5 минут и 55 отказов по
+    # лимиту, то есть миграция отбирала лимит у боевой обработки. Пропущенные
+    # за это время БОЕВЫЕ закрытия не теряются: окно reconcile отсчитывается от
+    # _last_reconcile_ts, который мы здесь НЕ двигаем, — следующий проход после
+    # прогона возьмёт их все.
+    if migration_freeze.bulk_skip(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, now):
+        logger.info("office_transfer reconcile: массовый прогон миграции — проход пропущен")
+        return "skipped-migration-bulk"
     window_from = max(_last_reconcile_ts, OFFICE_TRANSFER_SINCE_TS)
     if window_from <= 0:
         logger.warning("office_transfer reconcile: OFFICE_TRANSFER_SINCE_TS не задан — проход пропущен")

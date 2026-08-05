@@ -275,6 +275,18 @@ MS_API_URL = os.getenv("MS_API_URL", "https://api.moysklad.ru/api/remap/1.2").rs
 MS_TOKEN = os.getenv("MS_TOKEN", "").strip()
 MS_SYNC_POLL_INTERVAL_S = int(os.getenv("MS_SYNC_POLL_INTERVAL_S", "30"))
 MS_SYNC_LOOKBACK_MIN = int(os.getenv("MS_SYNC_LOOKBACK_MIN", "120"))
+# ═══ Выключатели контура Фулфилмента (05.08.2026, решение Кати) ═══
+# Воронку Фулфилмент разобрали и удаляют: сделки переехали в Офис, основную и «Работу
+# с базой». Механизмы вокруг неё гасим настройкой, а не удалением кода — если ФФ вернут,
+# достаточно снова поставить 1. По умолчанию ВКЛЮЧЕНО: молча отключить чужой контур,
+# просто выкатив новый код, нельзя.
+#   MS_STATUS_SYNC_ENABLED=0 — МойСклад перестаёт двигать сделки по этапам Фулфилмента
+#   KONTROL_GATE_ENABLED=0   — не работает проверка заказа перед отгрузкой на «КОНТРОЛЬ»
+# Третий выключатель — OFFICE_TRANSFER_RULE_UR_FULFILLMENT: успешные сделки перестают
+# уезжать в Фулфилмент из основной воронки.
+MS_STATUS_SYNC_ENABLED = os.getenv("MS_STATUS_SYNC_ENABLED", "1").strip() != "0"
+KONTROL_GATE_ENABLED = os.getenv("KONTROL_GATE_ENABLED", "1").strip() != "0"
+
 # Час ночной ПОЛНОЙ сверки ФФ (amo-driven страховка от промахов узкого окна
 # живого опроса: рестарт/деплой/подвисание сервиса дольше lookback теряет
 # изменение статуса МС навсегда). ≠1 (Метрика в 01:00), 0..23 МСК.
@@ -507,6 +519,27 @@ OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").str
 # reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии
 # фича не должна включаться на проде (задать перед первым боевым включением).
 OFFICE_TRANSFER_SINCE_TS = int(os.getenv("OFFICE_TRANSFER_SINCE_TS", "0"))
+
+# ═══ Заморозка на время миграции воронок (решение Кати 03.08.2026) ═══
+# Скрипт переноса вешает каждой перенесённой сделке тег MIGRATION_FREEZE_TAG.
+# Пока идёт окно [FROM, TO], наши обработчики такие сделки игнорируют:
+# office_transfer, Метрика, Woo, гейт КОНТРОЛЬ, «Причина→ЗИН». После окна тег
+# остаётся (менеджеру видно, откуда сделка), блокировка снимается — работают
+# как с обычными. Подробности и границы применимости — migration_freeze.py.
+# Пустой тег или TO=0 → механизм выключен целиком.
+MIGRATION_FREEZE_TAG = os.getenv("MIGRATION_FREEZE_TAG", "").strip()
+MIGRATION_FREEZE_FROM_TS = int(os.getenv("MIGRATION_FREEZE_FROM_TS", "0"))
+MIGRATION_FREEZE_TO_TS = int(os.getenv("MIGRATION_FREEZE_TO_TS", "0"))
+# ТОЧЕЧНАЯ отсечка вебхуков на время МАССОВОГО прогона (легаси-воронка, ~103 тыс.
+# сделок = двести тысяч вебхуков). Гасит только поток самой миграции: вебхуки из
+# воронок-источников и заходы в 142/143 основной воронки. Накладные, счета и новые
+# заказы идут штатно. Действует только ВНУТРИ окна — migration_freeze.bulk_skip().
+MIGRATION_BULK_PAUSE = os.getenv("MIGRATION_BULK_PAUSE", "").strip() == "1"
+# Воронки, ИЗ которых идёт перенос. Через запятую, по умолчанию легаси «Отдел продаж».
+MIGRATION_SOURCE_PIPELINES = {
+    int(x) for x in os.getenv("MIGRATION_SOURCE_PIPELINES", "901105").replace(" ", "").split(",") if x
+}
+
 
 # Периодическая reconciliation-проверка (страховка от зависания amo API):
 # пересматривает сделки, недавно вошедшие в 142/143, но ещё не перенесённые.

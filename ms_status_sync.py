@@ -34,6 +34,7 @@ from waybill_config import (
     MS_API_URL,
     MS_ATTR_TREK,
     MS_RECONCILE_HOUR_MSK,
+    MS_STATUS_SYNC_ENABLED,
     MS_SYNC_LOOKBACK_MIN,
     MS_SYNC_POLL_INTERVAL_S,
     MS_TOKEN,
@@ -77,6 +78,12 @@ async def _alert(text: str) -> None:
 async def init() -> None:
     """Требует уже прогретый amo_service.warm_pipeline_cache()."""
     global _enabled, _poll_task
+    if not MS_STATUS_SYNC_ENABLED:
+        logger.info(
+            "MS sync: выключен настройкой (MS_STATUS_SYNC_ENABLED=0) — воронку Фулфилмент "
+            "разобрали 05.08.2026, склад больше не двигает сделки по её этапам"
+        )
+        return
     if not MS_TOKEN:
         logger.warning("MS sync: MS_TOKEN не задан — синхронизация ВЫКЛЮЧЕНА")
         return
