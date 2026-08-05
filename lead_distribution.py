@@ -34,6 +34,7 @@ import uuid
 from typing import Any
 
 import amo_service
+import team_panel_client
 import telegram_bot
 import tg_recipients
 from waybill_config import (
@@ -453,9 +454,14 @@ def _in_hour_window(now_hour: int, window: tuple[int, int]) -> bool:
 
 
 def _is_on_shift(user_id: int) -> bool:
-    """Единое захардкоженное окно на всех участников — плейсхолдер до
-    появления реального источника индивидуального присутствия (team-panel
-    сегодня отметку «на перерыве»/присутствие не даёт)."""
+    """team-panel — источник правды графика сотрудника (team_panel_client.py,
+    батч-опрос раз в TEAM_PANEL_SCHEDULE_POLL_INTERVAL_S, свежий кэш в
+    памяти). Кэш пуст/протух/team-panel выключен фичей-флагом — откат на
+    прежний плейсхолдер: единое окно на всех, чтобы сбой ДРУГОГО сервиса не
+    останавливал распределение лидов."""
+    cached = team_panel_client.get_cached(user_id)
+    if cached is not None:
+        return cached
     now_hour = datetime.datetime.now(_MSK).hour
     return _in_hour_window(now_hour, LEAD_DISTRIBUTION_DEFAULT_WINDOW)
 

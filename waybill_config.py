@@ -656,6 +656,20 @@ TAG_LEAD_DISTRIBUTION_ERROR = "ошибка распределения"
 # /uis/{secret}. Пусто → эндпоинты недоступны (403 на любой секрет).
 LEAD_DISTRIBUTION_ADMIN_SECRET = os.getenv("LEAD_DISTRIBUTION_ADMIN_SECRET", "").strip()
 
+# ---------------------------------------------------------------------------
+# team-panel (05.08.2026) — источник правды графика сотрудников. См.
+# team_panel_client.py. Мастер-флаг выключен по умолчанию: до включения
+# _is_on_shift работает на плейсхолдере LEAD_DISTRIBUTION_DEFAULT_WINDOW,
+# как и раньше — включать только когда график в team-panel реально заполнен
+# для всех участников профилей lead_distribution.
+# ---------------------------------------------------------------------------
+TEAM_PANEL_BASE_URL = os.getenv("TEAM_PANEL_BASE_URL", "").strip()
+# Тот же X-Ingest-Token, каким amo_fix_fields уже пользуется для Wazzup-обмена
+# с team-panel — общий секрет на все /api/ingest/* team-panel.
+TEAM_PANEL_INGEST_TOKEN = os.getenv("TEAM_PANEL_INGEST_TOKEN", "").strip()
+TEAM_PANEL_SCHEDULE_POLL_INTERVAL_S = int(os.getenv("TEAM_PANEL_SCHEDULE_POLL_INTERVAL_S", "300"))
+TEAM_PANEL_SCHEDULE_ENABLED = os.getenv("TEAM_PANEL_SCHEDULE_ENABLED", "").strip() == "1"
+
 
 _TOTAL_RE = re.compile(
     r"Итого:\s*([\d\s]+[\d])[.,]\d+\s*(?:руб(?:ль|ля|лей|\.?)|₽)",
