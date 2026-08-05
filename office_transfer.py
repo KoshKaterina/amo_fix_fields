@@ -490,17 +490,6 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         if any((t.get("name") or "") == _tag for t in amo_service.get_tags(lead)):
             await amo_service.remove_tag(lead_id, _tag, lead=lead)
 
-        # Страховка: не проверено live, шлёт ли amo свежий /lead_change вебхук
-        # на PATCH, сделанный НАШИМ же кодом (а не UI-действием) — если нет,
-        # штатный триггер enqueue_kontrol() в webhooks.py просто не сработает.
-        # Дублируем вызов напрямую; enqueue_kontrol сам дедуплицирует по lead_id.
-        # source="webhook" (не "office_transfer"!) — намеренно: это заставляет
-        # process_kontrol_lead ПЕРЕЧИТАТЬ сделку и сверить, что она ДЕЙСТВИТЕЛЬНО
-        # ещё на «КОНТРОЛЬ» к моменту обработки в очереди (гейт под source=="webhook"
-        # а не «доверять данным без переповерки», как у батч-источников.
-        from queue_manager import enqueue_kontrol
-        enqueue_kontrol(lead_id, source="webhook")
-
     return "moved"
 
 

@@ -11,8 +11,6 @@ STATUS_CREATE_WAYBILL = 75426822
 STATUS_WAYBILL_READY = 75426874
 
 # Фулфилмент: гейт «КОНТРОЛЬ» → «00. Обрабатывается» (автоматическая проверка заказа).
-STATUS_FF_KONTROL = 86475482      # «КОНТРОЛЬ (ПРОВЕРИТЬ ВРУЧНУЮ КАЖДЫЙ ЗАКАЗ)»
-STATUS_FF_PROCESSING = 86450946   # «00. Обрабатывается»
 
 # amoCRM custom field IDs (сделка)
 FIELD_CDEK_ORDER_NUMBER = 571657
@@ -205,8 +203,6 @@ PIPELINE_FULFILLMENT = 10997702  # Фулфилмент
 # Целевые статусы. 142/143 — системные, общие для всех воронок.
 STATUS_SUCCESS = 142             # Успешно реализовано
 STATUS_CLOSED_LOST = 143         # Закрыто и не реализовано
-FULFILLMENT_DELIVERED = 86476486          # Фулфилмент «09. Доставлено»
-FULFILLMENT_PAYMENT_FORWARDED = 86451330  # Фулфилмент «09.2 Платёж отправлен владельцу»
 
 # Поля сделки для Метрики
 FIELD_YM_CLIENT_ID = 578015          # «id (для метрики)» — ClientID Яндекс.Метрики (_ym_uid)
@@ -227,7 +223,7 @@ def is_cod_payment(payment_method) -> bool:
 
 
 # Явно распознанная ПРЕДОПЛАТА (онлайн/картой/перевод/крипта/безнал). Крипта —
-# предоплата, как и в kontrol_gate.categorize_payment. Пустой/непонятный способ
+# предоплата. Пустой/непонятный способ
 # оплаты сюда НЕ попадает (вернёт False) — это нужно, чтобы при нулевой сумме не
 # считать заказ предоплаченным по умолчанию.
 _PREPAID_TOKENS = (
@@ -267,9 +263,9 @@ WOO_STATUS_SINCE_TS: int | None = _parse_since_ts(
 )
 
 # ---------------------------------------------------------------------------
-# МойСклад API — для ms_status_sync (ведём ФФ-копию по статусу заказа склада).
+# МойСклад API — счёт Ozon (ozon_invoice) читает суммы заказа.
 # Только чтение. MS_TOKEN — Bearer-токен главного админа МС (тот же, что в
-# проекте woocommerce-sklad). Пусто → ms_status_sync ВЫКЛЮЧЕН (сервис работает).
+# проекте woocommerce-sklad).
 # ---------------------------------------------------------------------------
 MS_API_URL = os.getenv("MS_API_URL", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
 MS_TOKEN = os.getenv("MS_TOKEN", "").strip()
@@ -280,12 +276,6 @@ MS_SYNC_LOOKBACK_MIN = int(os.getenv("MS_SYNC_LOOKBACK_MIN", "120"))
 # с базой». Механизмы вокруг неё гасим настройкой, а не удалением кода — если ФФ вернут,
 # достаточно снова поставить 1. По умолчанию ВКЛЮЧЕНО: молча отключить чужой контур,
 # просто выкатив новый код, нельзя.
-#   MS_STATUS_SYNC_ENABLED=0 — МойСклад перестаёт двигать сделки по этапам Фулфилмента
-#   KONTROL_GATE_ENABLED=0   — не работает проверка заказа перед отгрузкой на «КОНТРОЛЬ»
-# Третий выключатель — OFFICE_TRANSFER_RULE_UR_FULFILLMENT: успешные сделки перестают
-# уезжать в Фулфилмент из основной воронки.
-MS_STATUS_SYNC_ENABLED = os.getenv("MS_STATUS_SYNC_ENABLED", "1").strip() != "0"
-KONTROL_GATE_ENABLED = os.getenv("KONTROL_GATE_ENABLED", "1").strip() != "0"
 
 # Час ночной ПОЛНОЙ сверки ФФ (amo-driven страховка от промахов узкого окна
 # живого опроса: рестарт/деплой/подвисание сервиса дольше lookback теряет
@@ -510,7 +500,6 @@ OFFICE_TRANSFER_RULE_UR_DELIVERY = os.getenv("OFFICE_TRANSFER_RULE_UR_DELIVERY",
 OFFICE_TRANSFER_RULE_UR_PICKUP = os.getenv("OFFICE_TRANSFER_RULE_UR_PICKUP", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_WAYBILL = os.getenv("OFFICE_TRANSFER_RULE_UR_WAYBILL", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER", "").strip() == "1"
-OFFICE_TRANSFER_RULE_UR_FULFILLMENT = os.getenv("OFFICE_TRANSFER_RULE_UR_FULFILLMENT", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").strip() == "1"

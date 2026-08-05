@@ -39,13 +39,10 @@ from waybill_config import (
     FIELD_PAYMENT_METHOD,
     FIELD_PHONE,
     FIELD_YM_CLIENT_ID,
-    FULFILLMENT_DELIVERED,
-    FULFILLMENT_PAYMENT_FORWARDED,
     METRIKA_COUNTER_ID,
     METRIKA_SINCE_TS,
     METRIKA_TOKEN,
     PIPELINE_CLEVER,
-    PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
     STATUS_CLOSED_LOST,
     STATUS_SUCCESS,
@@ -215,11 +212,6 @@ def _classify(pipeline_id, status_id, cod: bool) -> tuple[str | None, bool]:
     # upsert по id заказа, Woo completed→completed идемпотентен.
     if pipeline_id == PIPELINE_OFFICE and status_id == STATUS_SUCCESS:
         return "PAID", True
-    if pipeline_id == PIPELINE_FULFILLMENT and status_id in (
-        FULFILLMENT_DELIVERED,
-        FULFILLMENT_PAYMENT_FORWARDED,
-    ):
-        return "PAID", True
 
     return None, False
 
@@ -244,7 +236,7 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
 
     # Работаем только со сквозным потоком заказа: CLEVER → Офис/Фулфилмент.
     # Сделки из прочих воронок (опт, отдел продаж и т.п.) игнорируем.
-    if pipeline_id not in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+    if pipeline_id not in (PIPELINE_CLEVER, PIPELINE_OFFICE):
         return
 
     payment = _cf(lead, FIELD_PAYMENT_METHOD)
@@ -420,7 +412,7 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
         since = since_ts if since_ts is not None else run_started - days * 86400
         leads_by_id: dict[int, dict] = {}
         fetch_failed = False
-        for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+        for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE):
             try:
                 batch = await amo_service.get_leads_updated_since(pipeline, since, with_=("contacts",))
             except Exception:

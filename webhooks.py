@@ -15,7 +15,7 @@ import dup_autoclose
 import jivo_service
 import metrika_sync
 import migration_freeze
-import ms_status_sync
+import ms_client
 import office_transfer
 import ozon_invoice
 import showroom_tag
@@ -36,7 +36,6 @@ from help_function import (
 from queue_manager import (
     enqueue_invoice,
     enqueue_jivo,
-    enqueue_kontrol,
     enqueue_new,
     enqueue_office_transfer,
     enqueue_waybill,
@@ -45,13 +44,10 @@ from queue_manager import (
     shutdown_queue,
 )
 from waybill_config import (
-    KONTROL_GATE_ENABLED,
     OFFICE_TRANSFER_ENABLED,
     PIPELINE_CLEVER_MAIN,
-    PIPELINE_FULFILLMENT,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
-    STATUS_FF_KONTROL,
     STATUS_PAYMENT_REQUESTED,
     STATUS_SUCCESS,
     UIS_WEBHOOK_SECRET,
@@ -82,7 +78,10 @@ async def lifespan(app):
     await cdek_status_sync.init()
     await metrika_sync.init()
     await woo_status_sync.init()
-    await ms_status_sync.init()
+    # Клиент МойСклада поднимаем здесь: его читает ozon_invoice (суммы заказа для
+    # СБП-счёта). Раньше клиент вставал внутри синка Фулфилмента — когда тот выключили
+    # 05.08, счета молча перестали создаваться. Контур ФФ удалён, клиент остался.
+    ms_client.init()
     ozon_invoice.init()
     await wazzup_sla.init()
     await wazzup_forward.init()
@@ -96,7 +95,7 @@ async def lifespan(app):
     await unmiss_tag.shutdown()
     await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
-    await ms_status_sync.shutdown()
+    await ms_client.aclose()
     await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
     await cdek_status_sync.shutdown()
@@ -364,18 +363,6 @@ async def lead_change(request: Request):
     pipeline_add = await get_nested(nested, ["leads", "add", "0", "pipeline_id"])
     incoming_pipeline = pipeline_update if pipeline_update is not None else pipeline_add
 
-    # Гейт КОНТРОЛЬ: ФФ-сделка зашла на этап «КОНТРОЛЬ» → автопроверка заказа
-    # (подгон полей МС + стоп-поля + наличие) → релиз в «00» или удержание с тегом
-    # «ошибка передачи» и причиной в примечании. Тяжёлая работа — в очереди (LANE_AMO).
-    if (
-        KONTROL_GATE_ENABLED
-        and lead_id is not None
-        and incoming_status is not None
-        and str(incoming_status) == str(STATUS_FF_KONTROL)
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
-    ):
-        logger.info("Lead %s entered STATUS_FF_KONTROL — enqueue kontrol gate", lead_id)
-        enqueue_kontrol(lead_id, source="webhook")
 
     # Office Transfer: сделка [CLEVER] Основная зашла в УР(142)/ЗНР(143) →
     # вместо нативного копирования (F5-виджет/«Создать сделку») переносим ЭТУ
@@ -392,15 +379,6 @@ async def lead_change(request: Request):
         logger.info("Lead %s entered %s in CLEVER — enqueue office_transfer", lead_id, incoming_status)
         enqueue_office_transfer(lead_id, source="webhook")
 
-    # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
-    # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).
-    if (
-        lead_id is not None
-        and incoming_status is not None
-        and ms_status_sync.is_enabled()
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
-    ):
-        ms_status_sync.push_processing_bg(lead_id, incoming_status)
 
     # Счёт СБП (MAG-285): сделка зашла на тех-этап «Оплата запрошена» (CLEVER
     # Основная) → создаём платёжную ссылку Ozon из суммы заказа МС и одним PATCH
