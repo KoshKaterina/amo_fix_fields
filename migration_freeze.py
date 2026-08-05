@@ -84,6 +84,31 @@ def bulk_skip(pipeline_id, status_id, now: float | None = None) -> bool:
     return pid == PIPELINE_CLEVER_MAIN and sid in (STATUS_SUCCESS, STATUS_CLOSED_LOST)
 
 
+def is_bulk_move_event(before_pipeline_id, now: float | None = None) -> bool:
+    """Событие входа в 142/143 создано МАССОВЫМ ПРОГОНОМ, а не менеджером?
+
+    Отличаем по тому, ОТКУДА сделка приехала: прогон тащит её из воронки-
+    источника, а живая продажа закрывается внутри основной воронки. Это поле
+    (`value_before`) уже лежит в ответе `/api/v4/events`, который reconciliation
+    и так читает, — дочитывать сделку ради тега не нужно. Именно дочитывание
+    съедало лимит amo 04.08 (537 запросов за 5 минут).
+
+    Осторожность намеренная: миграцией считаем ТОЛЬКО приезд из перечисленных
+    в MIGRATION_SOURCE_PIPELINES воронок. Ручной перевод менеджером из любой
+    другой воронки останется боевым и будет обработан.
+
+    ⚠️ Новую воронку в перенос — сразу в MIGRATION_SOURCE_PIPELINES, иначе её
+    поток пойдёт в обычную обработку и опять начнёт есть лимит.
+    """
+    if not (MIGRATION_BULK_PAUSE and window_active(now)):
+        return False
+    try:
+        pid = int(before_pipeline_id) if before_pipeline_id is not None else None
+    except (TypeError, ValueError):
+        return False
+    return pid in MIGRATION_SOURCE_PIPELINES
+
+
 async def is_frozen(lead_id, lead: dict | None = None) -> bool:
     """Сделка заморожена на время миграции?
 

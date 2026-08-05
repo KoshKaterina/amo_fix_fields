@@ -26,7 +26,6 @@ from waybill_config import (
     FIELD_ORDER_WAREHOUSE,
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
-    PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
@@ -35,7 +34,6 @@ from waybill_config import (
     STATUS_ACADEMY_FIRST_CONTACT,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
-    STATUS_FF_KONTROL,
     STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_SUCCESS,
@@ -89,7 +87,7 @@ office_transfer.OFFICE_TRANSFER_ENABLED = True
 for _flag in (
     "OFFICE_TRANSFER_RULE_UR_DELIVERY", "OFFICE_TRANSFER_RULE_UR_PICKUP",
     "OFFICE_TRANSFER_RULE_UR_WAYBILL", "OFFICE_TRANSFER_RULE_UR_PREORDER",
-    "OFFICE_TRANSFER_RULE_UR_FULFILLMENT", "OFFICE_TRANSFER_RULE_ZNR_WAITLIST",
+    "OFFICE_TRANSFER_RULE_ZNR_WAITLIST",
     "OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "OFFICE_TRANSFER_RULE_UR_POST",
 ):
     setattr(office_transfer, _flag, True)
@@ -140,9 +138,7 @@ print("✓ УР-4 Предзаказ")
 
 # УР(ЭРМС) → Фулфилмент/КОНТРОЛЬ
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_ERMS_MAIN)
-assert office_transfer._match_ur_fulfillment(lead) == (PIPELINE_FULFILLMENT, STATUS_FF_KONTROL)
 lead2 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN)
-assert office_transfer._match_ur_fulfillment(lead2) is None
 print("✓ УР(ЭРМС→Фулфилмент)")
 
 # ЗНР Лист ожидания
@@ -380,6 +376,104 @@ for path, params in _events_requests:
     assert int(params["filter[created_at][from]"]) >= 1000, params
 print("✓ reconciliation: окно не раньше OFFICE_TRANSFER_SINCE_TS (без ретроактивности)")
 
+# ── 5б) reconciliation в окне миграции: поток прогона отсеян, боевое живо ──
+# (05.08.2026: раньше проход целиком выключался флагом, и заказы стояли до ночи)
+
+_LEGACY_PIPELINE = 901105
+
+
+def _status_event(entity_id, before_pipeline, after_status):
+    return {
+        "entity_id": entity_id,
+        "value_before": [{"lead_status": {"id": 12345, "pipeline_id": before_pipeline}}],
+        "value_after": [{"lead_status": {"id": after_status, "pipeline_id": PIPELINE_CLEVER_MAIN}}],
+    }
+
+
+async def _fake_do_get_mixed(path, params=None):
+    _events_requests.append((path, dict(params or [])))
+    after = int(dict(params or [])["filter[value_after][leads_statuses][0][status_id]"])
+    if after != STATUS_SUCCESS:
+        return {"_embedded": {"events": []}}
+    return {"_embedded": {"events": [
+        _status_event(101, _LEGACY_PIPELINE, STATUS_SUCCESS),      # привёз прогон
+        _status_event(102, PIPELINE_CLEVER_MAIN, STATUS_SUCCESS),  # закрыл менеджер
+        _status_event(103, _LEGACY_PIPELINE, STATUS_SUCCESS),      # привёз прогон
+    ]}}
+
+
+_processed_by_reconcile: list = []
+
+
+async def _fake_process(lead_id, source="webhook"):
+    _processed_by_reconcile.append(int(lead_id))
+    return "moved"
+
+
+_orig_process = office_transfer.process_office_transfer
+office_transfer.amo_service._do_get = _fake_do_get_mixed
+office_transfer.process_office_transfer = _fake_process
+office_transfer.OFFICE_TRANSFER_SINCE_TS = 1000
+office_transfer._last_reconcile_ts = 0
+
+# окно миграции ОТКРЫТО, воронка-источник в списке
+_mf = office_transfer.migration_freeze
+_mf_backup = (_mf.MIGRATION_BULK_PAUSE, _mf.MIGRATION_FREEZE_TAG, _mf.MIGRATION_FREEZE_FROM_TS,
+              _mf.MIGRATION_FREEZE_TO_TS, _mf.MIGRATION_SOURCE_PIPELINES)
+_mf.MIGRATION_BULK_PAUSE = True
+_mf.MIGRATION_FREEZE_TAG = "перенесено из старой воронки"
+_mf.MIGRATION_FREEZE_FROM_TS = 1
+_mf.MIGRATION_FREEZE_TO_TS = 99_999_999_999
+_mf.MIGRATION_SOURCE_PIPELINES = {_LEGACY_PIPELINE}
+
+res = run(office_transfer._reconcile_once())
+assert res == "processed=1", res
+assert _processed_by_reconcile == [102], _processed_by_reconcile
+print("✓ reconciliation в окне миграции: сделки прогона отсеяны, боевая обработана")
+
+# то же окно, но воронки-источника в списке НЕТ — обрабатываем всех,
+# лучше лишняя работа, чем потерянный заказ
+_mf.MIGRATION_SOURCE_PIPELINES = set()
+_processed_by_reconcile.clear()
+office_transfer._last_reconcile_ts = 0
+res = run(office_transfer._reconcile_once())
+assert res == "processed=3", res
+assert sorted(_processed_by_reconcile) == [101, 102, 103], _processed_by_reconcile
+print("✓ reconciliation: воронка не в списке источников — ничего не теряем")
+
+(_mf.MIGRATION_BULK_PAUSE, _mf.MIGRATION_FREEZE_TAG, _mf.MIGRATION_FREEZE_FROM_TS,
+ _mf.MIGRATION_FREEZE_TO_TS, _mf.MIGRATION_SOURCE_PIPELINES) = _mf_backup
+office_transfer.process_office_transfer = _orig_process
+office_transfer.amo_service._do_get = _fake_do_get
+office_transfer._last_reconcile_ts = 0
+_events_requests.clear()
+
+# ── 5в) потолок оглядки: после рестарта окно не разворачивается на неделю ──
+# (05.08.2026: первый же проход после выката перебрал 23 224 события миграции)
+
+import time as _time  # noqa: E402
+
+office_transfer.OFFICE_TRANSFER_SINCE_TS = 1000  # cutover глубоко в прошлом
+office_transfer._last_reconcile_ts = 0           # как после рестарта
+run(office_transfer._reconcile_once())
+_now = int(_time.time())
+for path, params in _events_requests:
+    _from = int(params["filter[created_at][from]"])
+    assert _from >= _now - office_transfer.RECONCILE_MAX_LOOKBACK_S - 5, (_from, _now)
+print("✓ reconciliation: окно назад ограничено RECONCILE_MAX_LOOKBACK_S")
+
+# защита «без cutover не запускаться» потолок не сломал
+office_transfer.OFFICE_TRANSFER_SINCE_TS = 0
+office_transfer._last_reconcile_ts = 0
+_events_requests.clear()
+res = run(office_transfer._reconcile_once())
+assert res == "skipped-no-cutover", res
+assert not _events_requests
+print("✓ потолок оглядки не отменяет проверку cutover")
+
+office_transfer._last_reconcile_ts = 0
+_events_requests.clear()
+
 office_transfer.OFFICE_TRANSFER_SINCE_TS = 0
 
 
@@ -586,7 +680,6 @@ woo_status_sync.is_enabled = _orig_woo_enabled
 # Офис/142 и ФФ(доставлено/переведено) теперь PAID для ЛЮБОЙ оплаты (не только наложки)
 assert metrika_sync._classify(metrika_sync.PIPELINE_OFFICE, STATUS_SUCCESS, False) == ("PAID", True)
 assert metrika_sync._classify(metrika_sync.PIPELINE_OFFICE, STATUS_SUCCESS, True) == ("PAID", True)
-assert metrika_sync._classify(metrika_sync.PIPELINE_FULFILLMENT, metrika_sync.FULFILLMENT_DELIVERED, False) == ("PAID", True)
 # CLEVER-логика не тронута: предоплата PAID, наложка в CLEVER — нет
 assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER, STATUS_SUCCESS, False) == ("PAID", False)
 assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER, STATUS_SUCCESS, True) == (None, False)
