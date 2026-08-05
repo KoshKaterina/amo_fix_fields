@@ -120,6 +120,18 @@ logger = logging.getLogger("uvicorn")
 
 AMO_LEAD_URL = "https://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{}"
 
+# Сколько сделок за проход reconciliation считать нормой. Больше — в лог
+# предупреждение: скорее всего, воронку-источник миграции забыли внести в
+# MIGRATION_SOURCE_PIPELINES, и её поток пошёл в обычную обработку.
+RECONCILE_VOLUME_ALERT = 50
+
+# Насколько глубоко проход заглядывает назад. При штатной работе окно = интервал
+# между проходами (2 минуты), но после рестарта _last_reconcile_ts обнуляется, и
+# окно раскрывается от cutover — на прогоне миграции это 23 000+ событий и сотни
+# страниц за один проход (поймано 05.08.2026 сразу после выката). Час назад —
+# запас на любой разумный перезапуск; более долгий простой добираем руками.
+RECONCILE_MAX_LOOKBACK_S = 3600
+
 
 # ════════════════ чтение условий по свежей сделке ════════════════
 
@@ -515,8 +527,13 @@ async def _entered_status_leads(pipeline_id: int, status_id: int, ts_from: int, 
     обобщённый на произвольные pipeline/status. НЕ используем
     amo_service.get_leads_by_status() здесь — та возвращает ВСЁ, что сейчас
     сидит в статусе, независимо от времени входа, что нарушило бы требование
-    «без ретроактивности» (задело бы сделки, висевшие в УР/ЗНР до cutover)."""
+    «без ретроактивности» (задело бы сделки, висевшие в УР/ЗНР до cutover).
+
+    Во время массового прогона миграции отсеиваем его собственные события по
+    `value_before` — сделка приехала из воронки-источника, а не закрылась у
+    менеджера. Признак лежит в этом же ответе, дочитывать сделки не нужно."""
     leads: set[int] = set()
+    skipped_bulk = 0
     page = 1
     while True:
         params = [
@@ -534,11 +551,22 @@ async def _entered_status_leads(pipeline_id: int, status_id: int, ts_from: int, 
             ls = (va[0].get("lead_status") if va else None) or {}
             if ls.get("id") == status_id and ls.get("pipeline_id") == pipeline_id:
                 lid = e.get("entity_id")
-                if lid is not None:
-                    leads.add(int(lid))
+                if lid is None:
+                    continue
+                vb = e.get("value_before") or []
+                before = (vb[0].get("lead_status") if vb else None) or {}
+                if migration_freeze.is_bulk_move_event(before.get("pipeline_id")):
+                    skipped_bulk += 1
+                    continue
+                leads.add(int(lid))
         if len(evs) < 100:
             break
         page += 1
+    if skipped_bulk:
+        logger.info(
+            "office_transfer reconcile: событий миграции отсеяно %s (статус %s), сделок к работе %s",
+            skipped_bulk, status_id, len(leads),
+        )
     return leads
 
 
@@ -550,23 +578,35 @@ async def _reconcile_once() -> str:
     global _last_reconcile_ts
     now = int(time.time())
 
-    # Массовый прогон миграции: проход НЕ делаем. Иначе reconcile находит по
-    # событиям каждую перенесённую сделку и дочитывает её, чтобы увидеть тег, —
-    # на боевом прогоне 04.08 это 537 дочитываний за 5 минут и 55 отказов по
-    # лимиту, то есть миграция отбирала лимит у боевой обработки. Пропущенные
-    # за это время БОЕВЫЕ закрытия не теряются: окно reconcile отсчитывается от
-    # _last_reconcile_ts, который мы здесь НЕ двигаем, — следующий проход после
-    # прогона возьмёт их все.
-    if migration_freeze.bulk_skip(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, now):
-        logger.info("office_transfer reconcile: массовый прогон миграции — проход пропущен")
-        return "skipped-migration-bulk"
+    # Массовый прогон миграции проход НЕ отключает (05.08.2026). Раньше здесь
+    # стоял выход по bulk_skip: reconcile дочитывал каждую перенесённую сделку
+    # ради тега — 537 запросов за 5 минут на прогоне 04.08. Но вместе с
+    # прогоном глохла и БОЕВАЯ обработка: вебхуки о закрытии гасит bulk_skip, а
+    # страховкой был как раз этот проход. 05.08 так встали заказы №18235 и
+    # №18245 — уехали бы в Офис только после конца окна, ночью.
+    # Теперь миграционные события отсеивает _entered_status_leads по
+    # value_before (видно в самом событии), сделки не дочитываются, лимит цел.
     window_from = max(_last_reconcile_ts, OFFICE_TRANSFER_SINCE_TS)
     if window_from <= 0:
         logger.warning("office_transfer reconcile: OFFICE_TRANSFER_SINCE_TS не задан — проход пропущен")
         return "skipped-no-cutover"
+    # Потолок оглядки ставим ПОСЛЕ проверки cutover: иначе окно всегда выглядело
+    # бы заданным и защита «без границы не запускаться» перестала бы работать.
+    window_from = max(window_from, now - RECONCILE_MAX_LOOKBACK_S)
 
     leads = await _entered_status_leads(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, window_from, now)
     leads |= await _entered_status_leads(PIPELINE_CLEVER_MAIN, STATUS_CLOSED_LOST, window_from, now)
+
+    # Предохранитель: в норме за проход набегают единицы сделок. Много — значит
+    # в перенос завели воронку, которой нет в MIGRATION_SOURCE_PIPELINES, и её
+    # поток пошёл в дочитывание. Дальше работаем (терять боевые нельзя), но в
+    # логе это видно сразу, а не по отказам amo.
+    if len(leads) > RECONCILE_VOLUME_ALERT:
+        logger.warning(
+            "office_transfer reconcile: в окне %s сделок — сверьте MIGRATION_SOURCE_PIPELINES, "
+            "похоже, воронку-источник не внесли в список",
+            len(leads),
+        )
 
     processed = 0
     for lead_id in leads:
