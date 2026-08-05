@@ -1,7 +1,7 @@
 """Юнит-тест гейта КОНТРОЛЬ (process_kontrol_lead) без сети/прода.
 
 Мокаем amo_service (get_lead_full/patch_lead/add_note) и ms_client (get/put);
-чистые функции (get_tags/has_tag/filter_tags_excluding/blockers/auto_fix) — реальные.
+чистые функции (get_tags/has_tag/filter_tags_excluding/blockers) — реальные.
 Проверяем: релиз в «00», удержание с тегом «ошибка передачи» + причина, эхо-защиту
 (повторный тот же провал не плодит примечаний/тег), и skip для не-КОНТРОЛЬ сделки.
 """

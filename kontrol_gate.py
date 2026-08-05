@@ -13,16 +13,18 @@
 копию (статус != 143) в воронке Офис или Фулфилмент. Иначе — флаг. Окно жёстко 3 дня.
 
 ЧАСТЬ 2 (gate): для каждой сделки ФФ на этапе «КОНТРОЛЬ»:
-  1. подгоняем производные поля заказа МС (логика woo field_resync): оценочная/
-     доставка/итого, тип платежа, вид доставки;
-  2. проверяем стоп-поля (если не заполнить нечем — оставляем в КОНТРОЛЕ):
+  1. проверяем стоп-поля (если не заполнить нечем — оставляем в КОНТРОЛЕ):
      телефон контрагента; ≥1 товарная позиция; распознаваемый способ оплаты;
      для курьера — адрес доставки, для ПВЗ/постамата — Код ПВЗ;
-  3. проверяем физ. остаток товаров по складу Sunscrypt Основной (≥ заказанного);
-  4. если стоп-полей и дефицита нет — переносим копию в «00. Обрабатывается»
+  2. проверяем физ. остаток товаров по складу Sunscrypt Основной (≥ заказанного);
+  3. если стоп-полей и дефицита нет — переносим копию в «00. Обрабатывается»
      и ставим заказу в МС статус «00» (релиз в комплектацию).
 
-По умолчанию СРАЗУ ПРИМЕНЯЕТ (подгоняет поля + переносит готовые в «00» + релиз МС).
+⚠️ 05.08.2026 из гейта убран автоподгон производных полей заказа МС (оценочная,
+доставка, итого, тип платежа, вид доставки) — сами поля удалены как наследие
+фулфилмента. Гейт теперь только проверяет и переносит.
+
+По умолчанию СРАЗУ ПРИМЕНЯЕТ (переносит готовые в «00» + релиз МС).
 --dry-run — только показать план, ничего не писать.
 """
 import argparse
@@ -66,15 +68,10 @@ STOCK_STORE_ID = "0e5a2b05-c413-11ee-0a80-13fd002f63f9"
 
 # ── доп-поля заказа МС (из entity/customerorder/metadata/attributes) ──
 A_PAYMENT_METHOD = "33735877-ba29-11f0-0a80-1737003bc63e"   # «Способ оплаты» (string)
-A_DELIVERY_TYPE = "8c337f77-5d2b-11f1-0a80-1cae0026fe2e"    # «Вид доставки» (long)
 A_PVZ_CODE = "308100c4-2aa3-11f1-0a80-01a9002fcf77"         # «Код ПВЗ» (string)
-A_DELIVERY_COST = "6197cf57-5d04-11f1-0a80-0e1800256067"    # «Стоимость доставки» (double)
-A_ESTIMATED = "6197d336-5d04-11f1-0a80-0e1800256068"        # «Оценочная стоимость» (double)
-A_TOTAL_TO_PAY = "80814b14-5d04-11f1-0a80-1d5a00242f6e"     # «Итого к оплате получателем» (double)
-A_PAYMENT_TYPE = "574102c9-60ac-11f1-0a80-0e5500051d84"     # «Прием платежа» (customentity)
-PAY_DICT = "00a648ac-60ac-11f1-0a80-1cc60006b0c8"
-PAY_PREPAID = "0db95b3b-60ac-11f1-0a80-1b9f0005d237"        # «1. предоплачен»
-PAY_NONCASH = "16bb90ce-60ac-11f1-0a80-11190005b58b"        # «2. безналичная»
+# ⚠️ 05.08.2026 удалены поля фулфилмента: «Вид доставки», «Стоимость доставки»,
+# «Оценочная стоимость», «Итого к оплате получателем», «Прием платежа». Вместе с
+# ними ушёл автоподгон производных полей — гейт теперь только проверяет заказ.
 
 _state00_uuid = None  # uuid статуса МС «00. Обрабатывается», резолвим в init
 
@@ -97,36 +94,6 @@ def categorize_payment(s):
     return None
 
 
-def _line_kop(p):
-    """Сумма позиции в копейках С УЧЁТОМ скидки (как «Сумма» в карточке МС).
-
-    У позиции МС есть скидка в процентах (discount); «Сумма» = цена×кол-во×
-    (1 − скидка/100). Без учёта скидки «Итого к оплате»/«Оценочная» завышались."""
-    disc = p.get("discount") or 0
-    return round(p["price"] * p["quantity"] * (100 - disc) / 100)
-
-
-def compute_desired(positions, category):
-    """Желаемые значения производных полей из позиций и категории оплаты (как woo)."""
-    goods_kop = services_kop = 0
-    for p in positions:
-        line = _line_kop(p)
-        if p["type"] == "service":
-            services_kop += line
-        else:
-            goods_kop += line
-    all_kop = goods_kop + services_kop
-    desired = {"estimated": goods_kop // 100, "delivery": services_kop // 100,
-               "total_to_pay": None, "payment_element": None}
-    if category == "cod":
-        desired["total_to_pay"] = all_kop // 100
-        desired["payment_element"] = PAY_NONCASH
-    elif category == "prepaid":
-        desired["total_to_pay"] = 0
-        desired["payment_element"] = PAY_PREPAID
-    return desired
-
-
 def detect_delivery_num(positions):
     """Вид доставки из имён услуг: 1=ПВЗ, 2=курьер, 3=постамат, None=не определить."""
     for p in positions:
@@ -143,22 +110,7 @@ def detect_delivery_num(positions):
     return None
 
 
-# ════════════════ построение атрибутов МС ════════════════
-def _attr_meta(uuid):
-    return {"href": f"{MS_API_URL}/entity/customerorder/metadata/attributes/{uuid}",
-            "type": "attributemetadata", "mediaType": "application/json"}
-
-
-def num_attr(uuid, value):
-    return {"meta": _attr_meta(uuid), "value": value}
-
-
-def ce_attr(uuid, elem_id):
-    return {"meta": _attr_meta(uuid),
-            "value": {"meta": {"href": f"{MS_API_URL}/entity/customentity/{PAY_DICT}/{elem_id}",
-                               "type": "customentity", "mediaType": "application/json"}}}
-
-
+# ════════════════ чтение атрибутов МС ════════════════
 def attr_val(order, uuid):
     for a in order.get("attributes", []):
         if a.get("id") == uuid:
@@ -194,45 +146,6 @@ async def stock_map(assortment_ids):
     return res
 
 
-# ════════════════ автоподгон полей (resync) ════════════════
-async def auto_fix(order, positions, apply):
-    """Пересчитать производные поля заказа МС. Возвращает план изменений (или {})."""
-    sc = (order.get("salesChannel") or {})
-    sc_name = sc.get("name") if isinstance(sc, dict) else None
-    if sc_name == "Маркетплейс":
-        return {"skip": "маркетплейс — поля не трогаем"}
-
-    payment_str = attr_val(order, A_PAYMENT_METHOD)
-    category = categorize_payment(payment_str if isinstance(payment_str, str) else None)
-    desired = compute_desired(positions, category)
-
-    patch, plan = [], {}
-
-    def push_num(uuid, value, key):
-        cur = attr_val(order, uuid)
-        if cur is None or float(cur) != float(value):
-            patch.append(num_attr(uuid, value))
-            plan[key] = {"old": cur, "new": value}
-
-    push_num(A_ESTIMATED, desired["estimated"], "Оценочная стоимость")
-    push_num(A_DELIVERY_COST, desired["delivery"], "Стоимость доставки")
-    if desired["total_to_pay"] is not None:
-        push_num(A_TOTAL_TO_PAY, desired["total_to_pay"], "Итого к оплате")
-    dt = detect_delivery_num(positions)
-    if dt is not None:
-        push_num(A_DELIVERY_TYPE, dt, "Вид доставки")
-    if desired["payment_element"]:
-        cur = attr_val(order, A_PAYMENT_TYPE)
-        cur_elem = (cur.get("meta", {}).get("href", "").rstrip("/").split("/")[-1]
-                    if isinstance(cur, dict) else None)
-        if cur_elem != desired["payment_element"]:
-            patch.append(ce_attr(A_PAYMENT_TYPE, desired["payment_element"]))
-            plan["Прием платежа"] = {"old": cur_elem, "new": desired["payment_element"]}
-
-    if apply and patch:
-        await ms_client.put(f"entity/customerorder/{order['id']}", {"attributes": patch})
-    return plan
-
 
 # ════════════════ стоп-поля ════════════════
 def blockers(order, positions, stock):
@@ -251,11 +164,9 @@ def blockers(order, positions, stock):
     pm = attr_val(order, A_PAYMENT_METHOD)
     if categorize_payment(pm if isinstance(pm, str) else None) is None:
         out.append(f"способ оплаты не распознан ({pm!r})")
-    # 4) адрес / код ПВЗ по виду доставки
+    # 4) адрес / код ПВЗ по виду доставки (определяем по именам услуг в заказе;
+    #    доп.поле «Вид доставки» удалено 05.08.2026 вместе с обвязкой фулфилмента)
     dt = detect_delivery_num(positions)
-    if dt is None:
-        v = attr_val(order, A_DELIVERY_TYPE)
-        dt = int(v) if v not in (None, "") else None
     if dt == 2:  # курьер
         if not (order.get("shipmentAddress") or order.get("shipmentAddressFull")):
             out.append("курьер, но нет адреса доставки")
@@ -395,12 +306,7 @@ async def process_kontrol_lead(lead_id, *, apply=True, source="webhook") -> dict
         return {"action": "held", "reason": "заказ МС не найден"}
     positions = await fetch_positions(uu)
 
-    # 1) автоподгон производных полей заказа МС (как woo field_resync)
-    plan = await auto_fix(order, positions, apply)
-    if plan and not plan.get("skip") and apply:
-        order = await ms_client.get(f"entity/customerorder/{uu}", {"expand": "agent,state,salesChannel"})
-
-    # 2-3) стоп-поля + наличие на складе Sunscrypt Основной
+    # 1-2) стоп-поля + наличие на складе Sunscrypt Основной
     stock = await stock_map([p["assortment_id"] for p in positions if p["type"] == "goods" and p["assortment_id"]])
     blk = blockers(order, positions, stock)
     if blk:
@@ -416,7 +322,7 @@ async def process_kontrol_lead(lead_id, *, apply=True, source="webhook") -> dict
         await amo_service.patch_lead(lead_id, status_id=PROCESSING_STATUS,
                                      pipeline_id=PIPELINE_FULFILLMENT, tags=new_tags)
         await _set_ms_state00(uu)
-        await amo_service.add_note(lead_id, "✅ Гейт КОНТРОЛЬ пройден автоматически: поля подогнаны, "
+        await amo_service.add_note(lead_id, "✅ Гейт КОНТРОЛЬ пройден автоматически: заказ заполнен, "
                                             "товары в наличии (Sunscrypt Основной) → «00. Обрабатывается».")
         _last_error_reason.pop(key, None)
     return {"action": "released", "reason": None}
