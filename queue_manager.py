@@ -26,6 +26,9 @@ PRIORITY_INVOICE = PRIORITY_WAYBILL  # счёт СБП «Оплата запро
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
 PRIORITY_METRIKA_SYNC = 25
+# Нераспределённая сделка блокирует хэндофф ответственного — тот же приоритет
+# и то же обоснование, что у office_transfer.
+PRIORITY_LEAD_DISTRIBUTION = PRIORITY_NEW
 
 # ---------------------------------------------------------------------------
 # Дорожки (lanes) — редизайн 08.07.2026. У каждого класса задач своя очередь и
@@ -51,6 +54,7 @@ _CATEGORY_BY_KIND = {
     "jivo": "jivo",
     "lead_update": "lead",
     "office_transfer": "office_transfer",
+    "lead_distribution": "lead_distribution",
 }
 
 RATE_LIMIT_SECONDS = 3
@@ -88,6 +92,7 @@ _pending_leads: dict[str, dict] = {}
 _pending_waybills: set[str] = set()
 _pending_kontrol: set[str] = set()
 _pending_office_transfer: set[str] = set()
+_pending_lead_distribution: set[str] = set()
 _pending_invoice: set[str] = set()
 _pending_cdek_sync: set[str] = set()
 _pending_metrika_sync: set[str] = set()
@@ -136,6 +141,7 @@ async def shutdown_queue() -> None:
     _pending_waybills.clear()
     _pending_kontrol.clear()
     _pending_office_transfer.clear()
+    _pending_lead_distribution.clear()
     _pending_invoice.clear()
     _pending_cdek_sync.clear()
     _pending_metrika_sync.clear()
@@ -352,6 +358,27 @@ def enqueue_office_transfer(lead_id, source: str = "webhook") -> None:
     )
 
 
+def enqueue_lead_distribution(lead_id, source: str = "webhook") -> None:
+    """Распределение лида по профилю конструктора (lead_distribution.py) —
+    замена нативного виджета «Генезис». Приоритет PRIORITY_NEW: нераспределённая
+    сделка блокирует хэндофф ответственного, тот же аргумент, что у
+    office_transfer. Дедуп по lead_id, пока задача ждёт в очереди."""
+    if not _queues:
+        logger.error("Task queue not initialized, dropping lead_distribution for lead %s", lead_id)
+        return
+    key = str(lead_id)
+    if key in _pending_lead_distribution:
+        logger.info("Lead %s lead_distribution already in queue, skipping duplicate", key)
+        return
+    _pending_lead_distribution.add(key)
+    payload = {"_kind": "lead_distribution", "lead_id": lead_id, "source": source}
+    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_LEAD_DISTRIBUTION, payload=payload))
+    logger.info(
+        "ENQUEUE lead_distribution lead_id=%s source=%s lane=%s queue_size=%d",
+        key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
+    )
+
+
 def enqueue_cdek_sync(payload: dict) -> None:
     """Отдельная дорожка cdek: перемещение сделки по статусу СДЭК не встаёт
     в общую очередь и не тормозит клиентский путь (и наоборот)."""
@@ -438,6 +465,8 @@ async def _worker(lane: str) -> None:
             _pending_kontrol.discard(lead_id)
         elif kind == "office_transfer":
             _pending_office_transfer.discard(lead_id)
+        elif kind == "lead_distribution":
+            _pending_lead_distribution.discard(lead_id)
         elif kind == "ozon_invoice":
             _pending_invoice.discard(lead_id)
         elif kind == "cdek_sync":
@@ -484,6 +513,12 @@ async def _worker(lane: str) -> None:
             elif kind == "office_transfer":
                 from office_transfer import process_office_transfer
                 await process_office_transfer(
+                    item.payload["lead_id"],
+                    source=item.payload.get("source", "webhook"),
+                )
+            elif kind == "lead_distribution":
+                from lead_distribution import process_lead_distribution
+                await process_lead_distribution(
                     item.payload["lead_id"],
                     source=item.payload.get("source", "webhook"),
                 )

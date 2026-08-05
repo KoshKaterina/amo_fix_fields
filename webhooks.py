@@ -13,6 +13,7 @@ import cdek_client
 import cdek_status_sync
 import dup_autoclose
 import jivo_service
+import lead_distribution
 import metrika_sync
 import migration_freeze
 import ms_status_sync
@@ -33,10 +34,12 @@ from help_function import (
     parse_the_cart_field,
     parse_the_cart_field_2,
 )
+from lead_distribution_api import router as lead_distribution_router
 from queue_manager import (
     enqueue_invoice,
     enqueue_jivo,
     enqueue_kontrol,
+    enqueue_lead_distribution,
     enqueue_new,
     enqueue_office_transfer,
     enqueue_waybill,
@@ -88,6 +91,7 @@ async def lifespan(app):
     await wazzup_forward.init()
     await wazzup_delivery.init()
     await office_transfer.init()
+    await lead_distribution.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -95,6 +99,7 @@ async def lifespan(app):
     await wazzup_delivery.shutdown()
     await unmiss_tag.shutdown()
     await office_transfer.stop_reconcile()
+    await lead_distribution.stop_reconcile()
     await ozon_invoice.aclose()
     await ms_status_sync.shutdown()
     await woo_status_sync.shutdown()
@@ -107,6 +112,7 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(lead_distribution_router)
 
 logger = logging.getLogger("uvicorn")
 
@@ -391,6 +397,38 @@ async def lead_change(request: Request):
     ):
         logger.info("Lead %s entered %s in CLEVER — enqueue office_transfer", lead_id, incoming_status)
         enqueue_office_transfer(lead_id, source="webhook")
+
+    # Lead Distribution: сделка вошла в точку входа (pipeline_id/status_id)
+    # какого-то ВКЛЮЧЁННОГО профиля конструктора (lead_distribution.py) —
+    # замена нативного виджета «Генезис». В отличие от office_transfer здесь
+    # нет одной фиксированной пары воронка/этап — профили сами конфигурируют
+    # свои точки входа, поэтому дешёвая проверка идёт через has_matching_*.
+    # Часть событий amo приходит без pipeline_id в теле — это нормально,
+    # тогда матчим по одному status_id (может дать ложный enqueue при двух
+    # одинаковых status_id в разных воронках — не проблема: диспетчер
+    # перечитывает сделку и сверяет пару заново).
+    if lead_id is not None and incoming_status is not None:
+        try:
+            _ld_status = int(incoming_status)
+        except (TypeError, ValueError):
+            _ld_status = None
+        if _ld_status is not None:
+            if incoming_pipeline is not None:
+                try:
+                    _ld_matched = lead_distribution.has_matching_enabled_profile(int(incoming_pipeline), _ld_status)
+                except (TypeError, ValueError):
+                    _ld_matched = False
+            else:
+                _ld_matched = lead_distribution.has_matching_status(_ld_status)
+            if _ld_matched:
+                logger.info("Lead %s entered %s — enqueue lead_distribution", lead_id, incoming_status)
+                enqueue_lead_distribution(lead_id, source="webhook")
+
+    # Lead Distribution: ручная смена ответственного на сделке, распределённой
+    # этим модулем СЕГОДНЯ, — коррекция счётчиков нагрузки (см. correct_reassignment).
+    responsible_update = await get_nested(nested, ["leads", "update", "0", "responsible_user_id"])
+    if lead_id is not None and responsible_update is not None:
+        lead_distribution.correct_reassignment_bg(lead_id, responsible_update)
 
     # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
     # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).

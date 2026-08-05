@@ -606,6 +606,56 @@ TAG_OFFICE_TRANSFER_ERROR = "ошибка переноса в офис"
 TAG_NO_DELIVERY = "доставка не заполнена"        # Заказ + склад на месте, «Тип доставки» пуст
 TAG_BAD_FILL = "заказ заполнен некорректно"      # нет типа заявки/склада, чужой склад, нераспознанная доставка
 
+# ---------------------------------------------------------------------------
+# Lead Distribution (05.08.2026): конструктор профилей распределения лидов —
+# замена нативного виджета «Генезис» (F5). В отличие от office_transfer, здесь
+# нет захардкоженных правил в этом файле — профили создаются/редактируются
+# через API (lead_distribution_api.py), хранятся в var/lead_distribution_profiles.json.
+# См. lead_distribution.py.
+# ---------------------------------------------------------------------------
+# Мастер-флаг, OFF по умолчанию. Отдельные профили ТАКЖЕ должны быть enabled=True
+# в своей записи — оба уровня должны совпасть, как OFFICE_TRANSFER_ENABLED + правило.
+LEAD_DISTRIBUTION_ENABLED = os.getenv("LEAD_DISTRIBUTION_ENABLED", "").strip() == "1"
+
+# Cutover-граница (unix ts): события ДО неё игнорируются в reconciliation —
+# без ретроактивности. 0 = не задана; фича не должна включаться в этом состоянии.
+LEAD_DISTRIBUTION_SINCE_TS = int(os.getenv("LEAD_DISTRIBUTION_SINCE_TS", "0"))
+
+# Периодическая reconciliation-проверка (страховка от сбоев API/сети).
+# 0 = фоновый проход выключен (только вебхук).
+LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S = int(os.getenv("LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S", "120"))
+
+# Сделка не распределяется дольше N минут → один алерт в ТГ (дедуп, снимается
+# при успехе). 0 = алерт выключен.
+LEAD_DISTRIBUTION_STALE_ALERT_MIN = int(os.getenv("LEAD_DISTRIBUTION_STALE_ALERT_MIN", "30"))
+
+# Защита от гонки amgroup (создаёт сделку и асинхронно привязывает контакт):
+# если у свежепрочитанной сделки ещё нет контакта — активное ожидание короткими
+# проверками (не блокирующее воркер очереди) до этого бюджета, затем — алерт.
+LEAD_DISTRIBUTION_CONTACT_WAIT_S = int(os.getenv("LEAD_DISTRIBUTION_CONTACT_WAIT_S", "10"))
+LEAD_DISTRIBUTION_CONTACT_POLL_S = float(os.getenv("LEAD_DISTRIBUTION_CONTACT_POLL_S", "2"))
+
+# Разница в сегодняшних счётчиках (по источнику / по общему кол-ву), после
+# которой алгоритм «по нагрузке» перестаёт отдавать приоритет исходному
+# кандидату — см. lead_distribution._pick_load_balanced.
+LEAD_DISTRIBUTION_FAIRNESS_GAP = int(os.getenv("LEAD_DISTRIBUTION_FAIRNESS_GAP", "2"))
+
+# Индивидуальный график сотрудника («на месте ли он сейчас») — источника этих
+# данных в компании пока нет (team-panel не отслеживает присутствие/перерывы),
+# поэтому единое захардкоженное окно на всех участников распределения.
+LEAD_DISTRIBUTION_DEFAULT_WINDOW = (10, 19)  # (час начала МСК, час конца МСК)
+
+# Тег успешного распределения — идемпотентность (повторный вебхук на уже
+# помеченной сделке — no-op).
+TAG_LEAD_DISTRIBUTION_ROUTED = "распределено автоматически"
+# Тег зависшего/неудавшегося распределения — информационный, НЕ блокирует
+# повторные попытки reconciliation (по образцу TAG_OFFICE_TRANSFER_ERROR).
+TAG_LEAD_DISTRIBUTION_ERROR = "ошибка распределения"
+
+# Секрет в пути для /admin/lead-distribution/* — по образцу /wazzup/{secret},
+# /uis/{secret}. Пусто → эндпоинты недоступны (403 на любой секрет).
+LEAD_DISTRIBUTION_ADMIN_SECRET = os.getenv("LEAD_DISTRIBUTION_ADMIN_SECRET", "").strip()
+
 
 _TOTAL_RE = re.compile(
     r"Итого:\s*([\d\s]+[\d])[.,]\d+\s*(?:руб(?:ль|ля|лей|\.?)|₽)",
