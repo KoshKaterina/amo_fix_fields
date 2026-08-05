@@ -1,0 +1,20 @@
+# Сторож Sunscrypt. На сервере: /etc/cron.d/watchdog
+# tokens - раз в час: доступ отваливается тихо, и чем раньше узнаем, тем лучше.
+# deadlines и renewals - утром, одной сводкой, чтобы не дёргать в течение дня.
+#
+# ⚠️ Время здесь в UTC: системные часы сервера идут по UTC, а CRON_TZ эта сборка
+# cron (3.0pl1 Ubuntu) молча игнорирует - проверено 01.08.2026 живым заданием.
+# Москва = UTC+3 круглый год, перевода часов нет, так что сдвиг постоянный:
+#   06:00 UTC = 09:00 МСК, 06:05 UTC = 09:05 МСК.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+17 * * * * root /opt/watchdog/run.sh tokens
+0 6 * * *  root /opt/watchdog/run.sh deadlines
+5 6 * * *  root /opt/watchdog/run.sh renewals
+# defi - раз в полчаса: дашборд ходит к Morpho/Balancer/Compound через прокси в
+# Вену, и если тот отвалится, разделы опустеют молча (сайт снаружи живой).
+7,37 * * * * root /opt/watchdog/run.sh defi
+# services - каждые 5 минут: упавший сервис сам не поднимается и наружу молчит.
+# 04.08.2026 tg-analytics пролежал 4 часа, нашли случайно глазами.
+*/5 * * * * root /opt/watchdog/run.sh services

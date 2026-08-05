@@ -1,0 +1,10 @@
+# Ротация лога сторожа. На сервере: /etc/logrotate.d/watchdog
+/var/log/watchdog.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
