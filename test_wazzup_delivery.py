@@ -84,6 +84,22 @@ ERROR_BAD_CONTACT = {
     }]
 }
 
+ERROR_OFFICE_IMAGE = {  # картинка офисного шаблона, тело из прода (05.08.2026)
+    "messages": [{
+        "type": "image",
+        "error": {"error": "24_HOURS_EXCEEDED", "description": "The 24-h dialog box is closed"},
+        "chatId": "79505134197",
+        "isEcho": True,
+        "status": "error",
+        "contact": {"name": "79505134197"},
+        "chatType": "whatsapp",
+        "dateTime": "2026-08-05T07:39:12.218Z",
+        "messageId": "a1e7a817-9c61-4638-8e58-f05b2fbb0cde",
+        "authorName": "Екатерина Зубалий",
+        "contentUri": "https://store.wazzup24.com/993eb47b31999f8f3a4d3c3b5d65391cf45dbdc6/?filename=наш офис.jpg",
+    }]
+}
+
 OUT_SENT_WA = {  # исходящее менеджера, доставки пока нет
     "messages": [{
         "text": "Добрый день! Заказ собран",
@@ -456,6 +472,51 @@ def test_human_delay():
     assert wazzup_delivery._human_delay(12) == "12 сек"
     assert wazzup_delivery._human_delay(150) == "2.5 мин"
     assert wazzup_delivery._human_delay(7200) == "2.0 ч"
+
+
+# --- глушилка по вложению ---------------------------------------------------
+
+def test_office_image_silent_everywhere():
+    """Картинка офисного шаблона: ни алерта в ТГ, ни примечания в сделке."""
+    _reset()
+    _run(_handle(ERROR_OFFICE_IMAGE))
+    assert _sent == [], "по заглушённому вложению в чат не пишем"
+    assert _notes == [], "и примечание в сделку тоже не пишем"
+
+
+def test_office_image_silent_when_filename_encoded():
+    """Wazzup может прислать имя файла percent-encoded — глушилка всё равно ловит."""
+    _reset()
+    m = dict(ERROR_OFFICE_IMAGE["messages"][0])
+    m["messageId"] = "office-encoded"
+    m["contentUri"] = (
+        "https://store.wazzup24.com/993eb47b/"
+        "?filename=%D0%BD%D0%B0%D1%88%20%D0%BE%D1%84%D0%B8%D1%81.jpg"
+    )
+    _run(_handle({"messages": [m]}))
+    assert _sent == []
+    assert _notes == []
+
+
+def test_other_errors_still_alert():
+    """Глушилка узкая: остальные недоставки шумят как раньше."""
+    _reset()
+    _run(_handle(ERROR_TEMPLATE))
+    assert len(_sent) == 1
+    assert len(_notes) == 1
+
+
+def test_office_image_not_in_stuck_digest():
+    """Заглушённое вложение не всплывает и в вечернем списке висяков."""
+    _reset()
+    m = dict(ERROR_OFFICE_IMAGE["messages"][0])
+    m["messageId"] = "office-stuck"
+    m.pop("error")
+    m["status"] = "sent"
+    _run(_handle({"messages": [m]}))
+    wazzup_delivery._tracked["office-stuck"]["sent_mono"] -= 10_000
+    _run(wazzup_delivery._sweep(threshold_s=60))
+    assert wazzup_delivery._stuck_pending == {}
 
 
 if __name__ == "__main__":

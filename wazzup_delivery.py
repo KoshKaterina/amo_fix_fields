@@ -42,6 +42,7 @@ WAZZUP_DELIVERY_BURST_MAX алертов за окно — шлём одну с�
 import asyncio
 import datetime
 import logging
+import urllib.parse
 
 import httpx
 
@@ -55,6 +56,7 @@ from waybill_config import (
     WAZZUP_DELIVERY_BURST_WINDOW_S,
     WAZZUP_DELIVERY_CHAT_ID,
     WAZZUP_DELIVERY_ENABLED,
+    WAZZUP_DELIVERY_MUTE_CONTENT,
     WAZZUP_DELIVERY_POLL_INTERVAL_S,
     WAZZUP_DELIVERY_THREAD_ID,
     WAZZUP_RESPONSIBLE_TIMEOUT_S,
@@ -75,7 +77,7 @@ _MSK = datetime.timezone(datetime.timedelta(hours=3))
 # messageId → сведения об исходящем, ждущем доставки.
 #   sent_mono    : monotonic, когда мы узнали о сообщении (для таймера)
 #   sent_at_msk  : «ЧЧ:ММ» МСК для человека в дайджесте
-#   chat_type / chat_id / contact_name / author_name / text / msg_type
+#   chat_type / chat_id / contact_name / author_name / text / msg_type / content_uri
 #   alerted      : алерт (или постановка в дайджест) по нему уже был
 _tracked: dict[str, dict] = {}
 
@@ -192,6 +194,7 @@ def _handle_messages(messages) -> None:
             "contact_phone": str((contact or {}).get("phone") or ""),
             "author_name": str(m.get("authorName") or ""),
             "msg_type": str(m.get("type") or ""),
+            "content_uri": str(m.get("contentUri") or ""),
             "text": _snippet(m.get("text")),
             "alerted": info.get("alerted", False),
             "sent_mono": info.get("sent_mono") or _monotonic(),
@@ -245,6 +248,7 @@ def _handle_statuses(statuses) -> None:
                     "contact_phone": "",
                     "author_name": "",
                     "msg_type": "",
+                    "content_uri": str(s.get("contentUri") or ""),
                     "text": "",
                     "alerted": False,
                     "sent_mono": _monotonic(),
@@ -276,6 +280,25 @@ def _snippet(text) -> str:
         return ""
     t = " ".join(text.split())
     return t if len(t) <= _SNIPPET_MAX else t[: _SNIPPET_MAX - 1] + "…"
+
+
+def _is_muted_content(info: dict) -> bool:
+    """Вложение из списка WAZZUP_DELIVERY_MUTE_CONTENT — шуметь по нему не надо.
+
+    Живой случай: офисный шаблон уходит двумя сообщениями, и картинка «наш офис.jpg»
+    стабильно падает с 24_HOURS_EXCEEDED (за 31.07-05.08 это ВСЕ 9 ошибок по
+    картинкам, других не было). Чинить нечего — обычным сообщением в закрытое окно
+    нельзя, — а алерт с примечанием пугают: клиенту недоставленной остаётся только
+    картинка, сам шаблон доходит.
+
+    Ищем подстроку в contentUri: Wazzup кладёт имя файла в query (?filename=…),
+    и оно бывает percent-encoded, поэтому сверяем и сырую строку, и раскодированную.
+    """
+    uri = str(info.get("content_uri") or "")
+    if not (uri and WAZZUP_DELIVERY_MUTE_CONTENT):
+        return False
+    haystacks = (uri.lower(), urllib.parse.unquote(uri).lower())
+    return any(needle in h for needle in WAZZUP_DELIVERY_MUTE_CONTENT for h in haystacks)
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +422,14 @@ async def _sweep(threshold_s: int) -> None:
         if age >= _TTL_SECONDS:
             _tracked.pop(message_id, None)
             continue
-        if not info.get("alerted") and age >= threshold_s:
-            due.append((message_id, info))
+        if info.get("alerted") or age < threshold_s:
+            continue
+        if _is_muted_content(info):
+            # Глушилка режет вложение целиком: и мгновенный алерт, и вечерний
+            # список. Метим, чтобы не проверять его на каждом проходе.
+            info["alerted"] = True
+            continue
+        due.append((message_id, info))
 
     for message_id, info in due:
         # Помечаем сразу: второй раз в очередь то же сообщение не кладём.
@@ -508,6 +537,16 @@ async def _alert(message_id: str, info: dict, error: dict | None) -> None:
     # повторно, и удалённая запись завела бы второй алерт про то же сообщение.
     # Чистит запись TTL в _sweep.
     info["alerted"] = True
+
+    # Известная и не чинящаяся недоставка (картинка офисного шаблона) — молчим
+    # везде: ни в чат, ни в примечание. Метку alerted оставляем выставленной,
+    # чтобы повторный вебхук не пошёл по кругу.
+    if _is_muted_content(info):
+        logger.info(
+            "Wazzup доставка: %s — вложение в списке глушилки, алерт и примечание пропущены",
+            message_id,
+        )
+        return
     try:
         allowed, first_suppressed = _burst_allow()
         lead_id, _ = await _resolve_lead_safe(info.get("chat_id") or info.get("contact_phone") or "")
