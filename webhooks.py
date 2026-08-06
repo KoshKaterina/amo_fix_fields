@@ -18,6 +18,7 @@ import migration_freeze
 import ms_client
 import office_transfer
 import ozon_invoice
+import showroom_store
 import showroom_tag
 import telegram_bot
 import uis_missed_call
@@ -87,12 +88,14 @@ async def lifespan(app):
     await wazzup_forward.init()
     await wazzup_delivery.init()
     await office_transfer.init()
+    await showroom_store.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
     await wazzup_forward.shutdown()
     await wazzup_delivery.shutdown()
     await unmiss_tag.shutdown()
+    await showroom_store.shutdown()
     await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
     await ms_client.aclose()

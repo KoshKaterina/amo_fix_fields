@@ -75,7 +75,7 @@ from waybill_config import (
     DELIVERY_CDEK_MARKERS,
     DELIVERY_COURIER_MOSCOW_MARKER,
     DELIVERY_RUSSIAN_POST_MARKER,
-    DELIVERY_SHOWROOM_MARKER,
+    DELIVERY_PICKUP_MARKERS,
     DUP_REASON_FIELD_ID,
     FIELD_APPLICATION_TYPE,
     FIELD_DELIVERY_TYPE,
@@ -178,7 +178,9 @@ def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, in
         return None
     if _warehouse(lead) not in OFFICE_TRANSFER_WAREHOUSES:
         return None
-    if DELIVERY_SHOWROOM_MARKER not in _delivery_text(lead):
+    text = _delivery_text(lead)
+    # С 06.08.2026 самовывоз бывает из офиса и из шоурума (у шоурума свой склад).
+    if not any(marker in text for marker in DELIVERY_PICKUP_MARKERS):
         return None
     return (PIPELINE_OFFICE, STATUS_SUCCESS)
 

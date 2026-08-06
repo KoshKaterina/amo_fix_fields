@@ -288,6 +288,29 @@ MS_RECONCILE_HOUR_MSK = int(os.getenv("MS_RECONCILE_HOUR_MSK", "2"))
 MS_ATTR_TREK = "e25b4e11-2aa4-11f1-0a80-0704003169db"
 FIELD_FF_TREK = 571657
 
+# ---------------------------------------------------------------------------
+# Склад шоурума (задача Кати 06.08.2026). Кирилл отгружает из отдельного склада
+# «Sunscrypt Шоурум», заведённого в МойСкладе 03.08.
+#
+# Источник правды — УСЛУГА ДОСТАВКИ в заказе: стоит «Самовывоз из Шоурума» →
+# склад заказа обязан быть шоурумным; убрали услугу → склад возвращается на
+# «Sunscrypt Основной». Менеджеров этим не грузим, склад ведёт showroom_store.py.
+#
+# ⚠️ Возврат делаем ТОЛЬКО со шоурумного склада: заказы ЭРМС и «Вскрытые» живут
+# по своим правилам, трогать их нельзя.
+# ---------------------------------------------------------------------------
+SHOWROOM_STORE_ENABLED = os.getenv("SHOWROOM_STORE_ENABLED", "0") == "1"
+SHOWROOM_STORE_POLL_INTERVAL_S = int(os.getenv("SHOWROOM_STORE_POLL_INTERVAL_S", "120"))
+SHOWROOM_STORE_LOOKBACK_MIN = int(os.getenv("SHOWROOM_STORE_LOOKBACK_MIN", "30"))
+
+MS_STORE_SHOWROOM_ID = os.getenv("MS_STORE_SHOWROOM_ID", "1c480a71-8f76-11f1-0a80-16b200011979")
+MS_STORE_MAIN_ID = os.getenv("MS_STORE_MAIN_ID", "0e5a2b05-c413-11ee-0a80-13fd002f63f9")
+# Услуга «Самовывоз из Шоурума» в МойСкладе (id надёжнее названия: название правят руками)
+MS_SERVICE_SHOWROOM_PICKUP_ID = os.getenv(
+    "MS_SERVICE_SHOWROOM_PICKUP_ID", "15ff040c-529c-11f1-0a80-0d0c00781fe6")
+# Запасной признак, если услугу пересоздадут с новым id
+SHOWROOM_SERVICE_NAME_MARKER = "самовывоз из шоурума"
+
 # Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 _raw_chat_id = os.getenv("TG_ALLOWED_CHAT_ID", "")
@@ -554,13 +577,20 @@ APPLICATION_TYPE_PREORDER = 1041239  # Предзаказ
 WAREHOUSE_SUNSCRYPT_MAIN = 1040201    # Sunscrypt Основной
 WAREHOUSE_SUNSCRYPT_OPENED = 1040207  # Sunscrypt Вскрытые
 WAREHOUSE_ERMS_MAIN = 1041653         # ЭРМС_Основной
-OFFICE_TRANSFER_WAREHOUSES = {WAREHOUSE_SUNSCRYPT_MAIN, WAREHOUSE_SUNSCRYPT_OPENED}
+WAREHOUSE_SUNSCRYPT_SHOWROOM = 1041885  # Sunscrypt Шоурум (заведён 03.08.2026 под отгрузки Кирилла)
+# Шоурум добавлен 06.08.2026: без него сделка с новым складом переставала подходить
+# под правила автопереноса и зависала в УР розницы с алертом «заказ заполнен некорректно».
+OFFICE_TRANSFER_WAREHOUSES = {
+    WAREHOUSE_SUNSCRYPT_MAIN, WAREHOUSE_SUNSCRYPT_OPENED, WAREHOUSE_SUNSCRYPT_SHOWROOM}
 
 # 577623 (= DUP_REASON_FIELD_ID выше, живое имя «Причина ЗИН») — доп. enum_id для office-transfer
 REASON_WAITLIST = 1041245  # Лист ожидания
 REASON_ACADEMY = 1041243   # Академия
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
+# Самовывоз бывает двух видов: из офиса (как было) и из шоурума (с 06.08.2026, свой склад).
+# Оба ведут в один и тот же этап Офиса, поэтому правило матчит по любому из маркеров.
+DELIVERY_PICKUP_MARKERS = (DELIVERY_SHOWROOM_MARKER, "самовывоз из шоурума")
 DELIVERY_COURIER_MOSCOW_MARKER = "курьером по москве"
 DELIVERY_CDEK_MARKERS = ("cdek", "сдэк")
 DELIVERY_RUSSIAN_POST_MARKER = "почта россии"
