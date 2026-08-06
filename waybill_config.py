@@ -299,7 +299,10 @@ FIELD_FF_TREK = 571657
 # ⚠️ Возврат делаем ТОЛЬКО со шоурумного склада: заказы ЭРМС и «Вскрытые» живут
 # по своим правилам, трогать их нельзя.
 # ---------------------------------------------------------------------------
-SHOWROOM_STORE_ENABLED = os.getenv("SHOWROOM_STORE_ENABLED", "0") == "1"
+# По умолчанию ВКЛЮЧЕНО (решение Кати 06.08): отдельный шаг «добавь строку в env»
+# ей не нужен, а проверить работу сторожа можно по логам. Переменная остаётся
+# аварийным выключателем: SHOWROOM_STORE_ENABLED=0 усыпляет модуль без выкатки кода.
+SHOWROOM_STORE_ENABLED = os.getenv("SHOWROOM_STORE_ENABLED", "1") == "1"
 SHOWROOM_STORE_POLL_INTERVAL_S = int(os.getenv("SHOWROOM_STORE_POLL_INTERVAL_S", "120"))
 SHOWROOM_STORE_LOOKBACK_MIN = int(os.getenv("SHOWROOM_STORE_LOOKBACK_MIN", "30"))
 
