@@ -64,6 +64,18 @@ def test_inbound_starts_timer():
     assert st["text"] == "привет"
 
 
+def test_skipped_channel_never_starts_timer():
+    """Решение Кати 06.08.2026: партнёрский телеграм Саши (обменники, боты,
+    блогеры) SLA не сторожит — там пишут не клиенты."""
+    W._pending.clear()
+    skipped = next(iter(W.WAZZUP_SLA_SKIP_CHANNELS))
+    W.handle_webhook({"messages": [_msg(channel=skipped, text="Добрый день!")]})
+    assert W._pending == {}
+    # клиентский канал в том же вебхуке продолжает работать
+    W.handle_webhook({"messages": [_msg(channel="ch1", text="Добрый день!")]})
+    assert len(W._pending) == 1
+
+
 def test_repeated_inbound_does_not_reset_timer():
     """Таймер считаем от первого неотвеченного сообщения: повторное входящее
     не сдвигает waiting_since (иначе частые сообщения = вечное молчание алерта)."""

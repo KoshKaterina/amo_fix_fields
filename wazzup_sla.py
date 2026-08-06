@@ -46,6 +46,7 @@ from waybill_config import (
     WAZZUP_SLA_ENABLED,
     WAZZUP_SLA_MINUTES,
     WAZZUP_SLA_POLL_INTERVAL_S,
+    WAZZUP_SLA_SKIP_CHANNELS,
     WAZZUP_SLA_WINDOW_END_H,
     WAZZUP_SLA_WINDOW_START_H,
     WAZZUP_WEBHOOK_URL,
@@ -115,6 +116,12 @@ def handle_webhook(payload: dict) -> None:
         if not chat_id:
             continue
         key = (channel_id, chat_id)
+
+        # Канал вне зоны SLA (партнёрский телеграм Саши: обменники, боты,
+        # блогеры). Пропускаем ДО ветки «ответили» — там всё равно нечего снимать,
+        # ожиданий по этому каналу мы не заводим.
+        if channel_id in WAZZUP_SLA_SKIP_CHANNELS:
+            continue
 
         if _is_outbound(m):
             # Ответили (оператор/бот/CRM) → снимаем ожидание.
@@ -195,9 +202,10 @@ async def init() -> None:
     _sub_task = asyncio.create_task(_ensure_subscription_later())
     _loop_task = asyncio.create_task(_poll_loop())
     logger.info(
-        "Wazzup SLA: включён — порог %s мин, окно %02d:00–%02d:00 МСК, опрос %s сек",
+        "Wazzup SLA: включён — порог %s мин, окно %02d:00–%02d:00 МСК, опрос %s сек, "
+        "каналов вне SLA: %s",
         WAZZUP_SLA_MINUTES, WAZZUP_SLA_WINDOW_START_H, WAZZUP_SLA_WINDOW_END_H,
-        WAZZUP_SLA_POLL_INTERVAL_S,
+        WAZZUP_SLA_POLL_INTERVAL_S, len(WAZZUP_SLA_SKIP_CHANNELS),
     )
 
 
