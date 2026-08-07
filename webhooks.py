@@ -18,6 +18,7 @@ import migration_freeze
 import ms_client
 import office_transfer
 import ozon_invoice
+import showroom_alert
 import showroom_store
 import showroom_tag
 import telegram_bot
@@ -422,6 +423,10 @@ async def lead_change(request: Request):
         # Автотег «Запись в шоурум»: тип доставки (577315) = самовывоз из офиса
         # Sunscrypt → вешаем тег (в фоне, идемпотентно). «CDEK: Самовывоз» не триггерит.
         showroom_tag.maybe_apply_bg(delivery_type, lead_id)
+        # Алерт в ТГ: самовывоз (офис ИЛИ шоурум) → в топик ШОУРУМ с тегом Кати,
+        # чтобы записать клиента на визит. Шире автотега выше: тег вешается только на
+        # самовывоз из офиса, а записывать надо и тех, кто забирает из шоурума.
+        showroom_alert.notify_bg(delivery_type, lead_id)
 
         if (
             goods is not None

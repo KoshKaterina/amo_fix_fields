@@ -26,6 +26,15 @@ MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya @gladkov_369"
 # ответственного (в т.ч. самого Игоря на его сделках) его не добавляем.
 MISSED_CALL_FALLBACK_TAG = "@thebarsa1"
 
+# Алерт «новый заказ с самовывозом → записать в шоурум» (showroom_alert).
+# Та же супергруппа ОП, но СВОЙ топик ШОУРУМ и один адресат — Катя-офис.
+# Топик «Магазин, ШОУРУМ» = thread 4083 (снято 07.08.2026 из адреса веб-телеграма
+# web.telegram.org/a/#-1003680811996_4083). В закрепе топика ветка адресована
+# @offf1cer и @kathrina_bistraya — оба в супергруппе, тег уведомит.
+# None → алерт НЕ шлётся (в General сыпать не будем), в логе — предупреждение.
+SHOWROOM_ALERT_THREAD_ID: int | None = 4083
+SHOWROOM_ALERT_TAG = "@kathrina_bistraya"
+
 
 def mentions_for(responsible_id) -> str:
     """Строка @-тегов для алерта по ответственному сделки.
