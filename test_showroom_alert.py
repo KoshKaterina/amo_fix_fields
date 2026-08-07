@@ -88,10 +88,14 @@ def _lead(
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
+def _clean(monkeypatch, tmp_path):
     _sent.clear()
     showroom_alert._seen_leads.clear()
     showroom_alert._seen_order.clear()
+    # Дедуп пишется на диск (постоянный том контейнера) — в тестах во временную папку.
+    monkeypatch.setattr(showroom_alert, "_SEEN_PATH", str(tmp_path / "seen.json"),
+                        raising=False)
+    monkeypatch.setattr(showroom_alert, "_seen_loaded", False, raising=False)
     monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_THREAD_ID", 4083, raising=False)
     monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_ENABLED", True, raising=False)
     monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_DELAY_S", 0, raising=False)
@@ -211,6 +215,32 @@ def test_raznye_sdelki_obe_prohodyat(scheduled):
     showroom_alert.notify_bg("Самовывоз из офиса Sunscrypt", 1)
     showroom_alert.notify_bg("Самовывоз из Шоурума", 2)
     assert len(scheduled) == 2
+
+
+def test_dedup_perezhivaet_restart(scheduled, monkeypatch):
+    """Бой 07.08: пересборка контейнера обнулила память, и по заказу 45-минутной
+    давности ушёл второй алерт. Список уведомлённых лежит на диске."""
+    showroom_alert.notify_bg("Самовывоз из офиса Sunscrypt", LEAD_ID)
+    assert len(scheduled) == 1
+
+    # «Рестарт»: память процесса чистая, файл на месте.
+    showroom_alert._seen_leads.clear()
+    showroom_alert._seen_order.clear()
+    monkeypatch.setattr(showroom_alert, "_seen_loaded", False, raising=False)
+
+    showroom_alert.notify_bg("Самовывоз из офиса Sunscrypt", LEAD_ID)
+    assert len(scheduled) == 1
+
+
+def test_bitiy_fayl_dedupa_ne_lomaet_alert(scheduled, monkeypatch, tmp_path):
+    """Файл повреждён → начинаем дедуп с нуля, но алерты идут."""
+    bad = tmp_path / "broken.json"
+    bad.write_text("{не json", encoding="utf-8")
+    monkeypatch.setattr(showroom_alert, "_SEEN_PATH", str(bad), raising=False)
+    monkeypatch.setattr(showroom_alert, "_seen_loaded", False, raising=False)
+
+    showroom_alert.notify_bg("Самовывоз из офиса Sunscrypt", LEAD_ID)
+    assert len(scheduled) == 1
 
 
 def test_master_flag_gasit(scheduled, monkeypatch):

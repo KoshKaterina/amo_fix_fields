@@ -19,14 +19,17 @@
 Ждём SHOWROOM_ALERT_DELAY_S и только потом читаем сделку — ровно так же, как
 делал прежний триггер Цифровой воронки (он ждал минуту).
 
-Дедуп — по lead_id в памяти процесса: поле корзины обновляется несколько раз
-(в т.ч. эхом от наших же PATCH), а сообщение нужно одно. Рестарт контейнера
-дедуп обнуляет — тогда возможен повтор по сделке, которая в этот момент в
-обработке; это дешевле пропуска. Построено по образцу uis_missed_call.py.
+Дедуп — по lead_id, и он ПЕРЕЖИВАЕТ рестарт: список отправленных лежит в
+/app/var (постоянный том контейнера). Память процесса гасит параллельные
+вебхуки, файл — повтор после пересборки. Без файла 07.08 второй выкат заново
+уведомил про заказ, о котором уже писали 45 минут назад: сделка всё ещё висела
+в «Новый лид», а память процесса обнулилась.
 """
 
 import asyncio
+import json
 import logging
+import os
 import time
 from collections import deque
 
@@ -51,10 +54,43 @@ _bg_tasks: set = set()
 _seen_leads: set = set()
 _seen_order: deque = deque()
 _SEEN_CAP = 5000
+_SEEN_PATH = os.getenv("SHOWROOM_ALERT_SEEN_PATH", "/app/var/showroom_alert_seen.json")
+_seen_loaded = False
+
+
+def _load_seen() -> None:
+    """Поднять список уведомлённых сделок с диска. Файла нет / битый — начинаем с пустого."""
+    global _seen_loaded
+    if _seen_loaded:
+        return
+    _seen_loaded = True
+    try:
+        with open(_SEEN_PATH, encoding="utf-8") as f:
+            for key in json.load(f):
+                _seen_leads.add(str(key))
+                _seen_order.append(str(key))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception("Шоурум-алерт: не прочитался %s — дедуп с нуля", _SEEN_PATH)
+
+
+def _save_seen() -> None:
+    """Сбросить список на диск. Не удался — не беда, дедуп в памяти остаётся."""
+    try:
+        os.makedirs(os.path.dirname(_SEEN_PATH), exist_ok=True)
+        tmp = f"{_SEEN_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(_seen_order), f)
+        os.replace(tmp, _SEEN_PATH)
+    except Exception:
+        logger.exception("Шоурум-алерт: не записался %s", _SEEN_PATH)
 
 
 def _is_new(lead_id) -> bool:
-    """True — по этой сделке ещё не слали (слать). False — уже слали (эхо вебхука)."""
+    """True — по этой сделке ещё не слали (слать). False — уже слали (эхо вебхука
+    или повтор после рестарта: список поднимается с диска)."""
+    _load_seen()
     key = str(lead_id)
     if key in _seen_leads:
         return False
@@ -62,6 +98,7 @@ def _is_new(lead_id) -> bool:
     _seen_order.append(key)
     if len(_seen_order) > _SEEN_CAP:
         _seen_leads.discard(_seen_order.popleft())
+    _save_seen()
     return True
 
 
