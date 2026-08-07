@@ -116,7 +116,7 @@ def _esc(s) -> str:
 
 def _build_message(lead_id, client, composition, delivery, price) -> str:
     lines = [
-        "🏬 Новый заказ с самовывозом — записать клиента в шоурум",
+        "🏬 Новый заказ с самовывозом",
         SHOWROOM_ALERT_TAG,
     ]
     if client:
