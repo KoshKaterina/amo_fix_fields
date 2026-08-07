@@ -17,6 +17,7 @@ import metrika_sync
 import migration_freeze
 import ms_client
 import office_transfer
+import order_watchdog
 import ozon_invoice
 import showroom_alert
 import showroom_store
@@ -90,6 +91,7 @@ async def lifespan(app):
     await wazzup_delivery.init()
     await office_transfer.init()
     await showroom_store.init()
+    await order_watchdog.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -97,6 +99,7 @@ async def lifespan(app):
     await wazzup_delivery.shutdown()
     await unmiss_tag.shutdown()
     await showroom_store.shutdown()
+    await order_watchdog.shutdown()
     await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
     await ms_client.aclose()

@@ -286,6 +286,21 @@ MS_RECONCILE_HOUR_MSK = int(os.getenv("MS_RECONCILE_HOUR_MSK", "2"))
 # «Трек-номер» (то же, что FIELD_CDEK_ORDER_NUMBER; у ФФ-копий оно пустое,
 # конфликта с CDEK-синком нет — тот пишет в офисные сделки).
 MS_ATTR_TREK = "e25b4e11-2aa4-11f1-0a80-0704003169db"
+# Доп. поле заказа МС «Номер заказа на сайте» (= id заказа WooCommerce).
+# По нему woocommerce-sklad связывает заказ сайта с заказом покупателя, и по нему
+# же сторож order_watchdog проверяет, что заказ вообще доехал.
+MS_ATTR_ORDER_NUMBER_ID = os.getenv(
+    "MS_ATTR_ORDER_NUMBER_ID", "70c4735f-c542-11f0-0a80-1755000e25a7")
+
+# Сторож заказов (order_watchdog): раз в час сверяет заказы сайта за сутки с
+# заказами в МойСкладе и пишет в технический чат, если чего-то не хватает.
+# Заведён 07.08.2026 после потери заказа №18287: вебхук не дошёл, а сверка в
+# woocommerce-sklad девять дней молча возвращала ноль.
+ORDER_WATCHDOG_ENABLED = os.getenv("ORDER_WATCHDOG_ENABLED", "1") == "1"
+ORDER_WATCHDOG_INTERVAL_S = int(os.getenv("ORDER_WATCHDOG_INTERVAL_S", "3600"))
+ORDER_WATCHDOG_LOOKBACK_H = int(os.getenv("ORDER_WATCHDOG_LOOKBACK_H", "24"))
+# Заказ моложе этого возраста ещё может ехать штатно — не тревожим.
+ORDER_WATCHDOG_MIN_AGE_MIN = int(os.getenv("ORDER_WATCHDOG_MIN_AGE_MIN", "15"))
 FIELD_FF_TREK = 571657
 
 # ---------------------------------------------------------------------------
