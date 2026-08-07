@@ -1,12 +1,23 @@
 """Алерт в Telegram: новый заказ с самовывозом → записать клиента в шоурум.
 
-Заказ приходит на сайте, тип доставки (577315) парсится из корзины (576703) и
+Заказ приходит с сайта, тип доставки (577315) парсится из корзины (576703) и
 прилетает вебхуком /lead_change через пару секунд после создания сделки. Если
 доставка — любой из НАШИХ самовывозов (из офиса или из шоурума), шлём сообщение
 в супергруппу ОП, топик ШОУРУМ, с @-тегом Кати: её задача записать клиента.
 
-⚠️ Дискриминатор — DELIVERY_PICKUP_MARKERS: «CDEK: Самовывоз» (пункт выдачи СДЭК)
-сюда НЕ попадает, это доставка, а не визит в офис.
+Четыре гейта, и все четыре нужны (07.08.2026, разбор спама в бою):
+  1. самовывоз — «CDEK: Самовывоз» это ПВЗ, не наш офис, он НЕ считается;
+  2. воронка «ОП розница» и этап «Новый лид» (хаб или буферный) — только свежая
+     заявка, а не сделка в работе, в Офисе или в тестовой воронке;
+  3. сделка создана не давнее SHOWROOM_ALERT_MAX_AGE_MIN — отсекает массовые
+     прогоны по старью: 07.08 чужой прогон переписал корзину у полутора десятков
+     закрытых сделок от 10-29.07, и в топик улетела пачка сообщений;
+  4. мастер-флаг SHOWROOM_ALERT_ENABLED — выключить без выкатки кода.
+
+Задержка перед отправкой: поля сделки заполняются не разом. Первое сообщение
+того же дня ушло без товара («0.00 рублей»), потому что состав ещё не записался.
+Ждём SHOWROOM_ALERT_DELAY_S и только потом читаем сделку — ровно так же, как
+делал прежний триггер Цифровой воронки (он ждал минуту).
 
 Дедуп — по lead_id в памяти процесса: поле корзины обновляется несколько раз
 (в т.ч. эхом от наших же PATCH), а сообщение нужно одно. Рестарт контейнера
@@ -16,6 +27,7 @@
 
 import asyncio
 import logging
+import time
 from collections import deque
 
 import amo_service
@@ -26,6 +38,11 @@ from waybill_config import (
     DELIVERY_PICKUP_MARKERS,
     FIELD_COMPOSITION,
     FIELD_DELIVERY_TYPE,
+    PIPELINE_CLEVER_MAIN,
+    SHOWROOM_ALERT_DELAY_S,
+    SHOWROOM_ALERT_ENABLED,
+    SHOWROOM_ALERT_MAX_AGE_MIN,
+    STATUS_NEW_LEAD_ALL,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -56,9 +73,27 @@ def is_pickup(delivery_type) -> bool:
     return any(marker in text for marker in DELIVERY_PICKUP_MARKERS)
 
 
+def is_fresh_new_lead(lead: dict) -> bool:
+    """Сделка — свежая заявка в «Новый лид» воронки ОП розница?
+
+    Проверяется по СДЕЛКЕ, а не по вебхуку: массовый прогон по старым сделкам
+    шлёт такие же вебхуки, и отличить их можно только этапом и возрастом."""
+    if not lead:
+        return False
+    if str(lead.get("pipeline_id")) != str(PIPELINE_CLEVER_MAIN):
+        return False
+    if lead.get("status_id") not in STATUS_NEW_LEAD_ALL:
+        return False
+    created = lead.get("created_at") or 0
+    return (time.time() - created) <= SHOWROOM_ALERT_MAX_AGE_MIN * 60
+
+
 def notify_bg(delivery_type, lead_id) -> None:
     """delivery_type = «Тип доставки» (577315), распарсенный из корзины.
-    Самовывоз и по сделке ещё не слали → в фоне шлём алерт. Вебхук не блокирует."""
+    Самовывоз и по сделке ещё не слали → в фоне проверяем остальное и шлём.
+    Вебхук не блокируем: тяжёлые проверки уходят в фон."""
+    if not SHOWROOM_ALERT_ENABLED:
+        return
     if lead_id is None or not is_pickup(delivery_type):
         return
     if SHOWROOM_ALERT_THREAD_ID is None:
@@ -76,17 +111,26 @@ def notify_bg(delivery_type, lead_id) -> None:
 
 async def _apply(lead_id, delivery_type) -> None:
     try:
+        # Ждём, пока плагин сайта дозапишет состав, сумму и контакт.
+        if SHOWROOM_ALERT_DELAY_S:
+            await asyncio.sleep(SHOWROOM_ALERT_DELAY_S)
+
         lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
-        client = _client_name(lead) if lead else None
-        composition = (
-            amo_service.get_custom_field_value(lead, FIELD_COMPOSITION) if lead else None
-        )
-        # Тип доставки из сделки надёжнее распарсенного: к моменту чтения поле уже
-        # записано. Нет — берём то, что пришло вебхуком.
-        delivery = (
-            amo_service.get_custom_field_value(lead, FIELD_DELIVERY_TYPE) if lead else None
-        ) or delivery_type
-        price = (lead or {}).get("price")
+        if not is_fresh_new_lead(lead):
+            logger.info(
+                "Шоурум-алерт: сделка %s не свежая заявка в «Новый лид» — молчим", lead_id,
+            )
+            return
+
+        # Тип доставки перечитываем из сделки: к этому моменту поле уже записано.
+        delivery = amo_service.get_custom_field_value(lead, FIELD_DELIVERY_TYPE) or delivery_type
+        if not is_pickup(delivery):
+            logger.info("Шоурум-алерт: у сделки %s доставка уже не самовывоз — молчим", lead_id)
+            return
+
+        client = await _client_name(lead)
+        composition = amo_service.get_custom_field_value(lead, FIELD_COMPOSITION)
+        price = lead.get("price")
 
         text = _build_message(lead_id, client, composition, delivery, price)
         ok = await telegram_bot.send_alert(
@@ -94,20 +138,26 @@ async def _apply(lead_id, delivery_type) -> None:
             chat_id=NOTIFY_CHAT_ID, message_thread_id=SHOWROOM_ALERT_THREAD_ID,
         )
         logger.info(
-            "Шоурум-алерт: %s (сделка %s, доставка %s)",
-            "отправлен" if ok else "НЕ отправлен", lead_id, delivery or "—",
+            "Шоурум-алерт: %s (сделка %s, клиент %s, доставка %s)",
+            "отправлен" if ok else "НЕ отправлен", lead_id, client or "—", delivery or "—",
         )
     except Exception:
         logger.exception("Шоурум-алерт: ошибка на сделке %s", lead_id)
 
 
-def _client_name(lead: dict) -> str | None:
+async def _client_name(lead: dict) -> str | None:
+    """Имя клиента. ⚠️ Во вложенных контактах сделки amo отдаёт только id и
+    is_main — имени там НЕТ, его надо дочитывать отдельным запросом."""
     contacts = ((lead.get("_embedded") or {}).get("contacts")) or []
-    for contact in contacts:
-        name = (contact.get("name") or "").strip()
-        if name:
-            return name
-    return None
+    if not contacts:
+        return None
+    main = next((c for c in contacts if c.get("is_main")), contacts[0])
+    try:
+        contact = await amo_service.get_contact_by_id(main.get("id"))
+    except Exception:
+        logger.exception("Шоурум-алерт: контакт %s не прочитался", main.get("id"))
+        return None
+    return ((contact or {}).get("name") or "").strip() or None
 
 
 def _esc(s) -> str:

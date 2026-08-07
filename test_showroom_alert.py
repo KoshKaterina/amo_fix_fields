@@ -1,13 +1,17 @@
 """Тесты алерта «новый заказ с самовывозом → записать в шоурум» (showroom_alert).
 
-Проверяем то, ради чего фича: срабатывает на оба наших самовывоза, молчит на
-доставке и на «CDEK: Самовывоз», не дублирует на эхо-вебхуках, тегает Катю и
-даёт ссылку на сделку.
+Половина тестов написана по РЕАЛЬНОМУ разбору 07.08.2026: фича ушла в бой и
+насыпала в топик пачку сообщений по чужим сделкам. Что тогда прошло сквозь гейт
+и теперь ловится тестами:
+  • закрытые сделки из воронки «Тест» (10.07-29.07), которым чужой прогон
+    переписал корзину;
+  • сделки в Офисе и в работе, куда алерт вообще не относится;
+  • сообщение без товара — состав ещё не успел записаться;
+  • пустое имя клиента: во вложенных контактах amo отдаёт только id и is_main.
 
-⚠️ Фон (asyncio.create_task) в этих тестах НЕ используется: соседние тест-модули
-(test_dup_autoclose, test_unmiss_tag) подменяют asyncio.create_task глобально, и
-при общем прогоне настоящие задачи не создаются. Поэтому гейт проверяем на
-notify_bg со своей заглушкой, а отправку — вызовом _apply напрямую.
+⚠️ Фон (asyncio.create_task) тут НЕ используется: соседние тест-модули
+(test_dup_autoclose, test_unmiss_tag) подменяют asyncio.create_task глобально.
+Гейт проверяем на notify_bg со своей заглушкой, отправку — вызовом _apply.
 
 Запуск: python3 -m pytest test_showroom_alert.py -q
 """
@@ -15,6 +19,7 @@ notify_bg со своей заглушкой, а отправку — вызов
 import asyncio
 import os
 import sys
+import time
 import types
 
 import pytest
@@ -44,18 +49,41 @@ _install_stubs()
 
 import showroom_alert  # noqa: E402
 import tg_recipients  # noqa: E402
+from waybill_config import (  # noqa: E402
+    PIPELINE_CLEVER_MAIN,
+    STATUS_NEW_LEAD,
+    STATUS_NEW_LEAD_BUFFERS,
+)
 
 LEAD_ID = 36600001
+PIPELINE_OFFICE_ANY = 10593103
+STATUS_IN_WORK = 83537858
+STATUS_CLOSED_LOST = 143
 
 
-async def _fake_lead(lead_id, with_=()):
+def _lead(
+    lead_id=LEAD_ID,
+    pipeline=PIPELINE_CLEVER_MAIN,
+    status=STATUS_NEW_LEAD,
+    age_min=1,
+    delivery="Самовывоз из офиса Sunscrypt, 1 шт, 0.00 рублей",
+    composition="Keystone 3 Pro, 1 шт, 15 990.00 рублей",
+    price=15990,
+    contacts=({"id": 1, "is_main": True},),
+):
+    fields = []
+    if composition is not None:
+        fields.append({"field_id": 577313, "values": [{"value": composition}]})
+    if delivery is not None:
+        fields.append({"field_id": 577315, "values": [{"value": delivery}]})
     return {
-        "id": lead_id, "price": 42000,
-        "custom_fields_values": [
-            {"field_id": 577313, "values": [{"value": "Keystone 3 Pro — 1 шт."}]},
-            {"field_id": 577315, "values": [{"value": "Самовывоз из офиса Sunscrypt"}]},
-        ],
-        "_embedded": {"contacts": [{"id": 1, "name": "Пётр Иванов"}]},
+        "id": lead_id,
+        "pipeline_id": pipeline,
+        "status_id": status,
+        "created_at": int(time.time()) - age_min * 60,
+        "price": price,
+        "custom_fields_values": fields,
+        "_embedded": {"contacts": list(contacts)},
     }
 
 
@@ -64,8 +92,14 @@ def _clean(monkeypatch):
     _sent.clear()
     showroom_alert._seen_leads.clear()
     showroom_alert._seen_order.clear()
-    monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_THREAD_ID", 777, raising=False)
-    monkeypatch.setattr(showroom_alert.amo_service, "get_lead_full", _fake_lead)
+    monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_THREAD_ID", 4083, raising=False)
+    monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_ENABLED", True, raising=False)
+    monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_DELAY_S", 0, raising=False)
+
+    async def contact(contact_id):
+        return {"id": contact_id, "name": "Пётр Иванов"}
+
+    monkeypatch.setattr(showroom_alert.amo_service, "get_contact_by_id", contact)
     yield
     _sent.clear()
     showroom_alert._seen_leads.clear()
@@ -90,6 +124,14 @@ def scheduled(monkeypatch):
     return fired
 
 
+def _send(lead, monkeypatch, delivery="Самовывоз из офиса Sunscrypt"):
+    async def get_lead(lead_id, with_=()):
+        return lead
+
+    monkeypatch.setattr(showroom_alert.amo_service, "get_lead_full", get_lead)
+    asyncio.run(showroom_alert._apply(lead.get("id") if lead else LEAD_ID, delivery))
+
+
 # ── гейт по типу доставки ────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("delivery", [
@@ -102,7 +144,7 @@ def test_nash_samovyvoz_triggerit(delivery):
 
 
 @pytest.mark.parametrize("delivery", [
-    "CDEK: Самовывоз",
+    "CDEK: Самовывоз, (1-2 дней), 1 шт, 219.00 рублей",
     "CDEK: Курьером до двери",
     "Курьером по Москве",
     "Почта России",
@@ -111,6 +153,39 @@ def test_nash_samovyvoz_triggerit(delivery):
 ])
 def test_dostavka_ne_triggerit(delivery):
     assert showroom_alert.is_pickup(delivery) is False
+
+
+# ── гейт «свежая заявка» (то, чего не хватило в бою 07.08) ───────────────────
+
+def test_svezhaya_zayavka_prohodit():
+    assert showroom_alert.is_fresh_new_lead(_lead()) is True
+
+
+@pytest.mark.parametrize("buffer_status", STATUS_NEW_LEAD_BUFFERS)
+def test_bufernye_etapy_tozhe_prohodyat(buffer_status):
+    assert showroom_alert.is_fresh_new_lead(_lead(status=buffer_status)) is True
+
+
+def test_chuzhaya_voronka_ne_prohodit():
+    """Сделка из Офиса/Теста - не наш случай, даже если самовывоз."""
+    assert showroom_alert.is_fresh_new_lead(_lead(pipeline=PIPELINE_OFFICE_ANY)) is False
+
+
+def test_sdelka_v_rabote_ne_prohodit():
+    assert showroom_alert.is_fresh_new_lead(_lead(status=STATUS_IN_WORK)) is False
+
+
+def test_zakrytaya_sdelka_ne_prohodit():
+    assert showroom_alert.is_fresh_new_lead(_lead(status=STATUS_CLOSED_LOST)) is False
+
+
+def test_staraya_sdelka_ne_prohodit():
+    """Бой 07.08: чужой прогон переписал корзину сделкам от 10-29.07."""
+    assert showroom_alert.is_fresh_new_lead(_lead(age_min=60 * 24 * 28)) is False
+
+
+def test_net_sdelki_ne_prohodit():
+    assert showroom_alert.is_fresh_new_lead(None) is False
 
 
 # ── гейт notify_bg ───────────────────────────────────────────────────────────
@@ -138,6 +213,12 @@ def test_raznye_sdelki_obe_prohodyat(scheduled):
     assert len(scheduled) == 2
 
 
+def test_master_flag_gasit(scheduled, monkeypatch):
+    monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_ENABLED", False, raising=False)
+    showroom_alert.notify_bg("Самовывоз из офиса Sunscrypt", LEAD_ID)
+    assert scheduled == []
+
+
 def test_bez_topika_fon_ne_zavodim(scheduled, monkeypatch):
     """Топик не настроен → молчим и пишем в лог, а не сыпем в General супергруппы."""
     monkeypatch.setattr(showroom_alert, "SHOWROOM_ALERT_THREAD_ID", None, raising=False)
@@ -152,39 +233,65 @@ def test_bez_lead_id_fon_ne_zavodim(scheduled):
 
 # ── само сообщение ───────────────────────────────────────────────────────────
 
-def test_alert_uhodit_v_topik_shourum_s_tegom_kati():
-    asyncio.run(showroom_alert._apply(LEAD_ID, "Самовывоз из офиса Sunscrypt"))
+def test_alert_uhodit_v_topik_shourum_s_tegom_kati(monkeypatch):
+    _send(_lead(), monkeypatch)
 
     assert len(_sent) == 1
     msg = _sent[0]
     assert msg["chat_id"] == tg_recipients.NOTIFY_CHAT_ID
-    assert msg["thread"] == 777
+    assert msg["thread"] == 4083
     assert tg_recipients.SHOWROOM_ALERT_TAG in msg["text"]
     assert "Пётр Иванов" in msg["text"]
     assert "Keystone 3 Pro" in msg["text"]
     assert f"leads/detail/{LEAD_ID}" in msg["text"]
 
 
-def test_sdelka_ne_prochitalas_soobshenie_vsyo_ravno_uhodit(monkeypatch):
-    """amo не отдал сделку → шлём короткий алерт со ссылкой, а не молчим."""
-    async def no_lead(lead_id, with_=()):
-        return None
+def test_imya_klienta_dochityvaetsya_otdelnym_zaprosom(monkeypatch):
+    """Бой 07.08: имени не было, потому что во вложенном контакте только id."""
+    asked: list = []
 
-    monkeypatch.setattr(showroom_alert.amo_service, "get_lead_full", no_lead)
-    asyncio.run(showroom_alert._apply(LEAD_ID, "Самовывоз из Шоурума"))
+    async def contact(contact_id):
+        asked.append(contact_id)
+        return {"id": contact_id, "name": "Мария Кузнецова"}
 
+    monkeypatch.setattr(showroom_alert.amo_service, "get_contact_by_id", contact)
+    _send(_lead(contacts=({"id": 777, "is_main": True},)), monkeypatch)
+
+    assert asked == [777]
+    assert "Мария Кузнецова" in _sent[0]["text"]
+
+
+def test_starye_sdelki_v_topik_ne_letyat(monkeypatch):
+    """Тот самый спам: закрытая сделка из воронки «Тест» от 10.07."""
+    _send(_lead(pipeline=PIPELINE_OFFICE_ANY, status=STATUS_CLOSED_LOST,
+                age_min=60 * 24 * 28), monkeypatch)
+    assert _sent == []
+
+
+def test_dostavka_pomenyalas_poka_zhdali(monkeypatch):
+    """За время паузы клиент/менеджер сменил доставку на СДЭК → не шлём."""
+    _send(_lead(delivery="CDEK: Самовывоз, (1-2 дней), 1 шт, 219.00 рублей"), monkeypatch)
+    assert _sent == []
+
+
+def test_sdelka_ne_prochitalas_molchim(monkeypatch):
+    """amo не отдал сделку → проверить гейты нечем, лучше промолчать."""
+    _send(None, monkeypatch)
+    assert _sent == []
+
+
+def test_bez_sostava_stroka_ne_vyvoditsya(monkeypatch):
+    _send(_lead(composition=None), monkeypatch)
     assert len(_sent) == 1
-    assert tg_recipients.SHOWROOM_ALERT_TAG in _sent[0]["text"]
-    assert "Самовывоз из Шоурума" in _sent[0]["text"]
+    assert "📦" not in _sent[0]["text"]
 
 
 def test_html_ekraniruetsya(monkeypatch):
     """parse_mode=HTML: угловые скобки в имени клиента не должны ломать разметку."""
-    async def sharp_lead(lead_id, with_=()):
-        return {"id": lead_id, "price": 0, "custom_fields_values": [],
-                "_embedded": {"contacts": [{"id": 1, "name": "<b>Вася</b>"}]}}
+    async def contact(contact_id):
+        return {"id": contact_id, "name": "<b>Вася</b>"}
 
-    monkeypatch.setattr(showroom_alert.amo_service, "get_lead_full", sharp_lead)
-    asyncio.run(showroom_alert._apply(LEAD_ID, "Самовывоз из офиса Sunscrypt"))
+    monkeypatch.setattr(showroom_alert.amo_service, "get_contact_by_id", contact)
+    _send(_lead(), monkeypatch)
 
     assert "&lt;b&gt;Вася&lt;/b&gt;" in _sent[0]["text"]
