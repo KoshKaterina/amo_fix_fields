@@ -21,8 +21,14 @@ team-panel) — это же свойство гарантирует, что сч
 проверки, не блокирующие воркер очереди LANE_AMO) — см. _contact_wait_loop.
 
 Надёжность — тот же приём, что в office_transfer.py: вебхук (быстрый путь) +
-периодическая reconciliation по окну времени через /api/v4/events (без
-ретроактивности) как страховка от сбоев API.
+периодическая reconciliation по окну времени (без ретроактивности) как
+страховка от сбоев API/пропущенных вебхуков. В отличие от office_transfer,
+где точки входа всегда достигаются ПЕРЕХОДОМ из другого этапа, точки входа
+lead_distribution (напр. «Неразобранное») часто — это статус сделки СРАЗУ
+при создании, для которого amoCRM не даёт события lead_status_changed
+(см. _created_in_status_leads) — поэтому окно проверяется и через
+/api/v4/events (lead_status_changed), и напрямую через /api/v4/leads
+(created_at в окне + сделка всё ещё в нужном статусе).
 """
 
 import asyncio
@@ -644,6 +650,42 @@ async def _entered_status_leads(pipeline_id: int, status_id: int, ts_from: int, 
     return leads
 
 
+async def _created_in_status_leads(pipeline_id: int, status_id: int, ts_from: int, ts_to: int) -> set[int]:
+    """ID сделок, СОЗДАННЫХ и ВСЁ ЕЩЁ находящихся в pipeline_id/status_id, чей created_at
+    попадает в окно [ts_from, ts_to) — дополняет _entered_status_leads.
+
+    Обнаружено вживую 09.08.2026: сделка, созданная СРАЗУ в точке входа (а не
+    перешедшая туда из другого этапа — типичный случай для входных этапов вроде
+    «Неразобранное»/«Первичный контакт»), не даёт события lead_status_changed —
+    amoCRM шлёт lead_added, а его value_after всегда пуст (проверено на живом
+    аккаунте), так что по событиям её вообще нечем поймать. Вебхук (быстрый
+    путь) эту сделку ловит нормально (webhooks.py читает leads[add][0][status_id]
+    точно так же, как leads[update][0][status_id]) — а вот reconciliation как
+    страховка от ПРОПУЩЕННОГО вебхука эту сделку раньше не подстраховывал.
+    Идемпотентность (TAG_LEAD_DISTRIBUTION_ROUTED) делает пересечение с
+    _entered_status_leads безопасным — задвоенная обработка просто no-op."""
+    leads: set[int] = set()
+    page = 1
+    while True:
+        params = [
+            ("filter[statuses][0][pipeline_id]", str(pipeline_id)),
+            ("filter[statuses][0][status_id]", str(status_id)),
+            ("filter[created_at][from]", str(ts_from)),
+            ("filter[created_at][to]", str(ts_to)),
+            ("limit", "100"), ("page", str(page)),
+        ]
+        d = await amo_service._do_get("/api/v4/leads", params)
+        batch = ((d or {}).get("_embedded") or {}).get("leads") or []
+        for lead in batch:
+            lid = lead.get("id")
+            if lid is not None:
+                leads.add(int(lid))
+        if len(batch) < 100:
+            break
+        page += 1
+    return leads
+
+
 _last_reconcile_ts: int = 0
 _reconcile_task: asyncio.Task | None = None
 
@@ -660,6 +702,7 @@ async def _reconcile_once() -> str:
     leads: set[int] = set()
     for pipeline_id, status_id in entry_points:
         leads |= await _entered_status_leads(pipeline_id, status_id, window_from, now)
+        leads |= await _created_in_status_leads(pipeline_id, status_id, window_from, now)
 
     processed = 0
     for lead_id in leads:
