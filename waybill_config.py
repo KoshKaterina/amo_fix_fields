@@ -493,6 +493,13 @@ OZON_PAY_NOTIFICATION_SECRET_KEY = os.getenv("OZON_PAY_NOTIFICATION_SECRET_KEY",
 # висеть на тех-этапе с тегом (видно в воронке).
 PIPELINE_CLEVER_MAIN = 10593102
 
+# Воронка ОПТ — вторая воронка-ИСТОЧНИК переноса (09.08.2026). Этапы 142/143 у
+# неё те же, что у розницы, поэтому контракт «переносим на входе в 142, ни на
+# этап раньше» повторяется один в один: своё «Оплата получена» 86132358 в
+# триггер НЕ берём — сделка обязана физически войти в ОПТ/142, иначе won_at
+# останется NULL и опт-продажи молча обнулятся у панели и Метрики.
+PIPELINE_OPT = 10131762
+
 # Вход воронки: хаб «Новый лид» + четыре буферных, куда падают заявки до
 # распределения Genezis. Свежий заказ с сайта всегда в одном из пяти.
 STATUS_NEW_LEAD = 83537714
@@ -575,6 +582,12 @@ OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER",
 OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").strip() == "1"
+
+# Воронка ОПТ как ИСТОЧНИК переноса (09.08.2026). Отдельный флаг, а не правило:
+# сами правила у опта те же пять, что у розницы (решение Кати 09.08.2026), новый
+# здесь только вход. Порядок включения тот же — сперва убрать ручное
+# копирование в ОПТ, потом флаг, иначе получим и копию, и перенос.
+OFFICE_TRANSFER_SOURCE_OPT = os.getenv("OFFICE_TRANSFER_SOURCE_OPT", "").strip() == "1"
 
 # Cutover-граница (unix ts): события ДО неё игнорируются везде (вебхук и
 # reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии

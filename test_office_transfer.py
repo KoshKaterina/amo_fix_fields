@@ -14,6 +14,7 @@ get_custom_field_enum_id) — реальные функции, сделки со
 payload amo (custom_fields_values).
 """
 import asyncio
+import time
 
 import office_transfer
 from waybill_config import (
@@ -27,6 +28,7 @@ from waybill_config import (
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
+    PIPELINE_OPT,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
     REASON_WAITLIST,
@@ -136,10 +138,19 @@ lead2 = _lead(application_type=APPLICATION_TYPE_ORDER)
 assert office_transfer._match_ur_preorder(lead2) is None
 print("✓ УР-4 Предзаказ")
 
-# УР(ЭРМС) → Фулфилмент/КОНТРОЛЬ
-lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_ERMS_MAIN)
-lead2 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN)
-print("✓ УР(ЭРМС→Фулфилмент)")
+# УР(ЭРМС): маршрута в Фулфилмент БОЛЬШЕ НЕТ (воронка разобрана 05.08.2026).
+# ⚠️ Этот блок был выпотрошен вместе с правилом: остались две присвоенные сделки
+# и печать «✓», а проверок — НИ ОДНОЙ, то есть галочка врала. Возвращаем смысл:
+# ЭРМС-склад не должен матчиться ни одним правилом, розничный склад — должен.
+lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_ERMS_MAIN,
+             delivery_text="СДЭК до ПВЗ")
+assert office_transfer._match_rules(lead, STATUS_SUCCESS) is None, (
+    "ЭРМС больше не маршрут: после выпила Фулфилмента правила его не берут")
+lead2 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+              delivery_text="СДЭК до ПВЗ")
+assert office_transfer._match_rules(lead2, STATUS_SUCCESS) == (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL), (
+    "склад — единственное отличие от предыдущей сделки, розничный обязан матчиться")
+print("✓ УР(ЭРМС): не матчится ни одним правилом, розничный склад матчится")
 
 # ЗНР Лист ожидания
 lead = _lead(status_id=STATUS_CLOSED_LOST, reason=REASON_WAITLIST)
@@ -287,12 +298,18 @@ assert "custom_fields" not in _patches[0], _patches
 print("✓ ответственный уже Зубалий → без повторной записи")
 
 _reset()
+# ЭРМС БОЛЬШЕ НЕ МАРШРУТ (Фулфилмент разобран 05.08.2026, правило убрано из
+# _UR_RULES). Раньше здесь проверялось «перенос в ФФ не меняет ответственного»,
+# но переноса не стало — блок ждал _patches[0] и падал с IndexError, а весь файл
+# был красным начиная с выпила ФФ. Фиксируем ФАКТИЧЕСКОЕ поведение: заказ с
+# ЭРМС-склада не подходит ни под одно правило и уходит в алерт заполнения.
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_ERMS_MAIN, responsible_user_id=999)
 _install_dispatcher_mocks(lead)
-run(office_transfer.process_office_transfer(42))
-assert "responsible_user_id" not in _patches[0], _patches
-assert "custom_fields" not in _patches[0], _patches
-print("✓ перенос в Фулфилмент(ЭРМС): ответственный не меняется")
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match-bad-fill", res
+assert not _patches, "ЭРМС больше никуда не переносится — PATCH быть не должно"
+assert (42, TAG_BAD_FILL) in _tags, _tags
+print("✓ ЭРМС после выпила Фулфилмента: не переносится, уходит в алерт заполнения")
 
 _reset()
 lead = _lead(status_id=STATUS_CLOSED_LOST, reason=REASON_WAITLIST, responsible_user_id=999)
@@ -610,6 +627,146 @@ res = run(office_transfer.process_office_transfer(42))
 assert res == "moved", res
 assert (42, TAG_NO_DELIVERY) in _removed_tags, _removed_tags
 print("✓ поля дозаполнены → перенос + тег «доставка не заполнена» снят")
+
+
+# ── 8б) ОПТ как вторая воронка-источник (Катя 09.08.2026) ───────────────────
+# Правила те же пять, новый только вход. Проверяем: гейт по флагу в обе стороны,
+# что опт-сделка едет тем же маршрутом, что розничная с такой же доставкой,
+# смену ответственного, ЗНР-ветку и что reconciliation обходит обе воронки.
+
+assert office_transfer.OFFICE_TRANSFER_SOURCE_OPT is False, (
+    "флаг ОПТ обязан быть выключен по умолчанию — включается только руками, "
+    "после снятия ручного копирования в ОПТ")
+
+# флаг ВЫКЛЮЧЕН → опт-сделка не наша, даже если по полям подошла бы идеально
+_reset()
+lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ")
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "skipped-not-applicable", res
+assert not _patches, _patches
+assert not _tags, "выключенный источник не должен алертить: копии ведёт нативка"
+print("✓ ОПТ: флаг выключен → сделка не трогается и не алертит")
+
+assert office_transfer.is_source_pipeline(PIPELINE_CLEVER_MAIN) is True
+assert office_transfer.is_source_pipeline(PIPELINE_OPT) is False
+assert office_transfer.is_source_pipeline(None) is False, "мусор на входе гейта — не источник"
+
+office_transfer.OFFICE_TRANSFER_SOURCE_OPT = True
+assert office_transfer.is_source_pipeline(PIPELINE_OPT) is True
+assert office_transfer.is_source_pipeline(str(PIPELINE_OPT)) is True, (
+    "вебхук отдаёт pipeline_id строкой — гейт обязан её понимать")
+assert office_transfer.is_source_pipeline(PIPELINE_OFFICE) is False, (
+    "Офис — ЦЕЛЬ переноса, не источник: иначе перенесённая сделка поехала бы по кругу")
+print("✓ ОПТ: гейт источника по флагу, строка и мусор обработаны")
+
+# флаг ВКЛЮЧЁН → опт-заказ едет тем же маршрутом, что розничный с той же доставкой
+_reset()
+lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ",
+             responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert len(_patches) == 1, _patches
+assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
+assert _patches[0]["status_id"] == STATUS_CREATE_WAYBILL, (
+    "опт-СДЭК обязан ехать в тот же этап, что розничный СДЭК")
+# ответственный: как в рознице — Зубалий, прежний в 578151
+assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
+assert _patches[0]["custom_fields"][FIELD_FORMER_RESPONSIBLE] == "Иван Иванов"
+print("✓ ОПТ/142 СДЭК → Офис/«Сделать накладную», ответственный → Зубалий, прежний в 578151")
+
+# опт-предзаказ → «Предзаказ оплачен» (ровно то, что делала ручная копия 03.08)
+_reset()
+lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_PREORDER,
+             responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert _patches[0]["status_id"] == STATUS_OFFICE_PREORDER_PAID, _patches
+print("✓ ОПТ/142 предзаказ → Офис/«Предзаказ оплачен»")
+
+# ЗНР из ОПТ: Лист ожидания и Академия — как в рознице, ответственный НЕ меняется
+for _reason, _pipe, _stat, _label in (
+    (REASON_WAITLIST, PIPELINE_WAITLIST, STATUS_WAITLIST, "Лист ожидания"),
+    (REASON_ACADEMY, PIPELINE_ACADEMY, STATUS_ACADEMY_FIRST_CONTACT, "Академия"),
+):
+    _reset()
+    lead = _lead(pipeline_id=PIPELINE_OPT, status_id=STATUS_CLOSED_LOST,
+                 reason=_reason, responsible_user_id=999)
+    _install_dispatcher_mocks(lead)
+    res = run(office_transfer.process_office_transfer(42))
+    assert res == "moved", (res, _label)
+    assert _patches[0]["pipeline_id"] == _pipe, (_patches, _label)
+    assert _patches[0]["status_id"] == _stat, (_patches, _label)
+    assert "responsible_user_id" not in _patches[0], (
+        f"перенос в «{_label}» не должен менять ответственного")
+print("✓ ОПТ/143 → Лист ожидания / Академия, ответственный не меняется")
+
+# опт-сделка мимо всех правил (у опта своя логистика — например фура) → алерт,
+# PATCH не шлём. Это принятое следствие решения «те же пять правил».
+_reset()
+lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="транспортная компания")
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match-bad-fill", res
+assert not _patches, "наугад не переносим"
+assert (42, TAG_BAD_FILL) in _tags, _tags
+print("✓ ОПТ: доставка вне пяти правил → алерт, наугад не переносим")
+
+# гейт «уже переносилась» действует и для опта
+_reset()
+lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ")
+lead["custom_fields_values"].append(_cf(FIELD_FORMER_RESPONSIBLE, value="Иван Иванов"))
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "skipped-already-transferred", res
+assert not _patches
+print("✓ ОПТ: гейт «578151 заполнен → уже переносилась» работает и здесь")
+
+# reconciliation обходит ОБЕ воронки: 4 запроса (2 воронки × 2 статуса)
+_opt_reconcile_requests: list = []
+
+
+async def _fake_do_get_two_sources(path, params=None):
+    p = dict(params or [])
+    _opt_reconcile_requests.append((
+        int(p["filter[value_after][leads_statuses][0][pipeline_id]"]),
+        int(p["filter[value_after][leads_statuses][0][status_id]"]),
+    ))
+    return {"_embedded": {"events": []}}
+
+
+_saved_do_get = office_transfer.amo_service._do_get
+_saved_process = office_transfer.process_office_transfer
+office_transfer.amo_service._do_get = _fake_do_get_two_sources
+office_transfer.process_office_transfer = _fake_process
+office_transfer.OFFICE_TRANSFER_SINCE_TS = int(time.time()) - 60
+office_transfer._last_reconcile_ts = 0
+run(office_transfer._reconcile_once())
+assert set(_opt_reconcile_requests) == {
+    (PIPELINE_CLEVER_MAIN, STATUS_SUCCESS), (PIPELINE_CLEVER_MAIN, STATUS_CLOSED_LOST),
+    (PIPELINE_OPT, STATUS_SUCCESS), (PIPELINE_OPT, STATUS_CLOSED_LOST),
+}, _opt_reconcile_requests
+print("✓ ОПТ: reconciliation обходит обе воронки-источника (4 запроса)")
+
+# ...а с выключенным флагом — только розницу, лишних запросов в лимит нет
+office_transfer.OFFICE_TRANSFER_SOURCE_OPT = False
+_opt_reconcile_requests.clear()
+office_transfer._last_reconcile_ts = 0
+run(office_transfer._reconcile_once())
+assert set(_opt_reconcile_requests) == {
+    (PIPELINE_CLEVER_MAIN, STATUS_SUCCESS), (PIPELINE_CLEVER_MAIN, STATUS_CLOSED_LOST),
+}, _opt_reconcile_requests
+print("✓ ОПТ: флаг выключен → reconciliation не тратит запросы на ОПТ")
+
+office_transfer.amo_service._do_get = _saved_do_get
+office_transfer.process_office_transfer = _saved_process
+office_transfer._last_reconcile_ts = 0
 
 
 # ── 9) PAID до переноса: синки зовутся по ещё-CLEVER состоянию, до PATCH ──

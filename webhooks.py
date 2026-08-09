@@ -371,19 +371,27 @@ async def lead_change(request: Request):
     incoming_pipeline = pipeline_update if pipeline_update is not None else pipeline_add
 
 
-    # Office Transfer: сделка [CLEVER] Основная зашла в УР(142)/ЗНР(143) →
+    # Office Transfer: сделка воронки-источника зашла в УР(142)/ЗНР(143) →
     # вместо нативного копирования (F5-виджет/«Создать сделку») переносим ЭТУ
     # ЖЕ сделку в целевую воронку/этап (office_transfer.py). Мастер-флаг
     # OFFICE_TRANSFER_ENABLED + флаг конкретного правила (там же) — по умолчанию
     # выключено, включает Тиана по мере отключения нативной автоматики.
+    # Источники: розница всегда, ОПТ — за OFFICE_TRANSFER_SOURCE_OPT (09.08.2026).
+    # Гейт спрашиваем у office_transfer, чтобы список источников жил в одном
+    # месте: разъехавшиеся гейты вебхука и диспетчера дали бы «вебхук ставит
+    # задачу, диспетчер её скипает» — сделка ехала бы только страховкой раз в
+    # две минуты, и то молча.
     if (
         OFFICE_TRANSFER_ENABLED
         and lead_id is not None
         and incoming_status is not None
         and str(incoming_status) in (str(STATUS_SUCCESS), str(STATUS_CLOSED_LOST))
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_CLEVER_MAIN))
+        and (incoming_pipeline is None or office_transfer.is_source_pipeline(incoming_pipeline))
     ):
-        logger.info("Lead %s entered %s in CLEVER — enqueue office_transfer", lead_id, incoming_status)
+        logger.info(
+            "Lead %s entered %s in pipeline %s — enqueue office_transfer",
+            lead_id, incoming_status, incoming_pipeline,
+        )
         enqueue_office_transfer(lead_id, source="webhook")
 
 

@@ -1,5 +1,12 @@
-"""Перенос УР(142)/ЗНР(143) сделок [CLEVER] Основная в целевую воронку/этап
+"""Перенос УР(142)/ЗНР(143) сделок из воронок-источников в целевую воронку/этап
 вместо нативного копирования (F5-виджет / «Создать сделку»).
+
+Воронки-источники: [CLEVER] Основная (розница) — всегда; ОПТ — за флагом
+OFFICE_TRANSFER_SOURCE_OPT (09.08.2026, решение Кати). Правила для опта те же
+пять, что для розницы: этапы 142/143 у ОПТ те же, поля («Тип заявки», «Склад
+заказа», «Тип доставки») заполняются так же, поэтому опт-заказ едет в тот же
+этап Офиса, что розничный с такой же доставкой. Список источников — в
+_source_pipelines(), гейт для вебхука — is_source_pipeline().
 
 Правила (условия читаются по СВЕЖЕЙ дочитанной сделке, не по телу вебхука —
 select-поля сверяются по enum_id, не по тексту, чтобы не зависеть от того, как
@@ -16,7 +23,10 @@ select-поля сверяются по enum_id, не по тексту, что�
        пометила дублем #3, #7 добавлял избыточный тег «тест» поверх того же
        условия).
     4. Тип заявки=Предзаказ → Офис/«Предзаказ оплачен»
-    5. Тип заявки=Заказ + Склад=ЭРМС_Основной → Фулфилмент/«КОНТРОЛЬ»
+    5. (УБРАНО 05.08.2026) Тип заявки=Заказ + Склад=ЭРМС_Основной → Фулфилмент/
+       «КОНТРОЛЬ». Воронка Фулфилмент разобрана, правила в _UR_RULES больше нет:
+       заказ с ЭРМС-склада теперь никуда не переносится и уходит в алерт
+       заполнения — если такие заказы ещё появляются, это сигнал, а не маршрут.
 
   ЗНР (143), поле «Причина ЗИН» (577623, он же DUP_REASON_FIELD_ID):
     1. Причина ЗИН=Лист ожидания → воронка «Лист ожидания»/«Лист ожидания»
@@ -91,11 +101,13 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_ZNR_ACADEMY,
     OFFICE_TRANSFER_RULE_ZNR_WAITLIST,
     OFFICE_TRANSFER_SINCE_TS,
+    OFFICE_TRANSFER_SOURCE_OPT,
     OFFICE_TRANSFER_STALE_ALERT_MIN,
     OFFICE_TRANSFER_WAREHOUSES,
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
+    PIPELINE_OPT,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
     REASON_WAITLIST,
@@ -265,6 +277,30 @@ def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False) -> t
     return None
 
 
+def _source_pipelines() -> tuple[int, ...]:
+    """Воронки, ИЗ которых переносим. Розница — всегда, ОПТ — за флагом
+    OFFICE_TRANSFER_SOURCE_OPT (09.08.2026).
+
+    Читаем флаг на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
+    подменённый в тестах (и в консоли при разборе инцидента), не подействовал бы.
+
+    Правила у опта те же пять, что у розницы, — отдельного матчера нет по
+    построению. Условия правил читаются с полей сделки («Тип заявки», «Склад
+    заказа», «Тип доставки»), а они у опта заполняются так же, поэтому опт-заказ
+    едет в тот же этап Офиса, что и розничный с такой же доставкой."""
+    if OFFICE_TRANSFER_SOURCE_OPT:
+        return (PIPELINE_CLEVER_MAIN, PIPELINE_OPT)
+    return (PIPELINE_CLEVER_MAIN,)
+
+
+def is_source_pipeline(pipeline_id) -> bool:
+    """Публичный гейт для webhooks.py: воронка годится как источник переноса."""
+    try:
+        return int(pipeline_id) in _source_pipelines()
+    except (TypeError, ValueError):
+        return False
+
+
 # ════════════════ диспетчер ════════════════
 
 # lead_id → {"since": monotonic-независимый unix ts первой неудачи, "alerted": bool}
@@ -399,12 +435,14 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
 
     status_id = int(lead.get("status_id") or 0)
     pipeline_id = int(lead.get("pipeline_id") or 0)
-    if pipeline_id != PIPELINE_CLEVER_MAIN or status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
+    if pipeline_id not in _source_pipelines() or status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
         # Уже перенесена (нами или вручную), либо это не тот случай — идемпотентный
         # no-op. Гасит и эхо от нашего же PATCH, и повторную доставку вебхука.
+        # Сюда же попадает ОПТ при выключенном OFFICE_TRANSFER_SOURCE_OPT.
         logger.info(
-            "office_transfer %s: не в CLEVER/{142,143} (pipeline=%s status=%s) — скип",
-            lead_id, pipeline_id, status_id,
+            "office_transfer %s: воронка не источник или этап не {142,143} "
+            "(pipeline=%s status=%s, источники=%s) — скип",
+            lead_id, pipeline_id, status_id, _source_pipelines(),
         )
         _clear_fail(lead_id)
         return "skipped-not-applicable"
@@ -570,8 +608,14 @@ async def _reconcile_once() -> str:
     # бы заданным и защита «без границы не запускаться» перестала бы работать.
     window_from = max(window_from, now - RECONCILE_MAX_LOOKBACK_S)
 
-    leads = await _entered_status_leads(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, window_from, now)
-    leads |= await _entered_status_leads(PIPELINE_CLEVER_MAIN, STATUS_CLOSED_LOST, window_from, now)
+    # Обе воронки-источника за один проход: розница всегда, ОПТ — если включён
+    # флаг. По воронке два запроса (142 и 143), то есть с ОПТ проход стоит
+    # четыре запроса вместо двух — на интервале 2 минуты это в лимиты влезает
+    # с запасом (замер лимитов amo: 50 на аккаунт, 7 на интеграцию, 03.08.2026).
+    leads: set[int] = set()
+    for _src in _source_pipelines():
+        leads |= await _entered_status_leads(_src, STATUS_SUCCESS, window_from, now)
+        leads |= await _entered_status_leads(_src, STATUS_CLOSED_LOST, window_from, now)
 
     # Предохранитель: в норме за проход набегают единицы сделок. Много — значит
     # в перенос завели воронку, которой нет в MIGRATION_SOURCE_PIPELINES, и её
