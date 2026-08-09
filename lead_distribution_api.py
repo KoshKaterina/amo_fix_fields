@@ -1,14 +1,20 @@
 """Админ-эндпоинты конструктора профилей распределения лидов (lead_distribution.py).
 
-Без UI — эндпоинты под будущую панель (Тиана попросила именно API в этом
-раунде). Защита — секрет в пути, по образцу /wazzup/{secret}, /uis/{secret}:
-пустой LEAD_DISTRIBUTION_ADMIN_SECRET делает все роуты недоступными (403 на
-любой переданный секрет), это безопасное состояние по умолчанию.
+CRUD профилей (POST/PATCH/DELETE/GET /profiles) переехал в team-panel 09.08.2026 —
+там теперь единственное хранилище (Postgres) и валидация, см. app/lead_distribution/
+service.py в team-panel и lead_distribution_profiles_client.py здесь (write-through
+кэш, которым эти эндпоинты больше не занимаются). Остаются только точки, которым
+нужен живой доступ к amoCRM API (его нет у team-panel) — дропдауны конструктора и
+отладочный /state.
+
+Защита — секрет в пути, по образцу /wazzup/{secret}, /uis/{secret}: пустой
+LEAD_DISTRIBUTION_ADMIN_SECRET делает все роуты недоступными (403 на любой
+переданный секрет), это безопасное состояние по умолчанию.
 """
 
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 import amo_service
@@ -26,80 +32,6 @@ def _check_secret(secret: str) -> bool:
 
 def _forbidden() -> JSONResponse:
     return JSONResponse({"detail": "forbidden"}, status_code=403)
-
-
-def _conflict(exc: ld.ProfileConflictError) -> JSONResponse:
-    return JSONResponse(
-        {
-            "detail": str(exc),
-            "conflicting_profile_id": exc.conflicting_profile_id,
-            "conflicting_source_ids": sorted(exc.conflicting_source_ids),
-        },
-        status_code=409,
-    )
-
-
-@router.get("/profiles")
-async def list_profiles_route(secret: str):
-    if not _check_secret(secret):
-        return _forbidden()
-    return {"profiles": [p.to_dict() for p in ld.list_profiles()]}
-
-
-@router.post("/profiles")
-async def create_profile_route(secret: str, request: Request):
-    if not _check_secret(secret):
-        return _forbidden()
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"detail": "невалидный JSON"}, status_code=400)
-    try:
-        profile = ld.create_profile(data)
-    except ld.ProfileValidationError as exc:
-        return JSONResponse({"detail": str(exc)}, status_code=400)
-    except ld.ProfileConflictError as exc:
-        return _conflict(exc)
-    return JSONResponse(profile.to_dict(), status_code=201)
-
-
-@router.get("/profiles/{profile_id}")
-async def get_profile_route(secret: str, profile_id: str):
-    if not _check_secret(secret):
-        return _forbidden()
-    profile = ld.get_profile(profile_id)
-    if profile is None:
-        return JSONResponse({"detail": "not found"}, status_code=404)
-    return profile.to_dict()
-
-
-@router.patch("/profiles/{profile_id}")
-async def patch_profile_route(secret: str, profile_id: str, request: Request):
-    if not _check_secret(secret):
-        return _forbidden()
-    try:
-        patch = await request.json()
-    except Exception:
-        return JSONResponse({"detail": "невалидный JSON"}, status_code=400)
-    try:
-        profile = ld.update_profile(profile_id, patch)
-    except KeyError:
-        return JSONResponse({"detail": "not found"}, status_code=404)
-    except ld.ProfileValidationError as exc:
-        return JSONResponse({"detail": str(exc)}, status_code=400)
-    except ld.ProfileConflictError as exc:
-        return _conflict(exc)
-    return profile.to_dict()
-
-
-@router.delete("/profiles/{profile_id}")
-async def delete_profile_route(secret: str, profile_id: str):
-    if not _check_secret(secret):
-        return _forbidden()
-    ok = ld.delete_profile(profile_id)
-    if not ok:
-        return JSONResponse({"detail": "not found"}, status_code=404)
-    return {"ok": True}
 
 
 @router.get("/pipelines")

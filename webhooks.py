@@ -14,6 +14,7 @@ import cdek_status_sync
 import dup_autoclose
 import jivo_service
 import lead_distribution
+import lead_distribution_profiles_client
 import metrika_sync
 import migration_freeze
 import ms_status_sync
@@ -92,6 +93,7 @@ async def lifespan(app):
     await wazzup_forward.init()
     await wazzup_delivery.init()
     await office_transfer.init()
+    lead_distribution_profiles_client.start()
     await lead_distribution.init()
     team_panel_client.start()
     yield
@@ -103,6 +105,7 @@ async def lifespan(app):
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await team_panel_client.stop()
+    await lead_distribution_profiles_client.stop()
     await ozon_invoice.aclose()
     await ms_status_sync.shutdown()
     await woo_status_sync.shutdown()

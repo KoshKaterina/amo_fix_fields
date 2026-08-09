@@ -1,15 +1,19 @@
 """Распределение лидов — замена нативного виджета «Генезис»/F5 (05.08.2026).
 
-Конструктор профилей: администратор создаёт/редактирует/удаляет профили через
-API (lead_distribution_api.py), в этом файле нет захардкоженных правил — они
-данные, не код (в отличие от office_transfer.py).
+Конструктор профилей: администратор создаёт/редактирует/удаляет профили в
+team-panel (владелец данных с 09.08.2026, app/lead_distribution/service.py) —
+в этом файле нет захардкоженных правил, они данные, не код (в отличие от
+office_transfer.py). Здесь профили только читаются — через
+lead_distribution_profiles_client (write-through кэш, работает при
+недоступности team-panel на последних известных данных).
 
 Профиль: точка входа (pipeline_id/status_id) + фильтр источников (source_ids,
 [] = любой) + участники + режим учёта повторных клиентов (always/load/random)
 + опциональные рабочие часы профиля. Один source_id не может быть в двух
-профилях одновременно (валидация в create_profile/update_profile) — это же
-свойство гарантирует, что счётчики нагрузки, которые ведутся ПО ИСТОЧНИКУ (не
-по профилю), однозначны: у каждого источника один профиль-владелец.
+профилях одновременно (валидация при создании/редактировании — на стороне
+team-panel) — это же свойство гарантирует, что счётчики нагрузки, которые
+ведутся ПО ИСТОЧНИКУ (не по профилю), однозначны: у каждого источника один
+профиль-владелец.
 
 Защита от гонки с amgroup (создаёт сделку и асинхронно привязывает контакт):
 если у свежепрочитанной сделки ещё нет контакта, диспетчер не принимает
@@ -29,11 +33,12 @@ import logging
 import os
 import pathlib
 import random
+import re
 import time
-import uuid
 from typing import Any
 
 import amo_service
+import lead_distribution_profiles_client
 import team_panel_client
 import telegram_bot
 import tg_recipients
@@ -57,6 +62,40 @@ _MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 _VALID_MODES = ("always", "load", "random")
 
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _normalize_entry_points(d: dict) -> list[dict[str, Any]]:
+    """Профиль до 08.08.2026 хранил ровно одну точку входа (pipeline_id/status_id
+    плоскими полями); UI конструктора теперь даёт добавлять несколько воронок,
+    каждая — с несколькими этапами. Старые записи читаем как список из одной
+    точки входа — чисто защитный код на чтение кэша, писать умеет только team-panel."""
+    raw = d.get("entry_points")
+    if raw:
+        return [
+            {"pipeline_id": int(ep["pipeline_id"]), "status_ids": sorted({int(s) for s in ep["status_ids"]})}
+            for ep in raw
+        ]
+    if d.get("pipeline_id") and d.get("status_id"):
+        return [{"pipeline_id": int(d["pipeline_id"]), "status_ids": [int(d["status_id"])]}]
+    return []
+
+
+def _normalize_work_hours(raw: Any) -> list[dict[str, str]] | None:
+    """Профиль до 08.08.2026 хранил один интервал часами ({"from":10,"to":19});
+    формат сменён на список интервалов ("HH:MM"), т.к. UI конструктора теперь
+    даёт добавлять несколько окон и указывать минуты (по образцу графика
+    сотрудников в team-panel). Старые записи в кэше читаем как раньше —
+    конвертируем на лету, чисто защитный код на чтение, писать умеет только team-panel."""
+    if not raw:
+        return None
+    if isinstance(raw, dict) and "from" in raw and "to" in raw:
+        f, t = int(raw["from"]), int(raw["to"])
+        return [{"start": f"{f:02d}:00", "end": f"{t:02d}:00"}]
+    if isinstance(raw, list):
+        return [{"start": str(iv["start"]), "end": str(iv["end"])} for iv in raw] or None
+    return None
+
 
 # ════════════════ модель профиля ════════════════
 
@@ -66,13 +105,12 @@ class Profile:
     name: str
     enabled: bool = False
     priority: int = 100
-    pipeline_id: int = 0
-    status_id: int = 0
+    entry_points: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     source_ids: list[int] = dataclasses.field(default_factory=list)
     participant_ids: list[int] = dataclasses.field(default_factory=list)
     duty_user_id: int | None = None
     repeat_contact_mode: str = "load"
-    work_hours: dict[str, int] | None = None
+    work_hours: list[dict[str, str]] | None = None
     created_at: int = 0
     updated_at: int = 0
 
@@ -86,74 +124,33 @@ class Profile:
             name=d.get("name", ""),
             enabled=bool(d.get("enabled", False)),
             priority=int(d.get("priority", 100)),
-            pipeline_id=int(d.get("pipeline_id", 0)),
-            status_id=int(d.get("status_id", 0)),
+            entry_points=_normalize_entry_points(d),
             source_ids=[int(x) for x in d.get("source_ids") or []],
             participant_ids=[int(x) for x in d.get("participant_ids") or []],
             duty_user_id=int(d["duty_user_id"]) if d.get("duty_user_id") is not None else None,
             repeat_contact_mode=d.get("repeat_contact_mode", "load"),
-            work_hours=d.get("work_hours"),
+            work_hours=_normalize_work_hours(d.get("work_hours")),
             created_at=int(d.get("created_at", 0)),
             updated_at=int(d.get("updated_at", 0)),
         )
 
 
-class ProfileValidationError(Exception):
-    pass
-
-
-class ProfileConflictError(Exception):
-    def __init__(self, message: str, conflicting_profile_id: str, conflicting_source_ids: set[int]):
-        super().__init__(message)
-        self.conflicting_profile_id = conflicting_profile_id
-        self.conflicting_source_ids = conflicting_source_ids
-
-
-# ════════════════ хранилище профилей (var/, атомарная запись) ════════════════
-
-PROFILES_PATH = pathlib.Path(os.getenv("LEAD_DISTRIBUTION_PROFILES_PATH", "var/lead_distribution_profiles.json"))
-
-_profiles_cache: dict[str, Profile] | None = None
-
-
-def _atomic_write_json(path: pathlib.Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _load_profiles_from_disk() -> dict[str, Profile]:
-    if not PROFILES_PATH.exists():
-        return {}
-    try:
-        raw = json.loads(PROFILES_PATH.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        logger.exception("lead_distribution: не удалось прочитать %s — считаем пустым", PROFILES_PATH)
-        return {}
-    out: dict[str, Profile] = {}
-    for pid, pdata in (raw.get("profiles") or {}).items():
-        try:
-            out[pid] = Profile.from_dict(pdata)
-        except Exception:
-            logger.exception("lead_distribution: битая запись профиля %s — пропущена", pid)
-    return out
-
-
-def _save_profiles_to_disk(profiles: dict[str, Profile]) -> None:
-    _atomic_write_json(PROFILES_PATH, {"profiles": {pid: p.to_dict() for pid, p in profiles.items()}})
+# ════════════════ хранилище профилей (владелец — team-panel, здесь read-only кэш) ════════════════
+#
+# 09.08.2026: CRUD и валидация профилей переехали в team-panel (app/lead_distribution/
+# service.py + validation.py) — team-panel единственный, кто пишет правила. Здесь только
+# читаем через lead_distribution_profiles_client (write-through кэш в var/, переживает
+# недоступность team-panel на последних известных данных). См. docstring клиента.
 
 
 def _profiles() -> dict[str, Profile]:
-    global _profiles_cache
-    if _profiles_cache is None:
-        _profiles_cache = _load_profiles_from_disk()
-    return _profiles_cache
-
-
-def invalidate_cache() -> None:
-    global _profiles_cache
-    _profiles_cache = None
+    out: dict[str, Profile] = {}
+    for pid, pdata in lead_distribution_profiles_client.get_profiles().items():
+        try:
+            out[pid] = Profile.from_dict(pdata)
+        except Exception:
+            logger.exception("lead_distribution: битая запись профиля %s в кэше — пропущена", pid)
+    return out
 
 
 def list_profiles() -> list[Profile]:
@@ -164,120 +161,15 @@ def get_profile(profile_id: str) -> Profile | None:
     return _profiles().get(profile_id)
 
 
-def _validate_fields(data: dict) -> None:
-    if not str(data.get("name") or "").strip():
-        raise ProfileValidationError("name обязателен")
-    if not data.get("pipeline_id"):
-        raise ProfileValidationError("pipeline_id обязателен")
-    if not data.get("status_id"):
-        raise ProfileValidationError("status_id обязателен")
-    if not data.get("participant_ids"):
-        raise ProfileValidationError("participant_ids не может быть пустым")
-    mode = data.get("repeat_contact_mode", "load")
-    if mode not in _VALID_MODES:
-        raise ProfileValidationError(f"repeat_contact_mode должен быть одним из {_VALID_MODES}")
-    wh = data.get("work_hours")
-    if wh is not None:
-        if not isinstance(wh, dict) or "from" not in wh or "to" not in wh:
-            raise ProfileValidationError("work_hours должен быть {'from': int, 'to': int} или null")
-        try:
-            f, t = int(wh["from"]), int(wh["to"])
-        except (TypeError, ValueError):
-            raise ProfileValidationError("work_hours.from/to должны быть целыми часами")
-        if not (0 <= f <= 23 and 0 <= t <= 23):
-            raise ProfileValidationError("work_hours.from/to должны быть в диапазоне 0..23")
+# ════════════════ утилита атомарной записи — используется ротацией/счётчиками ниже ════════════════
+# (runtime-состояние диспетчера, не правила — остаётся локальным var/*.json как было)
 
 
-def _find_source_conflict(
-    candidate: Profile, existing: dict[str, Profile], *, exclude_id: str | None = None
-) -> tuple[str, set[int]] | None:
-    """Источник не может быть в двух профилях одновременно. Пустой source_ids
-    (любой источник) конфликтует с ЛЮБЫМ другим профилем на ТОЙ ЖЕ точке входа
-    (pipeline_id/status_id); конкретные source_id конфликтуют глобально —
-    между любыми профилями, независимо от точки входа."""
-    cand_set = set(candidate.source_ids)
-    for pid, other in existing.items():
-        if pid == exclude_id:
-            continue
-        other_set = set(other.source_ids)
-        if cand_set and other_set:
-            overlap = cand_set & other_set
-            if overlap:
-                return pid, overlap
-        else:
-            same_entry = (candidate.pipeline_id == other.pipeline_id
-                          and candidate.status_id == other.status_id)
-            if same_entry:
-                return pid, (other_set or cand_set)
-    return None
-
-
-def create_profile(data: dict) -> Profile:
-    _validate_fields(data)
-    profiles = dict(_profiles())
-    now = int(time.time())
-    candidate = Profile(
-        id=uuid.uuid4().hex[:12],
-        name=str(data["name"]).strip(),
-        enabled=bool(data.get("enabled", False)),
-        priority=int(data.get("priority", 100)),
-        pipeline_id=int(data["pipeline_id"]),
-        status_id=int(data["status_id"]),
-        source_ids=sorted({int(x) for x in data.get("source_ids") or []}),
-        participant_ids=[int(x) for x in data["participant_ids"]],
-        duty_user_id=int(data["duty_user_id"]) if data.get("duty_user_id") is not None else None,
-        repeat_contact_mode=data.get("repeat_contact_mode", "load"),
-        work_hours=data.get("work_hours"),
-        created_at=now,
-        updated_at=now,
-    )
-    conflict = _find_source_conflict(candidate, profiles)
-    if conflict is not None:
-        other_id, overlap = conflict
-        raise ProfileConflictError(
-            f"источник(и) {sorted(overlap) if overlap else 'любой'} уже заняты профилем {other_id}",
-            other_id, overlap,
-        )
-    profiles[candidate.id] = candidate
-    _save_profiles_to_disk(profiles)
-    invalidate_cache()
-    return candidate
-
-
-def update_profile(profile_id: str, patch: dict) -> Profile:
-    profiles = dict(_profiles())
-    current = profiles.get(profile_id)
-    if current is None:
-        raise KeyError(profile_id)
-    merged = current.to_dict()
-    merged.update({k: v for k, v in patch.items() if k not in ("id", "created_at")})
-    _validate_fields(merged)
-    updated = Profile.from_dict(merged)
-    updated.id = profile_id
-    updated.created_at = current.created_at
-    updated.updated_at = int(time.time())
-    updated.source_ids = sorted(set(updated.source_ids))
-    conflict = _find_source_conflict(updated, profiles, exclude_id=profile_id)
-    if conflict is not None:
-        other_id, overlap = conflict
-        raise ProfileConflictError(
-            f"источник(и) {sorted(overlap) if overlap else 'любой'} уже заняты профилем {other_id}",
-            other_id, overlap,
-        )
-    profiles[profile_id] = updated
-    _save_profiles_to_disk(profiles)
-    invalidate_cache()
-    return updated
-
-
-def delete_profile(profile_id: str) -> bool:
-    profiles = dict(_profiles())
-    if profile_id not in profiles:
-        return False
-    del profiles[profile_id]
-    _save_profiles_to_disk(profiles)
-    invalidate_cache()
-    return True
+def _atomic_write_json(path: pathlib.Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # ════════════════ матчинг профиля по свежей сделке ════════════════
@@ -289,10 +181,19 @@ def _lead_source_id(lead: dict) -> int | None:
     return int(src["id"])
 
 
+def _matches_entry(profile: Profile, pipeline_id: int, status_id: int) -> bool:
+    return any(ep["pipeline_id"] == pipeline_id and status_id in ep["status_ids"] for ep in profile.entry_points)
+
+
+def _entry_pairs(profile: Profile) -> set[tuple[int, int]]:
+    return {(ep["pipeline_id"], sid) for ep in profile.entry_points for sid in ep["status_ids"]}
+
+
 def match_profile(pipeline_id: int, status_id: int, source_id: int | None) -> Profile | None:
+    pipeline_id, status_id = int(pipeline_id), int(status_id)
     candidates = [
         p for p in _profiles().values()
-        if p.enabled and p.pipeline_id == int(pipeline_id) and p.status_id == int(status_id)
+        if p.enabled and _matches_entry(p, pipeline_id, status_id)
         and (not p.source_ids or (source_id is not None and source_id in p.source_ids))
     ]
     if not candidates:
@@ -309,16 +210,18 @@ def match_profile(pipeline_id: int, status_id: int, source_id: int | None) -> Pr
 def has_matching_enabled_profile(pipeline_id: int, status_id: int) -> bool:
     """Дешёвая проверка для вебхука (без учёта source_id — тот матчится в
     диспетчере на свежих данных), чтобы не ставить в очередь заведомо лишнее."""
-    return any(
-        p.enabled and p.pipeline_id == int(pipeline_id) and p.status_id == int(status_id)
-        for p in _profiles().values()
-    )
+    pipeline_id, status_id = int(pipeline_id), int(status_id)
+    return any(p.enabled and _matches_entry(p, pipeline_id, status_id) for p in _profiles().values())
 
 
 def has_matching_status(status_id: int) -> bool:
     """Как has_matching_enabled_profile, но без воронки — часть событий amo
     приходит без pipeline_id в теле вебхука (нормальное поведение)."""
-    return any(p.enabled and p.status_id == int(status_id) for p in _profiles().values())
+    status_id = int(status_id)
+    return any(
+        p.enabled and any(status_id in ep["status_ids"] for ep in p.entry_points)
+        for p in _profiles().values()
+    )
 
 
 # ════════════════ ротация (random-режим и фолбэк load без source_id) ════════════════
@@ -469,8 +372,8 @@ def _is_on_shift(user_id: int) -> bool:
 def _profile_in_work_hours(profile: Profile) -> bool:
     if not profile.work_hours:
         return True
-    now_hour = datetime.datetime.now(_MSK).hour
-    return _in_hour_window(now_hour, (int(profile.work_hours["from"]), int(profile.work_hours["to"])))
+    now_hhmm = datetime.datetime.now(_MSK).strftime("%H:%M")
+    return any(iv["start"] <= now_hhmm < iv["end"] for iv in profile.work_hours)
 
 
 def eligible_pool(profile: Profile) -> list[int]:
@@ -753,7 +656,7 @@ async def _reconcile_once() -> str:
         logger.warning("lead_distribution reconcile: LEAD_DISTRIBUTION_SINCE_TS не задан — проход пропущен")
         return "skipped-no-cutover"
 
-    entry_points = {(p.pipeline_id, p.status_id) for p in _profiles().values() if p.enabled}
+    entry_points = {pair for p in _profiles().values() if p.enabled for pair in _entry_pairs(p)}
     leads: set[int] = set()
     for pipeline_id, status_id in entry_points:
         leads |= await _entered_status_leads(pipeline_id, status_id, window_from, now)

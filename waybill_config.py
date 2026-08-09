@@ -609,9 +609,10 @@ TAG_BAD_FILL = "заказ заполнен некорректно"      # не�
 # ---------------------------------------------------------------------------
 # Lead Distribution (05.08.2026): конструктор профилей распределения лидов —
 # замена нативного виджета «Генезис» (F5). В отличие от office_transfer, здесь
-# нет захардкоженных правил в этом файле — профили создаются/редактируются
-# через API (lead_distribution_api.py), хранятся в var/lead_distribution_profiles.json.
-# См. lead_distribution.py.
+# нет захардкоженных правил в этом файле — профили редактируются в team-panel
+# (владелец данных с 09.08.2026), amo_fix_fields читает их через
+# lead_distribution_profiles_client.py и держит write-through кэш в
+# var/lead_distribution_profiles.json. См. lead_distribution.py.
 # ---------------------------------------------------------------------------
 # Мастер-флаг, OFF по умолчанию. Отдельные профили ТАКЖЕ должны быть enabled=True
 # в своей записи — оба уровня должны совпасть, как OFFICE_TRANSFER_ENABLED + правило.
@@ -652,9 +653,14 @@ TAG_LEAD_DISTRIBUTION_ROUTED = "распределено автоматичес�
 # повторные попытки reconciliation (по образцу TAG_OFFICE_TRANSFER_ERROR).
 TAG_LEAD_DISTRIBUTION_ERROR = "ошибка распределения"
 
-# Секрет в пути для /admin/lead-distribution/* — по образцу /wazzup/{secret},
-# /uis/{secret}. Пусто → эндпоинты недоступны (403 на любой секрет).
+# Секрет в пути для /admin/lead-distribution/* (пайплайны/источники/сотрудники —
+# CRUD профилей 09.08.2026 переехал в team-panel, см. lead_distribution_profiles_client.py).
+# Пусто → эндпоинты недоступны (403 на любой секрет).
 LEAD_DISTRIBUTION_ADMIN_SECRET = os.getenv("LEAD_DISTRIBUTION_ADMIN_SECRET", "").strip()
+
+# Опрос team-panel за профилями конструктора (владелец данных с 09.08.2026, см.
+# lead_distribution_profiles_client.py) — write-through кэш в var/, не мастер-файл.
+LEAD_DISTRIBUTION_PROFILES_POLL_INTERVAL_S = int(os.getenv("LEAD_DISTRIBUTION_PROFILES_POLL_INTERVAL_S", "30"))
 
 # ---------------------------------------------------------------------------
 # team-panel (05.08.2026) — источник правды графика сотрудников. См.

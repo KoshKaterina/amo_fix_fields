@@ -1,6 +1,14 @@
 """Юнит-тесты lead_distribution (без сети/прода — amo_service/telegram_bot фейки,
 файлы состояния — во временных путях, изолированных per-test).
 
+09.08.2026: CRUD и валидация профилей (create/update/delete_profile,
+ProfileValidationError/ProfileConflictError) переехали в team-panel
+(app/lead_distribution/service.py + validation.py, свои тесты там). Здесь
+lead_distribution — read-only потребитель: профили попадают в тесты через
+_seed_profile(), который пишет прямо в кэш lead_distribution_profiles_client
+(тот же кэш, что в проде наполняет опрос team-panel) — так тестируется именно
+то, что сервис делает с уже полученными правилами, без повторной валидации.
+
 Запуск: python test_lead_distribution.py   (свой мини-раннер, как test_wazzup_sla.py)
         или python -m pytest test_lead_distribution.py -q
 """
@@ -12,6 +20,7 @@ import time
 
 import amo_service
 import lead_distribution as ld
+import lead_distribution_profiles_client as ldpc
 import telegram_bot
 
 
@@ -20,14 +29,15 @@ def run(coro):
 
 
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="ld_test_"))
+_seed_counter = {"n": 0}
 
 
 def setup_function(_=None):
     # Изолированные файлы состояния на каждый тест.
-    ld.PROFILES_PATH = _TMP / f"profiles_{time.monotonic_ns()}.json"
+    ldpc.CACHE_PATH = _TMP / f"profiles_{time.monotonic_ns()}.json"
+    ldpc._cache = {}
     ld.COUNTERS_PATH = _TMP / f"counters_{time.monotonic_ns()}.json"
     ld.ROTATION_PATH = _TMP / f"rotation_{time.monotonic_ns()}.json"
-    ld.invalidate_cache()
     ld._pending_fail.clear()
     ld._contact_wait_pending.clear()
     ld._bg_tasks.clear()
@@ -44,19 +54,37 @@ def setup_function(_=None):
 
 # ── билдеры ──────────────────────────────────────────────────────────────
 
-def _profile_data(**over):
+def _seed_profile(**over) -> ld.Profile:
+    """Кладёт готовый профиль прямо в write-through кэш lead_distribution_profiles_client
+    (в проде его наполняет опрос team-panel) — валидация/уникальность source_id теперь
+    проверяются на стороне team-panel до попадания сюда, здесь их сознательно не
+    перепроверяем. Принимает и старый плоский pipeline_id/status_id (конвертирует в
+    entry_points) для совместимости с существующими вызовами в этом файле."""
+    _seed_counter["n"] += 1
     data = {
         "name": "Тест",
-        "pipeline_id": 10593102,
-        "status_id": 83537714,
+        "enabled": True,
+        "priority": 100,
+        "entry_points": [{"pipeline_id": 10593102, "status_ids": [83537714]}],
         "source_ids": [],
         "participant_ids": [1, 2, 3],
         "duty_user_id": None,
         "repeat_contact_mode": "load",
-        "enabled": True,
+        "work_hours": None,
     }
+    if "pipeline_id" in over or "status_id" in over:
+        pipeline_id = over.pop("pipeline_id", data["entry_points"][0]["pipeline_id"])
+        status_id = over.pop("status_id", data["entry_points"][0]["status_ids"][0])
+        data["entry_points"] = [{"pipeline_id": pipeline_id, "status_ids": [status_id]}]
     data.update(over)
-    return data
+    pid = data.pop("id", None) or f"p{_seed_counter['n']}"
+    now = int(time.time())
+    profile = {"id": pid, "created_at": now, "updated_at": now, **data}
+
+    cache = dict(ldpc.get_profiles())
+    cache[pid] = profile
+    ldpc._cache = cache
+    return ld.get_profile(pid)
 
 
 def _lead(*, lead_id=100, pipeline_id=10593102, status_id=83537714, source_id=None,
@@ -140,133 +168,68 @@ amo_service.add_tag = _fake_add_tag
 telegram_bot.send_alert = _fake_send_alert
 
 
-# ════════════════ CRUD профилей ════════════════
+# ════════════════ чтение профилей из кэша ════════════════
 
-def test_create_get_list_profile():
-    _reset_fakes()
-    p = ld.create_profile(_profile_data(name="Заказ с сайта"))
+def test_list_and_get_profile_from_cache():
+    p = _seed_profile(name="Заказ с сайта")
     assert p.name == "Заказ с сайта"
     assert p.id
     assert ld.get_profile(p.id).name == "Заказ с сайта"
     assert [x.id for x in ld.list_profiles()] == [p.id]
 
 
-def test_create_profile_validation_errors():
-    try:
-        ld.create_profile(_profile_data(name=""))
-        assert False, "должен упасть без name"
-    except ld.ProfileValidationError:
-        pass
-    try:
-        ld.create_profile(_profile_data(participant_ids=[]))
-        assert False, "должен упасть без участников"
-    except ld.ProfileValidationError:
-        pass
-    try:
-        ld.create_profile(_profile_data(repeat_contact_mode="иногда"))
-        assert False, "должен упасть на неизвестном режиме"
-    except ld.ProfileValidationError:
-        pass
-    try:
-        ld.create_profile(_profile_data(work_hours={"from": 30, "to": 19}))
-        assert False, "должен упасть на часе вне 0..23"
-    except ld.ProfileValidationError:
-        pass
+def test_broken_cache_entry_is_skipped_not_fatal():
+    _seed_profile(name="Ок")
+    cache = dict(ldpc.get_profiles())
+    # pipeline_id нечисловой — int() в _normalize_entry_points упадёт, запись пропускается
+    cache["битый"] = {"id": "битый", "entry_points": [{"pipeline_id": "x", "status_ids": [1]}]}
+    ldpc._cache = cache
+    names = {p.name for p in ld.list_profiles()}
+    assert names == {"Ок"}
 
 
-def test_update_and_delete_profile_applies_immediately():
-    p = ld.create_profile(_profile_data(name="Квизы", enabled=False))
-    assert ld.get_profile(p.id).enabled is False
-    updated = ld.update_profile(p.id, {"enabled": True, "duty_user_id": 9})
-    assert updated.enabled is True
-    assert updated.duty_user_id == 9
-    assert ld.get_profile(p.id).enabled is True  # без явного invalidate — CRUD сам обновляет кэш
-
-    assert ld.delete_profile(p.id) is True
-    assert ld.get_profile(p.id) is None
-    assert ld.delete_profile(p.id) is False
-
-
-# ════════════════ уникальность source_id между профилями ════════════════
-
-def test_specific_source_conflict_is_global_across_entry_points():
-    ld.create_profile(_profile_data(name="A", status_id=1, source_ids=[111]))
-    try:
-        ld.create_profile(_profile_data(name="B", status_id=2, source_ids=[111, 222]))
-        assert False, "источник 111 уже занят — должен быть конфликт"
-    except ld.ProfileConflictError as exc:
-        assert exc.conflicting_source_ids == {111}
-
-
-def test_wildcard_conflicts_only_on_same_entry_point():
-    ld.create_profile(_profile_data(name="A", pipeline_id=1, status_id=1, source_ids=[]))
-    # тот же вход, любой другой профиль — конфликт (в т.ч. с конкретным источником)
-    try:
-        ld.create_profile(_profile_data(name="B", pipeline_id=1, status_id=1, source_ids=[7]))
-        assert False, "wildcard-профиль резервирует всю точку входа"
-    except ld.ProfileConflictError:
-        pass
-    # другой вход — конфликта нет
-    b = ld.create_profile(_profile_data(name="C", pipeline_id=1, status_id=2, source_ids=[7]))
-    assert b.id
-
-
-def test_update_profile_conflict_excludes_self():
-    p = ld.create_profile(_profile_data(name="A", status_id=1, source_ids=[111]))
-    # обновление профиля своими же источниками — не конфликт с самим собой
-    updated = ld.update_profile(p.id, {"source_ids": [111, 222]})
-    assert set(updated.source_ids) == {111, 222}
-
-
-def test_update_profile_conflict_with_other_profile():
-    ld.create_profile(_profile_data(name="A", status_id=1, source_ids=[111]))
-    b = ld.create_profile(_profile_data(name="B", status_id=1, source_ids=[222]))
-    try:
-        ld.update_profile(b.id, {"source_ids": [111]})
-        assert False
-    except ld.ProfileConflictError:
-        pass
+def test_stale_cache_survives_team_panel_outage():
+    """Если опрос team-panel не удался, get_profiles() продолжает отдавать
+    последнее, что успело сохраниться (fetch_once не трогает кэш при сбое)."""
+    p = _seed_profile(name="Держится")
+    ok = run(ldpc.fetch_once())  # TEAM_PANEL_BASE_URL/TOKEN не настроены в тестах → сбой
+    assert ok is False
+    assert ld.get_profile(p.id) is not None
 
 
 # ════════════════ матчинг профиля ════════════════
 
 def test_match_profile_by_entry_point_and_source():
-    ld.create_profile(_profile_data(name="Квизы", pipeline_id=10, status_id=20, source_ids=[555]))
+    _seed_profile(name="Квизы", pipeline_id=10, status_id=20, source_ids=[555])
     assert ld.match_profile(10, 20, 555) is not None
     assert ld.match_profile(10, 20, 999) is None  # чужой источник
     assert ld.match_profile(10, 21, 555) is None  # чужой этап
 
 
 def test_match_profile_wildcard_matches_any_source():
-    ld.create_profile(_profile_data(name="Любой", pipeline_id=10, status_id=20, source_ids=[]))
+    _seed_profile(name="Любой", pipeline_id=10, status_id=20, source_ids=[])
     assert ld.match_profile(10, 20, 12345) is not None
     assert ld.match_profile(10, 20, None) is not None
 
 
 def test_match_profile_multiple_matches_picks_lowest_priority():
-    # Прямая манипуляция кэшем — обходит валидацию уникальности намеренно,
-    # чтобы проверить защитный путь диспетчера (priority), а не саму валидацию.
-    a = ld.create_profile(_profile_data(name="A", status_id=1, source_ids=[1], priority=50))
-    profiles = dict(ld._profiles())
-    b = ld.Profile(id="dup", name="B", enabled=True, priority=10,
-                    pipeline_id=10593102, status_id=1, source_ids=[1],
-                    participant_ids=[1])
-    profiles["dup"] = b
-    ld._profiles_cache = profiles
+    # Два профиля на один и тот же вход намеренно (в проде такое отсекает
+    # валидация team-panel) — проверяем защитный путь диспетчера (priority).
+    _seed_profile(name="A", status_id=1, source_ids=[1], priority=50)
+    _seed_profile(id="dup", name="B", status_id=1, source_ids=[1], priority=10)
     picked = ld.match_profile(10593102, 1, 1)
     assert picked.id == "dup"  # меньший priority выигрывает
 
 
 def test_disabled_profile_does_not_match():
-    ld.create_profile(_profile_data(name="Выкл", status_id=1, enabled=False))
+    _seed_profile(name="Выкл", status_id=1, enabled=False)
     assert ld.match_profile(10593102, 1, None) is None
 
 
 # ════════════════ repeat_contact_mode: random ════════════════
 
 def test_random_mode_round_robin_ignores_history():
-    p = ld.create_profile(_profile_data(name="Random", repeat_contact_mode="random",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Random", repeat_contact_mode="random", participant_ids=[1, 2, 3])
     lead = _lead(source_id=None, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 1, "updated_at": 1}])
     picks = [run(ld.decide_and_record(lead, p)) for _ in range(4)]
@@ -276,8 +239,7 @@ def test_random_mode_round_robin_ignores_history():
 # ════════════════ repeat_contact_mode: always ════════════════
 
 def test_always_mode_gives_to_previous_responsible_unconditionally():
-    p = ld.create_profile(_profile_data(name="Always", repeat_contact_mode="always",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Always", repeat_contact_mode="always", participant_ids=[1, 2, 3])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 2, "updated_at": 1}])
     # Егор (2) сильно перегружен по этому источнику — always это не волнует
@@ -287,8 +249,7 @@ def test_always_mode_gives_to_previous_responsible_unconditionally():
 
 
 def test_always_mode_waits_when_previous_responsible_off_shift():
-    p = ld.create_profile(_profile_data(name="Always", repeat_contact_mode="always",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Always", repeat_contact_mode="always", participant_ids=[1, 2, 3])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 2, "updated_at": 1}])
     now_h = datetime.datetime.now(ld._MSK).hour
@@ -298,8 +259,7 @@ def test_always_mode_waits_when_previous_responsible_off_shift():
 
 
 def test_always_mode_new_client_falls_back_to_round_robin():
-    p = ld.create_profile(_profile_data(name="Always", repeat_contact_mode="always",
-                                         participant_ids=[1, 2]))
+    p = _seed_profile(name="Always", repeat_contact_mode="always", participant_ids=[1, 2])
     lead = _lead(source_id=1, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])  # новый клиент
     target = run(ld.decide_and_record(lead, p))
@@ -309,8 +269,7 @@ def test_always_mode_new_client_falls_back_to_round_robin():
 # ════════════════ repeat_contact_mode: load ════════════════
 
 def test_load_mode_gives_to_repeat_responsible_within_fairness_gap():
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2, 3])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 1, "updated_at": 1}])
     _seed_counts({1: {42: 3}, 2: {42: 4}, 3: {42: 2}})  # разница ≤ 2 со всеми
@@ -319,8 +278,7 @@ def test_load_mode_gives_to_repeat_responsible_within_fairness_gap():
 
 
 def test_load_mode_skips_repeat_responsible_beyond_fairness_gap():
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2, 3])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 1, "updated_at": 1}])
     # 1 обогнал 3-го на источнике 42 больше, чем на 2 — приоритет снимается
@@ -330,8 +288,7 @@ def test_load_mode_skips_repeat_responsible_beyond_fairness_gap():
 
 
 def test_load_mode_x_with_min_total_wins():
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2, 3])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])  # новый клиент — без приоритета R
     # X по источнику 42 — только пользователь 3 (0), и он же с наименьшим общим (0)
@@ -341,8 +298,7 @@ def test_load_mode_x_with_min_total_wins():
 
 
 def test_load_mode_small_total_gap_still_gives_to_x():
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])
     # X = 1 (наим. по источнику 42), но общий минимум у 2. Разница общих ≤ 2 → всё равно X.
@@ -355,8 +311,7 @@ def test_load_mode_large_total_gap_overrides_x():
     """Уточнение Тианы: если разрыв общих счётчиков X-а с минимальным общим
     превышает LEAD_DISTRIBUTION_FAIRNESS_GAP — отдаём НЕ X, а человеку с
     наименьшим общим счётчиком."""
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])
     # X = 1 (наим. по источнику 42 — 0), но общий у 1 = 10, у 2 = 0 → разрыв 10 > 2
@@ -366,8 +321,7 @@ def test_load_mode_large_total_gap_overrides_x():
 
 
 def test_load_mode_no_source_id_falls_back_to_round_robin():
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2])
     lead = _lead(source_id=None, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])
     target = run(ld.decide_and_record(lead, p))
@@ -375,8 +329,7 @@ def test_load_mode_no_source_id_falls_back_to_round_robin():
 
 
 def test_counters_persist_and_reset_by_date():
-    p = ld.create_profile(_profile_data(name="Load", repeat_contact_mode="load",
-                                         participant_ids=[1, 2, 3]))
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2, 3])
     lead = _lead(lead_id=1, source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])
     _seed_counts({1: {42: 0}, 2: {42: 0}, 3: {42: 0}})
@@ -395,7 +348,7 @@ def test_counters_persist_and_reset_by_date():
 # ════════════════ дежурный / пустой пул ════════════════
 
 def test_duty_user_fallback_when_pool_empty():
-    p = ld.create_profile(_profile_data(name="Duty", participant_ids=[1, 2], duty_user_id=9))
+    p = _seed_profile(name="Duty", participant_ids=[1, 2], duty_user_id=9)
     now_h = datetime.datetime.now(ld._MSK).hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна
     lead = _lead(source_id=1, contacts=[{"id": 500}])
@@ -405,7 +358,7 @@ def test_duty_user_fallback_when_pool_empty():
 
 
 def test_no_candidate_waiting_without_duty():
-    p = ld.create_profile(_profile_data(name="NoDuty", participant_ids=[1, 2], duty_user_id=None))
+    p = _seed_profile(name="NoDuty", participant_ids=[1, 2], duty_user_id=None)
     now_h = datetime.datetime.now(ld._MSK).hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)
     lead = _lead(source_id=1, contacts=[{"id": 500}])
@@ -419,7 +372,7 @@ def test_no_candidate_waiting_without_duty():
 def test_profile_work_hours_gate_skips_outside_window():
     _reset_fakes()
     now_h = datetime.datetime.now(ld._MSK).hour
-    p = ld.create_profile(_profile_data(name="WH", work_hours={"from": now_h, "to": now_h}))
+    _seed_profile(name="WH", work_hours={"from": now_h, "to": now_h})
     lead = _lead(lead_id=200, source_id=1, contacts=[{"id": 500}])
     _lead_by_id[200] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
@@ -430,7 +383,7 @@ def test_profile_work_hours_gate_skips_outside_window():
 
 def test_profile_without_work_hours_always_runs():
     _reset_fakes()
-    p = ld.create_profile(_profile_data(name="NoWH", work_hours=None))
+    _seed_profile(name="NoWH", work_hours=None)
     lead = _lead(lead_id=201, source_id=1, contacts=[{"id": 500}])
     _lead_by_id[201] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
@@ -443,7 +396,7 @@ def test_profile_without_work_hours_always_runs():
 
 def test_already_routed_tag_is_noop():
     _reset_fakes()
-    p = ld.create_profile(_profile_data(name="Idemp"))
+    _seed_profile(name="Idemp")
     lead = _lead(lead_id=300, source_id=1, tags=[{"name": ld.TAG_LEAD_DISTRIBUTION_ROUTED}])
     _lead_by_id[300] = lead
     outcome = run(ld.process_lead_distribution(300))
@@ -464,7 +417,7 @@ def test_no_matching_profile_is_noop():
 
 def test_contact_gate_spawns_wait_and_no_decision_without_contact():
     _reset_fakes()
-    p = ld.create_profile(_profile_data(name="Race"))
+    _seed_profile(name="Race")
     lead = _lead(lead_id=400, source_id=1, contacts=[])
     _lead_by_id[400] = lead
     outcome = run(ld.process_lead_distribution(400))
@@ -475,7 +428,7 @@ def test_contact_gate_spawns_wait_and_no_decision_without_contact():
 
 def test_contact_wait_loop_succeeds_when_contact_appears():
     _reset_fakes()
-    p = ld.create_profile(_profile_data(name="Race"))
+    _seed_profile(name="Race")
     ld.LEAD_DISTRIBUTION_CONTACT_WAIT_S = 1
     ld.LEAD_DISTRIBUTION_CONTACT_POLL_S = 0.01
     no_contact = _lead(lead_id=401, source_id=1, contacts=[])
@@ -498,7 +451,7 @@ def test_contact_wait_loop_succeeds_when_contact_appears():
 
 def test_contact_wait_loop_times_out_and_alerts():
     _reset_fakes()
-    ld.create_profile(_profile_data(name="Race"))
+    _seed_profile(name="Race")
     ld.LEAD_DISTRIBUTION_CONTACT_WAIT_S = 0.05
     ld.LEAD_DISTRIBUTION_CONTACT_POLL_S = 0.01
     ld.LEAD_DISTRIBUTION_STALE_ALERT_MIN = 1
@@ -555,8 +508,8 @@ def test_reconcile_skipped_without_cutover():
 
 def test_reconcile_collects_entry_points_from_enabled_profiles_only():
     _reset_fakes()
-    ld.create_profile(_profile_data(name="On", pipeline_id=10, status_id=20, enabled=True))
-    ld.create_profile(_profile_data(name="Off", pipeline_id=30, status_id=40, enabled=False))
+    _seed_profile(name="On", pipeline_id=10, status_id=20, enabled=True)
+    _seed_profile(name="Off", pipeline_id=30, status_id=40, enabled=False)
     ld.LEAD_DISTRIBUTION_SINCE_TS = int(time.time()) - 3600
     ld._last_reconcile_ts = 0
 
