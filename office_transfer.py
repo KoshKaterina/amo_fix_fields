@@ -1,5 +1,12 @@
-"""Перенос УР(142)/ЗНР(143) сделок [CLEVER] Основная в целевую воронку/этап
+"""Перенос УР(142)/ЗНР(143) сделок из воронок-источников в целевую воронку/этап
 вместо нативного копирования (F5-виджет / «Создать сделку»).
+
+Воронки-источники: [CLEVER] Основная (розница) — всегда; ОПТ — за флагом
+OFFICE_TRANSFER_SOURCE_OPT (09.08.2026, решение Кати). Правила для опта те же
+пять, что для розницы: этапы 142/143 у ОПТ те же, поля («Тип заявки», «Склад
+заказа», «Тип доставки») заполняются так же, поэтому опт-заказ едет в тот же
+этап Офиса, что розничный с такой же доставкой. Список источников — в
+_source_pipelines(), гейт для вебхука — is_source_pipeline().
 
 Правила (условия читаются по СВЕЖЕЙ дочитанной сделке, не по телу вебхука —
 select-поля сверяются по enum_id, не по тексту, чтобы не зависеть от того, как
@@ -16,7 +23,10 @@ select-поля сверяются по enum_id, не по тексту, что�
        пометила дублем #3, #7 добавлял избыточный тег «тест» поверх того же
        условия).
     4. Тип заявки=Предзаказ → Офис/«Предзаказ оплачен»
-    5. Тип заявки=Заказ + Склад=ЭРМС_Основной → Фулфилмент/«КОНТРОЛЬ»
+    5. (УБРАНО 05.08.2026) Тип заявки=Заказ + Склад=ЭРМС_Основной → Фулфилмент/
+       «КОНТРОЛЬ». Воронка Фулфилмент разобрана, правила в _UR_RULES больше нет:
+       заказ с ЭРМС-склада теперь никуда не переносится и уходит в алерт
+       заполнения — если такие заказы ещё появляются, это сигнал, а не маршрут.
 
   ЗНР (143), поле «Причина ЗИН» (577623, он же DUP_REASON_FIELD_ID):
     1. Причина ЗИН=Лист ожидания → воронка «Лист ожидания»/«Лист ожидания»
@@ -54,7 +64,7 @@ metrika_sync.py._resolve_clever() резолвит «оригинал в CLEVER�
 сиблинга и заказ молча выпадет из отправки в Яндекс.Метрику (в логе будет
 «не нашёл оригинал в CLEVER» — сегодня это ожидаемо для АРХИВНЫХ дублей,
 после этой фичи станет систематическим для КАЖДОГО перенесённого COD-заказа).
-kontrol_gate.py и ms_status_sync.py — ПРОВЕРЕНЫ, у них нет такого допущения
+остальные обработчики — ПРОВЕРЕНЫ, у них нет такого допущения
 (читают 576689 с самой сделки / ищут по воронке+UUID без требования отдельного
 оригинала), их трогать не нужно. metrika_sync.py — нужно трогать, но это
 отдельное решение (влияет на согласованную бизнес-логику аналитики), не
@@ -75,7 +85,7 @@ from waybill_config import (
     DELIVERY_CDEK_MARKERS,
     DELIVERY_COURIER_MOSCOW_MARKER,
     DELIVERY_RUSSIAN_POST_MARKER,
-    DELIVERY_SHOWROOM_MARKER,
+    DELIVERY_PICKUP_MARKERS,
     DUP_REASON_FIELD_ID,
     FIELD_APPLICATION_TYPE,
     FIELD_DELIVERY_TYPE,
@@ -84,7 +94,6 @@ from waybill_config import (
     OFFICE_TRANSFER_ENABLED,
     OFFICE_TRANSFER_RECONCILE_INTERVAL_S,
     OFFICE_TRANSFER_RULE_UR_DELIVERY,
-    OFFICE_TRANSFER_RULE_UR_FULFILLMENT,
     OFFICE_TRANSFER_RULE_UR_PICKUP,
     OFFICE_TRANSFER_RULE_UR_PREORDER,
     OFFICE_TRANSFER_RULE_UR_POST,
@@ -92,12 +101,13 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_ZNR_ACADEMY,
     OFFICE_TRANSFER_RULE_ZNR_WAITLIST,
     OFFICE_TRANSFER_SINCE_TS,
+    OFFICE_TRANSFER_SOURCE_OPT,
     OFFICE_TRANSFER_STALE_ALERT_MIN,
     OFFICE_TRANSFER_WAREHOUSES,
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
-    PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
+    PIPELINE_OPT,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
     REASON_WAITLIST,
@@ -105,7 +115,6 @@ from waybill_config import (
     STATUS_ACADEMY_FIRST_CONTACT,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
-    STATUS_FF_KONTROL,
     STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_SUCCESS,
@@ -119,6 +128,18 @@ from waybill_config import (
 logger = logging.getLogger("uvicorn")
 
 AMO_LEAD_URL = "https://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{}"
+
+# Сколько сделок за проход reconciliation считать нормой. Больше — в лог
+# предупреждение: скорее всего, воронку-источник миграции забыли внести в
+# MIGRATION_SOURCE_PIPELINES, и её поток пошёл в обычную обработку.
+RECONCILE_VOLUME_ALERT = 50
+
+# Насколько глубоко проход заглядывает назад. При штатной работе окно = интервал
+# между проходами (2 минуты), но после рестарта _last_reconcile_ts обнуляется, и
+# окно раскрывается от cutover — на прогоне миграции это 23 000+ событий и сотни
+# страниц за один проход (поймано 05.08.2026 сразу после выката). Час назад —
+# запас на любой разумный перезапуск; более долгий простой добираем руками.
+RECONCILE_MAX_LOOKBACK_S = 3600
 
 
 # ════════════════ чтение условий по свежей сделке ════════════════
@@ -169,7 +190,9 @@ def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, in
         return None
     if _warehouse(lead) not in OFFICE_TRANSFER_WAREHOUSES:
         return None
-    if DELIVERY_SHOWROOM_MARKER not in _delivery_text(lead):
+    text = _delivery_text(lead)
+    # С 06.08.2026 самовывоз бывает из офиса и из шоурума (у шоурума свой склад).
+    if not any(marker in text for marker in DELIVERY_PICKUP_MARKERS):
         return None
     return (PIPELINE_OFFICE, STATUS_SUCCESS)
 
@@ -213,15 +236,6 @@ def _match_ur_preorder(lead: dict, *, ignore_flags: bool = False) -> tuple[int, 
     return (PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID)
 
 
-def _match_ur_fulfillment(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
-    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_FULFILLMENT:
-        return None
-    if _application_type(lead) != APPLICATION_TYPE_ORDER:
-        return None
-    if _warehouse(lead) != WAREHOUSE_ERMS_MAIN:
-        return None
-    return (PIPELINE_FULFILLMENT, STATUS_FF_KONTROL)
-
 
 _UR_RULES = (
     _match_ur_delivery,
@@ -229,7 +243,6 @@ _UR_RULES = (
     _match_ur_waybill,
     _match_ur_post,
     _match_ur_preorder,
-    _match_ur_fulfillment,
 )
 
 
@@ -262,6 +275,30 @@ def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False) -> t
         if target is not None:
             return target
     return None
+
+
+def _source_pipelines() -> tuple[int, ...]:
+    """Воронки, ИЗ которых переносим. Розница — всегда, ОПТ — за флагом
+    OFFICE_TRANSFER_SOURCE_OPT (09.08.2026).
+
+    Читаем флаг на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
+    подменённый в тестах (и в консоли при разборе инцидента), не подействовал бы.
+
+    Правила у опта те же пять, что у розницы, — отдельного матчера нет по
+    построению. Условия правил читаются с полей сделки («Тип заявки», «Склад
+    заказа», «Тип доставки»), а они у опта заполняются так же, поэтому опт-заказ
+    едет в тот же этап Офиса, что и розничный с такой же доставкой."""
+    if OFFICE_TRANSFER_SOURCE_OPT:
+        return (PIPELINE_CLEVER_MAIN, PIPELINE_OPT)
+    return (PIPELINE_CLEVER_MAIN,)
+
+
+def is_source_pipeline(pipeline_id) -> bool:
+    """Публичный гейт для webhooks.py: воронка годится как источник переноса."""
+    try:
+        return int(pipeline_id) in _source_pipelines()
+    except (TypeError, ValueError):
+        return False
 
 
 # ════════════════ диспетчер ════════════════
@@ -398,12 +435,14 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
 
     status_id = int(lead.get("status_id") or 0)
     pipeline_id = int(lead.get("pipeline_id") or 0)
-    if pipeline_id != PIPELINE_CLEVER_MAIN or status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
+    if pipeline_id not in _source_pipelines() or status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
         # Уже перенесена (нами или вручную), либо это не тот случай — идемпотентный
         # no-op. Гасит и эхо от нашего же PATCH, и повторную доставку вебхука.
+        # Сюда же попадает ОПТ при выключенном OFFICE_TRANSFER_SOURCE_OPT.
         logger.info(
-            "office_transfer %s: не в CLEVER/{142,143} (pipeline=%s status=%s) — скип",
-            lead_id, pipeline_id, status_id,
+            "office_transfer %s: воронка не источник или этап не {142,143} "
+            "(pipeline=%s status=%s, источники=%s) — скип",
+            lead_id, pipeline_id, status_id, _source_pipelines(),
         )
         _clear_fail(lead_id)
         return "skipped-not-applicable"
@@ -491,19 +530,6 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         if any((t.get("name") or "") == _tag for t in amo_service.get_tags(lead)):
             await amo_service.remove_tag(lead_id, _tag, lead=lead)
 
-    if target_pipeline_id == PIPELINE_FULFILLMENT and target_status_id == STATUS_FF_KONTROL:
-        # Страховка: не проверено live, шлёт ли amo свежий /lead_change вебхук
-        # на PATCH, сделанный НАШИМ же кодом (а не UI-действием) — если нет,
-        # штатный триггер enqueue_kontrol() в webhooks.py просто не сработает.
-        # Дублируем вызов напрямую; enqueue_kontrol сам дедуплицирует по lead_id.
-        # source="webhook" (не "office_transfer"!) — намеренно: это заставляет
-        # process_kontrol_lead ПЕРЕЧИТАТЬ сделку и сверить, что она ДЕЙСТВИТЕЛЬНО
-        # ещё на «КОНТРОЛЬ» к моменту обработки в очереди (гейт под source=="webhook"
-        # в kontrol_gate.py) — тот же уровень свежести, что у настоящего вебхука,
-        # а не «доверять данным без переповерки», как у батч-источников.
-        from queue_manager import enqueue_kontrol
-        enqueue_kontrol(lead_id, source="webhook")
-
     return "moved"
 
 
@@ -511,12 +537,17 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
 
 async def _entered_status_leads(pipeline_id: int, status_id: int, ts_from: int, ts_to: int) -> set[int]:
     """ID сделок, ПЕРЕШЕДШИХ в pipeline_id/status_id за окно [ts_from, ts_to) —
-    по событию lead_status_changed. Порт _entered_ur_leads из kontrol_gate.py,
+    по событию lead_status_changed.
     обобщённый на произвольные pipeline/status. НЕ используем
     amo_service.get_leads_by_status() здесь — та возвращает ВСЁ, что сейчас
     сидит в статусе, независимо от времени входа, что нарушило бы требование
-    «без ретроактивности» (задело бы сделки, висевшие в УР/ЗНР до cutover)."""
+    «без ретроактивности» (задело бы сделки, висевшие в УР/ЗНР до cutover).
+
+    Во время массового прогона миграции отсеиваем его собственные события по
+    `value_before` — сделка приехала из воронки-источника, а не закрылась у
+    менеджера. Признак лежит в этом же ответе, дочитывать сделки не нужно."""
     leads: set[int] = set()
+    skipped_bulk = 0
     page = 1
     while True:
         params = [
@@ -534,11 +565,22 @@ async def _entered_status_leads(pipeline_id: int, status_id: int, ts_from: int, 
             ls = (va[0].get("lead_status") if va else None) or {}
             if ls.get("id") == status_id and ls.get("pipeline_id") == pipeline_id:
                 lid = e.get("entity_id")
-                if lid is not None:
-                    leads.add(int(lid))
+                if lid is None:
+                    continue
+                vb = e.get("value_before") or []
+                before = (vb[0].get("lead_status") if vb else None) or {}
+                if migration_freeze.is_bulk_move_event(before.get("pipeline_id")):
+                    skipped_bulk += 1
+                    continue
+                leads.add(int(lid))
         if len(evs) < 100:
             break
         page += 1
+    if skipped_bulk:
+        logger.info(
+            "office_transfer reconcile: событий миграции отсеяно %s (статус %s), сделок к работе %s",
+            skipped_bulk, status_id, len(leads),
+        )
     return leads
 
 
@@ -550,23 +592,41 @@ async def _reconcile_once() -> str:
     global _last_reconcile_ts
     now = int(time.time())
 
-    # Массовый прогон миграции: проход НЕ делаем. Иначе reconcile находит по
-    # событиям каждую перенесённую сделку и дочитывает её, чтобы увидеть тег, —
-    # на боевом прогоне 04.08 это 537 дочитываний за 5 минут и 55 отказов по
-    # лимиту, то есть миграция отбирала лимит у боевой обработки. Пропущенные
-    # за это время БОЕВЫЕ закрытия не теряются: окно reconcile отсчитывается от
-    # _last_reconcile_ts, который мы здесь НЕ двигаем, — следующий проход после
-    # прогона возьмёт их все.
-    if migration_freeze.bulk_skip(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, now):
-        logger.info("office_transfer reconcile: массовый прогон миграции — проход пропущен")
-        return "skipped-migration-bulk"
+    # Массовый прогон миграции проход НЕ отключает (05.08.2026). Раньше здесь
+    # стоял выход по bulk_skip: reconcile дочитывал каждую перенесённую сделку
+    # ради тега — 537 запросов за 5 минут на прогоне 04.08. Но вместе с
+    # прогоном глохла и БОЕВАЯ обработка: вебхуки о закрытии гасит bulk_skip, а
+    # страховкой был как раз этот проход. 05.08 так встали заказы №18235 и
+    # №18245 — уехали бы в Офис только после конца окна, ночью.
+    # Теперь миграционные события отсеивает _entered_status_leads по
+    # value_before (видно в самом событии), сделки не дочитываются, лимит цел.
     window_from = max(_last_reconcile_ts, OFFICE_TRANSFER_SINCE_TS)
     if window_from <= 0:
         logger.warning("office_transfer reconcile: OFFICE_TRANSFER_SINCE_TS не задан — проход пропущен")
         return "skipped-no-cutover"
+    # Потолок оглядки ставим ПОСЛЕ проверки cutover: иначе окно всегда выглядело
+    # бы заданным и защита «без границы не запускаться» перестала бы работать.
+    window_from = max(window_from, now - RECONCILE_MAX_LOOKBACK_S)
 
-    leads = await _entered_status_leads(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, window_from, now)
-    leads |= await _entered_status_leads(PIPELINE_CLEVER_MAIN, STATUS_CLOSED_LOST, window_from, now)
+    # Обе воронки-источника за один проход: розница всегда, ОПТ — если включён
+    # флаг. По воронке два запроса (142 и 143), то есть с ОПТ проход стоит
+    # четыре запроса вместо двух — на интервале 2 минуты это в лимиты влезает
+    # с запасом (замер лимитов amo: 50 на аккаунт, 7 на интеграцию, 03.08.2026).
+    leads: set[int] = set()
+    for _src in _source_pipelines():
+        leads |= await _entered_status_leads(_src, STATUS_SUCCESS, window_from, now)
+        leads |= await _entered_status_leads(_src, STATUS_CLOSED_LOST, window_from, now)
+
+    # Предохранитель: в норме за проход набегают единицы сделок. Много — значит
+    # в перенос завели воронку, которой нет в MIGRATION_SOURCE_PIPELINES, и её
+    # поток пошёл в дочитывание. Дальше работаем (терять боевые нельзя), но в
+    # логе это видно сразу, а не по отказам amo.
+    if len(leads) > RECONCILE_VOLUME_ALERT:
+        logger.warning(
+            "office_transfer reconcile: в окне %s сделок — сверьте MIGRATION_SOURCE_PIPELINES, "
+            "похоже, воронку-источник не внесли в список",
+            len(leads),
+        )
 
     processed = 0
     for lead_id in leads:
@@ -598,7 +658,6 @@ _RULE_TARGETS = (
     (OFFICE_TRANSFER_RULE_UR_PICKUP, PIPELINE_OFFICE, STATUS_SUCCESS, "УР→Офис/УР (самовывоз: выдан на месте)"),
     (OFFICE_TRANSFER_RULE_UR_WAYBILL, PIPELINE_OFFICE, STATUS_CREATE_WAYBILL, "УР→Офис/Сделать накладную"),
     (OFFICE_TRANSFER_RULE_UR_PREORDER, PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID, "УР→Офис/Предзаказ оплачен"),
-    (OFFICE_TRANSFER_RULE_UR_FULFILLMENT, PIPELINE_FULFILLMENT, STATUS_FF_KONTROL, "УР→Фулфилмент/КОНТРОЛЬ"),
     (OFFICE_TRANSFER_RULE_ZNR_WAITLIST, PIPELINE_WAITLIST, STATUS_WAITLIST, "ЗНР→Лист ожидания"),
     (OFFICE_TRANSFER_RULE_ZNR_ACADEMY, PIPELINE_ACADEMY, STATUS_ACADEMY_FIRST_CONTACT, "ЗНР→Академия"),
 )

@@ -126,6 +126,34 @@ class WooClient:
         )
 
 
+    async def list_orders_created_since(self, since_utc) -> list[dict]:
+        """Заказы, созданные с момента since_utc (aware datetime в UTC).
+
+        ⚠️ Дату шлём БЕЗ смещения зоны: WooCommerce в паре с dates_are_gmt=true
+        на строку с хвостом «+00:00» отдаёт ПУСТОЙ список. Та же грабля девять
+        дней держала сломанной сверку в woocommerce-sklad (07.08.2026)."""
+        after = since_utc.replace(tzinfo=None, microsecond=0).isoformat()
+        out: list[dict] = []
+        page = 1
+        while page <= 10:  # 1000 заказов за окно — с большим запасом
+            resp = await self._request(
+                "GET",
+                f"/orders?after={after}&dates_are_gmt=true&per_page=100&page={page}",
+            )
+            if resp.status_code != 200:
+                raise WooError(
+                    f"Woo GET orders: {resp.status_code}", resp.status_code, resp.text[:300]
+                )
+            batch = resp.json()
+            if not batch:
+                break
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return out
+
+
 _client: WooClient | None = None
 
 
@@ -154,3 +182,7 @@ async def get_order_status(order_id) -> str | None:
 
 async def complete_order(order_id) -> str:
     return await _ensure().complete_order(order_id)
+
+
+async def list_orders_created_since(since_utc) -> list[dict]:
+    return await _ensure().list_orders_created_since(since_utc)

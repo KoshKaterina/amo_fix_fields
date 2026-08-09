@@ -1,4 +1,4 @@
-"""Минимальный async-клиент API МойСклад (только чтение) для ms_status_sync.
+"""Минимальный async-клиент API МойСклад (только чтение) для счёта Ozon (ozon_invoice).
 
 Нужен лишь GET: список изменённых заказов и метаданные статусов. Запись в МС
 модуль НЕ делает (двигает только сделки amoCRM). Bearer-токен + rate limit + retry.
@@ -21,7 +21,16 @@ _lock = asyncio.Lock()
 
 
 def init() -> None:
+    """Поднимает общий клиент. Зовётся из lifespan (webhooks.py) и НИКОГДА не
+    прячется внутрь модуля, который можно выключить флагом: 05.08.2026 клиент
+    жил внутри синка Фулфилмента, синк выключили — и счета Ozon перестали
+    создаваться. Идемпотентно: повторный вызов не пересоздаёт соединения."""
     global _client
+    if _client is not None:
+        return
+    if not MS_TOKEN:
+        logger.warning("MS_TOKEN пуст — клиент МойСклада не поднят")
+        return
     _client = httpx.AsyncClient(
         headers={"Authorization": f"Bearer {MS_TOKEN}", "Accept-Encoding": "gzip"},
         timeout=httpx.Timeout(30.0, connect=30.0),

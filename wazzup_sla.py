@@ -35,6 +35,7 @@ import logging
 import httpx
 
 import amo_service
+import sla_filter
 import telegram_bot
 from api import BASE_URL
 from waybill_config import (
@@ -45,6 +46,7 @@ from waybill_config import (
     WAZZUP_SLA_ENABLED,
     WAZZUP_SLA_MINUTES,
     WAZZUP_SLA_POLL_INTERVAL_S,
+    WAZZUP_SLA_SKIP_CHANNELS,
     WAZZUP_SLA_WINDOW_END_H,
     WAZZUP_SLA_WINDOW_START_H,
     WAZZUP_WEBHOOK_URL,
@@ -115,10 +117,27 @@ def handle_webhook(payload: dict) -> None:
             continue
         key = (channel_id, chat_id)
 
+        # Канал вне зоны SLA (партнёрский телеграм Саши: обменники, боты,
+        # блогеры). Пропускаем ДО ветки «ответили» — там всё равно нечего снимать,
+        # ожиданий по этому каналу мы не заводим.
+        if channel_id in WAZZUP_SLA_SKIP_CHANNELS:
+            continue
+
         if _is_outbound(m):
             # Ответили (оператор/бот/CRM) → снимаем ожидание.
             if _pending.pop(key, None) is not None:
                 logger.info("Wazzup SLA: ответ по беседе %s — ожидание снято", chat_id)
+            continue
+
+        # Закрывашка (реакция, «спасибо», «да, всё верно») НОВОЕ ожидание не
+        # запускает. Уже идущее — НЕ снимаем: если клиент спросил, ответа не
+        # получил и следом написал «спасибо», вопрос всё равно висит.
+        closing, reason = sla_filter.is_closing_message(m)
+        if closing and key not in _pending:
+            logger.info(
+                "Wazzup SLA: беседа %s — сообщение не требует ответа (%s), таймер не запускаю",
+                chat_id, reason,
+            )
             continue
 
         # Входящее от клиента. Таймер считаем от ПЕРВОГО неотвеченного сообщения:
@@ -183,9 +202,10 @@ async def init() -> None:
     _sub_task = asyncio.create_task(_ensure_subscription_later())
     _loop_task = asyncio.create_task(_poll_loop())
     logger.info(
-        "Wazzup SLA: включён — порог %s мин, окно %02d:00–%02d:00 МСК, опрос %s сек",
+        "Wazzup SLA: включён — порог %s мин, окно %02d:00–%02d:00 МСК, опрос %s сек, "
+        "каналов вне SLA: %s",
         WAZZUP_SLA_MINUTES, WAZZUP_SLA_WINDOW_START_H, WAZZUP_SLA_WINDOW_END_H,
-        WAZZUP_SLA_POLL_INTERVAL_S,
+        WAZZUP_SLA_POLL_INTERVAL_S, len(WAZZUP_SLA_SKIP_CHANNELS),
     )
 
 

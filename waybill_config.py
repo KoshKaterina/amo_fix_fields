@@ -11,8 +11,6 @@ STATUS_CREATE_WAYBILL = 75426822
 STATUS_WAYBILL_READY = 75426874
 
 # Фулфилмент: гейт «КОНТРОЛЬ» → «00. Обрабатывается» (автоматическая проверка заказа).
-STATUS_FF_KONTROL = 86475482      # «КОНТРОЛЬ (ПРОВЕРИТЬ ВРУЧНУЮ КАЖДЫЙ ЗАКАЗ)»
-STATUS_FF_PROCESSING = 86450946   # «00. Обрабатывается»
 
 # amoCRM custom field IDs (сделка)
 FIELD_CDEK_ORDER_NUMBER = 571657
@@ -205,8 +203,6 @@ PIPELINE_FULFILLMENT = 10997702  # Фулфилмент
 # Целевые статусы. 142/143 — системные, общие для всех воронок.
 STATUS_SUCCESS = 142             # Успешно реализовано
 STATUS_CLOSED_LOST = 143         # Закрыто и не реализовано
-FULFILLMENT_DELIVERED = 86476486          # Фулфилмент «09. Доставлено»
-FULFILLMENT_PAYMENT_FORWARDED = 86451330  # Фулфилмент «09.2 Платёж отправлен владельцу»
 
 # Поля сделки для Метрики
 FIELD_YM_CLIENT_ID = 578015          # «id (для метрики)» — ClientID Яндекс.Метрики (_ym_uid)
@@ -227,7 +223,7 @@ def is_cod_payment(payment_method) -> bool:
 
 
 # Явно распознанная ПРЕДОПЛАТА (онлайн/картой/перевод/крипта/безнал). Крипта —
-# предоплата, как и в kontrol_gate.categorize_payment. Пустой/непонятный способ
+# предоплата. Пустой/непонятный способ
 # оплаты сюда НЕ попадает (вернёт False) — это нужно, чтобы при нулевой сумме не
 # считать заказ предоплаченным по умолчанию.
 _PREPAID_TOKENS = (
@@ -267,9 +263,9 @@ WOO_STATUS_SINCE_TS: int | None = _parse_since_ts(
 )
 
 # ---------------------------------------------------------------------------
-# МойСклад API — для ms_status_sync (ведём ФФ-копию по статусу заказа склада).
+# МойСклад API — счёт Ozon (ozon_invoice) читает суммы заказа.
 # Только чтение. MS_TOKEN — Bearer-токен главного админа МС (тот же, что в
-# проекте woocommerce-sklad). Пусто → ms_status_sync ВЫКЛЮЧЕН (сервис работает).
+# проекте woocommerce-sklad).
 # ---------------------------------------------------------------------------
 MS_API_URL = os.getenv("MS_API_URL", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
 MS_TOKEN = os.getenv("MS_TOKEN", "").strip()
@@ -280,12 +276,6 @@ MS_SYNC_LOOKBACK_MIN = int(os.getenv("MS_SYNC_LOOKBACK_MIN", "120"))
 # с базой». Механизмы вокруг неё гасим настройкой, а не удалением кода — если ФФ вернут,
 # достаточно снова поставить 1. По умолчанию ВКЛЮЧЕНО: молча отключить чужой контур,
 # просто выкатив новый код, нельзя.
-#   MS_STATUS_SYNC_ENABLED=0 — МойСклад перестаёт двигать сделки по этапам Фулфилмента
-#   KONTROL_GATE_ENABLED=0   — не работает проверка заказа перед отгрузкой на «КОНТРОЛЬ»
-# Третий выключатель — OFFICE_TRANSFER_RULE_UR_FULFILLMENT: успешные сделки перестают
-# уезжать в Фулфилмент из основной воронки.
-MS_STATUS_SYNC_ENABLED = os.getenv("MS_STATUS_SYNC_ENABLED", "1").strip() != "0"
-KONTROL_GATE_ENABLED = os.getenv("KONTROL_GATE_ENABLED", "1").strip() != "0"
 
 # Час ночной ПОЛНОЙ сверки ФФ (amo-driven страховка от промахов узкого окна
 # живого опроса: рестарт/деплой/подвисание сервиса дольше lookback теряет
@@ -296,7 +286,48 @@ MS_RECONCILE_HOUR_MSK = int(os.getenv("MS_RECONCILE_HOUR_MSK", "2"))
 # «Трек-номер» (то же, что FIELD_CDEK_ORDER_NUMBER; у ФФ-копий оно пустое,
 # конфликта с CDEK-синком нет — тот пишет в офисные сделки).
 MS_ATTR_TREK = "e25b4e11-2aa4-11f1-0a80-0704003169db"
+# Доп. поле заказа МС «Номер заказа на сайте» (= id заказа WooCommerce).
+# По нему woocommerce-sklad связывает заказ сайта с заказом покупателя, и по нему
+# же сторож order_watchdog проверяет, что заказ вообще доехал.
+MS_ATTR_ORDER_NUMBER_ID = os.getenv(
+    "MS_ATTR_ORDER_NUMBER_ID", "70c4735f-c542-11f0-0a80-1755000e25a7")
+
+# Сторож заказов (order_watchdog): раз в час сверяет заказы сайта за сутки с
+# заказами в МойСкладе и пишет в технический чат, если чего-то не хватает.
+# Заведён 07.08.2026 после потери заказа №18287: вебхук не дошёл, а сверка в
+# woocommerce-sklad девять дней молча возвращала ноль.
+ORDER_WATCHDOG_ENABLED = os.getenv("ORDER_WATCHDOG_ENABLED", "1") == "1"
+ORDER_WATCHDOG_INTERVAL_S = int(os.getenv("ORDER_WATCHDOG_INTERVAL_S", "3600"))
+ORDER_WATCHDOG_LOOKBACK_H = int(os.getenv("ORDER_WATCHDOG_LOOKBACK_H", "24"))
+# Заказ моложе этого возраста ещё может ехать штатно — не тревожим.
+ORDER_WATCHDOG_MIN_AGE_MIN = int(os.getenv("ORDER_WATCHDOG_MIN_AGE_MIN", "15"))
 FIELD_FF_TREK = 571657
+
+# ---------------------------------------------------------------------------
+# Склад шоурума (задача Кати 06.08.2026). Кирилл отгружает из отдельного склада
+# «Sunscrypt Шоурум», заведённого в МойСкладе 03.08.
+#
+# Источник правды — УСЛУГА ДОСТАВКИ в заказе: стоит «Самовывоз из Шоурума» →
+# склад заказа обязан быть шоурумным; убрали услугу → склад возвращается на
+# «Sunscrypt Основной». Менеджеров этим не грузим, склад ведёт showroom_store.py.
+#
+# ⚠️ Возврат делаем ТОЛЬКО со шоурумного склада: заказы ЭРМС и «Вскрытые» живут
+# по своим правилам, трогать их нельзя.
+# ---------------------------------------------------------------------------
+# По умолчанию ВКЛЮЧЕНО (решение Кати 06.08): отдельный шаг «добавь строку в env»
+# ей не нужен, а проверить работу сторожа можно по логам. Переменная остаётся
+# аварийным выключателем: SHOWROOM_STORE_ENABLED=0 усыпляет модуль без выкатки кода.
+SHOWROOM_STORE_ENABLED = os.getenv("SHOWROOM_STORE_ENABLED", "1") == "1"
+SHOWROOM_STORE_POLL_INTERVAL_S = int(os.getenv("SHOWROOM_STORE_POLL_INTERVAL_S", "120"))
+SHOWROOM_STORE_LOOKBACK_MIN = int(os.getenv("SHOWROOM_STORE_LOOKBACK_MIN", "30"))
+
+MS_STORE_SHOWROOM_ID = os.getenv("MS_STORE_SHOWROOM_ID", "1c480a71-8f76-11f1-0a80-16b200011979")
+MS_STORE_MAIN_ID = os.getenv("MS_STORE_MAIN_ID", "0e5a2b05-c413-11ee-0a80-13fd002f63f9")
+# Услуга «Самовывоз из Шоурума» в МойСкладе (id надёжнее названия: название правят руками)
+MS_SERVICE_SHOWROOM_PICKUP_ID = os.getenv(
+    "MS_SERVICE_SHOWROOM_PICKUP_ID", "15ff040c-529c-11f1-0a80-0d0c00781fe6")
+# Запасной признак, если услугу пересоздадут с новым id
+SHOWROOM_SERVICE_NAME_MARKER = "самовывоз из шоурума"
 
 # Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
@@ -356,6 +387,20 @@ WAZZUP_SLA_MINUTES = int(os.getenv("WAZZUP_SLA_MINUTES", "30"))       # поро
 WAZZUP_SLA_WINDOW_START_H = int(os.getenv("WAZZUP_SLA_WINDOW_START_H", "12"))  # окно, МСК, включительно
 WAZZUP_SLA_WINDOW_END_H = int(os.getenv("WAZZUP_SLA_WINDOW_END_H", "19"))      # окно, МСК, до (не вкл.)
 WAZZUP_SLA_POLL_INTERVAL_S = int(os.getenv("WAZZUP_SLA_POLL_INTERVAL_S", "60"))  # период проверки, сек
+
+# Каналы Wazzup, которые SLA не сторожит (решение Кати 06.08.2026). Пока один —
+# телеграм +7 901 960-80-28 (в Wazzup зовётся «79019608028»), личный канал Саши
+# Гладкова под партнёрку: обменники, крипто-боты, блогеры, рекламные каналы.
+# По корпусу 28.07–06.08 оттуда пришло 35 алертов из 153 — почти четверть, и это
+# не клиенты: отдел продаж будили «Вас приветствует MAXMINER» и «Выберите язык :».
+# Фильтром текста такое не лечится, там нет закрывашки — просто не наш разговор.
+# Клиентские каналы (WhatsApp и телеграм +7 926 082-36-03) сторожим как раньше.
+WAZZUP_SLA_SKIP_CHANNELS = {
+    c.strip() for c in os.getenv(
+        "WAZZUP_SLA_SKIP_CHANNELS",
+        "33be01a6-7d00-4fae-b797-93fd66e9f0f4",
+    ).split(",") if c.strip()
+}
 
 # ---------------------------------------------------------------------------
 # Контроль ДОСТАВКИ Wazzup (01.08.2026, просьба Кати). Не путать с SLA выше:
@@ -447,6 +492,30 @@ OZON_PAY_NOTIFICATION_SECRET_KEY = os.getenv("OZON_PAY_NOTIFICATION_SECRET_KEY",
 # (7173) шлют шаблон с уже заполненным полем. Ошибка счёта → сделка остаётся
 # висеть на тех-этапе с тегом (видно в воронке).
 PIPELINE_CLEVER_MAIN = 10593102
+
+# Воронка ОПТ — вторая воронка-ИСТОЧНИК переноса (09.08.2026). Этапы 142/143 у
+# неё те же, что у розницы, поэтому контракт «переносим на входе в 142, ни на
+# этап раньше» повторяется один в один: своё «Оплата получена» 86132358 в
+# триггер НЕ берём — сделка обязана физически войти в ОПТ/142, иначе won_at
+# останется NULL и опт-продажи молча обнулятся у панели и Метрики.
+PIPELINE_OPT = 10131762
+
+# Вход воронки: хаб «Новый лид» + четыре буферных, куда падают заявки до
+# распределения Genezis. Свежий заказ с сайта всегда в одном из пяти.
+STATUS_NEW_LEAD = 83537714
+STATUS_NEW_LEAD_BUFFERS = (83915186, 84215622, 86794306, 86794354)
+STATUS_NEW_LEAD_ALL = {STATUS_NEW_LEAD, *STATUS_NEW_LEAD_BUFFERS}
+
+# Шоурум-алерт (showroom_alert): заказ с самовывозом → сообщение в топик ШОУРУМ.
+# ⚠️ Мастер-флаг заведён 07.08.2026 после спама в бою: без него единственным
+# способом заглушить фичу была правка кода прямо на сервере.
+SHOWROOM_ALERT_ENABLED = os.getenv("SHOWROOM_ALERT_ENABLED", "1") == "1"
+# Пауза перед чтением сделки: поля (состав, сумма, контакт) плагин сайта
+# дозаписывает не разом, первый вебхук приходит с полупустой сделкой.
+SHOWROOM_ALERT_DELAY_S = int(os.getenv("SHOWROOM_ALERT_DELAY_S", "90"))
+# Возраст сделки, старше — не наш случай. Защита от массовых прогонов по старью.
+SHOWROOM_ALERT_MAX_AGE_MIN = int(os.getenv("SHOWROOM_ALERT_MAX_AGE_MIN", "60"))
+
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
 STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)
@@ -510,10 +579,15 @@ OFFICE_TRANSFER_RULE_UR_DELIVERY = os.getenv("OFFICE_TRANSFER_RULE_UR_DELIVERY",
 OFFICE_TRANSFER_RULE_UR_PICKUP = os.getenv("OFFICE_TRANSFER_RULE_UR_PICKUP", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_WAYBILL = os.getenv("OFFICE_TRANSFER_RULE_UR_WAYBILL", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER", "").strip() == "1"
-OFFICE_TRANSFER_RULE_UR_FULFILLMENT = os.getenv("OFFICE_TRANSFER_RULE_UR_FULFILLMENT", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").strip() == "1"
+
+# Воронка ОПТ как ИСТОЧНИК переноса (09.08.2026). Отдельный флаг, а не правило:
+# сами правила у опта те же пять, что у розницы (решение Кати 09.08.2026), новый
+# здесь только вход. Порядок включения тот же — сперва убрать ручное
+# копирование в ОПТ, потом флаг, иначе получим и копию, и перенос.
+OFFICE_TRANSFER_SOURCE_OPT = os.getenv("OFFICE_TRANSFER_SOURCE_OPT", "").strip() == "1"
 
 # Cutover-граница (unix ts): события ДО неё игнорируются везде (вебхук и
 # reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии
@@ -565,13 +639,20 @@ APPLICATION_TYPE_PREORDER = 1041239  # Предзаказ
 WAREHOUSE_SUNSCRYPT_MAIN = 1040201    # Sunscrypt Основной
 WAREHOUSE_SUNSCRYPT_OPENED = 1040207  # Sunscrypt Вскрытые
 WAREHOUSE_ERMS_MAIN = 1041653         # ЭРМС_Основной
-OFFICE_TRANSFER_WAREHOUSES = {WAREHOUSE_SUNSCRYPT_MAIN, WAREHOUSE_SUNSCRYPT_OPENED}
+WAREHOUSE_SUNSCRYPT_SHOWROOM = 1041885  # Sunscrypt Шоурум (заведён 03.08.2026 под отгрузки Кирилла)
+# Шоурум добавлен 06.08.2026: без него сделка с новым складом переставала подходить
+# под правила автопереноса и зависала в УР розницы с алертом «заказ заполнен некорректно».
+OFFICE_TRANSFER_WAREHOUSES = {
+    WAREHOUSE_SUNSCRYPT_MAIN, WAREHOUSE_SUNSCRYPT_OPENED, WAREHOUSE_SUNSCRYPT_SHOWROOM}
 
 # 577623 (= DUP_REASON_FIELD_ID выше, живое имя «Причина ЗИН») — доп. enum_id для office-transfer
 REASON_WAITLIST = 1041245  # Лист ожидания
 REASON_ACADEMY = 1041243   # Академия
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
+# Самовывоз бывает двух видов: из офиса (как было) и из шоурума (с 06.08.2026, свой склад).
+# Оба ведут в один и тот же этап Офиса, поэтому правило матчит по любому из маркеров.
+DELIVERY_PICKUP_MARKERS = (DELIVERY_SHOWROOM_MARKER, "самовывоз из шоурума")
 DELIVERY_COURIER_MOSCOW_MARKER = "курьером по москве"
 DELIVERY_CDEK_MARKERS = ("cdek", "сдэк")
 DELIVERY_RUSSIAN_POST_MARKER = "почта россии"

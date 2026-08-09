@@ -21,7 +21,6 @@ PRIORITY_NEW = 0
 # поведению (в 9dd0e93 было PRIORITY_NEW). Тай-брейк с lead_update — FIFO по sequence.
 PRIORITY_JIVO = PRIORITY_NEW
 PRIORITY_WAYBILL = 5
-PRIORITY_KONTROL = PRIORITY_WAYBILL  # гейт КОНТРОЛЬ→00 — та же дорожка(LANE_AMO)/приоритет, что автонакладные
 PRIORITY_INVOICE = PRIORITY_WAYBILL  # счёт СБП «Оплата запрошена» — клиент ЖДЁТ ссылку, путь клиентский
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
@@ -47,7 +46,6 @@ LANES = (LANE_AMO, LANE_SYNC, LANE_CDEK)
 # kind задачи → категория брейкера (изоляция 429 по типу интеграции)
 _CATEGORY_BY_KIND = {
     "waybill": "waybill",
-    "kontrol": "kontrol",
     "ozon_invoice": "invoice",
     "cdek_sync": "cdek",
     "metrika_sync": "sync",
@@ -90,7 +88,6 @@ _alert_tasks: set[asyncio.Task] = set()
 # более свежие значения полей).
 _pending_leads: dict[str, dict] = {}
 _pending_waybills: set[str] = set()
-_pending_kontrol: set[str] = set()
 _pending_office_transfer: set[str] = set()
 _pending_lead_distribution: set[str] = set()
 _pending_invoice: set[str] = set()
@@ -139,7 +136,6 @@ async def shutdown_queue() -> None:
     _alert_tasks.clear()
     _pending_leads.clear()
     _pending_waybills.clear()
-    _pending_kontrol.clear()
     _pending_office_transfer.clear()
     _pending_lead_distribution.clear()
     _pending_invoice.clear()
@@ -313,34 +309,13 @@ def enqueue_invoice(lead_id, source: str = "webhook") -> None:
     )
 
 
-def enqueue_kontrol(lead_id, source: str = "webhook") -> None:
-    """Гейт КОНТРОЛЬ: ФФ-сделка зашла на этап «КОНТРОЛЬ» → автопроверка заказа
-    (подгон полей МС, стоп-поля, наличие) и релиз в «00» или удержание с тегом
-    «ошибка передачи». Та же дорожка LANE_AMO и приоритет, что автонакладные.
-    Дедуп по lead_id, пока задача ждёт в очереди."""
-    if not _queues:
-        logger.error("Task queue not initialized, dropping kontrol for lead %s", lead_id)
-        return
-    key = str(lead_id)
-    if key in _pending_kontrol:
-        logger.info("Lead %s kontrol already in queue, skipping duplicate", key)
-        return
-    _pending_kontrol.add(key)
-    payload = {"_kind": "kontrol", "lead_id": lead_id, "source": source}
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_KONTROL, payload=payload))
-    logger.info(
-        "ENQUEUE kontrol lead_id=%s source=%s lane=%s queue_size=%d",
-        key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
-    )
-
-
 def enqueue_office_transfer(lead_id, source: str = "webhook") -> None:
     """Перенос УР(142)/ЗНР(143) сделки [CLEVER] Основная в целевую воронку
     (office_transfer.py). Приоритет PRIORITY_NEW (наивысший, тот же, что
     заполнение полей) — по прямому требованию задачи «первый приоритет в
     очереди»: зависшая сделка блокирует хэндофф ответственного и дальнейшую
     обработку (ФФ-гейт, реф.комиссия и т.д.), выше по цене простоя, чем
-    внутренние операционные задачи (kontrol/waybill/invoice, приоритет 5).
+    внутренние операционные задачи (waybill/invoice, приоритет 5).
     Дедуп по lead_id, пока задача ждёт в очереди."""
     if not _queues:
         logger.error("Task queue not initialized, dropping office_transfer for lead %s", lead_id)
@@ -461,8 +436,6 @@ async def _worker(lane: str) -> None:
         set_breaker_category(category)
         if kind == "waybill":
             _pending_waybills.discard(lead_id)
-        elif kind == "kontrol":
-            _pending_kontrol.discard(lead_id)
         elif kind == "office_transfer":
             _pending_office_transfer.discard(lead_id)
         elif kind == "lead_distribution":
@@ -501,13 +474,6 @@ async def _worker(lane: str) -> None:
                 from waybill_service import create_waybill_for_lead
                 await create_waybill_for_lead(
                     item.payload["lead_id"],
-                    source=item.payload.get("source", "webhook"),
-                )
-            elif kind == "kontrol":
-                from kontrol_gate import process_kontrol_lead
-                await process_kontrol_lead(
-                    item.payload["lead_id"],
-                    apply=True,
                     source=item.payload.get("source", "webhook"),
                 )
             elif kind == "office_transfer":

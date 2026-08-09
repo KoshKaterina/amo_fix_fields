@@ -17,9 +17,12 @@ import lead_distribution
 import lead_distribution_profiles_client
 import metrika_sync
 import migration_freeze
-import ms_status_sync
+import ms_client
 import office_transfer
+import order_watchdog
 import ozon_invoice
+import showroom_alert
+import showroom_store
 import showroom_tag
 import team_panel_client
 import telegram_bot
@@ -40,7 +43,6 @@ from lead_distribution_api import router as lead_distribution_router
 from queue_manager import (
     enqueue_invoice,
     enqueue_jivo,
-    enqueue_kontrol,
     enqueue_lead_distribution,
     enqueue_new,
     enqueue_office_transfer,
@@ -50,13 +52,10 @@ from queue_manager import (
     shutdown_queue,
 )
 from waybill_config import (
-    KONTROL_GATE_ENABLED,
     OFFICE_TRANSFER_ENABLED,
     PIPELINE_CLEVER_MAIN,
-    PIPELINE_FULFILLMENT,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
-    STATUS_FF_KONTROL,
     STATUS_PAYMENT_REQUESTED,
     STATUS_SUCCESS,
     UIS_WEBHOOK_SECRET,
@@ -87,7 +86,10 @@ async def lifespan(app):
     await cdek_status_sync.init()
     await metrika_sync.init()
     await woo_status_sync.init()
-    await ms_status_sync.init()
+    # Клиент МойСклада поднимаем здесь: его читает ozon_invoice (суммы заказа для
+    # СБП-счёта). Раньше клиент вставал внутри синка Фулфилмента — когда тот выключили
+    # 05.08, счета молча перестали создаваться. Контур ФФ удалён, клиент остался.
+    ms_client.init()
     ozon_invoice.init()
     await wazzup_sla.init()
     await wazzup_forward.init()
@@ -96,18 +98,22 @@ async def lifespan(app):
     lead_distribution_profiles_client.start()
     await lead_distribution.init()
     team_panel_client.start()
+    await showroom_store.init()
+    await order_watchdog.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
     await wazzup_forward.shutdown()
     await wazzup_delivery.shutdown()
     await unmiss_tag.shutdown()
+    await showroom_store.shutdown()
+    await order_watchdog.shutdown()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await team_panel_client.stop()
     await lead_distribution_profiles_client.stop()
     await ozon_invoice.aclose()
-    await ms_status_sync.shutdown()
+    await ms_client.aclose()
     await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
     await cdek_status_sync.shutdown()
@@ -376,32 +382,28 @@ async def lead_change(request: Request):
     pipeline_add = await get_nested(nested, ["leads", "add", "0", "pipeline_id"])
     incoming_pipeline = pipeline_update if pipeline_update is not None else pipeline_add
 
-    # Гейт КОНТРОЛЬ: ФФ-сделка зашла на этап «КОНТРОЛЬ» → автопроверка заказа
-    # (подгон полей МС + стоп-поля + наличие) → релиз в «00» или удержание с тегом
-    # «ошибка передачи» и причиной в примечании. Тяжёлая работа — в очереди (LANE_AMO).
-    if (
-        KONTROL_GATE_ENABLED
-        and lead_id is not None
-        and incoming_status is not None
-        and str(incoming_status) == str(STATUS_FF_KONTROL)
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
-    ):
-        logger.info("Lead %s entered STATUS_FF_KONTROL — enqueue kontrol gate", lead_id)
-        enqueue_kontrol(lead_id, source="webhook")
 
-    # Office Transfer: сделка [CLEVER] Основная зашла в УР(142)/ЗНР(143) →
+    # Office Transfer: сделка воронки-источника зашла в УР(142)/ЗНР(143) →
     # вместо нативного копирования (F5-виджет/«Создать сделку») переносим ЭТУ
     # ЖЕ сделку в целевую воронку/этап (office_transfer.py). Мастер-флаг
     # OFFICE_TRANSFER_ENABLED + флаг конкретного правила (там же) — по умолчанию
     # выключено, включает Тиана по мере отключения нативной автоматики.
+    # Источники: розница всегда, ОПТ — за OFFICE_TRANSFER_SOURCE_OPT (09.08.2026).
+    # Гейт спрашиваем у office_transfer, чтобы список источников жил в одном
+    # месте: разъехавшиеся гейты вебхука и диспетчера дали бы «вебхук ставит
+    # задачу, диспетчер её скипает» — сделка ехала бы только страховкой раз в
+    # две минуты, и то молча.
     if (
         OFFICE_TRANSFER_ENABLED
         and lead_id is not None
         and incoming_status is not None
         and str(incoming_status) in (str(STATUS_SUCCESS), str(STATUS_CLOSED_LOST))
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_CLEVER_MAIN))
+        and (incoming_pipeline is None or office_transfer.is_source_pipeline(incoming_pipeline))
     ):
-        logger.info("Lead %s entered %s in CLEVER — enqueue office_transfer", lead_id, incoming_status)
+        logger.info(
+            "Lead %s entered %s in pipeline %s — enqueue office_transfer",
+            lead_id, incoming_status, incoming_pipeline,
+        )
         enqueue_office_transfer(lead_id, source="webhook")
 
     # Lead Distribution: сделка вошла в точку входа (pipeline_id/status_id)
@@ -435,16 +437,6 @@ async def lead_change(request: Request):
     responsible_update = await get_nested(nested, ["leads", "update", "0", "responsible_user_id"])
     if lead_id is not None and responsible_update is not None:
         lead_distribution.correct_reassignment_bg(lead_id, responsible_update)
-
-    # Обратная синхронизация amo→МС: ТОЛЬКО при заходе ФФ-сделки на «00. Обрабатывается»
-    # (ручной выпуск из КОНТРОЛЯ / создание копии там). Дальше склад ведёт amo (МС→amo).
-    if (
-        lead_id is not None
-        and incoming_status is not None
-        and ms_status_sync.is_enabled()
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_FULFILLMENT))
-    ):
-        ms_status_sync.push_processing_bg(lead_id, incoming_status)
 
     # Счёт СБП (MAG-285): сделка зашла на тех-этап «Оплата запрошена» (CLEVER
     # Основная) → создаём платёжную ссылку Ozon из суммы заказа МС и одним PATCH
@@ -485,6 +477,10 @@ async def lead_change(request: Request):
         # Автотег «Запись в шоурум»: тип доставки (577315) = самовывоз из офиса
         # Sunscrypt → вешаем тег (в фоне, идемпотентно). «CDEK: Самовывоз» не триггерит.
         showroom_tag.maybe_apply_bg(delivery_type, lead_id)
+        # Алерт в ТГ: самовывоз (офис ИЛИ шоурум) → в топик ШОУРУМ с тегом Кати,
+        # чтобы записать клиента на визит. Шире автотега выше: тег вешается только на
+        # самовывоз из офиса, а записывать надо и тех, кто забирает из шоурума.
+        showroom_alert.notify_bg(delivery_type, lead_id)
 
         if (
             goods is not None
