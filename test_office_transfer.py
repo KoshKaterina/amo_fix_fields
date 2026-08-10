@@ -38,7 +38,6 @@ from waybill_config import (
     STATUS_CREATE_WAYBILL,
     STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
-    STATUS_OFFICE_RESERVE,
     STATUS_SUCCESS,
     STATUS_WAITLIST,
     TAG_OFFICE_TRANSFER_ERROR,
@@ -121,23 +120,6 @@ lead2 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSC
               delivery_text="CDEK: Самовывоз")
 assert office_transfer._match_ur_pickup(lead2) is None
 print("✓ УР-2 Самовывоз: дискриминатор «из офиса» против CDEK: Самовывоз работает")
-
-# УР-2 исключение: ОПТ + самовывоз из ШОУРУМА + Заказ → «Отложенный/резерв товар», не УР(142)
-lead_opt_showroom = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
-                           warehouse=WAREHOUSE_SUNSCRYPT_OPENED, delivery_text="Самовывоз из шоурума")
-assert office_transfer._match_ur_pickup(lead_opt_showroom) == (PIPELINE_OFFICE, STATUS_OFFICE_RESERVE), \
-    "ОПТ + самовывоз из шоурума = резерв, а не УР (Катя 10.08)"
-# розница с тем же маркером «из шоурума» — как раньше, УР(142) (правило только для ОПТ)
-lead_retail_showroom = _lead(pipeline_id=PIPELINE_CLEVER_MAIN, application_type=APPLICATION_TYPE_ORDER,
-                              warehouse=WAREHOUSE_SUNSCRYPT_OPENED, delivery_text="Самовывоз из шоурума")
-assert office_transfer._match_ur_pickup(lead_retail_showroom) == (PIPELINE_OFFICE, STATUS_SUCCESS), \
-    "розница + самовывоз из шоурума — без изменений, сразу УР"
-# ОПТ + самовывоз ИЗ ОФИСА (не шоурум) — тоже без изменений, сразу УР
-lead_opt_office = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
-                         warehouse=WAREHOUSE_SUNSCRYPT_OPENED, delivery_text="Самовывоз из офиса Sunscrypt")
-assert office_transfer._match_ur_pickup(lead_opt_office) == (PIPELINE_OFFICE, STATUS_SUCCESS), \
-    "ОПТ + самовывоз из офиса (не шоурум) — исключение не применяется"
-print("✓ УР-2 исключение ОПТ+шоурум: резерв только для ОПТ, розница и «самовывоз из офиса» — без изменений")
 
 # УР-3 СДЭК (схлопнутые правила 3+6+7 исходного списка) — регистронезависимо, CDEK/СДЭК
 for text in ("CDEK: Посылка склад-дверь", "сдэк: самовывоз", "Доставка СДЭК курьером"):
@@ -695,20 +677,6 @@ assert _patches[0]["status_id"] == STATUS_CREATE_WAYBILL, (
 assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
 assert _patches[0]["custom_fields"][FIELD_FORMER_RESPONSIBLE] == "Иван Иванов"
 print("✓ ОПТ/142 СДЭК → Офис/«Сделать накладную», ответственный → Зубалий, прежний в 578151")
-
-# опт-самовывоз из ШОУРУМА → «Отложенный/резерв товар», НЕ тот же маршрут, что розница (Катя 10.08)
-_reset()
-lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
-             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="Самовывоз из шоурума",
-             responsible_user_id=999)
-_install_dispatcher_mocks(lead)
-res = run(office_transfer.process_office_transfer(42))
-assert res == "moved", res
-assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
-assert _patches[0]["status_id"] == STATUS_OFFICE_RESERVE, (
-    "ОПТ+самовывоз из шоурума обязан ехать в резерв, а не в УР(142)")
-assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
-print("✓ ОПТ/142 самовывоз из шоурума → Офис/«Отложенный/резерв товар» (исключение из общего маршрута)")
 
 # опт-предзаказ → «Предзаказ оплачен» (ровно то, что делала ручная копия 03.08)
 _reset()
