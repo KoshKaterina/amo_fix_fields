@@ -709,8 +709,10 @@ REASON_ACADEMY = 1041243   # Академия
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
 # Самовывоз бывает двух видов: из офиса (как было) и из шоурума (с 06.08.2026, свой склад).
-# Оба ведут в один и тот же этап Офиса, поэтому правило матчит по любому из маркеров.
-DELIVERY_PICKUP_MARKERS = (DELIVERY_SHOWROOM_MARKER, "самовывоз из шоурума")
+# Для розницы оба ведут в один и тот же этап Офиса; для ОПТ самовывоз из шоурума —
+# исключение (см. DELIVERY_SHOWROOM_PICKUP_MARKER + STATUS_OFFICE_RESERVE ниже).
+DELIVERY_SHOWROOM_PICKUP_MARKER = "самовывоз из шоурума"
+DELIVERY_PICKUP_MARKERS = (DELIVERY_SHOWROOM_MARKER, DELIVERY_SHOWROOM_PICKUP_MARKER)
 DELIVERY_COURIER_MOSCOW_MARKER = "курьером по москве"
 DELIVERY_CDEK_MARKERS = ("cdek", "сдэк")
 DELIVERY_RUSSIAN_POST_MARKER = "почта россии"
@@ -719,6 +721,10 @@ DELIVERY_RUSSIAN_POST_MARKER = "почта россии"
 STATUS_OFFICE_DELIVERY = 75426826       # «Оформить доставку» (Достависта)
 STATUS_OFFICE_PICKUP = 75426862         # «Самовывоз»
 STATUS_OFFICE_PREORDER_PAID = 83953914  # «Предзаказ оплачен»
+# «Отложенный/резерв товар» — ОПТ + самовывоз из ШОУРУМА (решение Кати 10.08.2026):
+# в отличие от розницы, опт-заказ на этот момент физически ещё не выдан клиенту,
+# поэтому уходит не в УР(142), а сюда — товар числится в резерве до выдачи.
+STATUS_OFFICE_RESERVE = 75426858
 # «Сделать накладную» — уже есть как STATUS_CREATE_WAYBILL (75426822)
 
 # Целевая воронка «Лист ожидания»

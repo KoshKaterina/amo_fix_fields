@@ -5,7 +5,8 @@
 OFFICE_TRANSFER_SOURCE_OPT (09.08.2026, решение Кати). Правила для опта те же
 пять, что для розницы: этапы 142/143 у ОПТ те же, поля («Тип заявки», «Склад
 заказа», «Тип доставки») заполняются так же, поэтому опт-заказ едет в тот же
-этап Офиса, что розничный с такой же доставкой. Список источников — в
+этап Офиса, что розничный с такой же доставкой — ЗА ИСКЛЮЧЕНИЕМ самовывоза из
+шоурума (см. правило 2 ниже, решение Кати 10.08.2026). Список источников — в
 _source_pipelines(), гейт для вебхука — is_source_pipeline().
 
 Правила (условия читаются по СВЕЖЕЙ дочитанной сделке, не по телу вебхука —
@@ -16,7 +17,11 @@ select-поля сверяются по enum_id, не по тексту, что�
     1. Тип доставки содержит «курьером по москве» + Тип заявки=Заказ +
        Склад∈{Основной,Вскрытые} → Офис/«Оформить доставку»
     2. Тип доставки содержит «самовывоз из офиса» + Тип заявки=Заказ +
-       Склад∈{Основной,Вскрытые} → Офис/«Самовывоз»
+       Склад∈{Основной,Вскрытые} → Офис/УР(142). Исключение (10.08.2026,
+       решение Кати): для ОПТ самовывоз ИЗ ШОУРУМА конкретно + Тип заявки=Заказ
+       → не в УР(142), а в Офис/«Отложенный/резерв товар» — товар опту ещё не
+       выдан физически на этот момент (в отличие от розницы). Розница с любым
+       самовывозом — как раньше, в УР(142).
     3. Тип заявки=Заказ + Тип доставки содержит CDEK/СДЭК + Склад∈{Основной,
        Вскрытые} → Офис/«Сделать накладную». Схлопнуты правила 3+6+7 исходного
        списка Тианы — все три вели в один и тот же этап (#6 сама Тиана
@@ -86,6 +91,7 @@ from waybill_config import (
     DELIVERY_COURIER_MOSCOW_MARKER,
     DELIVERY_RUSSIAN_POST_MARKER,
     DELIVERY_PICKUP_MARKERS,
+    DELIVERY_SHOWROOM_PICKUP_MARKER,
     DUP_REASON_FIELD_ID,
     FIELD_APPLICATION_TYPE,
     FIELD_DELIVERY_TYPE,
@@ -117,6 +123,7 @@ from waybill_config import (
     STATUS_CREATE_WAYBILL,
     STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
+    STATUS_OFFICE_RESERVE,
     STATUS_SUCCESS,
     STATUS_WAITLIST,
     TAG_OFFICE_TRANSFER_ERROR,
@@ -160,6 +167,10 @@ def _reason_enum(lead: dict) -> int | None:
     return amo_service.get_custom_field_enum_id(lead, DUP_REASON_FIELD_ID)
 
 
+def _pipeline_id(lead: dict) -> int:
+    return int(lead.get("pipeline_id") or 0)
+
+
 # ════════════════ матчеры правил — каждый: сделка → (pipeline_id, status_id) | None ════════════════
 # ignore_flags=True — «теневой» матчинг без учёта флагов правил: нужен _no_match_ur,
 # чтобы в переходный период (правила включаются по одному) не алертить «заказ
@@ -183,7 +194,13 @@ def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, in
     31.07.2026): МОП бросает сделку в УР ОП только когда клиент уже пришёл в
     офис, оплатил и забрал товар — выдача состоялась, в Офисе делать нечего,
     сделка закрывается. Этап «Самовывоз» при нативном копировании был
-    формальностью (копии закрывались в УР той же минутой)."""
+    формальностью (копии закрывались в УР той же минутой).
+
+    Исключение — ОПТ + самовывоз конкретно ИЗ ШОУРУМА (решение Кати 10.08.2026):
+    в отличие от розницы, опт-заказ на этот момент физически ещё не выдан
+    клиенту — уходит не в УР(142), а в «Отложенный/резерв товар»
+    (STATUS_OFFICE_RESERVE), товар числится в резерве до фактической выдачи.
+    Самовывоз из ОФИСА и розница с любым самовывозом — как раньше, в УР(142)."""
     if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_PICKUP:
         return None
     if _application_type(lead) != APPLICATION_TYPE_ORDER:
@@ -191,6 +208,8 @@ def _match_ur_pickup(lead: dict, *, ignore_flags: bool = False) -> tuple[int, in
     if _warehouse(lead) not in OFFICE_TRANSFER_WAREHOUSES:
         return None
     text = _delivery_text(lead)
+    if DELIVERY_SHOWROOM_PICKUP_MARKER in text and _pipeline_id(lead) == PIPELINE_OPT:
+        return (PIPELINE_OFFICE, STATUS_OFFICE_RESERVE)
     # С 06.08.2026 самовывоз бывает из офиса и из шоурума (у шоурума свой склад).
     if not any(marker in text for marker in DELIVERY_PICKUP_MARKERS):
         return None
@@ -656,6 +675,7 @@ async def _reconcile_loop() -> None:
 _RULE_TARGETS = (
     (OFFICE_TRANSFER_RULE_UR_DELIVERY, PIPELINE_OFFICE, STATUS_OFFICE_DELIVERY, "УР→Офис/Оформить доставку"),
     (OFFICE_TRANSFER_RULE_UR_PICKUP, PIPELINE_OFFICE, STATUS_SUCCESS, "УР→Офис/УР (самовывоз: выдан на месте)"),
+    (OFFICE_TRANSFER_RULE_UR_PICKUP, PIPELINE_OFFICE, STATUS_OFFICE_RESERVE, "УР→Офис/Отложенный резерв (ОПТ+шоурум)"),
     (OFFICE_TRANSFER_RULE_UR_WAYBILL, PIPELINE_OFFICE, STATUS_CREATE_WAYBILL, "УР→Офис/Сделать накладную"),
     (OFFICE_TRANSFER_RULE_UR_PREORDER, PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID, "УР→Офис/Предзаказ оплачен"),
     (OFFICE_TRANSFER_RULE_ZNR_WAITLIST, PIPELINE_WAITLIST, STATUS_WAITLIST, "ЗНР→Лист ожидания"),
