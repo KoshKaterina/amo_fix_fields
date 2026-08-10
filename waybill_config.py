@@ -199,6 +199,8 @@ METRIKA_SINCE_TS: int | None = _parse_since_ts(_raw_since)
 PIPELINE_CLEVER = 10593102       # [CLEVER] Основная — отдел продаж, ОРИГИНАЛЫ сделок
 PIPELINE_OFFICE = 9421022        # Офис
 PIPELINE_FULFILLMENT = 10997702  # Фулфилмент
+PIPELINE_TANGEMSHOP = 9822330    # TangemShop
+PIPELINE_TEST = 8642414          # «Тест» — песочница, ни с чем в проекте не пересекается (для живых тестов reserve_service)
 
 # Целевые статусы. 142/143 — системные, общие для всех воронок.
 STATUS_SUCCESS = 142             # Успешно реализовано
@@ -209,6 +211,62 @@ FIELD_YM_CLIENT_ID = 578015          # «id (для метрики)» — Client
 FIELD_MOYSKLAD_ORDER_UUID = 576689   # «ID Заказа» (UUID МойСклад) — ключ связки дубликат→оригинал
 # FIELD_PAYMENT_METHOD = 577373 (способ оплаты) уже определён выше
 # FIELD_PHONE = 413385, FIELD_EMAIL = 413387 (контакт) уже определены выше
+
+# Резерв товара в МойСклад (перенос с amGroup, 04.08.2026) — см. reserve_service.py.
+# Работаем только со сделками, где заполнено FIELD_MOYSKLAD_ORDER_UUID выше
+# (заказ МС уже создан amGroup/виджетом сайта — свой заказ мы не создаём).
+# Триггер пересмотра резерва при изменении корзины — поле 576703 «Состав
+# заказа», уже читается в webhooks.py рядом с parse_the_cart_field.
+
+# [CLEVER] Основная — статусы, где резерв ставим/держим (кроме уже определённых
+# выше STATUS_PAYMENT_REQUESTED/STATUS_LINK_SENT/STATUS_PAYMENT_RECEIVED и
+# системных STATUS_SUCCESS/STATUS_CLOSED_LOST — см. ниже).
+STATUS_CLEVER_NEW_LEAD = 83537714        # «Новый лид»
+STATUS_CLEVER_IN_PROGRESS = 83537718     # «Взят в работу»
+STATUS_CLEVER_OFFICE_RECORD = 86706902   # «Запись в офис»
+STATUS_CLEVER_QUALIFIED = 83537722       # «Квалификация проведена»
+STATUS_CLEVER_WALLET_PICKED = 83537858   # «Кошелек подобран»
+STATUS_CLEVER_UPSELL_DONE = 83893786     # «Допродажа сделана»
+STATUS_CLEVER_TERMS_AGREED = 83537862    # «Условия согласованы»
+STATUS_CLEVER_PRECLOSED = 83660350       # «Предварительно закрыт» — резерв СНИМАЕМ
+
+# TangemShop
+STATUS_TANGEM_NEW_ORDER = 78157066                    # «Новый заказ»
+STATUS_TANGEM_IN_PROGRESS = 78157070                   # «взят в работу»
+STATUS_TANGEM_UPSELL_DONE = 78157074                   # «апсейл / допродажа сделаны»
+STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED = 86477050   # «доплата получена»
+
+# Офис — отгрузка реально расходует резерв (STATUS_WAYBILL_READY уже определена
+# выше = «Готова накладная»; STATUS_SUCCESS здесь = «Успешно реализовано» в
+# Офисе, где сделка реально закрыта — в отличие от УР в Основной/TangemShop,
+# где резерв держим, т.к. сделка едет в Офис дальше).
+STATUS_OFFICE_COURIER_MSK = 75426866      # «Достависта МСК»
+STATUS_OFFICE_COURIER_OWN = 75426870      # «Доставка наш курьер»
+STATUS_OFFICE_SHIPPED = 75426878          # «Посылка отгружена»
+STATUS_OFFICE_IN_TRANSIT = 75426882       # «В пути»
+STATUS_OFFICE_AWAITING_PICKUP = 75426886  # «Ожидает в ПВЗ»
+
+# Офис — этапы, где резерв держим БЕССРОЧНО (решение встречи 04.08.2026): товар
+# отложен под конкретного клиента осознанно, тайм-аут трёх дней тут не применяем.
+STATUS_OFFICE_PREORDER_PAID = 83953914     # «Предзаказ оплачен»
+STATUS_OFFICE_DEFERRED_RESERVE = 75426858  # «Отложенный/резерв товар»
+
+# Мастер-флаг сервиса резерва. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН — как у ozon_invoice и
+# office_transfer: код едет на прод мёртвым грузом, а включается отдельным
+# движением. Так выключение резерва в виджете amGroup и включение нашего
+# сервиса делаются встык, без окна, где резерв ставят оба или ни один.
+# Выключенный сервис не пишет в МойСклад и не гоняет фоновый цикл тайм-аута.
+RESERVE_SERVICE_ENABLED = os.getenv("RESERVE_SERVICE_ENABLED", "").strip() == "1"
+
+# Тайм-аут автосброса резерва (то, чего не умеет amGroup): если с момента
+# первой постановки резерва прошло столько дней, а сделка не дошла до оплаты —
+# снимаем резерв сами. Статус сделки в amo НЕ трогаем, только резерв в МС.
+RESERVE_TIMEOUT_DAYS = int(os.getenv("RESERVE_TIMEOUT_DAYS", "3"))
+RESERVE_TIMEOUT_POLL_INTERVAL_S = int(os.getenv("RESERVE_TIMEOUT_POLL_INTERVAL_S", "900"))  # 15 мин
+
+# Воронка «Тест» (PIPELINE_TEST) — резерв ставим на «В работе», снимаем на ЗНР(143).
+# Только для живого теста механизма резерва, песочница изолирована от прочих автоматик.
+STATUS_TEST_IN_PROGRESS = 72186654   # «В работе»
 
 # Наложка (оплата по факту получения) определяется по полю «Способ оплаты».
 def is_cod_payment(payment_method) -> bool:

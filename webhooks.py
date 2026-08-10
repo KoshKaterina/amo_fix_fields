@@ -19,6 +19,7 @@ import ms_client
 import office_transfer
 import order_watchdog
 import ozon_invoice
+import reserve_service
 import showroom_alert
 import showroom_store
 import showroom_tag
@@ -82,9 +83,11 @@ async def lifespan(app):
     await metrika_sync.init()
     await woo_status_sync.init()
     # Клиент МойСклада поднимаем здесь: его читает ozon_invoice (суммы заказа для
-    # СБП-счёта). Раньше клиент вставал внутри синка Фулфилмента — когда тот выключили
-    # 05.08, счета молча перестали создаваться. Контур ФФ удалён, клиент остался.
+    # СБП-счёта) и reserve_service (позиции заказа). Раньше клиент вставал внутри
+    # синка Фулфилмента — когда тот выключили 05.08, счета молча перестали
+    # создаваться. Контур ФФ удалён, клиент остался.
     ms_client.init()
+    await reserve_service.init()
     ozon_invoice.init()
     await wazzup_sla.init()
     await wazzup_forward.init()
@@ -102,6 +105,7 @@ async def lifespan(app):
     await order_watchdog.shutdown()
     await office_transfer.stop_reconcile()
     await ozon_invoice.aclose()
+    await reserve_service.shutdown()
     await ms_client.aclose()
     await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
@@ -410,6 +414,12 @@ async def lead_change(request: Request):
         logger.info("Lead %s entered STATUS_PAYMENT_REQUESTED — enqueue ozon invoice", lead_id)
         enqueue_invoice(lead_id, source="webhook")
 
+    # Резерв товара в МойСклад (перенос с amGroup) — сделка сменила статус в
+    # одной из отслеживаемых воронок (Основная/TangemShop/Офис). reserve_service
+    # сам решает по свежим данным сделки, ставить резерв, снимать или не трогать.
+    if lead_id is not None and incoming_status is not None:
+        reserve_service.maybe_apply_bg(lead_id, incoming_pipeline)
+
     updates = await get_nested(nested, ["leads", "update", "0", "custom_fields"])
     if updates:
         # Автотег «Срочно»: Срочность → «Срочно» → вешаем тег (в фоне, не блокирует).
@@ -422,6 +432,9 @@ async def lead_change(request: Request):
             if info["id"] == "576703":
                 order_summary = info["values"]["0"]["value"]
                 goods, delivery_type = await parse_the_cart_field(order_summary)
+                # Резерв товара: состав заказа изменился (например, допродажа) —
+                # пересмотреть резерв даже без смены статуса сделки.
+                reserve_service.maybe_apply_bg(lead_id, incoming_pipeline)
             if info["id"] == "576711":
                 comment_summary = info["values"]["0"]["value"]
                 promo_type, comment = await parse_the_cart_field_2(comment_summary)
