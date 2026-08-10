@@ -1,8 +1,9 @@
 """Тесты правила «склад идёт за услугой доставки» (showroom_store).
 
-Проверяем ровно то, что просила Катя 06.08.2026: услуга «Самовывоз из Шоурума»
-задаёт склад шоурума, любая другая услуга возвращает Основной, и при этом чужие
-склады (Вскрытые, ЭРМС) не трогаются.
+Проверяем правило в редакции 10.08.2026: услуга «Самовывоз из Шоурума»
+задаёт склад шоурума, а обратного хода нет: без этой услуги склад заказа
+не трогаем вообще - шоурум это рабочий склад с остатками, а не служебная
+метка самовывоза.
 """
 
 import showroom_store
@@ -41,9 +42,19 @@ def test_sklad_uzhe_verniy_nichego_ne_menyaem():
     assert showroom_store.target_store(order) is None
 
 
-def test_ubrali_uslugu_shourooma_vozvrashaem_osnovnoy():
+def test_bez_uslugi_shourooma_sklad_ne_trogaem():
+    """Заказ на складе шоурума с любой другой доставкой остаётся на шоуруме.
+
+    До 10.08 здесь был откат на Основной - он уводил отгрузки Кирилла
+    с его склада (11 заказов за 06-10.08).
+    """
     order = _order(MS_STORE_SHOWROOM_ID, services=[SERVICE_CDEK])
-    assert showroom_store.target_store(order) == MS_STORE_MAIN_ID
+    assert showroom_store.target_store(order) is None
+
+
+def test_sdek_s_osnovnogo_sklada_tozhe_ne_trogaem():
+    order = _order(MS_STORE_MAIN_ID, services=[SERVICE_CDEK])
+    assert showroom_store.target_store(order) is None
 
 
 def test_samovyvoz_sdeka_ne_schitaetsya_shouroomom():
