@@ -22,11 +22,6 @@ report/stock/all/current?stockType=reserve; {"reserve": 0} снимает.
 стоит строкой выше reserve_service.init() — клиент один на процесс, повторно
 его не поднимаем.
 
-PIPELINE_TEST («Тест», 8642414) — песочница для живого сквозного теста этого
-механизма (см. JOURNAL.md/PR): резерв ставим на «В работе», снимаем на ЗНР.
-Не пересекается ни с одной другой автоматикой проекта — все прочие модули
-(office_transfer/ozon_invoice/waybill_service) гейтятся на другие pipeline_id.
-
 Мастер-флаг RESERVE_SERVICE_ENABLED — рубильник на случай, если сервис начнёт
 спорить с виджетом amGroup за те же строки: выключается одной переменной
 в .env без выкатки кода. Выключенный сервис НИЧЕГО не пишет в МойСклад и не
@@ -45,7 +40,6 @@ from waybill_config import (
     PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
     PIPELINE_TANGEMSHOP,
-    PIPELINE_TEST,
     RESERVE_SERVICE_ENABLED,
     RESERVE_TIMEOUT_DAYS,
     RESERVE_TIMEOUT_POLL_INTERVAL_S,
@@ -73,7 +67,6 @@ from waybill_config import (
     STATUS_TANGEM_IN_PROGRESS,
     STATUS_TANGEM_NEW_ORDER,
     STATUS_TANGEM_UPSELL_DONE,
-    STATUS_TEST_IN_PROGRESS,
     STATUS_WAYBILL_READY,
 )
 
@@ -108,8 +101,6 @@ _RESERVE_ON: dict[int, set[int]] = {
     },
     # Офис: товар отложен под клиента осознанно — резерв ставим и держим бессрочно.
     PIPELINE_OFFICE: {STATUS_OFFICE_PREORDER_PAID, STATUS_OFFICE_DEFERRED_RESERVE},
-    # Песочница для живого теста механизма резерва (см. docstring модуля).
-    PIPELINE_TEST: {STATUS_TEST_IN_PROGRESS},
 }
 
 # Статусы, где резерв снимаем. STATUS_SUCCESS (142) в Офисе — реально
@@ -126,7 +117,6 @@ _RESERVE_OFF: dict[int, set[int]] = {
         STATUS_OFFICE_AWAITING_PICKUP,
         STATUS_SUCCESS,
     },
-    PIPELINE_TEST: {STATUS_CLOSED_LOST},
 }
 
 # Где тайм-аут трёх дней НЕ действует и резерв держим бессрочно — до статуса
@@ -138,7 +128,7 @@ _TIMEOUT_EXEMPT: dict[int, set[int]] = {
     PIPELINE_OFFICE: {STATUS_OFFICE_PREORDER_PAID, STATUS_OFFICE_DEFERRED_RESERVE},
 }
 
-_TRACKED_PIPELINES = (PIPELINE_CLEVER_MAIN, PIPELINE_TANGEMSHOP, PIPELINE_OFFICE, PIPELINE_TEST)
+_TRACKED_PIPELINES = (PIPELINE_CLEVER_MAIN, PIPELINE_TANGEMSHOP, PIPELINE_OFFICE)
 
 
 def maybe_apply_bg(lead_id, pipeline_hint=None) -> None:
