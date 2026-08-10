@@ -200,7 +200,6 @@ PIPELINE_CLEVER = 10593102       # [CLEVER] Основная — отдел пр
 PIPELINE_OFFICE = 9421022        # Офис
 PIPELINE_FULFILLMENT = 10997702  # Фулфилмент
 PIPELINE_TANGEMSHOP = 9822330    # TangemShop
-PIPELINE_TEST = 8642414          # «Тест» — песочница, ни с чем в проекте не пересекается (для живых тестов reserve_service)
 
 # Целевые статусы. 142/143 — системные, общие для всех воронок.
 STATUS_SUCCESS = 142             # Успешно реализовано
@@ -263,10 +262,6 @@ RESERVE_SERVICE_ENABLED = os.getenv("RESERVE_SERVICE_ENABLED", "").strip() == "1
 # снимаем резерв сами. Статус сделки в amo НЕ трогаем, только резерв в МС.
 RESERVE_TIMEOUT_DAYS = int(os.getenv("RESERVE_TIMEOUT_DAYS", "3"))
 RESERVE_TIMEOUT_POLL_INTERVAL_S = int(os.getenv("RESERVE_TIMEOUT_POLL_INTERVAL_S", "900"))  # 15 мин
-
-# Воронка «Тест» (PIPELINE_TEST) — резерв ставим на «В работе», снимаем на ЗНР(143).
-# Только для живого теста механизма резерва, песочница изолирована от прочих автоматик.
-STATUS_TEST_IN_PROGRESS = 72186654   # «В работе»
 
 # Наложка (оплата по факту получения) определяется по полю «Способ оплаты».
 def is_cod_payment(payment_method) -> bool:
