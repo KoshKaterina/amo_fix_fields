@@ -51,6 +51,7 @@ import team_panel_client
 import telegram_bot
 import tg_recipients
 from waybill_config import (
+    FIELD_PHONE,
     LEAD_DISTRIBUTION_CONTACT_POLL_S,
     LEAD_DISTRIBUTION_CONTACT_WAIT_S,
     LEAD_DISTRIBUTION_DEFAULT_WINDOW,
@@ -441,9 +442,10 @@ def _tie_break(candidates: list[int]) -> int:
     return random.choice(candidates)
 
 
-async def _find_repeat_responsible(lead: dict) -> int | None:
+async def _find_repeat_responsible(lead: dict, *, meta: dict | None = None) -> int | None:
     contacts = (lead.get("_embedded") or {}).get("contacts") or []
     lead_id = int(lead["id"])
+    captured_contact = False
     for c in contacts:
         cid = c.get("id")
         if cid is None:
@@ -451,6 +453,16 @@ async def _find_repeat_responsible(lead: dict) -> int | None:
         full = await amo_service.get_contact_by_id(cid, with_=("leads",))
         if not full:
             continue
+        if meta is not None and not captured_contact:
+            # Только у ПЕРВОГО прочитанного контакта - тот же contact_id, что
+            # process_lead_distribution кладёt в лог (contacts[0].get("id")).
+            # Дальше по циклу может пойти поиск по остальным контактам сделки
+            # (редкий случай нескольких контактов) - их имя/телефон в лог не путаем.
+            # Объект уже получен для поиска repeat-ответственного - второй
+            # API-вызов за именем/телефоном не нужен.
+            meta["contact_name"] = (full.get("name") or "").strip() or None
+            meta["contact_phone"] = amo_service.get_custom_field_value(full, FIELD_PHONE)
+            captured_contact = True
         found = amo_service.find_other_deal_responsible(full, exclude_lead_id=lead_id)
         if found is not None:
             return found
@@ -522,14 +534,16 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     `meta` — опциональный out-параметр (см. process_lead_distribution): если
     передан dict, туда кладётся meta["rule"] — каким путём выбран target
     ("load"/"random"/"always"/"duty_fallback"/"tomorrow_shift_fallback"),
-    для лога распределений."""
+    а также meta["repeat_responsible_user_id"] (последний ответственный по
+    ДРУГИМ сделкам контакта, см. _find_repeat_responsible) и
+    meta["contact_name"]/meta["contact_phone"] - для лога распределений."""
     if profile.work_hours and _work_day_ended(profile):
         pool = await _tomorrow_pool(profile)
         pool_is_tomorrow = True
     else:
         pool = eligible_pool(profile)
         pool_is_tomorrow = False
-    repeat_responsible = await _find_repeat_responsible(lead)
+    repeat_responsible = await _find_repeat_responsible(lead, meta=meta)
     source_id = _lead_source_id(lead)
 
     def _repeat_on_shift(uid: int) -> bool:
@@ -579,6 +593,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
             _save_counters_state(state)
         if meta is not None:
             meta["rule"] = rule
+            meta["repeat_responsible_user_id"] = repeat_responsible
         return target
 
 
@@ -641,6 +656,11 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         logger.warning("lead_distribution %s: сделка не прочиталась", lead_id)
         return "failed-lead-read"
 
+    # Ответственный ДО этого решения - PATCH ниже меняет его только на стороне
+    # amoCRM, локальный lead-dict не мутирует, так что читать можно и позже,
+    # но фиксируем сразу для ясности (для лога распределений).
+    prev_responsible_user_id = lead.get("responsible_user_id")
+
     pipeline_id = int(lead.get("pipeline_id") or 0)
     status_id = int(lead.get("status_id") or 0)
     source_id = _lead_source_id(lead)
@@ -679,6 +699,10 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         lead_id, profile.id, target, source, meta.get("rule"),
     )
     contact_id = contacts[0].get("id") if contacts else None
+    detail_blob = {k: v for k, v in {
+        "repeat_responsible_user_id": meta.get("repeat_responsible_user_id"),
+        "prev_responsible_user_id": prev_responsible_user_id,
+    }.items() if v is not None}
     _spawn(lead_distribution_log_client.send({
         "lead_id": lead_id,
         "contact_id": contact_id,
@@ -687,6 +711,11 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         "profile_name": profile.name,
         "source_id": source_id,
         "rule": meta.get("rule", ""),
+        "pipeline_id": pipeline_id,
+        "status_id": status_id,
+        "contact_name": meta.get("contact_name"),
+        "contact_phone": meta.get("contact_phone"),
+        "detail": detail_blob or None,
     }))
     return "routed"
 

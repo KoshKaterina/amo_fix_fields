@@ -24,6 +24,7 @@ import lead_distribution_log_client
 import lead_distribution_profiles_client as ldpc
 import team_panel_client
 import telegram_bot
+from waybill_config import FIELD_PHONE
 
 
 def run(coro):
@@ -132,8 +133,13 @@ def _lead(*, lead_id=100, pipeline_id=10593102, status_id=83537714, source_id=No
     }
 
 
-def _contact(contact_id=500, other_leads=None):
-    return {"id": contact_id, "_embedded": {"leads": other_leads or []}}
+def _contact(contact_id=500, other_leads=None, name=None, phone=None):
+    c = {"id": contact_id, "_embedded": {"leads": other_leads or []}}
+    if name is not None:
+        c["name"] = name
+    if phone is not None:
+        c["custom_fields_values"] = [{"field_id": FIELD_PHONE, "values": [{"value": phone}]}]
+    return c
 
 
 def _seed_counts(user_source_counts: dict) -> None:
@@ -741,6 +747,64 @@ def test_log_send_reports_duty_fallback_rule():
     assert _patch_calls[0]["responsible_user_id"] == 9
     assert _log_calls[0]["rule"] == "duty_fallback"
     assert _log_calls[0]["assigned_user_id"] == 9
+
+
+# ── лог: журнал распределений (11.08.2026) - pipeline/status/контакт/detail ──
+
+def test_find_repeat_responsible_captures_contact_name_and_phone_in_meta():
+    _reset_fakes()
+    lead = _lead(lead_id=610, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[], name="Иван Иванов", phone="+7 999 123-45-67")
+    meta: dict = {}
+    found = run(ld._find_repeat_responsible(lead, meta=meta))
+    assert found is None  # other_leads пуст - искать репит-ответственного не у кого
+    assert meta["contact_name"] == "Иван Иванов"
+    assert meta["contact_phone"] == "+7 999 123-45-67"
+
+
+def test_find_repeat_responsible_meta_none_by_default_is_safe():
+    _reset_fakes()
+    lead = _lead(lead_id=611, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[], name="Пётр")
+    # Без meta= (как во всех остальных вызовах этой функции) - не должно падать.
+    found = run(ld._find_repeat_responsible(lead))
+    assert found is None
+
+
+def test_log_send_includes_pipeline_status_contact_and_no_detail_when_empty():
+    _reset_fakes()
+    _seed_profile(name="LogFields", participant_ids=[1, 2], repeat_contact_mode="random",
+                   pipeline_id=111, status_id=222)
+    lead = _lead(lead_id=612, pipeline_id=111, status_id=222, source_id=7, contacts=[{"id": 500}])
+    _lead_by_id[612] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[], name="Клиент", phone="9991234567")
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(612)))
+
+    assert outcome == "routed"
+    call = _log_calls[0]
+    assert call["pipeline_id"] == 111
+    assert call["status_id"] == 222
+    assert call["contact_name"] == "Клиент"
+    assert call["contact_phone"] == "9991234567"
+    assert call["detail"] is None  # ни repeat, ни prev ответственного - пустой detail не шлём
+
+
+def test_log_send_detail_carries_repeat_and_prev_responsible():
+    _reset_fakes()
+    _seed_profile(name="LogDetail", participant_ids=[1, 2], duty_user_id=9,
+                   pipeline_id=111, status_id=222)
+    now_h = datetime.datetime.now(ld._MSK).hour
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна -> duty_fallback
+    lead = _lead(lead_id=613, pipeline_id=111, status_id=222, source_id=7,
+                 contacts=[{"id": 500}], responsible_user_id=42)
+    _lead_by_id[613] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 3, "updated_at": 1}])
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(613)))
+
+    assert outcome == "routed"
+    assert _log_calls[0]["detail"] == {"repeat_responsible_user_id": 3, "prev_responsible_user_id": 42}
 
 
 if __name__ == "__main__":
