@@ -44,6 +44,7 @@ import time
 from typing import Any
 
 import amo_service
+import lead_distribution_log_client
 import lead_distribution_profiles_client
 import team_panel_client
 import telegram_bot
@@ -446,33 +447,58 @@ def _decide_load_balanced(
     return _tie_break(tied)
 
 
-async def decide_and_record(lead: dict, profile: Profile) -> int | None:
+async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None = None) -> int | None:
     """Выбирает ответственного и (если выбран) сразу инкрементирует счётчики —
     под одной блокировкой на всё решение+запись, чтобы конкурентные вызовы
     (вебхук и reconciliation могут пересечься) не выдали одному человеку два
-    решения на основе одного и того же устаревшего снимка счётчиков."""
+    решения на основе одного и того же устаревшего снимка счётчиков.
+
+    `meta` — опциональный out-параметр (см. process_lead_distribution): если
+    передан dict, туда кладётся meta["rule"] — каким путём выбран target
+    ("load"/"random"/"always"/"duty_fallback"), для лога распределений."""
     pool = eligible_pool(profile)
     repeat_responsible = await _find_repeat_responsible(lead)
     source_id = _lead_source_id(lead)
 
     async with _counters_lock:
         state = _load_counters_state()
+        rule = ""
 
         if profile.repeat_contact_mode == "always":
             if repeat_responsible is not None:
                 target = repeat_responsible if _is_on_shift(repeat_responsible) else None
+                rule = "always"
+            elif pool:
+                target = await _next_in_rotation(profile.id, pool)
+                rule = "random"
             else:
-                target = await _next_in_rotation(profile.id, pool) if pool else profile.duty_user_id
+                target = profile.duty_user_id
+                rule = "duty_fallback"
         elif profile.repeat_contact_mode == "random":
-            target = await _next_in_rotation(profile.id, pool) if pool else profile.duty_user_id
+            if pool:
+                target = await _next_in_rotation(profile.id, pool)
+                rule = "random"
+            else:
+                target = profile.duty_user_id
+                rule = "duty_fallback"
         else:  # "load"
             target = _decide_load_balanced(state, profile, pool, repeat_responsible, source_id)
+            # _decide_load_balanced сам возвращает profile.duty_user_id, когда pool
+            # пуст (единственный путь, где это отличимо от «настоящего» load-подбора).
+            rule = "duty_fallback" if (not pool and target == profile.duty_user_id) else "load"
             if target is None and source_id is None and profile.repeat_contact_mode == "load":
-                target = await _next_in_rotation(profile.id, pool) if pool else profile.duty_user_id
+                if pool:
+                    target = await _next_in_rotation(profile.id, pool)
+                    rule = "random"
+                else:
+                    target = profile.duty_user_id
+                    rule = "duty_fallback"
 
         if target is not None and source_id is not None:
             _apply_assignment(state, lead_id=int(lead["id"]), source_id=source_id, user_id=target)
             _save_counters_state(state)
+        if meta is not None:
+            meta["rule"] = rule
         return target
 
 
@@ -558,7 +584,8 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
     if not _profile_in_work_hours(profile):
         return "skipped-outside-work-hours"
 
-    target = await decide_and_record(lead, profile)
+    meta: dict = {}
+    target = await decide_and_record(lead, profile, meta=meta)
     if target is None:
         # Пул пуст, дежурного нет — ждём reconciliation (не ошибка).
         return "no-candidate-waiting"
@@ -571,9 +598,19 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
 
     _clear_fail(int(lead["id"]))
     logger.info(
-        "lead_distribution %s: профиль=%s → пользователь=%s (source=%s)",
-        lead_id, profile.id, target, source,
+        "lead_distribution %s: профиль=%s → пользователь=%s (source=%s, правило=%s)",
+        lead_id, profile.id, target, source, meta.get("rule"),
     )
+    contact_id = contacts[0].get("id") if contacts else None
+    _spawn(lead_distribution_log_client.send({
+        "lead_id": lead_id,
+        "contact_id": contact_id,
+        "assigned_user_id": target,
+        "profile_id": profile.id,
+        "profile_name": profile.name,
+        "source_id": source_id,
+        "rule": meta.get("rule", ""),
+    }))
     return "routed"
 
 

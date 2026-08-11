@@ -20,12 +20,29 @@ import time
 
 import amo_service
 import lead_distribution as ld
+import lead_distribution_log_client
 import lead_distribution_profiles_client as ldpc
 import telegram_bot
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def _drain_bg_tasks():
+    """Ждёт задачи, запущенные через ld._spawn (напр. отправка лога распределения) —
+    они создаются в том же событийном цикле, что и вызывающий тест, поэтому ждать
+    их нужно ДО того, как run()/asyncio.run() закроет цикл, иначе они просто
+    не успеют выполниться (или будут отменены при закрытии цикла)."""
+    pending = [t for t in ld._bg_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _call_and_drain(coro):
+    result = await coro
+    await _drain_bg_tasks()
+    return result
 
 
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="ld_test_"))
@@ -50,6 +67,15 @@ def setup_function(_=None):
     ld.LEAD_DISTRIBUTION_SINCE_TS = 0
     ld.LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S = 120
     ld._last_reconcile_ts = 0
+    # lead_distribution_log_client - модуль общий с test_lead_distribution_log_client.py
+    # (тестирует его же send() напрямую, с настоящей httpx-подменой) - патчим/восстанавливаем
+    # per-test, а не один раз на весь модуль, иначе тот файл унаследует нашу заглушку,
+    # если тесты идут в одном процессе pytest.
+    lead_distribution_log_client.send = _fake_log_send
+
+
+def teardown_function(_=None):
+    lead_distribution_log_client.send = _real_log_send
 
 
 # ── билдеры ──────────────────────────────────────────────────────────────
@@ -121,6 +147,8 @@ _tag_calls: list = []
 _alert_calls: list = []
 _lead_by_id: dict = {}
 _contact_by_id: dict = {}
+_log_calls: list = []
+_log_should_raise = False
 
 
 def _reset_fakes():
@@ -130,6 +158,9 @@ def _reset_fakes():
     _alert_calls.clear()
     _lead_by_id.clear()
     _contact_by_id.clear()
+    _log_calls.clear()
+    global _log_should_raise
+    _log_should_raise = False
 
 
 async def _fake_get_lead_full(lead_id, with_=()):
@@ -160,12 +191,19 @@ async def _fake_send_alert(text, **kw):
     return True
 
 
+async def _fake_log_send(payload):
+    if _log_should_raise:
+        raise RuntimeError("сбой отправки лога (тест)")
+    _log_calls.append(payload)
+
+
 amo_service.get_lead_full = _fake_get_lead_full
 amo_service.get_contact_by_id = _fake_get_contact_by_id
 amo_service.patch_lead = _fake_patch_lead
 amo_service.add_note = _fake_add_note
 amo_service.add_tag = _fake_add_tag
 telegram_bot.send_alert = _fake_send_alert
+_real_log_send = lead_distribution_log_client.send
 
 
 # ════════════════ чтение профилей из кэша ════════════════
@@ -529,6 +567,60 @@ def test_reconcile_collects_entry_points_from_enabled_profiles_only():
         pass
     assert (10, 20) in seen_pairs
     assert (30, 40) not in seen_pairs
+
+
+# ════════════════ лог распределений (лог решений в team-panel) ════════════════
+
+def test_log_send_invoked_with_rule_on_routed():
+    _reset_fakes()
+    _seed_profile(name="Log", participant_ids=[1, 2], repeat_contact_mode="random")
+    lead = _lead(lead_id=600, source_id=7, contacts=[{"id": 500}])
+    _lead_by_id[600] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(600)))
+
+    assert outcome == "routed"
+    assert len(_log_calls) == 1
+    call = _log_calls[0]
+    assert call["lead_id"] == 600
+    assert call["contact_id"] == 500
+    assert call["assigned_user_id"] == _patch_calls[0]["responsible_user_id"]
+    assert call["source_id"] == 7
+    assert call["rule"] == "random"
+
+
+def test_log_send_failure_does_not_affect_routing_outcome():
+    _reset_fakes()
+    global _log_should_raise
+    _log_should_raise = True
+    _seed_profile(name="LogFail", participant_ids=[1, 2])
+    lead = _lead(lead_id=601, source_id=7, contacts=[{"id": 500}])
+    _lead_by_id[601] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(601)))
+
+    assert outcome == "routed"
+    assert _patch_calls and _patch_calls[0]["lead_id"] == 601
+    assert not _log_calls  # фейк упал внутри, но это не должно было всплыть наружу
+
+
+def test_log_send_reports_duty_fallback_rule():
+    _reset_fakes()
+    p = _seed_profile(name="LogDuty", participant_ids=[1, 2], duty_user_id=9)
+    now_h = datetime.datetime.now(ld._MSK).hour
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна
+    lead = _lead(lead_id=602, source_id=7, contacts=[{"id": 500}])
+    _lead_by_id[602] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(602)))
+
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 9
+    assert _log_calls[0]["rule"] == "duty_fallback"
+    assert _log_calls[0]["assigned_user_id"] == 9
 
 
 if __name__ == "__main__":
