@@ -22,6 +22,7 @@ import amo_service
 import lead_distribution as ld
 import lead_distribution_log_client
 import lead_distribution_profiles_client as ldpc
+import team_panel_client
 import telegram_bot
 
 
@@ -67,15 +68,19 @@ def setup_function(_=None):
     ld.LEAD_DISTRIBUTION_SINCE_TS = 0
     ld.LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S = 120
     ld._last_reconcile_ts = 0
-    # lead_distribution_log_client - модуль общий с test_lead_distribution_log_client.py
-    # (тестирует его же send() напрямую, с настоящей httpx-подменой) - патчим/восстанавливаем
-    # per-test, а не один раз на весь модуль, иначе тот файл унаследует нашу заглушку,
-    # если тесты идут в одном процессе pytest.
+    # lead_distribution_log_client/team_panel_client - модули общие с
+    # test_lead_distribution_log_client.py/test_team_panel_client.py (тестируют их
+    # send()/fetch_for_datetime() напрямую, с настоящей httpx-подменой) - патчим/
+    # восстанавливаем per-test, а не один раз на весь модуль, иначе те файлы
+    # унаследуют наши заглушки, если тесты идут в одном процессе pytest.
     lead_distribution_log_client.send = _fake_log_send
+    team_panel_client.fetch_for_datetime = _fake_fetch_for_datetime
+    _tomorrow_statuses.clear()
 
 
 def teardown_function(_=None):
     lead_distribution_log_client.send = _real_log_send
+    team_panel_client.fetch_for_datetime = _real_fetch_for_datetime
 
 
 # ── билдеры ──────────────────────────────────────────────────────────────
@@ -197,6 +202,13 @@ async def _fake_log_send(payload):
     _log_calls.append(payload)
 
 
+_tomorrow_statuses: dict = {}  # user_id -> bool, наполняется тестами tomorrow-fallback
+
+
+async def _fake_fetch_for_datetime(user_ids, at):
+    return {uid: _tomorrow_statuses.get(uid, False) for uid in user_ids}
+
+
 amo_service.get_lead_full = _fake_get_lead_full
 amo_service.get_contact_by_id = _fake_get_contact_by_id
 amo_service.patch_lead = _fake_patch_lead
@@ -204,6 +216,7 @@ amo_service.add_note = _fake_add_note
 amo_service.add_tag = _fake_add_tag
 telegram_bot.send_alert = _fake_send_alert
 _real_log_send = lead_distribution_log_client.send
+_real_fetch_for_datetime = team_panel_client.fetch_for_datetime
 
 
 # ════════════════ чтение профилей из кэша ════════════════
@@ -407,16 +420,89 @@ def test_no_candidate_waiting_without_duty():
 
 # ════════════════ work_hours профиля ════════════════
 
-def test_profile_work_hours_gate_skips_outside_window():
+def _hhmm(d: datetime.datetime) -> str:
+    return d.strftime("%H:%M")
+
+
+def test_profile_before_first_interval_routes_via_today_pool():
+    """До начала первого интервала - НЕ "рабочий день закончился" (это другое
+    состояние, не должно триггерить tomorrow-fallback) - обычный today-пул."""
     _reset_fakes()
-    now_h = datetime.datetime.now(ld._MSK).hour
-    _seed_profile(name="WH", work_hours={"from": now_h, "to": now_h})
-    lead = _lead(lead_id=200, source_id=1, contacts=[{"id": 500}])
-    _lead_by_id[200] = lead
+    now = datetime.datetime.now(ld._MSK)
+    work_hours = [{"start": _hhmm(now + datetime.timedelta(hours=2)), "end": _hhmm(now + datetime.timedelta(hours=3))}]
+    _seed_profile(name="BeforeStart", participant_ids=[1, 2], work_hours=work_hours)
+    lead = _lead(lead_id=210, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[210] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
-    outcome = run(ld.process_lead_distribution(200))
-    assert outcome == "skipped-outside-work-hours"
-    assert not _patch_calls
+    outcome = run(ld.process_lead_distribution(210))
+    assert outcome == "routed"
+    assert _log_calls[-1]["rule"] != "tomorrow_shift_fallback"
+
+
+def test_profile_gap_between_intervals_routes_via_today_pool():
+    """Между двумя интервалами (обеденный перерыв и т.п.) - тоже не "конец дня"
+    (последний интервал ещё не кончился) - обычный today-пул, не завтра."""
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    work_hours = [
+        {"start": _hhmm(now - datetime.timedelta(hours=2)), "end": _hhmm(now - datetime.timedelta(hours=1))},
+        {"start": _hhmm(now + datetime.timedelta(hours=1)), "end": _hhmm(now + datetime.timedelta(hours=2))},
+    ]
+    _seed_profile(name="Gap", participant_ids=[1, 2], work_hours=work_hours)
+    lead = _lead(lead_id=211, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[211] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(211))
+    assert outcome == "routed"
+    assert _log_calls[-1]["rule"] != "tomorrow_shift_fallback"
+
+
+def test_profile_past_last_interval_end_routes_to_tomorrow_pool():
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
+    _seed_profile(name="DayEnded", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
+    _tomorrow_statuses[2] = True  # только 2 работает завтра
+    lead = _lead(lead_id=212, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[212] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(212)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 2
+    assert _log_calls[-1]["rule"] == "tomorrow_shift_fallback"
+
+
+def test_profile_past_last_interval_end_tomorrow_pool_empty_falls_to_duty():
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
+    _seed_profile(name="DayEndedNoOne", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
+    # _tomorrow_statuses пуст - никто не работает завтра
+    lead = _lead(lead_id=213, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[213] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(213)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 9
+    assert _log_calls[-1]["rule"] == "duty_fallback"
+
+
+def test_always_mode_repeat_client_routed_to_tomorrow_pool():
+    """"always" раньше проверял _is_on_shift(repeat_responsible) напрямую -
+    под tomorrow-пулом это всегда False (сегодняшний день уже кончился),
+    повторный клиент завис бы навсегда. Должен смотреть в tomorrow-пул."""
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
+    _seed_profile(name="AlwaysTomorrow", participant_ids=[1, 2], repeat_contact_mode="always", work_hours=work_hours)
+    _tomorrow_statuses[1] = True
+    lead = _lead(lead_id=214, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[214] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[{"id": 900, "responsible_user_id": 1, "updated_at": 1}])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(214)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 1
+    assert _log_calls[-1]["rule"] == "tomorrow_shift_fallback"
 
 
 def test_profile_without_work_hours_always_runs():

@@ -14,6 +14,7 @@ lead_distribution._is_on_shift сам откатывается на прежни
 """
 
 import asyncio
+import datetime
 import logging
 import time
 
@@ -82,6 +83,35 @@ async def fetch_once(user_ids: set[int]) -> bool:
     _cache = {int(k): bool(v) for k, v in data.items()}
     _last_fetch_monotonic = time.monotonic()
     return True
+
+
+async def fetch_for_datetime(user_ids: set[int], at: datetime.datetime) -> dict[int, bool]:
+    """Прямой (не кэшируемый) запрос «кто на месте» на явно заданный момент -
+    для _tomorrow_pool в lead_distribution.py: когда рабочий день профиля
+    закончился, нужен статус на ЗАВТРА, а не «сейчас» (который держит get_cached).
+    Срабатывает раз в профиль на переходе через конец дня, не на каждый лид -
+    отдельный кэш под это не заводим, {} на любой сбой (конфиг/сеть/статус)."""
+    if not user_ids:
+        return {}
+    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN:
+        return {}
+
+    url = f"{TEAM_PANEL_BASE_URL.rstrip('/')}/api/ingest/schedule/on-shift"
+    params = {"amo_user_ids": ",".join(str(uid) for uid in sorted(user_ids)), "at": at.isoformat()}
+    headers = {"X-Ingest-Token": TEAM_PANEL_INGEST_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params, headers=headers)
+        if resp.status_code != 200:
+            logger.warning("team_panel_client: HTTP %s на /schedule/on-shift (at=%s)", resp.status_code, at)
+            return {}
+        data = resp.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("team_panel_client: сбой запроса /schedule/on-shift (at=%s)", at)
+        return {}
+    return {int(k): bool(v) for k, v in data.items()}
 
 
 def _collect_tracked_user_ids() -> set[int]:

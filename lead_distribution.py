@@ -376,15 +376,39 @@ def _is_on_shift(user_id: int) -> bool:
     return _in_hour_window(now_hour, LEAD_DISTRIBUTION_DEFAULT_WINDOW)
 
 
-def _profile_in_work_hours(profile: Profile) -> bool:
+def _work_day_ended(profile: Profile) -> bool:
+    """Рабочий день профиля ЗАКОНЧИЛСЯ на сегодня (сейчас позже конца последнего
+    интервала work_hours) - НЕ "сейчас вне рабочих часов" вообще (до 11.08.2026
+    это было одно и то же понятие, из-за чего распределение молча простаивало
+    и до начала первого интервала, и в перерыве между интервалами, не только
+    после конца дня). До первого интервала и в перерыве между интервалами
+    работает обычный путь (eligible_pool/_is_on_shift) - как если бы work_hours
+    не было задано вовсе; только после конца последнего интервала распределение
+    переключается на _tomorrow_pool (см. decide_and_record)."""
     if not profile.work_hours:
-        return True
+        return False
     now_hhmm = datetime.datetime.now(_MSK).strftime("%H:%M")
-    return any(iv["start"] <= now_hhmm < iv["end"] for iv in profile.work_hours)
+    return now_hhmm > max(iv["end"] for iv in profile.work_hours)
 
 
 def eligible_pool(profile: Profile) -> list[int]:
     return [uid for uid in profile.participant_ids if _is_on_shift(uid)]
+
+
+async def _tomorrow_pool(profile: Profile) -> list[int]:
+    """Участники профиля, которые на месте ЗАВТРА - используется вместо
+    eligible_pool, когда рабочий день профиля на сегодня уже закончился
+    (_work_day_ended). Момент - начало первого интервала work_hours, спроецированное
+    на завтра (читается как «кто на месте, когда завтра начнётся рабочий день»;
+    team-panel проверяет присутствие НА ЭТОТ МОМЕНТ, а не «весь день», поэтому
+    сотрудник с более поздней завтрашней сменой теоретически может быть пропущен -
+    известное ограничение, не критично для типичного графика)."""
+    tomorrow = (datetime.datetime.now(_MSK) + datetime.timedelta(days=1)).date()
+    start_hhmm = min(iv["start"] for iv in profile.work_hours)
+    start_h, start_m = (int(x) for x in start_hhmm.split(":"))
+    at = datetime.datetime.combine(tomorrow, datetime.time(start_h, start_m), tzinfo=_MSK)
+    statuses = await team_panel_client.fetch_for_datetime(set(profile.participant_ids), at)
+    return [uid for uid in profile.participant_ids if statuses.get(uid)]
 
 
 # ════════════════ алгоритм выбора ответственного ════════════════
@@ -455,10 +479,21 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
 
     `meta` — опциональный out-параметр (см. process_lead_distribution): если
     передан dict, туда кладётся meta["rule"] — каким путём выбран target
-    ("load"/"random"/"always"/"duty_fallback"), для лога распределений."""
-    pool = eligible_pool(profile)
+    ("load"/"random"/"always"/"duty_fallback"/"tomorrow_shift_fallback"),
+    для лога распределений."""
+    if profile.work_hours and _work_day_ended(profile):
+        pool = await _tomorrow_pool(profile)
+        pool_is_tomorrow = True
+    else:
+        pool = eligible_pool(profile)
+        pool_is_tomorrow = False
     repeat_responsible = await _find_repeat_responsible(lead)
     source_id = _lead_source_id(lead)
+
+    def _repeat_on_shift(uid: int) -> bool:
+        # Под tomorrow-пулом "на месте" значит "участвует в пуле на завтра" -
+        # _is_on_shift (сейчас) всегда даст False для дня, который уже закончился.
+        return uid in pool if pool_is_tomorrow else _is_on_shift(uid)
 
     async with _counters_lock:
         state = _load_counters_state()
@@ -466,7 +501,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
 
         if profile.repeat_contact_mode == "always":
             if repeat_responsible is not None:
-                target = repeat_responsible if _is_on_shift(repeat_responsible) else None
+                target = repeat_responsible if _repeat_on_shift(repeat_responsible) else None
                 rule = "always"
             elif pool:
                 target = await _next_in_rotation(profile.id, pool)
@@ -493,6 +528,9 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
                 else:
                     target = profile.duty_user_id
                     rule = "duty_fallback"
+
+        if pool_is_tomorrow and target is not None and rule != "duty_fallback":
+            rule = "tomorrow_shift_fallback"
 
         if target is not None and source_id is not None:
             _apply_assignment(state, lead_id=int(lead["id"]), source_id=source_id, user_id=target)
@@ -580,9 +618,6 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         # вообще, ротация/счётчики не расходуются. См. _contact_wait_loop.
         _spawn_contact_wait(int(lead["id"]), source)
         return "waiting-for-contact"
-
-    if not _profile_in_work_hours(profile):
-        return "skipped-outside-work-hours"
 
     meta: dict = {}
     target = await decide_and_record(lead, profile, meta=meta)
