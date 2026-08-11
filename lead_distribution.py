@@ -41,6 +41,7 @@ import pathlib
 import random
 import re
 import time
+from fractions import Fraction
 from typing import Any
 
 import amo_service
@@ -88,6 +89,27 @@ def _normalize_entry_points(d: dict) -> list[dict[str, Any]]:
     return []
 
 
+def _normalize_participant_weights(raw: Any) -> dict[int, int]:
+    """{user_id: вес} — соотношение распределения между участниками профиля,
+    задаётся отдельно в каждом профиле (team-panel app/lead_distribution/
+    validation.py normalize_participant_weights - там же настоящая валидация).
+    Здесь - защитный код на чтение кэша (см. докстринг модуля): некорректные
+    записи молча пропускаются, а не роняют весь профиль, битые данные не
+    должны останавливать распределение (та же дисциплина, что у остальных
+    _normalize_* в этом файле)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, int] = {}
+    for k, v in raw.items():
+        try:
+            uid, weight = int(k), int(v)
+        except (TypeError, ValueError):
+            continue
+        if weight >= 1:
+            out[uid] = weight
+    return out
+
+
 def _normalize_work_hours(raw: Any) -> list[dict[str, str]] | None:
     """Профиль до 08.08.2026 хранил один интервал часами ({"from":10,"to":19});
     формат сменён на список интервалов ("HH:MM"), т.к. UI конструктора теперь
@@ -115,6 +137,7 @@ class Profile:
     entry_points: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     source_ids: list[int] = dataclasses.field(default_factory=list)
     participant_ids: list[int] = dataclasses.field(default_factory=list)
+    participant_weights: dict[int, int] = dataclasses.field(default_factory=dict)
     duty_user_id: int | None = None
     repeat_contact_mode: str = "load"
     work_hours: list[dict[str, str]] | None = None
@@ -134,6 +157,7 @@ class Profile:
             entry_points=_normalize_entry_points(d),
             source_ids=[int(x) for x in d.get("source_ids") or []],
             participant_ids=[int(x) for x in d.get("participant_ids") or []],
+            participant_weights=_normalize_participant_weights(d.get("participant_weights")),
             duty_user_id=int(d["duty_user_id"]) if d.get("duty_user_id") is not None else None,
             repeat_contact_mode=d.get("repeat_contact_mode", "load"),
             work_hours=_normalize_work_hours(d.get("work_hours")),
@@ -433,16 +457,34 @@ async def _find_repeat_responsible(lead: dict) -> int | None:
     return None
 
 
+def _weight(profile: Profile, uid: int) -> int:
+    return max(1, profile.participant_weights.get(uid, 1))
+
+
 def _decide_load_balanced(
     state: dict, profile: Profile, pool: list[int],
     repeat_responsible: int | None, source_id: int | None,
 ) -> int | None:
+    """Сравнения ведутся не по сырым счётчикам, а по отношению count/вес
+    (Fraction, для точных сравнений без ошибок округления) — при весе 1 у всех
+    (профиль без единого заданного веса, дефолт) ratio == сырой count, решения
+    побайтово те же, что раньше (см. normalize_participant_weights: профиль
+    без весов сериализуется в {} именно ради этой гарантии). gap остаётся
+    порогом в этом же ratio-пространстве — при весе 1 у всех это тот же самый
+    порог "разница не больше N сделок", что и был; при разных весах — порог
+    "разница не больше N сделок НА ЕДИНИЦУ веса"."""
     gap = LEAD_DISTRIBUTION_FAIRNESS_GAP
 
+    def source_ratio(uid: int) -> Fraction:
+        return Fraction(_source_count(state, uid, source_id), _weight(profile, uid))
+
+    def total_ratio(uid: int) -> Fraction:
+        return Fraction(_total_count(state, uid), _weight(profile, uid))
+
     if repeat_responsible is not None and _is_on_shift(repeat_responsible) and source_id is not None:
-        r_count = _source_count(state, repeat_responsible, source_id)
+        r_ratio = source_ratio(repeat_responsible)
         others = [uid for uid in pool if uid != repeat_responsible]
-        if not others or all(abs(r_count - _source_count(state, uid, source_id)) <= gap for uid in others):
+        if not others or all(abs(r_ratio - source_ratio(uid)) <= gap for uid in others):
             return repeat_responsible
         # иначе R остаётся рядовым кандидатом пула — просто без приоритета,
         # продолжаем обычный подбор ниже.
@@ -454,10 +496,10 @@ def _decide_load_balanced(
         # «по нагрузке» неприменим без source_id, решает вызывающий (round-robin).
         return None
 
-    min_source = min(_source_count(state, uid, source_id) for uid in pool)
-    candidates_x = [uid for uid in pool if _source_count(state, uid, source_id) == min_source]
+    min_source = min(source_ratio(uid) for uid in pool)
+    candidates_x = [uid for uid in pool if source_ratio(uid) == min_source]
 
-    totals = {uid: _total_count(state, uid) for uid in pool}
+    totals = {uid: total_ratio(uid) for uid in pool}
     min_total = min(totals.values())
     x_at_min_total = [uid for uid in candidates_x if totals[uid] == min_total]
     if x_at_min_total:

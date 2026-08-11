@@ -371,6 +371,40 @@ def test_load_mode_large_total_gap_overrides_x():
     assert target == 2  # не X (1), а минимальный общий (2)
 
 
+def test_load_mode_weighted_participant_wins_despite_higher_raw_count():
+    """1 - вес 2, 2 - вес 1 (дефолт). У 1 сырой счётчик ВЫШЕ (3 против 2), но
+    ratio = count/вес у него ниже (1.5 против 2) - без веса выбрали бы 2
+    (меньше сырых), с весом - 1 (меньше по отношению к своему весу)."""
+    p = _seed_profile(name="Weighted", repeat_contact_mode="load", participant_ids=[1, 2],
+                       participant_weights={"1": 2})
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    _seed_counts({1: {42: 3}, 2: {42: 2}})
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 1
+
+
+def test_load_mode_unconfigured_weights_match_unweighted_behavior():
+    """Профиль без единого заданного веса - ratio == сырой count для всех,
+    решение побайтово то же, что дал бы старый (безвесовой) алгоритм."""
+    p = _seed_profile(name="NoWeights", repeat_contact_mode="load", participant_ids=[1, 2, 3])
+    assert p.participant_weights == {}
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    _seed_counts({1: {42: 2, 7: 10}, 2: {42: 2, 7: 10}, 3: {42: 0, 7: 0}})
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 3  # тот же результат, что test_load_mode_x_with_min_total_wins
+
+
+def test_load_mode_malformed_weight_in_cache_is_clamped_not_fatal():
+    """participant_weights приходит из write-through кэша (см. докстринг
+    _normalize_participant_weights) - битые записи молча пропускаются, весь
+    профиль не роняем."""
+    p = _seed_profile(name="Malformed", participant_ids=[1, 2, 3],
+                       participant_weights={"1": -5, "2": "не число", "3": 2})
+    assert p.participant_weights == {3: 2}
+
+
 def test_load_mode_no_source_id_falls_back_to_round_robin():
     p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2])
     lead = _lead(source_id=None, contacts=[{"id": 500}])
