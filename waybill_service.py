@@ -61,6 +61,17 @@ _alert_last_sent: dict[str, float] = {}
 # такое трогать нельзя, это не баг, а осознанный /retry.
 TREK_VERIFY_DELAY_S = float(os.getenv("TREK_VERIFY_DELAY_S", "60"))
 
+# Сколько ещё терпеливо спрашивать ТОТ ЖЕ заказ СДЭК в фоне, если за первые
+# 60с (цикл ниже) он не ответил ни номером, ни явным отказом. Разбор
+# 12.08.2026 (сделка 36532789, заказ 06193): 60с — не гарантия ничего, СДЭК
+# иногда проставляет cdek_number позже — оба «протаймаутивших» заказа в этом
+# разборе на самом деле были приняты СДЭК как валидные отправления. Раньше
+# такой таймаут сразу считался отказом и приглашал человека/(эхо-вебхук)
+# создать ВТОРОЙ заказ — получался настоящий дубль на реальную посылку.
+# Теперь вместо второго заказа просто дольше спрашиваем первый.
+WAYBILL_BACKGROUND_POLL_SECONDS = float(os.getenv("WAYBILL_BACKGROUND_POLL_SECONDS", "600"))
+WAYBILL_BACKGROUND_POLL_INTERVAL_S = float(os.getenv("WAYBILL_BACKGROUND_POLL_INTERVAL_S", "15"))
+
 
 def set_alert_callback(fn: Callable[[str], Awaitable[None]]) -> None:
     global _alert_callback
@@ -347,33 +358,61 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
                 f"UUID заказа: {order_uuid}.",
                 source, current_tags,
             )
-        return await _fail(
+        # СДЭК не отказал явно — просто не ответил за 60с. Заказ почти наверняка
+        # существует и обрабатывается дольше обычного (разбор 12.08.2026: оба
+        # «протаймаутивших» заказа в итоге оказались валидными, принятыми СДЭК).
+        # Тег ошибки НЕ ставим (иначе /retry подхватит сделку и создаст поверх
+        # ещё живого заказа настоящий дубль) — вместо этого дальше спрашиваем
+        # ТОТ ЖЕ order_uuid в фоне.
+        note_res = await amo_service.add_note(
             lead_id,
-            f"СДЭК не вернул cdek_number за 60с. UUID заказа: {order_uuid}. "
-            f"Проверьте кабинет СДЭК и впишите номер вручную, либо удалите дубль перед /retry.",
-            source, current_tags,
+            f"СДЭК не подтвердил заказ за 60с (UUID {order_uuid}) — похоже, просто "
+            f"обрабатывает дольше обычного. Ничего создавать/удалять вручную не нужно, "
+            f"проверяю в фоне ещё до {WAYBILL_BACKGROUND_POLL_SECONDS:.0f}с — номер "
+            f"впишется сам, как только СДЭК ответит.",
         )
+        if not note_res.get("ok"):
+            logger.warning("Lead %s: не удалось добавить примечание о фоновой проверке: %s", lead_id, note_res)
+        logger.warning(
+            "Lead %s: СДЭК не ответил за 60с (uuid=%s) — продолжаю спрашивать этот же заказ в фоне вместо retry",
+            lead_id, order_uuid,
+        )
+        asyncio.create_task(
+            _resolve_pending_order(lead_id, order_uuid, source, current_tags, used_cost_placeholder)
+        )
+        return {"ok": False, "lead_id": lead_id, "reason": "pending", "cdek_number": None, "skipped": False}
 
     cdek_value = str(cdek_number)
+    if not await _commit_success(lead_id, order_uuid, cdek_value, current_tags, used_cost_placeholder):
+        return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
+    return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}
 
-    # 8. Записать в AMO + перевести этап + снять тег ошибки
+
+async def _commit_success(
+    lead_id, order_uuid: str, cdek_value: str, current_tags: list[dict], used_cost_placeholder: bool,
+) -> bool:
+    """Общий финал успешного создания накладной: запись трек-номера в AMO,
+    перевод этапа, снятие тега ошибки, примечания (заглушка цены + штрихкод).
+    Используется и основным путём (номер пришёл за первые 60с), и фоновым
+    дожиданием _resolve_pending_order (номер пришёл позже) — оба ведут себя
+    идентично, разница только в том, кто и когда позвал."""
     result = await amo_service.commit_waybill(
         lead_id, cdek_value, current_tags,
         error_tag=TAG_ERROR, target_status=STATUS_WAYBILL_READY,
     )
     if not result.get("ok"):
         critical = (
-            f"КРИТИЧНО: сделка {lead_id}, СДЭК UUID={order_uuid} #{cdek_number} создан, "
+            f"КРИТИЧНО: сделка {lead_id}, СДЭК UUID={order_uuid} #{cdek_value} создан, "
             f"но AMO не обновлён (status={result.get('status_code')}). Внеси номер вручную."
         )
         logger.error(critical)
         await _alert(critical)
-        return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
+        return False
 
     asyncio.create_task(_verify_trek_after_delay(lead_id, cdek_value))
 
-    # 9. Прозрачность: если объявленная ценность СДЭК проставлена заглушкой —
-    #    примечание в сделку, чтобы офис видел (сумма заказа была 0).
+    # Прозрачность: если объявленная ценность СДЭК проставлена заглушкой —
+    # примечание в сделку, чтобы офис видел (сумма заказа была 0).
     if used_cost_placeholder:
         ph_note = await amo_service.add_note(
             lead_id,
@@ -384,7 +423,7 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         if not ph_note.get("ok"):
             logger.warning("Lead %s: не удалось добавить примечание о заглушке цены: %s", lead_id, ph_note)
 
-    # 10. Примечание со ссылкой на скачивание штрихкода СДЭК
+    # Примечание со ссылкой на скачивание штрихкода СДЭК
     barcode_url = f"{PUBLIC_BASE_URL}/barcode/{cdek_value}"
     note_res = await amo_service.add_note(
         lead_id, f"Штрихкод СДЭК (№{cdek_value}) — скачать/распечатать: {barcode_url}"
@@ -392,8 +431,52 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     if not note_res.get("ok"):
         logger.warning("Lead %s: не удалось добавить примечание со ссылкой на штрихкод: %s", lead_id, note_res)
 
-    logger.info("Lead %s waybill created: cdek=%s uuid=%s", lead_id, cdek_number, order_uuid)
-    return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}
+    logger.info("Lead %s waybill committed: cdek=%s uuid=%s", lead_id, cdek_value, order_uuid)
+    return True
+
+
+async def _resolve_pending_order(
+    lead_id, order_uuid: str, source: str, current_tags: list[dict], used_cost_placeholder: bool,
+) -> None:
+    """Продолжает спрашивать ТОТ ЖЕ заказ СДЭК после первых 60с — вместо того
+    чтобы (как раньше) сдаться и тем самым пригласить создание второго заказа.
+    Три исхода: номер пришёл → коммитим как обычный успех (_commit_success);
+    СДЭК явно отклонил → ТЕПЕРЬ ставим тег ошибки с настоящей причиной (раньше
+    этого шанса просто не было — код сдавался на первой минуте); СДЭК так и не
+    ответил за WAYBILL_BACKGROUND_POLL_SECONDS → сдаёмся и алертим человека, но
+    без намёка на «удалите дубль» — раз мы не создавали второй заказ, дубля и
+    нет, есть один непонятный uuid, который нужно посмотреть в кабинете."""
+    deadline = time.monotonic() + WAYBILL_BACKGROUND_POLL_SECONDS
+    while time.monotonic() < deadline:
+        await asyncio.sleep(WAYBILL_BACKGROUND_POLL_INTERVAL_S)
+        try:
+            order_info = await cdek_client.get_order(order_uuid)
+        except cdek_client.CdekError:
+            continue
+        entity = order_info.get("entity") or {}
+        cdek_number = entity.get("cdek_number")
+        if cdek_number:
+            await _commit_success(lead_id, order_uuid, str(cdek_number), current_tags, used_cost_placeholder)
+            return
+        reject_reason = _extract_reject_reason(order_info)
+        if reject_reason:
+            await _fail(
+                lead_id,
+                f"СДЭК отклонил заказ: {reject_reason}. Отправление НЕ создано, "
+                f"в кабинете удалять нечего — исправьте данные и повторите /retry. "
+                f"UUID заказа: {order_uuid}.",
+                source, current_tags,
+            )
+            return
+
+    total_wait = WAYBILL_BACKGROUND_POLL_SECONDS + 60
+    await _fail(
+        lead_id,
+        f"СДЭК так и не ответил за {total_wait:.0f}с (UUID {order_uuid}). Второй заказ "
+        f"НЕ создавался — проверьте этот UUID в кабинете СДЭК: если заказ там валиден, "
+        f"впишите номер в поле вручную; если заказа нет вообще, тогда уже можно /retry.",
+        source, current_tags,
+    )
 
 
 async def _last_field_clear_actor(lead_id, field_id: int) -> int | None:
