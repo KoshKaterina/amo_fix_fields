@@ -142,6 +142,13 @@ class Profile:
     duty_user_id: int | None = None
     repeat_contact_mode: str = "load"
     work_hours: list[dict[str, str]] | None = None
+    # 12.08.2026, задание Тианы: полностью опционально (дефолт False = поведение
+    # не меняется). Вместо дневных счётчиков «сколько мы раздали сегодня»
+    # (_load_counters_state, локальный JSON) - "load"-режим считает счётчик как
+    # «сколько у сотрудника СЕЙЧАС открытых (вне 142/143) сделок по источнику»,
+    # живым запросом к amoCRM (см. _open_deals_state). Работает только с
+    # repeat_contact_mode="load" - на always/random не влияет.
+    use_open_deals_counter: bool = False
     created_at: int = 0
     updated_at: int = 0
 
@@ -162,6 +169,7 @@ class Profile:
             duty_user_id=int(d["duty_user_id"]) if d.get("duty_user_id") is not None else None,
             repeat_contact_mode=d.get("repeat_contact_mode", "load"),
             work_hours=_normalize_work_hours(d.get("work_hours")),
+            use_open_deals_counter=bool(d.get("use_open_deals_counter", False)),
             created_at=int(d.get("created_at", 0)),
             updated_at=int(d.get("updated_at", 0)),
         )
@@ -336,6 +344,32 @@ def _apply_assignment(state: dict, *, lead_id: int, source_id: int, user_id: int
     state.setdefault("assignments", {})[str(lead_id)] = {
         "source_id": source_id, "user_id": user_id, "date": state["date"],
     }
+
+
+async def _open_deals_state(profile: Profile) -> dict:
+    """Альтернатива _load_counters_state() для profile.use_open_deals_counter:
+    вместо «сколько мы раздали сегодня» (локальный JSON, сбрасывается по дате) —
+    «сколько у участника СЕЙЧАС открытых (вне 142/143) сделок по источнику»,
+    живым запросом к amoCRM. Считаем по всем воронкам профиля (entry_points) и
+    суммируем — сама сделка попадает в диспетчер по этапу входа, но счётчик не
+    ограничен этим этапом (задание Тианы 12.08.2026: «этап мы указываем для
+    того, чтобы распределение выполнялось тогда, когда сделка в нём создаётся/
+    переходит», не для ограничения подсчёта).
+
+    Форма результата — {"counts": {user_id: {source_id: n}}} — та же, что у
+    _load_counters_state(), без "date"/"assignments" (незачем: _apply_assignment
+    сюда не пишет, см. decide_and_record — источник правды amoCRM, не наш файл).
+    Совместима 1:1 с _source_count/_total_count/_decide_load_balanced без
+    единой правки в них."""
+    pipeline_ids = sorted({ep["pipeline_id"] for ep in profile.entry_points})
+    merged: dict[int, dict[int, int]] = {}
+    for pipeline_id in pipeline_ids:
+        per_source = await amo_service.get_open_deal_counts_by_source(profile.participant_ids, pipeline_id)
+        for uid, sources in per_source.items():
+            bucket = merged.setdefault(uid, {})
+            for sid, n in sources.items():
+                bucket[sid] = bucket.get(sid, 0) + n
+    return {"counts": {str(uid): {str(sid): n for sid, n in sources.items()} for uid, sources in merged.items()}}
 
 
 def debug_state() -> dict:
@@ -551,8 +585,17 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         # _is_on_shift (сейчас) всегда даст False для дня, который уже закончился.
         return uid in pool if pool_is_tomorrow else _is_on_shift(uid)
 
+    # use_open_deals_counter - живой запрос к amoCRM ДО блокировки: _counters_lock
+    # общий на ВСЕ профили (не только этот), держать его на время сетевого похода
+    # сериализовало бы решения по другим, никак не связанным профилям.
+    open_deals_state = (
+        await _open_deals_state(profile)
+        if profile.use_open_deals_counter and profile.repeat_contact_mode == "load"
+        else None
+    )
+
     async with _counters_lock:
-        state = _load_counters_state()
+        state = open_deals_state if open_deals_state is not None else _load_counters_state()
         rule = ""
 
         if profile.repeat_contact_mode == "always":
@@ -588,7 +631,10 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         if pool_is_tomorrow and target is not None and rule != "duty_fallback":
             rule = "tomorrow_shift_fallback"
 
-        if target is not None and source_id is not None:
+        if target is not None and source_id is not None and open_deals_state is None:
+            # open_deals_state: писать некуда и незачем - источник правды amoCRM,
+            # следующее решение просто перезапросит его живьём (уже с учётом
+            # PATCH, который process_lead_distribution сделает следом).
             _apply_assignment(state, lead_id=int(lead["id"]), source_id=source_id, user_id=target)
             _save_counters_state(state)
         if meta is not None:

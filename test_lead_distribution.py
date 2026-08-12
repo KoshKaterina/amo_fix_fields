@@ -170,6 +170,8 @@ def _reset_fakes():
     _lead_by_id.clear()
     _contact_by_id.clear()
     _log_calls.clear()
+    _open_deal_counts.clear()
+    _open_deal_calls.clear()
     global _log_should_raise
     _log_should_raise = False
 
@@ -215,11 +217,25 @@ async def _fake_fetch_for_datetime(user_ids, at):
     return {uid: _tomorrow_statuses.get(uid, False) for uid in user_ids}
 
 
+# use_open_deals_counter: pipeline_id -> {user_id: {source_id: n}} — «сейчас открытых
+# сделок», наполняется тестами напрямую (никакой сети), в отличие от _load_counters_state
+# это не runtime-состояние диспетчера, а имитация живого amoCRM на момент запроса.
+_open_deal_counts: dict = {}
+_open_deal_calls: list = []  # (tuple(user_ids), pipeline_id) — проверить, что зовётся 1 раз на воронку профиля
+
+
+async def _fake_get_open_deal_counts_by_source(user_ids, pipeline_id):
+    _open_deal_calls.append((tuple(user_ids), pipeline_id))
+    by_pipeline = _open_deal_counts.get(pipeline_id, {})
+    return {uid: dict(sources) for uid, sources in by_pipeline.items() if uid in user_ids}
+
+
 amo_service.get_lead_full = _fake_get_lead_full
 amo_service.get_contact_by_id = _fake_get_contact_by_id
 amo_service.patch_lead = _fake_patch_lead
 amo_service.add_note = _fake_add_note
 amo_service.add_tag = _fake_add_tag
+amo_service.get_open_deal_counts_by_source = _fake_get_open_deal_counts_by_source
 telegram_bot.send_alert = _fake_send_alert
 _real_log_send = lead_distribution_log_client.send
 _real_fetch_for_datetime = team_panel_client.fetch_for_datetime
@@ -434,6 +450,106 @@ def test_counters_persist_and_reset_by_date():
     ld._save_counters_state(stale)
     fresh = ld._load_counters_state()
     assert fresh["counts"] == {}
+
+
+# ════════════════ use_open_deals_counter (12.08.2026) ════════════════
+# Полностью опциональный флаг "load"-режима: вместо "сколько мы раздали
+# сегодня" (локальный JSON) — "сколько у сотрудника СЕЙЧАС открытых сделок по
+# источнику" (живой запрос к amoCRM, здесь — _fake_get_open_deal_counts_by_source).
+
+
+def test_open_deals_counter_gives_to_least_loaded():
+    p = _seed_profile(name="OpenDeals", repeat_contact_mode="load", participant_ids=[1, 2],
+                       use_open_deals_counter=True)
+    _open_deal_counts[10593102] = {1: {42: 7}, 2: {42: 4}}
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 2  # у 2 меньше открытых по этому источнику (4 против 7)
+
+
+def test_open_deals_counter_ignores_daily_assigned_count():
+    """Ключевое отличие от обычного load: даже если ПО ДНЕВНОМУ счётчику
+    сотруднику уже отдали сегодня несколько сделок, решение смотрит только на
+    открытые в amoCRM - дневной JSON для этого режима не читается вовсе."""
+    p = _seed_profile(name="OpenDeals", repeat_contact_mode="load", participant_ids=[1, 2],
+                       use_open_deals_counter=True)
+    _seed_counts({1: {42: 0}, 2: {42: 50}})  # по дневному счётчику 2 сильно перегружен
+    _open_deal_counts[10593102] = {1: {42: 4}, 2: {42: 1}}  # а по открытым - наоборот
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 2  # решает открытая нагрузка (1 < 4), не дневная
+
+
+def test_open_deals_counter_does_not_touch_daily_counters_file():
+    p = _seed_profile(name="OpenDeals", repeat_contact_mode="load", participant_ids=[1, 2],
+                       use_open_deals_counter=True)
+    _open_deal_counts[10593102] = {1: {42: 0}, 2: {42: 0}}
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    run(ld.decide_and_record(lead, p))
+    state = ld._load_counters_state()
+    assert state["counts"] == {}, "источник правды - amoCRM, дневной JSON не должен получить запись"
+
+
+def test_open_deals_counter_sums_across_profile_pipelines():
+    p = _seed_profile(
+        name="OpenDeals", repeat_contact_mode="load", participant_ids=[1, 2],
+        entry_points=[
+            {"pipeline_id": 10593102, "status_ids": [83537714]},
+            {"pipeline_id": 999999, "status_ids": [888888]},
+        ],
+        use_open_deals_counter=True,
+    )
+    _open_deal_counts[10593102] = {1: {42: 2}, 2: {42: 1}}
+    _open_deal_counts[999999] = {1: {42: 0}, 2: {42: 4}}
+    # суммарно: 1 -> 2, 2 -> 5 - должны отдать 1
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 1
+    assert {c[1] for c in _open_deal_calls} == {10593102, 999999}, "запрос должен уйти по каждой воронке профиля"
+
+
+def test_open_deals_counter_respects_participant_weights():
+    p = _seed_profile(name="OpenDeals", repeat_contact_mode="load", participant_ids=[1, 2],
+                       participant_weights={1: 2, 2: 1}, use_open_deals_counter=True)
+    # Одинаковый сырой счётчик открытых (2 у обоих), но у 1 вес 2 - его ratio
+    # count/вес = 2/2 = 1.0 против 2/1 = 2.0 у 2, т.е. с учётом веса 1 менее
+    # загружен - та же Fraction-логика _decide_load_balanced, что у обычного load.
+    _open_deal_counts[10593102] = {1: {42: 2}, 2: {42: 2}}
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 1
+
+
+def test_open_deals_counter_off_by_default_uses_daily_counters():
+    """use_open_deals_counter отсутствует в профиле -> дефолт False, поведение
+    не меняется вообще (тот же путь, что был всегда)."""
+    _reset_fakes()  # чистый _open_deal_calls - другие тесты этого файла его тоже наполняют
+    p = _seed_profile(name="Load", repeat_contact_mode="load", participant_ids=[1, 2])
+    assert p.use_open_deals_counter is False
+    _open_deal_counts[10593102] = {1: {42: 0}, 2: {42: 99}}  # если бы читался - отдали бы 1
+    _seed_counts({1: {42: 5}, 2: {42: 0}})
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 2  # решил дневной счётчик, open_deal_counts не тронут
+    assert _open_deal_calls == []
+
+
+def test_open_deals_counter_repeat_responsible_priority_still_applies():
+    p = _seed_profile(name="OpenDeals", repeat_contact_mode="load", participant_ids=[1, 2, 3],
+                       use_open_deals_counter=True)
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 1, "updated_at": 1}])
+    # 1 (повторный) в пределах разрыва со всеми - должен получить приоритет,
+    # несмотря на то, что 3 формально меньше загружен.
+    _open_deal_counts[10593102] = {1: {42: 3}, 2: {42: 4}, 3: {42: 2}}
+    target = run(ld.decide_and_record(lead, p))
+    assert target == 1
 
 
 # ════════════════ дежурный / пустой пул ════════════════
