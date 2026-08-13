@@ -40,6 +40,13 @@ MISSED_CALL_FALLBACK_TAG = "@thebarsa1"
 SHOWROOM_ALERT_THREAD_ID: int | None = 4083
 SHOWROOM_ALERT_TAG = "@kathrina_bistraya"
 
+# SLA-алерт по клиенту, который приедет за заказом сам (тип доставки — наш
+# самовывоз): порог WAZZUP_SLA_PICKUP_MINUTES вместо общего, и адресат ОДИН —
+# Катя-офис (решение Кати 13.08.2026). Смену тут не тегаем: такого клиента ведёт
+# шоурум, а не весь отдел продаж. Топик тот же, что у остальных SLA-алертов
+# (NOTIFY_THREAD_ID) — меняется только скорость и адресат, не место.
+SLA_PICKUP_TAG = "@kathrina_bistraya"
+
 
 def mentions_for(responsible_id) -> str:
     """Строка @-тегов для алерта по ответственному сделки.
