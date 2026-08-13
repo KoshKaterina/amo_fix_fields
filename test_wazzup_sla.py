@@ -156,7 +156,7 @@ def test_sweep_marks_alerted_and_dedups(monkeypatch=None):
     assert len(sent) == 1, "должен быть ровно один алерт"
     assert "где заказ?" in sent[0]
     assert "@egorkonsss" in sent[0], "тег ответственного"
-    assert "@gladkov_369" in sent[0], "всегда тегаем Гладкова"
+    assert "@gladkov_369" not in sent[0], "Саша в отпуске — не тегаем (13.08.2026)"
     assert st["alerted"] is True
 
     # повторный проход — без нового алерта
@@ -183,26 +183,30 @@ def test_sweep_holds_outside_window():
     assert st["alerted"] is False
 
 
-def test_mentions_responsible_plus_gladkov():
+def test_mentions_responsible_only():
+    # Надзорный тег снят 13.08.2026 (отпуск Саши) — тегаем только ответственного.
     m = T.mentions_for(13929334)  # Егор
-    assert "@egorkonsss" in m and "@gladkov_369" in m
+    assert m == "@egorkonsss"
+    assert "@gladkov_369" not in m
 
 
-def test_mentions_gladkov_no_dup():
-    m = T.mentions_for(11513202)  # сам Гладков — не дублируем
-    assert m.count("@gladkov_369") == 1
-    assert m == "@gladkov_369"
+def test_mentions_gladkov_falls_back_to_shift():
+    # Саша убран из карты ответственных → его сделки уходят всей смене,
+    # а сам он не тегается нигде.
+    m = T.mentions_for(11513202)
+    assert m == T.MANAGERS_ON_SHIFT
+    assert "@gladkov_369" not in m
 
 
 def test_mentions_igor_and_kirill():
-    assert T.mentions_for(9291546) == "@thebarsa1 @gladkov_369"    # Игорь
-    assert T.mentions_for(13946318) == "@offf1cer @gladkov_369"   # Кирилл
+    assert T.mentions_for(9291546) == "@thebarsa1"    # Игорь
+    assert T.mentions_for(13946318) == "@offf1cer"   # Кирилл
 
 
 def test_mentions_artem_b2b():
     # ОПТ-сделки не должны падать в фолбэк «вся розничная смена» (MAG-жалоба
     # Тианы 31.07.2026: пропуск на сделке Артёма тегал офицера/Егора/Катю).
-    assert T.mentions_for(13822630) == "@sunscryptb2b @gladkov_369"
+    assert T.mentions_for(13822630) == "@sunscryptb2b"
 
 
 def test_mentions_unknown_falls_back_to_shift():

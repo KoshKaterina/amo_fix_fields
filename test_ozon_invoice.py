@@ -192,7 +192,7 @@ assert res == "failed-no-ms-order", res
 assert not _ozon_calls and not _patches
 assert _tags == [(LEAD_ID, TAG_INVOICE_ERROR)], _tags
 assert len(_alerts) == 1 and "Нет заказа в МС" in _alerts[0], _alerts
-assert "@gladkov_369" in _alerts[0], _alerts
+assert "@" in _alerts[0] and "@gladkov_369" not in _alerts[0], _alerts
 print("✓ нет заказа МС: ошибка менеджеру (тег+примечание+ТГ с @), сделка осталась на тех-этапе")
 
 # ── 3) сделка уехала с тех-этапа, пока ждала в очереди → полный скип ────────
