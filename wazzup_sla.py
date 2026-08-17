@@ -6,6 +6,12 @@
   клиент написал  →  ждём WAZZUP_SLA_MINUTES  →  если ответа так и нет
   и сейчас окно 12:00–19:00 МСК  →  один алерт в ТГ отделу продаж.
 
+Порог не один на всех (Катя 13.08.2026): если у клиента есть ОТКРЫТАЯ сделка с
+нашим самовывозом (из офиса или из шоурума), ждём WAZZUP_SLA_PICKUP_MINUTES —
+три минуты вместо пятнадцати, и тегаем одну Катю-офис, а не смену. Такой клиент
+едет за заказом сам и может уже стоять у дверей. Этап и воронка сделки не важны,
+смотрим ТОЛЬКО тип доставки; «CDEK: Самовывоз» — это ПВЗ СДЭК, не наш случай.
+
 Источник — вебхук Wazzup (POST /wazzup/<secret>). Почему Wazzup, а НЕ лента amo:
 в ленте сделки служебные записи Wazzup (ошибка доставки WABA-шаблона
 «=== SYSTEM WZ ===») ошибочно считаются входящими → прошлая попытка через задачи
@@ -39,12 +45,15 @@ import sla_filter
 import telegram_bot
 from api import BASE_URL
 from waybill_config import (
+    DELIVERY_PICKUP_MARKERS,
+    FIELD_DELIVERY_TYPE,
     WAZZUP_API_KEY,
     WAZZUP_API_URL,
     WAZZUP_ENSURE_WEBHOOK,
     WAZZUP_RESPONSIBLE_TIMEOUT_S,
     WAZZUP_SLA_ENABLED,
     WAZZUP_SLA_MINUTES,
+    WAZZUP_SLA_PICKUP_MINUTES,
     WAZZUP_SLA_POLL_INTERVAL_S,
     WAZZUP_SLA_SKIP_CHANNELS,
     WAZZUP_SLA_WINDOW_END_H,
@@ -55,6 +64,7 @@ from waybill_config import (
 from tg_recipients import (
     NOTIFY_CHAT_ID,
     NOTIFY_THREAD_ID,
+    SLA_PICKUP_TAG,
     mentions_for,
 )
 
@@ -202,9 +212,10 @@ async def init() -> None:
     _sub_task = asyncio.create_task(_ensure_subscription_later())
     _loop_task = asyncio.create_task(_poll_loop())
     logger.info(
-        "Wazzup SLA: включён — порог %s мин, окно %02d:00–%02d:00 МСК, опрос %s сек, "
-        "каналов вне SLA: %s",
-        WAZZUP_SLA_MINUTES, WAZZUP_SLA_WINDOW_START_H, WAZZUP_SLA_WINDOW_END_H,
+        "Wazzup SLA: включён — порог %s мин (самовывоз %s мин, тег %s), "
+        "окно %02d:00–%02d:00 МСК, опрос %s сек, каналов вне SLA: %s",
+        WAZZUP_SLA_MINUTES, WAZZUP_SLA_PICKUP_MINUTES, SLA_PICKUP_TAG,
+        WAZZUP_SLA_WINDOW_START_H, WAZZUP_SLA_WINDOW_END_H,
         WAZZUP_SLA_POLL_INTERVAL_S, len(WAZZUP_SLA_SKIP_CHANNELS),
     )
 
@@ -303,27 +314,43 @@ async def _poll_loop() -> None:
 
 
 async def _sweep(threshold_s: int) -> None:
+    """threshold_s — общий порог (WAZZUP_SLA_MINUTES). У самовывозных клиентов свой,
+    короткий: WAZZUP_SLA_PICKUP_MINUTES. Поэтому кандидатов собираем по МЕНЬШЕМУ из
+    двух порогов, а сколько ждать на самом деле, решаем после чтения сделки."""
     now_mono = _monotonic()
     in_window = _in_window()
 
-    # чистка протухших + сбор просроченных
-    due: list[tuple[tuple[str, str], dict]] = []
+    pickup_s = WAZZUP_SLA_PICKUP_MINUTES * 60
+    gate_s = min(threshold_s, pickup_s)
+
+    # чистка протухших + сбор тех, кто дожил хотя бы до нижнего порога
+    due: list[tuple[tuple[str, str], dict, float]] = []
     for key, st in list(_pending.items()):
         age = now_mono - st["waiting_since"]
         if age >= _TTL_SECONDS:
             _pending.pop(key, None)
             continue
-        if not st["alerted"] and age >= threshold_s:
-            due.append((key, st))
+        if not st["alerted"] and age >= gate_s:
+            due.append((key, st, age))
 
     if not due:
         return
     if not in_window:
         # Вне окна не досылаем (решение Кати). Ждём следующего прохода в окне.
+        # Сделки при этом не читаем: незачем дёргать amo ночью.
         return
 
-    for key, st in due:
+    for key, st, age in due:
         try:
+            # Сделку читаем на нижнем пороге — из неё и ответственный, и тип
+            # доставки, от которого зависит, сколько ждать. Результат кэшируем в
+            # ожидании: один amo-запрос на беседу, а не на каждый проход цикла.
+            await _fill_lead_info(st, now_mono)
+
+            wait_s = pickup_s if st.get("pickup") else threshold_s
+            if age < wait_s:
+                continue  # обычная беседа: ждём полный порог
+
             # «Ответ не требуется»: беседа закрыта в amo → алерт не нужен.
             if await _talk_closed_safe(st):
                 _pending.pop(key, None)
@@ -332,17 +359,20 @@ async def _sweep(threshold_s: int) -> None:
                     st["chat_id"],
                 )
                 continue
-            lead_id, responsible_id = await _resolve_lead_safe(st["chat_id"])
-            mentions = mentions_for(responsible_id)
-            text = _build_message(st, lead_id, mentions)
+            lead_id = st.get("lead_id")
+            pickup = bool(st.get("pickup"))
+            # Самовывоз ведёт шоурум — тегаем только Катю-офис, смену не будим.
+            mentions = SLA_PICKUP_TAG if pickup else mentions_for(st.get("responsible_id"))
+            text = _build_message(st, lead_id, mentions, int(wait_s // 60), pickup)
             ok = await telegram_bot.send_alert(
                 text, parse_mode="HTML",
                 chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
             )
             st["alerted"] = True
             logger.info(
-                "Wazzup SLA: алерт %s (беседа %s lead=%s)",
+                "Wazzup SLA: алерт %s (беседа %s lead=%s, порог %s мин%s)",
                 "отправлен" if ok else "НЕ отправлен", st["chat_id"], lead_id or "—",
+                int(wait_s // 60), ", самовывоз" if pickup else "",
             )
         except Exception:
             logger.exception("Wazzup SLA: ошибка отправки алерта (беседа %s)", st.get("chat_id"))
@@ -354,12 +384,34 @@ async def _sweep(threshold_s: int) -> None:
 
 _CLOSED_STATUS_IDS = {142, 143}
 
+# Сделка нашлась не сразу (клиент написал раньше, чем плагин сайта создал сделку) —
+# пробуем ещё, но не на каждом проходе цикла: раз в столько секунд.
+_RESOLVE_RETRY_S = 300
+
+
+async def _fill_lead_info(st: dict, now_mono: float) -> None:
+    """Дописывает в ожидание сделку клиента: lead_id, ответственного и признак
+    самовывоза (от него зависит порог). Удачный поиск кэшируется навсегда, пустой —
+    на _RESOLVE_RETRY_S: сделки часто ещё нет в момент первого сообщения, а тег
+    ответственного и ссылка на сделку в алерте нужны."""
+    if st.get("lead_resolved"):
+        return
+    last = st.get("resolved_at")
+    if last is not None and (now_mono - last) < _RESOLVE_RETRY_S:
+        return
+    lead_id, responsible_id, pickup = await _resolve_lead_safe(st["chat_id"])
+    st["resolved_at"] = now_mono
+    st["lead_id"] = lead_id
+    st["responsible_id"] = responsible_id
+    st["pickup"] = pickup
+    st["lead_resolved"] = lead_id is not None
+
 
 async def _resolve_lead_safe(chat_id: str):
-    """(lead_id, responsible_user_id) открытой сделки по chat_id (для WhatsApp это
-    телефон). Best-effort с таймаутом WAZZUP_RESPONSIBLE_TIMEOUT_S (10с): не нашли/
-    не успели → (None, None) → тегаем всю смену. Открытая = не 142/143, самая
-    свежая по работе (как в uis_missed_call)."""
+    """(lead_id, responsible_user_id, pickup) открытой сделки по chat_id (для WhatsApp
+    это телефон). Best-effort с таймаутом WAZZUP_RESPONSIBLE_TIMEOUT_S (10с): не нашли/
+    не успели → (None, None, False) → тегаем всю смену и ждём общий порог. Открытая =
+    не 142/143, самая свежая по работе (как в uis_missed_call)."""
     try:
         return await asyncio.wait_for(_resolve_lead(chat_id), timeout=WAZZUP_RESPONSIBLE_TIMEOUT_S)
     except asyncio.TimeoutError:
@@ -367,21 +419,38 @@ async def _resolve_lead_safe(chat_id: str):
             "Wazzup SLA: сделка/ответственный не определены за %sс — тегаем смену (беседа %s)",
             WAZZUP_RESPONSIBLE_TIMEOUT_S, chat_id,
         )
-        return None, None
+        return None, None, False
     except Exception:
         logger.exception("Wazzup SLA: поиск сделки не удался (беседа %s)", chat_id)
-        return None, None
+        return None, None, False
+
+
+def is_pickup_lead(lead: dict) -> bool:
+    """Тип доставки сделки (577315) — НАШ самовывоз, из офиса или из шоурума?
+    «CDEK: Самовывоз» это пункт выдачи СДЭК, он сюда НЕ идёт (тот же дискриминатор,
+    что в showroom_alert.is_pickup). Этап и воронка не проверяются намеренно:
+    правило Кати 13.08.2026 работает, где бы сделка ни висела."""
+    value = amo_service.get_custom_field_value(lead or {}, FIELD_DELIVERY_TYPE)
+    if not value:
+        return False
+    text = str(value).casefold()
+    return any(marker in text for marker in DELIVERY_PICKUP_MARKERS)
 
 
 async def _resolve_lead(chat_id: str):
     if not chat_id:
-        return None, None
+        return None, None, False
     leads = await amo_service.find_leads_by_query(chat_id)
     open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
     if not open_leads:
-        return None, None
-    best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
-    return best.get("id"), best.get("responsible_user_id")
+        return None, None, False
+    # Самовывоз важнее свежести: у клиента может висеть несколько открытых сделок,
+    # и если хоть одна — «приеду сам», реагируем по её правилам и на неё же даём
+    # ссылку. Иначе как раньше — самая свежая по работе.
+    pickup_leads = [ld for ld in open_leads if is_pickup_lead(ld)]
+    best = max(pickup_leads or open_leads,
+               key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
+    return best.get("id"), best.get("responsible_user_id"), bool(pickup_leads)
 
 
 _WZ_TALK_ORIGIN_PREFIX = "com.wazzup24"
@@ -439,12 +508,17 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_message(st: dict, lead_id, mentions: str) -> str:
-    wait_min = WAZZUP_SLA_MINUTES
+def _build_message(st: dict, lead_id, mentions: str,
+                   wait_min: int = WAZZUP_SLA_MINUTES, pickup: bool = False) -> str:
+    """wait_min — порог, который реально сработал: у самовывоза он свой, и в тексте
+    должно стоять именно оно, иначе алерт врёт про время ожидания."""
     lines = [
         f"⏳ Клиент ждёт ответа {wait_min}+ мин — ответьте",
-        mentions,
     ]
+    if pickup:
+        # Объясняем, почему разбудили через три минуты, а не через пятнадцать.
+        lines.append("🏬 самовывоз — клиент едет за заказом сам")
+    lines.append(mentions)
     chan = st.get("chat_type") or ""
     who = st.get("contact_name") or ""
     ident = st.get("chat_id") or ""

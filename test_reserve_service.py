@@ -23,7 +23,9 @@ from waybill_config import (
     STATUS_CLEVER_PRECLOSED,
     STATUS_CLEVER_TERMS_AGREED,
     STATUS_CLOSED_LOST,
+    STATUS_CREATE_WAYBILL,
     STATUS_OFFICE_DEFERRED_RESERVE,
+    STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_OFFICE_SHIPPED,
     STATUS_PAYMENT_RECEIVED,
@@ -200,6 +202,40 @@ def test_bessrochnyy_rezerv_taymautom_ne_snimaetsya(env):
     asyncio.run(reserve_service._timeout_once())
     assert env["puts"] == []
     assert reserve_store.get(1) is not None
+
+
+# --- Сделать накладную / Оформить доставку в Офисе (у amGroup тоже резервные,
+# но это рабочие этапы, не осознанный холд — тайм-аут действует как обычно) --
+
+
+def test_sdelat_nakladnuyu_stavit_rezerv(env):
+    puts = _run(env, PIPELINE_OFFICE, STATUS_CREATE_WAYBILL)
+    assert [b["reserve"] for _, b in puts] == [2, 1]
+
+
+def test_oformit_dostavku_stavit_rezerv(env):
+    puts = _run(env, PIPELINE_OFFICE, STATUS_OFFICE_DELIVERY)
+    assert [b["reserve"] for _, b in puts] == [2, 1]
+
+
+def test_sdelat_nakladnuyu_ne_exempt_v_store(env):
+    puts = _run(env, PIPELINE_OFFICE, STATUS_CREATE_WAYBILL)
+    assert puts, "резерв должен быть выставлен"
+    row = reserve_store.get(1)
+    assert row is not None and row["timeout_exempt"] is False
+
+
+def test_sdelat_nakladnuyu_taymaut_snimaet_rezerv(env):
+    """В отличие от «Предзаказ оплачен» — это не осознанный холд, тайм-аут
+    снимает резерв как на обычном рабочем этапе."""
+    reserve_store.mark_reserved(1, ORDER, PIPELINE_OFFICE, timeout_exempt=False)
+    _make_stale()
+    env["positions"]["rows"][0]["reserve"] = 2
+    env["positions"]["rows"][1]["reserve"] = 1
+    env["lead"] = _lead(PIPELINE_OFFICE, STATUS_CREATE_WAYBILL)
+    asyncio.run(reserve_service._timeout_once())
+    assert [b["reserve"] for _, b in env["puts"]] == [0, 0]
+    assert reserve_store.get(1) is None
 
 
 # --- снятие по факту отгрузки, независимо от статуса ------------------------

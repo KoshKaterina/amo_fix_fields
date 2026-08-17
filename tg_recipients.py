@@ -4,10 +4,14 @@
 (сообщения без ответа): куда слать (супергруппа ОП, топик РОЗНИЦА) и кого тегать.
 
 Правило тега (одно на оба сценария):
-  • ответственный по сделке — наш МОП (есть в WAZZUP_TG_HANDLES) → тегаем ЕГО +
-    WAZZUP_ALWAYS_TAG (Саша/Гладков);
+  • ответственный по сделке — наш МОП (есть в WAZZUP_TG_HANDLES) → тегаем ЕГО
+    (плюс WAZZUP_ALWAYS_TAG, если он не пуст);
   • ответственный не наш МОП / не определён / сделка не найдена → тегаем всю
-    смену MANAGERS_ON_SHIFT (Саша в неё уже входит).
+    смену MANAGERS_ON_SHIFT.
+
+⚠️ 13.08.2026 надзорный тег снят: WAZZUP_ALWAYS_TAG пуст, Саша (РОП) убран и из
+смены, и из карты ответственных — ушёл в отпуск и попросил убрать его из
+уведомлений. Возвращать будем не тегом РОПа, а задачей про точки контроля.
 """
 
 from waybill_config import WAZZUP_ALWAYS_TAG, WAZZUP_TG_HANDLES
@@ -18,7 +22,8 @@ NOTIFY_THREAD_ID: int | None = 10479
 
 # Вся смена — фолбэк, когда ответственного-МОПа определить не удалось.
 # ⚠️ ВРЕМЕННОЕ: фикс.список хендлов. TODO: динамика «кто на смене».
-MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya @gladkov_369"
+# 13.08.2026: @gladkov_369 (Саша, РОП) убран — отпуск, его же просьба.
+MANAGERS_ON_SHIFT = "@offf1cer @egorkonsss @kathrina_bistraya"
 
 # Доп. тег ТОЛЬКО для алертов о пропущенных звонках (не для wazzup SLA):
 # @thebarsa1 (Игорь) подмешиваем ТОЛЬКО в фолбэке — когда ответственного-МОПа
@@ -35,10 +40,17 @@ MISSED_CALL_FALLBACK_TAG = "@thebarsa1"
 SHOWROOM_ALERT_THREAD_ID: int | None = 4083
 SHOWROOM_ALERT_TAG = "@kathrina_bistraya"
 
+# SLA-алерт по клиенту, который приедет за заказом сам (тип доставки — наш
+# самовывоз): порог WAZZUP_SLA_PICKUP_MINUTES вместо общего, и адресат ОДИН —
+# Катя-офис (решение Кати 13.08.2026). Смену тут не тегаем: такого клиента ведёт
+# шоурум, а не весь отдел продаж. Топик тот же, что у остальных SLA-алертов
+# (NOTIFY_THREAD_ID) — меняется только скорость и адресат, не место.
+SLA_PICKUP_TAG = "@kathrina_bistraya"
+
 
 def mentions_for(responsible_id) -> str:
     """Строка @-тегов для алерта по ответственному сделки.
-    Наш МОП → «@его @gladkov_369»; иначе → вся смена (в ней Гладков уже есть)."""
+    Наш МОП → «@его» (+ WAZZUP_ALWAYS_TAG, если он задан); иначе → вся смена."""
     handle = None
     try:
         handle = WAZZUP_TG_HANDLES.get(int(responsible_id)) if responsible_id is not None else None

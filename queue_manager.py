@@ -434,9 +434,7 @@ async def _worker(lane: str) -> None:
         kind = item.payload.get("_kind") or "lead_update"
         category = _CATEGORY_BY_KIND.get(kind, "lead")
         set_breaker_category(category)
-        if kind == "waybill":
-            _pending_waybills.discard(lead_id)
-        elif kind == "office_transfer":
+        if kind == "office_transfer":
             _pending_office_transfer.discard(lead_id)
         elif kind == "lead_distribution":
             _pending_lead_distribution.discard(lead_id)
@@ -446,10 +444,19 @@ async def _worker(lane: str) -> None:
             _pending_cdek_sync.discard(str(item.payload.get("_key", "")))
         elif kind == "metrika_sync":
             _pending_metrika_sync.discard(lead_id)
-        elif kind != "jivo":
-            # jivo-пометку снимаем в finally (после обработки) — чтобы повторная
-            # доставка того же chat_id во время обработки схлопывалась, а не
-            # плодила дубль сделки.
+        elif kind not in ("jivo", "waybill"):
+            # jivo/waybill-пометку снимаем в finally (после обработки), НЕ здесь
+            # на dequeue — чтобы повторная доставка вебхука ВО ВРЕМЯ обработки
+            # схлопывалась, а не плодила дубль. Для waybill это не гипотетический
+            # риск: разбор 12.08.2026 (сделка 36532789, заказ 06193) — накладная
+            # СДЭК ждёт cdek_number до 60с, а office_transfer следом делает ещё
+            # несколько PATCH по той же сделке (смена ответственного, поле
+            # «Ответственный МОП», сам переход статуса) — каждый рождает свой
+            # lead_change-вебхук, который видит status_id="Сделать накладную" и
+            # снова зовёт enqueue_waybill. Флаг снимался тут же на dequeue →
+            # второй вебхук заставал сделку «свободной» и создавал ВТОРОЙ,
+            # настоящий, принятый СДЭК заказ поверх первого, который ещё просто
+            # ждал ответа.
             _pending_leads.pop(lead_id, None)
         waited = time.time() - item.enqueue_time
         stats = _lane_stats.get(lane)
@@ -528,6 +535,8 @@ async def _worker(lane: str) -> None:
         finally:
             if kind == "jivo":
                 _pending_jivo.discard(str(item.payload.get("_jivo_key", "")))
+            elif kind == "waybill":
+                _pending_waybills.discard(lead_id)
             queue.task_done()
 
 

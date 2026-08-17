@@ -52,11 +52,13 @@ from waybill_config import (
     STATUS_CLEVER_UPSELL_DONE,
     STATUS_CLEVER_WALLET_PICKED,
     STATUS_CLOSED_LOST,
+    STATUS_CREATE_WAYBILL,
     STATUS_LINK_SENT,
     STATUS_OFFICE_AWAITING_PICKUP,
     STATUS_OFFICE_COURIER_MSK,
     STATUS_OFFICE_COURIER_OWN,
     STATUS_OFFICE_DEFERRED_RESERVE,
+    STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_IN_TRANSIT,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_OFFICE_SHIPPED,
@@ -100,7 +102,16 @@ _RESERVE_ON: dict[int, set[int]] = {
         STATUS_SUCCESS,
     },
     # Офис: товар отложен под клиента осознанно — резерв ставим и держим бессрочно.
-    PIPELINE_OFFICE: {STATUS_OFFICE_PREORDER_PAID, STATUS_OFFICE_DEFERRED_RESERVE},
+    # STATUS_CREATE_WAYBILL/STATUS_OFFICE_DELIVERY — по исходной схеме amGroup
+    # тоже резервные (галочка «Резерв» стояла), но это рабочие технические
+    # этапы подготовки отправки, не осознанный холд — тайм-аут 3 дня на них
+    # действует как обычно (не добавлены в _TIMEOUT_EXEMPT ниже).
+    PIPELINE_OFFICE: {
+        STATUS_OFFICE_PREORDER_PAID,
+        STATUS_OFFICE_DEFERRED_RESERVE,
+        STATUS_CREATE_WAYBILL,
+        STATUS_OFFICE_DELIVERY,
+    },
 }
 
 # Статусы, где резерв снимаем. STATUS_SUCCESS (142) в Офисе — реально
