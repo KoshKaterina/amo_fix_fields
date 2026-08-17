@@ -643,6 +643,28 @@ def test_profile_past_last_interval_end_tomorrow_pool_empty_falls_to_duty():
     assert _log_calls[-1]["rule"] == "duty_fallback"
 
 
+def test_profile_before_first_interval_empty_live_pool_uses_upcoming_pool():
+    """Реальный баг 17.08.2026: eligible_pool пуст ПРЯМО СЕЙЧАС (team-panel
+    показывает, что реально никто не на месте) ДО начала первого интервала -
+    раньше это считалось "обычным путём" (eligible_pool), который просто
+    оставался пустым до начала дня, а лид висел без ответственного. Теперь
+    пустой пул тоже триггерит upcoming-пул (ближайший будущий старт - сегодня,
+    не обязательно "завтра")."""
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now.hour, now.hour)  # никто не «на месте» по плейсхолдеру
+    work_hours = [{"start": _hhmm(now + datetime.timedelta(hours=2)), "end": _hhmm(now + datetime.timedelta(hours=3))}]
+    _seed_profile(name="BeforeStartEmptyPool", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
+    _tomorrow_statuses[2] = True  # доступен на момент старта интервала (сегодня)
+    lead = _lead(lead_id=220, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[220] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(220)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 2
+    assert _log_calls[-1]["rule"] == "tomorrow_shift_fallback"
+
+
 def test_always_mode_repeat_client_routed_to_tomorrow_pool():
     """"always" раньше проверял _is_on_shift(repeat_responsible) напрямую -
     под tomorrow-пулом это всегда False (сегодняшний день уже кончился),

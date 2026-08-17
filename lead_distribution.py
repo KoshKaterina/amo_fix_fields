@@ -437,13 +437,10 @@ def _is_on_shift(user_id: int) -> bool:
 
 def _work_day_ended(profile: Profile) -> bool:
     """Рабочий день профиля ЗАКОНЧИЛСЯ на сегодня (сейчас позже конца последнего
-    интервала work_hours) - НЕ "сейчас вне рабочих часов" вообще (до 11.08.2026
-    это было одно и то же понятие, из-за чего распределение молча простаивало
-    и до начала первого интервала, и в перерыве между интервалами, не только
-    после конца дня). До первого интервала и в перерыве между интервалами
-    работает обычный путь (eligible_pool/_is_on_shift) - как если бы work_hours
-    не было задано вовсе; только после конца последнего интервала распределение
-    переключается на _tomorrow_pool (см. decide_and_record)."""
+    интервала work_hours). Один из двух триггеров ухода на _upcoming_pool в
+    decide_and_record - см. его комментарий там: сам по себе этот флаг больше
+    НЕ единственное условие (до 17.08.2026 было им, из-за чего пустой пул ДО
+    начала первого интервала/в перерыве молча простаивал до конца дня)."""
     if not profile.work_hours:
         return False
     now_hhmm = datetime.datetime.now(_MSK).strftime("%H:%M")
@@ -454,18 +451,37 @@ def eligible_pool(profile: Profile) -> list[int]:
     return [uid for uid in profile.participant_ids if _is_on_shift(uid)]
 
 
-async def _tomorrow_pool(profile: Profile) -> list[int]:
-    """Участники профиля, которые на месте ЗАВТРА - используется вместо
-    eligible_pool, когда рабочий день профиля на сегодня уже закончился
-    (_work_day_ended). Момент - начало первого интервала work_hours, спроецированное
-    на завтра (читается как «кто на месте, когда завтра начнётся рабочий день»;
-    team-panel проверяет присутствие НА ЭТОТ МОМЕНТ, а не «весь день», поэтому
-    сотрудник с более поздней завтрашней сменой теоретически может быть пропущен -
-    известное ограничение, не критично для типичного графика)."""
-    tomorrow = (datetime.datetime.now(_MSK) + datetime.timedelta(days=1)).date()
+def _next_work_moment(profile: Profile, now: datetime.datetime) -> datetime.datetime:
+    """Ближайший момент старта интервала work_hours СТРОГО в будущем: сперва
+    среди сегодняшних интервалов (следующий старт после now - покрывает и
+    «до первого интервала», и «перерыв между интервалами»), а если сегодня
+    стартов больше нет (все уже прошли/день закончился) - старт САМОГО РАННЕГО
+    интервала завтра. Одна функция вместо старого "всегда завтра" - именно это
+    убирает искусственное ожидание до 10:00, когда прямо сейчас никого нет на
+    месте, а следующий интервал начинается позже сегодня же."""
+    today = now.date()
+    starts_today = []
+    for iv in profile.work_hours:
+        h, m = (int(x) for x in iv["start"].split(":"))
+        starts_today.append(datetime.datetime.combine(today, datetime.time(h, m), tzinfo=_MSK))
+    upcoming_today = [t for t in starts_today if t > now]
+    if upcoming_today:
+        return min(upcoming_today)
+    tomorrow = today + datetime.timedelta(days=1)
     start_hhmm = min(iv["start"] for iv in profile.work_hours)
     start_h, start_m = (int(x) for x in start_hhmm.split(":"))
-    at = datetime.datetime.combine(tomorrow, datetime.time(start_h, start_m), tzinfo=_MSK)
+    return datetime.datetime.combine(tomorrow, datetime.time(start_h, start_m), tzinfo=_MSK)
+
+
+async def _upcoming_pool(profile: Profile) -> list[int]:
+    """Участники профиля, которые будут на месте в БЛИЖАЙШИЙ будущий момент
+    начала интервала work_hours (_next_work_moment) - используется вместо
+    eligible_pool, когда прямо сейчас пул пуст или рабочий день на сегодня уже
+    закончился (см. decide_and_record). team-panel проверяет присутствие НА
+    ЭТОТ МОМЕНТ, а не «весь интервал», поэтому сотрудник с более поздним
+    началом смены внутри того же интервала теоретически может быть пропущен -
+    известное ограничение, не критично для типичного графика."""
+    at = _next_work_moment(profile, datetime.datetime.now(_MSK))
     statuses = await team_panel_client.fetch_for_datetime(set(profile.participant_ids), at)
     return [uid for uid in profile.participant_ids if statuses.get(uid)]
 
@@ -570,20 +586,32 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     ("load"/"random"/"always"/"duty_fallback"/"tomorrow_shift_fallback"),
     а также meta["repeat_responsible_user_id"] (последний ответственный по
     ДРУГИМ сделкам контакта, см. _find_repeat_responsible) и
-    meta["contact_name"]/meta["contact_phone"] - для лога распределений."""
-    if profile.work_hours and _work_day_ended(profile):
-        pool = await _tomorrow_pool(profile)
-        pool_is_tomorrow = True
+    meta["contact_name"]/meta["contact_phone"] - для лога распределений.
+
+    Пул на "сейчас" (eligible_pool) используется, только если он НЕ пуст И
+    рабочий день профиля ещё не закончился формально (_work_day_ended) - иначе
+    (пул пуст ПРЯМО СЕЙЧАС - до первого интервала, в перерыве, или день уже
+    закончился) уходим на _upcoming_pool: ближайший будущий старт интервала,
+    сегодня или завтра. До 17.08.2026 форвардинг срабатывал только по второму
+    условию - пустой пул до начала первого интервала/в перерыве молча ждал
+    наступления часов, вместо того чтобы сразу посмотреть на ближайшую смену."""
+    if profile.work_hours:
+        today_pool = eligible_pool(profile)
+        if today_pool and not _work_day_ended(profile):
+            pool, pool_is_future = today_pool, False
+        else:
+            pool = await _upcoming_pool(profile)
+            pool_is_future = True
     else:
         pool = eligible_pool(profile)
-        pool_is_tomorrow = False
+        pool_is_future = False
     repeat_responsible = await _find_repeat_responsible(lead, meta=meta)
     source_id = _lead_source_id(lead)
 
     def _repeat_on_shift(uid: int) -> bool:
-        # Под tomorrow-пулом "на месте" значит "участвует в пуле на завтра" -
-        # _is_on_shift (сейчас) всегда даст False для дня, который уже закончился.
-        return uid in pool if pool_is_tomorrow else _is_on_shift(uid)
+        # Под forward-пулом "на месте" значит "участвует в пуле на ближайшую
+        # будущую смену" - _is_on_shift (сейчас) для него не годится.
+        return uid in pool if pool_is_future else _is_on_shift(uid)
 
     # use_open_deals_counter - живой запрос к amoCRM ДО блокировки: _counters_lock
     # общий на ВСЕ профили (не только этот), держать его на время сетевого похода
@@ -628,7 +656,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
                     target = profile.duty_user_id
                     rule = "duty_fallback"
 
-        if pool_is_tomorrow and target is not None and rule != "duty_fallback":
+        if pool_is_future and target is not None and rule != "duty_fallback":
             rule = "tomorrow_shift_fallback"
 
         if target is not None and source_id is not None and open_deals_state is None:
