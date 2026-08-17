@@ -14,3 +14,7 @@ query_ur_egor*.py
 # logs & build artifacts
 *.log
 __pycache__/
+
+# runtime state/cache written by the service itself (lead_distribution rotation/counters,
+# write-through cache of profiles from team-panel) — never source of truth, never commit
+/var/

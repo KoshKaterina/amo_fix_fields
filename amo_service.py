@@ -23,6 +23,7 @@ from api_helpers import (
     sanitize_custom_field_value,
     trim_text,
 )
+from waybill_config import STATUS_CLOSED_LOST, STATUS_SUCCESS
 
 logger = logging.getLogger("uvicorn")
 
@@ -241,6 +242,75 @@ def get_status_sort(status_id: int, pipeline_id: int) -> int | None:
     return info["sort"] if info else None
 
 
+def get_status_ids_for_pipeline(pipeline_id: int) -> list[int]:
+    """Все status_id воронки из уже прогретого _status_info (без сетевого
+    похода) — нужен get_open_deal_counts_by_source, чтобы перечислить НЕ-
+    закрытые статусы явно (см. её докстринг)."""
+    return [sid for (pid, sid) in _status_info if pid == pipeline_id]
+
+
+async def get_open_deal_counts_by_source(
+    user_ids: list[int], pipeline_id: int, *, page_limit: int = 250,
+) -> dict[int, dict[int, int]]:
+    """{responsible_user_id: {source_id: count}} — текущие ОТКРЫТЫЕ (не 142/143)
+    сделки указанных user_ids в pipeline_id, сгруппированные по источнику.
+    Для lead_distribution.py: правило «по открытым сделкам» вместо дневных
+    счётчиков (12.08.2026, задание Тианы).
+
+    Фильтруем ЯВНЫМ перечнем НЕзакрытых статусов воронки (filter[statuses][N] —
+    тот же приём, что get_leads_by_status, просто с несколькими парами разом,
+    OR между ними), а не filter[pipeline_id] целиком + отсев на своей стороне —
+    проверено вживую 12.08.2026: страница 1 такой выборки (250 записей) может
+    целиком состоять из старых закрытых сделок (сортировка по умолчанию — не
+    по актуальности), и искать открытые пришлось бы пролистать всю историю
+    воронки. С явным перечнем статусов — один запрос, без пагинации по факту
+    (типичный рабочий пул на человека << page_limit).
+
+    Источник amoCRM не фильтрует на своей стороне (см. get_recent_lead_sources) —
+    читаем с with_=source и группируем сами. Сделки без источника/ответственного
+    в счётчик не попадают (не 0-й source, а действительно «мимо», как и
+    _lead_source_id в lead_distribution.py для той же ситуации)."""
+    if not user_ids:
+        return {}
+    open_statuses = [s for s in get_status_ids_for_pipeline(pipeline_id) if s not in (STATUS_SUCCESS, STATUS_CLOSED_LOST)]
+    if not open_statuses:
+        await warm_pipeline_cache()
+        open_statuses = [s for s in get_status_ids_for_pipeline(pipeline_id) if s not in (STATUS_SUCCESS, STATUS_CLOSED_LOST)]
+    if not open_statuses:
+        logger.error("get_open_deal_counts_by_source: нет статусов для воронки %s — кэш не прогрет?", pipeline_id)
+        return {}
+
+    counts: dict[int, dict[int, int]] = {}
+    page = 1
+    while True:
+        params: list[tuple[str, str]] = []
+        for i, sid in enumerate(open_statuses):
+            params.append((f"filter[statuses][{i}][pipeline_id]", str(pipeline_id)))
+            params.append((f"filter[statuses][{i}][status_id]", str(sid)))
+        for uid in user_ids:
+            params.append(("filter[responsible_user_id][]", str(uid)))
+        params += [("with", "source"), ("limit", str(page_limit)), ("page", str(page))]
+
+        data = await _do_get("/api/v4/leads", params)
+        if not data:
+            break
+        batch = (data.get("_embedded") or {}).get("leads") or []
+        if not batch:
+            break
+        for lead in batch:
+            uid = lead.get("responsible_user_id")
+            src = (lead.get("_embedded") or {}).get("source")
+            if uid is None or not src or src.get("id") is None:
+                continue
+            bucket = counts.setdefault(int(uid), {})
+            sid = int(src["id"])
+            bucket[sid] = bucket.get(sid, 0) + 1
+        if len(batch) < page_limit:
+            break
+        page += 1
+    return counts
+
+
 async def get_lead_full(lead_id: int | str, with_: tuple[str, ...] = ("contacts", "companies")) -> dict | None:
     params: list[tuple[str, str]] = []
     if with_:
@@ -248,8 +318,86 @@ async def get_lead_full(lead_id: int | str, with_: tuple[str, ...] = ("contacts"
     return await _do_get(f"/api/v4/leads/{lead_id}", params)
 
 
-async def get_contact_by_id(contact_id: int | str) -> dict | None:
-    return await _do_get(f"/api/v4/contacts/{contact_id}")
+async def get_contact_by_id(contact_id: int | str, with_: tuple[str, ...] = ()) -> dict | None:
+    params: list[tuple[str, str]] = []
+    if with_:
+        params.append(("with", ",".join(with_)))
+    return await _do_get(f"/api/v4/contacts/{contact_id}", params)
+
+
+def find_other_deal_responsible(contact: dict, *, exclude_lead_id: int) -> int | None:
+    """Ответственный последней (по updated_at) сделки контакта, кроме exclude_lead_id.
+    Контакт должен быть дочитан с with_=("leads",) — см. get_contact_by_id.
+    Нужен lead_distribution.py для правила «повторный клиент → тот же ответственный»."""
+    leads = (contact.get("_embedded") or {}).get("leads") or []
+    exclude = int(exclude_lead_id)
+    other = [l for l in leads if int(l.get("id") or 0) != exclude]
+    if not other:
+        return None
+    latest = max(other, key=lambda l: l.get("updated_at") or 0)
+    uid = latest.get("responsible_user_id")
+    return int(uid) if uid is not None else None
+
+
+async def get_users(limit: int = 250) -> list[dict]:
+    """Все пользователи amoCRM (id, name, is_active) — для дропдауна участников/
+    дежурного в lead_distribution_api.py."""
+    users: list[dict] = []
+    page = 1
+    while True:
+        data = await _do_get("/api/v4/users", [("limit", str(limit)), ("page", str(page))])
+        if not data:
+            break
+        batch = (data.get("_embedded") or {}).get("users") or []
+        if not batch:
+            break
+        users.extend(batch)
+        if len(batch) < limit:
+            break
+        page += 1
+    return users
+
+
+async def get_pipelines_with_statuses() -> list[dict]:
+    """Сырой список воронок с этапами — для дропдауна «воронка → этапы» в
+    lead_distribution_api.py (в отличие от warm_pipeline_cache, которая строит
+    внутренний плоский кэш, эта функция отдаёт структуру как есть)."""
+    data = await _do_get("/api/v4/leads/pipelines")
+    if not data:
+        return []
+    return (data.get("_embedded") or {}).get("pipelines") or []
+
+
+async def get_recent_lead_sources(pipeline_id: int, *, days: int = 30, page_limit: int = 250) -> list[dict]:
+    """Уникальные {id, name} из _embedded.source сделок воронки за последние
+    `days` дней — прямой каталог /api/v4/sources на этом аккаунте пуст, это
+    лучшее доступное приближение (см. lead_distribution_api.py /sources)."""
+    import time as _time
+    since = int(_time.time()) - days * 86400
+    seen: dict[int, str] = {}
+    page = 1
+    while True:
+        params: list[tuple[str, str]] = [
+            ("filter[pipeline_id]", str(pipeline_id)),
+            ("filter[created_at][from]", str(since)),
+            ("with", "source"),
+            ("limit", str(page_limit)),
+            ("page", str(page)),
+        ]
+        data = await _do_get("/api/v4/leads", params)
+        if not data:
+            break
+        batch = (data.get("_embedded") or {}).get("leads") or []
+        if not batch:
+            break
+        for lead in batch:
+            src = (lead.get("_embedded") or {}).get("source")
+            if src and src.get("id") is not None:
+                seen[int(src["id"])] = src.get("name") or ""
+        if len(batch) < page_limit:
+            break
+        page += 1
+    return [{"id": sid, "name": name} for sid, name in sorted(seen.items())]
 
 
 async def get_contacts_by_ids(contact_ids: list[int]) -> dict[int, dict]:
