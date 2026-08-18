@@ -134,7 +134,19 @@ def _lead(*, lead_id=100, pipeline_id=10593102, status_id=83537714, source_id=No
 
 
 def _contact(contact_id=500, other_leads=None, name=None, phone=None):
-    c = {"id": contact_id, "_embedded": {"leads": other_leads or []}}
+    """`other_leads` — ПОЛНЫЕ объекты сделок ({id, responsible_user_id, updated_at}),
+    как их удобно описывать в тестах. Но в сам контакт кладутся ТОЛЬКО ссылки
+    {"id", "_links"} — ровно то, что отдаёт живой amoCRM на /contacts/{id}?with=leads
+    (проверено на боевом аккаунте 18.08.2026). Полные объекты уходят в реестр
+    _leads_full, откуда их достаёт фейк get_leads_by_ids — так путь данных в
+    тесте совпадает с продовым, и баг «responsible_user_id читается прямо из
+    _embedded.leads» больше не может спрятаться за удобным фейком."""
+    refs = []
+    for l in other_leads or []:
+        lid = int(l["id"])
+        _leads_full[lid] = l
+        refs.append({"id": lid, "_links": {"self": {"href": f"/api/v4/leads/{lid}"}}})
+    c = {"id": contact_id, "_embedded": {"leads": refs}}
     if name is not None:
         c["name"] = name
     if phone is not None:
@@ -158,6 +170,9 @@ _tag_calls: list = []
 _alert_calls: list = []
 _lead_by_id: dict = {}
 _contact_by_id: dict = {}
+# lead_id -> полный объект сделки; наполняется _contact(), читается фейком
+# get_leads_by_ids (см. докстринг _contact)
+_leads_full: dict = {}
 _log_calls: list = []
 _log_should_raise = False
 
@@ -169,6 +184,7 @@ def _reset_fakes():
     _alert_calls.clear()
     _lead_by_id.clear()
     _contact_by_id.clear()
+    _leads_full.clear()
     _log_calls.clear()
     _open_deal_counts.clear()
     _open_deal_calls.clear()
@@ -230,8 +246,18 @@ async def _fake_get_open_deal_counts_by_source(user_ids, pipeline_id):
     return {uid: dict(sources) for uid, sources in by_pipeline.items() if uid in user_ids}
 
 
+async def _fake_get_leads_by_ids(lead_ids):
+    """Дочитывание сделок батчем — единственный источник responsible_user_id/
+    updated_at, ровно как в проде (в _embedded.leads контакта их нет)."""
+    _leads_by_ids_calls.append(list(lead_ids))
+    return [_leads_full[int(i)] for i in lead_ids if int(i) in _leads_full]
+
+
+_leads_by_ids_calls: list = []
+
 amo_service.get_lead_full = _fake_get_lead_full
 amo_service.get_contact_by_id = _fake_get_contact_by_id
+amo_service.get_leads_by_ids = _fake_get_leads_by_ids
 amo_service.patch_lead = _fake_patch_lead
 amo_service.add_note = _fake_add_note
 amo_service.add_tag = _fake_add_tag
@@ -681,6 +707,47 @@ def test_always_mode_repeat_client_routed_to_tomorrow_pool():
     assert outcome == "routed"
     assert _patch_calls[0]["responsible_user_id"] == 1
     assert _log_calls[-1]["rule"] == "tomorrow_shift_fallback"
+
+
+def test_repeat_responsible_read_via_batch_fetch_not_contact_embed():
+    """Живой amoCRM кладёт в contact["_embedded"]["leads"] ТОЛЬКО ссылки
+    {"id","_links"} — ответственный и updated_at берутся исключительно из
+    дочитанных батчем сделок (18.08.2026: раньше читались прямо из ссылок,
+    из-за чего повторный клиент не определялся никогда)."""
+    _reset_fakes()
+    _seed_profile(name="BatchFetch", participant_ids=[1, 2])
+    lead = _lead(lead_id=231, source_id=1, contacts=[{"id": 501}])
+    _lead_by_id[231] = lead
+    _contact_by_id[501] = _contact(501, other_leads=[
+        {"id": 901, "responsible_user_id": 1, "updated_at": 10},
+        {"id": 902, "responsible_user_id": 2, "updated_at": 99},  # свежее — она и решает
+    ])
+    embedded = _contact_by_id[501]["_embedded"]["leads"]
+    assert all(set(l.keys()) == {"id", "_links"} for l in embedded), "контакт обязан отдавать только ссылки"
+    resp = run(ld._find_repeat_responsible(_lead_by_id[231]))
+    assert resp == 2
+    assert _leads_by_ids_calls, "сделки контакта должны дочитываться батчем"
+
+
+def test_load_mode_repeat_responsible_wins_under_upcoming_pool():
+    """load-режим под forward-пулом: приоритет повторного клиента проверялся
+    через _is_on_shift (на смене СЕЙЧАС) — вне рабочих часов всегда False, и
+    повторный клиент молча уходил по общей балансировке. Для режима always это
+    чинили раньше (_repeat_on_shift), ветку load пропустили (18.08.2026)."""
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
+    _seed_profile(name="RepeatUpcoming", participant_ids=[1, 2], work_hours=work_hours)
+    _tomorrow_statuses[1] = True
+    _tomorrow_statuses[2] = True
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now.hour, now.hour)  # СЕЙЧАС на смене никого
+    _seed_counts({2: {1: 1}})  # у прежнего ответственного даже больше по источнику, но в пределах gap
+    lead = _lead(lead_id=232, source_id=1, contacts=[{"id": 502}])
+    _lead_by_id[232] = lead
+    _contact_by_id[502] = _contact(502, other_leads=[{"id": 903, "responsible_user_id": 2, "updated_at": 7}])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(232)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 2, "повторный клиент должен остаться у прежнего ответственного"
 
 
 def test_profile_without_work_hours_always_runs():

@@ -325,16 +325,52 @@ async def get_contact_by_id(contact_id: int | str, with_: tuple[str, ...] = ()) 
     return await _do_get(f"/api/v4/contacts/{contact_id}", params)
 
 
-def find_other_deal_responsible(contact: dict, *, exclude_lead_id: int) -> int | None:
+async def get_leads_by_ids(lead_ids: list[int]) -> list[dict]:
+    """Сделки по списку id, батчем через filter[id][] (страницами по 250 —
+    ограничение limit у amoCRM). Пустой список id → пустой результат без
+    единого запроса.
+
+    Тёзка есть и в api.py (для jivo_service), но тот шлёт все id одним URL и
+    ходит мимо _do_get. Здесь сознательно свой: _do_get даёт ретраи и circuit
+    breaker, а в пути принятия решения о распределении тихий сетевой сбой
+    означал бы «повторный клиент не найден» и неверного ответственного."""
+    out: list[dict] = []
+    for start in range(0, len(lead_ids), 250):
+        chunk = lead_ids[start:start + 250]
+        params: list[tuple[str, str]] = [
+            (f"filter[id][{i}]", str(lid)) for i, lid in enumerate(chunk)
+        ]
+        params.append(("limit", "250"))
+        data = await _do_get("/api/v4/leads", params)
+        out.extend(((data or {}).get("_embedded") or {}).get("leads") or [])
+    return out
+
+
+async def find_other_deal_responsible(contact: dict, *, exclude_lead_id: int) -> int | None:
     """Ответственный последней (по updated_at) сделки контакта, кроме exclude_lead_id.
     Контакт должен быть дочитан с with_=("leads",) — см. get_contact_by_id.
-    Нужен lead_distribution.py для правила «повторный клиент → тот же ответственный»."""
+    Нужен lead_distribution.py для правила «повторный клиент → тот же ответственный».
+
+    18.08.2026: функция стала async и дочитывает сделки отдельным запросом.
+    Раньше responsible_user_id/updated_at читались прямо из contact["_embedded"]
+    ["leads"] — но amoCRM кладёт туда ТОЛЬКО ссылки {"id", "_links"} (проверено
+    на живом аккаунте), так что оба поля всегда были None и функция всегда
+    возвращала None: правило «повторный клиент» не срабатывало ни разу, а в
+    режиме always каждая сделка молча уходила в round-robin. Юнит-тесты это не
+    ловили, потому что фейк отдавал полные объекты сделок (см. тесты).
+
+    Статус сделки не фильтруем сознательно (решение Тианы 18.08.2026): закрытые
+    сделки (142/143) тоже считаются — «прежний ответственный» это тот, кто вёл
+    последнюю сделку клиента, независимо от её исхода."""
     leads = (contact.get("_embedded") or {}).get("leads") or []
     exclude = int(exclude_lead_id)
-    other = [l for l in leads if int(l.get("id") or 0) != exclude]
-    if not other:
+    other_ids = [int(l["id"]) for l in leads if l.get("id") is not None and int(l["id"]) != exclude]
+    if not other_ids:
         return None
-    latest = max(other, key=lambda l: l.get("updated_at") or 0)
+    full = await get_leads_by_ids(other_ids)
+    if not full:
+        return None
+    latest = max(full, key=lambda l: l.get("updated_at") or 0)
     uid = latest.get("responsible_user_id")
     return int(uid) if uid is not None else None
 

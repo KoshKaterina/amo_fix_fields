@@ -513,7 +513,7 @@ async def _find_repeat_responsible(lead: dict, *, meta: dict | None = None) -> i
             meta["contact_name"] = (full.get("name") or "").strip() or None
             meta["contact_phone"] = amo_service.get_custom_field_value(full, FIELD_PHONE)
             captured_contact = True
-        found = amo_service.find_other_deal_responsible(full, exclude_lead_id=lead_id)
+        found = await amo_service.find_other_deal_responsible(full, exclude_lead_id=lead_id)
         if found is not None:
             return found
     return None
@@ -526,6 +526,7 @@ def _weight(profile: Profile, uid: int) -> int:
 def _decide_load_balanced(
     state: dict, profile: Profile, pool: list[int],
     repeat_responsible: int | None, source_id: int | None,
+    is_available=None,
 ) -> int | None:
     """Сравнения ведутся не по сырым счётчикам, а по отношению count/вес
     (Fraction, для точных сравнений без ошибок округления) — при весе 1 у всех
@@ -534,8 +535,17 @@ def _decide_load_balanced(
     без весов сериализуется в {} именно ради этой гарантии). gap остаётся
     порогом в этом же ratio-пространстве — при весе 1 у всех это тот же самый
     порог "разница не больше N сделок", что и был; при разных весах — порог
-    "разница не больше N сделок НА ЕДИНИЦУ веса"."""
+    "разница не больше N сделок НА ЕДИНИЦУ веса".
+
+    `is_available` — проверка "прежний ответственный вообще доступен". По
+    умолчанию _is_on_shift (на смене СЕЙЧАС), но вызывающий обязан передать
+    свою, когда пул построен не на "сейчас", а на ближайшую будущую смену:
+    _is_on_shift за пределами рабочих часов всегда False, и приоритет
+    повторного клиента молча пропадал (18.08.2026 — тот же баг, что уже чинили
+    для режима always через _repeat_on_shift, ветку load тогда пропустили)."""
     gap = LEAD_DISTRIBUTION_FAIRNESS_GAP
+    if is_available is None:
+        is_available = _is_on_shift
 
     def source_ratio(uid: int) -> Fraction:
         return Fraction(_source_count(state, uid, source_id), _weight(profile, uid))
@@ -543,7 +553,7 @@ def _decide_load_balanced(
     def total_ratio(uid: int) -> Fraction:
         return Fraction(_total_count(state, uid), _weight(profile, uid))
 
-    if repeat_responsible is not None and _is_on_shift(repeat_responsible) and source_id is not None:
+    if repeat_responsible is not None and is_available(repeat_responsible) and source_id is not None:
         r_ratio = source_ratio(repeat_responsible)
         others = [uid for uid in pool if uid != repeat_responsible]
         if not others or all(abs(r_ratio - source_ratio(uid)) <= gap for uid in others):
@@ -644,7 +654,9 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
                 target = profile.duty_user_id
                 rule = "duty_fallback"
         else:  # "load"
-            target = _decide_load_balanced(state, profile, pool, repeat_responsible, source_id)
+            target = _decide_load_balanced(
+                state, profile, pool, repeat_responsible, source_id, is_available=_repeat_on_shift,
+            )
             # _decide_load_balanced сам возвращает profile.duty_user_id, когда pool
             # пуст (единственный путь, где это отличимо от «настоящего» load-подбора).
             rule = "duty_fallback" if (not pool and target == profile.duty_user_id) else "load"
