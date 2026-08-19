@@ -120,17 +120,20 @@ def _seed_profile(**over) -> ld.Profile:
 
 
 def _lead(*, lead_id=100, pipeline_id=10593102, status_id=83537714, source_id=None,
-          tags=None, contacts=None, responsible_user_id=None):
+          tags=None, contacts=None, responsible_user_id=None, delivery_type=None):
     embedded = {}
     if source_id is not None:
         embedded["source"] = {"id": source_id, "name": f"source-{source_id}"}
     embedded["tags"] = tags or []
     embedded["contacts"] = contacts if contacts is not None else [{"id": 500}]
-    return {
+    out = {
         "id": lead_id, "pipeline_id": pipeline_id, "status_id": status_id,
         "name": "Тестовая сделка", "responsible_user_id": responsible_user_id,
         "_embedded": embedded,
     }
+    if delivery_type is not None:
+        out["custom_fields_values"] = [{"field_id": ld.FIELD_DELIVERY_TYPE, "values": [{"value": delivery_type}]}]
+    return out
 
 
 def _contact(contact_id=500, other_leads=None, name=None, phone=None):
@@ -780,6 +783,53 @@ def test_no_matching_profile_is_noop():
     outcome = run(ld.process_lead_distribution(301))
     assert outcome == "no-profile"
     assert not _patch_calls
+
+
+# ════════════════ доставка «офис» — не распределяем (решение Тианы 19.08.2026) ════════════════
+
+def test_office_pickup_delivery_is_not_distributed():
+    """Реальное значение поля 577315 на живом аккаунте: 'Самовывоз из офиса
+    Sunscrypt, 1 шт, 0.00 рублей' — с ценой/количеством в той же строке,
+    не голое 'офис'. Матч обязан быть по подстроке, не по точному значению."""
+    _reset_fakes()
+    _seed_profile(name="OfficeGuard", source_ids=[1])
+    lead = _lead(lead_id=310, source_id=1, delivery_type="Самовывоз из офиса Sunscrypt, 1 шт, 0.00 рублей")
+    _lead_by_id[310] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(310))
+    assert outcome == "skipped-office-delivery"
+    assert not _patch_calls, "сделка с самовывозом из офиса не должна получать ответственного"
+
+
+def test_office_pickup_delivery_case_insensitive():
+    _reset_fakes()
+    _seed_profile(name="OfficeGuardCase", source_ids=[1])
+    lead = _lead(lead_id=311, source_id=1, delivery_type="САМОВЫВОЗ ИЗ ОФИСА")
+    _lead_by_id[311] = lead
+    outcome = run(ld.process_lead_distribution(311))
+    assert outcome == "skipped-office-delivery"
+
+
+def test_non_office_delivery_is_distributed_normally():
+    """Контрольный случай — курьер/СДЭК не должны попасть под фильтр офиса."""
+    _reset_fakes()
+    _seed_profile(name="NonOfficeGuard", source_ids=[1])
+    lead = _lead(lead_id=312, source_id=1, delivery_type="Доставка курьером по Москве, 1 шт, 1 000.00 рублей")
+    _lead_by_id[312] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(312))
+    assert outcome == "routed"
+    assert _patch_calls and _patch_calls[0]["lead_id"] == 312
+
+
+def test_empty_delivery_type_is_distributed_normally():
+    _reset_fakes()
+    _seed_profile(name="EmptyDeliveryGuard", source_ids=[1])
+    lead = _lead(lead_id=313, source_id=1)  # delivery_type не задан вовсе
+    _lead_by_id[313] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(313))
+    assert outcome == "routed"
 
 
 # ════════════════ защита от гонки amgroup ════════════════

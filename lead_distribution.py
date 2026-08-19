@@ -51,6 +51,7 @@ import team_panel_client
 import telegram_bot
 import tg_recipients
 from waybill_config import (
+    FIELD_DELIVERY_TYPE,
     FIELD_PHONE,
     LEAD_DISTRIBUTION_CONTACT_POLL_S,
     LEAD_DISTRIBUTION_CONTACT_WAIT_S,
@@ -219,6 +220,16 @@ def _lead_source_id(lead: dict) -> int | None:
     if not src or src.get("id") is None:
         return None
     return int(src["id"])
+
+
+def _is_office_delivery(lead: dict) -> bool:
+    """Тип доставки (FIELD_DELIVERY_TYPE, 577315, text) содержит «офис» -
+    самовывоз из офиса Sunscrypt (та же подстрока, что DELIVERY_SHOWROOM_MARKER
+    в office_transfer.py, регистронезависимо - .casefold(), тот же приём).
+    Решение Тианы 19.08.2026: такие сделки не распределяются вообще, ими
+    занимается офис-менеджер напрямую, не пул участников профиля."""
+    text = str(amo_service.get_custom_field_value(lead, FIELD_DELIVERY_TYPE) or "").casefold()
+    return "офис" in text
 
 
 def _matches_entry(profile: Profile, pipeline_id: int, status_id: int) -> bool:
@@ -753,6 +764,12 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
     profile = match_profile(pipeline_id, status_id, source_id)
     if profile is None:
         return "no-profile"
+
+    if _is_office_delivery(lead):
+        # Самовывоз из офиса — ведёт офис-менеджер напрямую, не пул профиля
+        # (решение Тианы 19.08.2026). Без тега и без записи в лог распределений:
+        # сделка вообще не считается вошедшей в диспетчер.
+        return "skipped-office-delivery"
 
     if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED):
         # Идемпотентно: решение уже зафиксировано в amoCRM, повторный вебхук
