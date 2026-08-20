@@ -60,6 +60,8 @@ def setup_function(_=None):
     ld._pending_fail.clear()
     ld._contact_wait_pending.clear()
     ld._bg_tasks.clear()
+    ld._in_flight.clear()
+    ld._recently_routed.clear()
     ld.LEAD_DISTRIBUTION_ENABLED = True
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (0, 24)  # все всегда «на месте» по умолчанию
     ld.LEAD_DISTRIBUTION_FAIRNESS_GAP = 2
@@ -783,6 +785,80 @@ def test_no_matching_profile_is_noop():
     outcome = run(ld.process_lead_distribution(301))
     assert outcome == "no-profile"
     assert not _patch_calls
+
+
+# ════════════════ двойное распределение одного лида (найдено вживую 19-20.08.2026) ════════════════
+# amgroup дозаполняет поля сразу после создания сделки несколькими вебхуками подряд;
+# между PATCH одного прогона и свежим GET следующего amoCRM какое-то время ещё не
+# отдаёт только что записанный тег (read-after-write задержка на их стороне) - живой
+# кейс: сделка 36538301 распределилась дважды за секунды, счётчик нагрузки задвоился.
+
+def test_recently_routed_lead_is_not_processed_again_within_window():
+    """Фейковое хранилище _lead_by_id НЕ мутируется PATCH'ем - как и настоящий
+    amoCRM какое-то время после записи, повторный GET видит сделку БЕЗ тега.
+    Тег тут бессилен - должно сработать окно памяти _recently_routed."""
+    _reset_fakes()
+    _seed_profile(name="Dedup", participant_ids=[1, 2])
+    lead = _lead(lead_id=320, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[320] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    first = run(ld.process_lead_distribution(320))
+    assert first == "routed"
+    assert len(_patch_calls) == 1
+
+    second = run(ld.process_lead_distribution(320))
+    assert second == "skipped-recently-routed"
+    assert len(_patch_calls) == 1, "второй прогон не должен был патчить ещё раз"
+
+
+def test_recently_routed_window_expires_and_allows_retry():
+    _reset_fakes()
+    _seed_profile(name="DedupExpire", participant_ids=[1, 2])
+    lead = _lead(lead_id=321, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[321] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    run(ld.process_lead_distribution(321))
+    assert len(_patch_calls) == 1
+    ld._recently_routed[321] -= (ld._ROUTE_DEDUP_WINDOW_S + 1)  # эмулируем истечение окна
+    outcome = run(ld.process_lead_distribution(321))
+    assert outcome == "routed"
+    assert len(_patch_calls) == 2
+
+
+def test_in_flight_lead_is_not_processed_concurrently():
+    """Пересекающийся по времени повторный заход (второй вебхук того же шквала
+    приходит, пока первый ещё внутри decide_and_record) не должен решать
+    параллельно - иначе оба одновременно посчитают счётчики с одного снимка."""
+    _reset_fakes()
+    _seed_profile(name="InFlight", participant_ids=[1, 2])
+    lead = _lead(lead_id=322, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[322] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    ld._in_flight.add(322)
+    try:
+        outcome = run(ld.process_lead_distribution(322))
+    finally:
+        ld._in_flight.discard(322)
+    assert outcome == "skipped-in-flight"
+    assert not _patch_calls
+
+
+def test_in_flight_released_on_empty_pool_allows_immediate_retry():
+    """Пустой пул (нет решения) не должен застревать в _in_flight на всё окно
+    дедупа - иначе следующий заход reconciliation ждал бы впустую."""
+    _reset_fakes()
+    now_h = datetime.datetime.now(ld._MSK).hour
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # никто не «на месте»
+    _seed_profile(name="EmptyPoolRetry", participant_ids=[1, 2], duty_user_id=None)
+    lead = _lead(lead_id=323, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[323] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    first = run(ld.process_lead_distribution(323))
+    assert first == "no-candidate-waiting"
+    assert 323 not in ld._in_flight
+    second = run(ld.process_lead_distribution(323))
+    assert second == "no-candidate-waiting"
 
 
 # ════════════════ доставка «офис» — не распределяем (решение Тианы 19.08.2026) ════════════════

@@ -700,6 +700,43 @@ _bg_tasks: set = set()
 _contact_wait_pending: set[int] = set()
 _pending_fail: dict[int, dict] = {}
 
+# Защита от двойного распределения одного лида (найдено вживую 19-20.08.2026):
+# amgroup дозаполняет поля сразу после создания сделки несколькими вебхуками
+# подряд - каждый пере-ставит её в очередь lead_distribution. Тег
+# TAG_LEAD_DISTRIBUTION_ROUTED сам по себе НЕ надёжная идемпотентность здесь:
+# между PATCH одного прогона и свежим GET следующего amoCRM может ещё не
+# отдавать только что записанный тег (read-after-write задержка на их
+# стороне) - второй прогон читает сделку "как будто ещё не распределена" и
+# принимает решение заново, задваивая счётчик нагрузки (реальный кейс:
+# сделка 36538301, 20.08.2026 - засчиталась дважды за 1-9 секунд).
+#
+# Два уровня защиты поверх тега:
+# 1. _in_flight - блокирует ПЕРЕСЕКАЮЩИЕСЯ по времени прогоны одного lead_id:
+#    держится только на время самого decide_and_record, снимается сразу после
+#    (успех ИЛИ пустой пул) - не блокирует легитимный повторный заход
+#    reconciliation, если пул был пуст.
+# 2. _recently_routed - после УСПЕШНОГО PATCH+тега держит короткое окно памяти
+#    в этом процессе: следующий прогон того же lead_id в это окно не читает
+#    amoCRM заново вообще, просто выходит - страховка именно от
+#    read-after-write задержки, которую тег на свежем GET не ловит.
+_in_flight: set[int] = set()
+_recently_routed: dict[int, float] = {}
+_ROUTE_DEDUP_WINDOW_S = 60.0
+
+
+def _was_recently_routed(lead_id: int) -> bool:
+    ts = _recently_routed.get(lead_id)
+    if ts is None:
+        return False
+    if time.monotonic() - ts >= _ROUTE_DEDUP_WINDOW_S:
+        del _recently_routed[lead_id]
+        return False
+    return True
+
+
+def _mark_routed(lead_id: int) -> None:
+    _recently_routed[lead_id] = time.monotonic()
+
 
 def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
@@ -753,6 +790,11 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         logger.warning("lead_distribution %s: сделка не прочиталась", lead_id)
         return "failed-lead-read"
 
+    # Нормализуем сразу - lead_id приходит то int (reconcile), то str (очередь,
+    # из payload вебхука), а _in_flight/_recently_routed ниже ключуются им же:
+    # разнотипица тихо сломала бы дедуп (int(1) и "1" - разные ключи словаря).
+    lid = int(lead["id"])
+
     # Ответственный ДО этого решения - PATCH ниже меняет его только на стороне
     # amoCRM, локальный lead-dict не мутирует, так что читать можно и позже,
     # но фиксируем сразу для ясности (для лога распределений).
@@ -774,29 +816,46 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
     if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED):
         # Идемпотентно: решение уже зафиксировано в amoCRM, повторный вебхук
         # (в т.ч. эхо от нашего же PATCH) — no-op.
-        _clear_fail(int(lead["id"]))
+        _clear_fail(lid)
         return "skipped-already-routed"
+
+    if _was_recently_routed(lid):
+        # Тег на свежем GET ещё не виден (read-after-write задержка amoCRM),
+        # но этот же процесс уже успешно распределил лид секунды назад —
+        # см. докстринг _recently_routed. Не трогаем счётчики повторно.
+        return "skipped-recently-routed"
 
     contacts = (lead.get("_embedded") or {}).get("contacts") or []
     if not contacts:
         # Гонка с amgroup: контакт ещё не привязан — решение не принимается
         # вообще, ротация/счётчики не расходуются. См. _contact_wait_loop.
-        _spawn_contact_wait(int(lead["id"]), source)
+        _spawn_contact_wait(lid, source)
         return "waiting-for-contact"
 
-    meta: dict = {}
-    target = await decide_and_record(lead, profile, meta=meta)
+    if lid in _in_flight:
+        # Пересекающийся по времени повторный заход (другой вебхук того же
+        # шквала уже внутри decide_and_record прямо сейчас) - не решаем
+        # параллельно один и тот же лид дважды.
+        return "skipped-in-flight"
+    _in_flight.add(lid)
+    try:
+        meta: dict = {}
+        target = await decide_and_record(lead, profile, meta=meta)
+    finally:
+        _in_flight.discard(lid)
+
     if target is None:
         # Пул пуст, дежурного нет — ждём reconciliation (не ошибка).
         return "no-candidate-waiting"
 
     tags = list(amo_service.get_tags(lead)) + [{"name": TAG_LEAD_DISTRIBUTION_ROUTED}]
-    result = await amo_service.patch_lead(lead_id, responsible_user_id=target, tags=tags)
+    result = await amo_service.patch_lead(lid, responsible_user_id=target, tags=tags)
     if not result.get("ok"):
         await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
         return "failed-patch"
 
-    _clear_fail(int(lead["id"]))
+    _mark_routed(lid)
+    _clear_fail(lid)
     logger.info(
         "lead_distribution %s: профиль=%s → пользователь=%s (source=%s, правило=%s)",
         lead_id, profile.id, target, source, meta.get("rule"),
