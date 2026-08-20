@@ -362,6 +362,19 @@ def test_always_mode_waits_when_previous_responsible_off_shift():
     assert target is None  # ждём его, не отдаём другому
 
 
+def test_always_mode_repeat_responsible_outside_pool_falls_back_to_round_robin():
+    """Прежний ответственный контакта — НЕ участник этого профиля (найдено
+    вживую 20.08.2026: последняя сделка контакта уехала в Офис/другую воронку
+    и досталась постороннему человеку - тот уводил НОВУЮ сделку мимо пула
+    продавцов, если был "на месте" по графику, хотя вообще не в participant_ids)."""
+    p = _seed_profile(name="AlwaysOutside", repeat_contact_mode="always", participant_ids=[1, 2, 3])
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 99, "updated_at": 1}])
+    target = run(ld.decide_and_record(lead, p))
+    assert target != 99
+    assert target in (1, 2, 3)
+
+
 def test_always_mode_new_client_falls_back_to_round_robin():
     p = _seed_profile(name="Always", repeat_contact_mode="always", participant_ids=[1, 2])
     lead = _lead(source_id=1, contacts=[{"id": 500}])
@@ -389,6 +402,26 @@ def test_load_mode_skips_repeat_responsible_beyond_fairness_gap():
     _seed_counts({1: {42: 5}, 2: {42: 5}, 3: {42: 0}})
     target = run(ld.decide_and_record(lead, p))
     assert target == 3  # наименьший по источнику И по общему
+
+
+def test_load_mode_repeat_responsible_outside_pool_gets_no_priority():
+    """Тот же баг, что и в always (см. соседний тест), но для load: прежний
+    ответственный не входит в participant_ids профиля — приоритет ему не
+    положен, даже если "на месте" и в пределах fairness gap. Счётчики 1/2/3
+    подобраны так, чтобы БЕЗ фикса gap-проверка сама по себе НЕ отсеяла 99
+    (его ratio=0 — в пределах gap=2 от всех троих) — единственное, что должно
+    его остановить, это отсутствие в пуле участников. meta всё равно хранит
+    настоящего repeat_responsible — для лога/аналитики он информативен
+    независимо от того, даёт ли приоритет."""
+    p = _seed_profile(name="LoadOutside", repeat_contact_mode="load", participant_ids=[1, 2, 3])
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 99, "updated_at": 1}])
+    _seed_counts({1: {42: 1}, 2: {42: 2}, 3: {42: 1}})
+    meta: dict = {}
+    target = run(ld.decide_and_record(lead, p, meta=meta))
+    assert target != 99
+    assert target in (1, 2, 3)  # обычный подбор по нагрузке среди реальных участников
+    assert meta["repeat_responsible_user_id"] == 99
 
 
 def test_load_mode_x_with_min_total_wins():

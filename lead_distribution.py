@@ -629,6 +629,18 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     repeat_responsible = await _find_repeat_responsible(lead, meta=meta)
     source_id = _lead_source_id(lead)
 
+    # Приоритет повторного клиента применим ТОЛЬКО если прежний ответственный —
+    # участник ЭТОГО профиля (найдено вживую 20.08.2026: _find_repeat_responsible
+    # берёт ответственного последней сделки контакта откуда угодно - в т.ч. уже
+    # закрытой, из другой воронки, от офис-менеджера после office_transfer. Без
+    # этой проверки такой человек, если просто "на месте" по графику, уводил
+    # НОВУЮ сделку мимо пула продавцов профиля целиком). meta ниже всё равно
+    # хранит настоящего repeat_responsible - для лога/аналитики он информативен
+    # независимо от того, даёт ли приоритет.
+    repeat_priority_candidate = (
+        repeat_responsible if repeat_responsible in profile.participant_ids else None
+    )
+
     def _repeat_on_shift(uid: int) -> bool:
         # Под forward-пулом "на месте" значит "участвует в пуле на ближайшую
         # будущую смену" - _is_on_shift (сейчас) для него не годится.
@@ -648,8 +660,8 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         rule = ""
 
         if profile.repeat_contact_mode == "always":
-            if repeat_responsible is not None:
-                target = repeat_responsible if _repeat_on_shift(repeat_responsible) else None
+            if repeat_priority_candidate is not None:
+                target = repeat_priority_candidate if _repeat_on_shift(repeat_priority_candidate) else None
                 rule = "always"
             elif pool:
                 target = await _next_in_rotation(profile.id, pool)
@@ -666,7 +678,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
                 rule = "duty_fallback"
         else:  # "load"
             target = _decide_load_balanced(
-                state, profile, pool, repeat_responsible, source_id, is_available=_repeat_on_shift,
+                state, profile, pool, repeat_priority_candidate, source_id, is_available=_repeat_on_shift,
             )
             # _decide_load_balanced сам возвращает profile.duty_user_id, когда pool
             # пуст (единственный путь, где это отличимо от «настоящего» load-подбора).
