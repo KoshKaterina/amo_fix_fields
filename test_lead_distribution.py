@@ -894,6 +894,46 @@ def test_in_flight_released_on_empty_pool_allows_immediate_retry():
     assert second == "no-candidate-waiting"
 
 
+def test_in_flight_covers_patch_not_just_decide_and_record():
+    """Реальный баг 20.08.2026 (сделка 36538563): _in_flight снимался сразу
+    после decide_and_record, ДО await patch_lead - параллельный вызов (в проде
+    обычно из _contact_wait_loop, независимая asyncio-задача, не через очередь)
+    успевал проскочить именно в эту щель, пока PATCH ещё летит по сети, и тоже
+    посчитать решение. Эмулируем "медленный" PATCH и запускаем второй
+    process_lead_distribution, пока первый ещё внутри await patch_lead."""
+    _reset_fakes()
+    _seed_profile(name="SlowPatch", participant_ids=[1, 2])
+    lead = _lead(lead_id=330, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[330] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    patch_started = asyncio.Event()
+    release_patch = asyncio.Event()
+
+    async def _slow_patch_lead(lead_id, **kwargs):
+        patch_started.set()
+        await release_patch.wait()
+        return await _fake_patch_lead(lead_id, **kwargs)
+
+    async def scenario():
+        first_task = asyncio.ensure_future(ld.process_lead_distribution(330))
+        await patch_started.wait()  # первый вызов уже внутри await patch_lead
+        second_outcome = await ld.process_lead_distribution(330)
+        release_patch.set()
+        first_outcome = await first_task
+        return first_outcome, second_outcome
+
+    ld.amo_service.patch_lead = _slow_patch_lead
+    try:
+        first_outcome, second_outcome = run(scenario())
+    finally:
+        ld.amo_service.patch_lead = _fake_patch_lead
+
+    assert second_outcome == "skipped-in-flight", "второй вызов не должен был решать параллельно, пока первый ждёт PATCH"
+    assert first_outcome == "routed"
+    assert len(_patch_calls) == 1
+
+
 # ════════════════ доставка «офис» — не распределяем (решение Тианы 19.08.2026) ════════════════
 
 def test_office_pickup_delivery_is_not_distributed():

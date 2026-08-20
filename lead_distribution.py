@@ -846,27 +846,34 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
 
     if lid in _in_flight:
         # Пересекающийся по времени повторный заход (другой вебхук того же
-        # шквала уже внутри decide_and_record прямо сейчас) - не решаем
-        # параллельно один и тот же лид дважды.
+        # шквала, или фоновое _contact_wait_loop, уже внутри этого блока
+        # прямо сейчас) - не решаем параллельно один и тот же лид дважды.
         return "skipped-in-flight"
     _in_flight.add(lid)
     try:
         meta: dict = {}
         target = await decide_and_record(lead, profile, meta=meta)
+        if target is None:
+            # Пул пуст, дежурного нет — ждём reconciliation (не ошибка).
+            return "no-candidate-waiting"
+
+        # PATCH остаётся ПОД _in_flight (найдено вживую 20.08.2026, сделка
+        # 36538563: снятие _in_flight сразу после decide_and_record и ДО этого
+        # await оставляло незащищённую щель - параллельный вызов (обычно из
+        # _contact_wait_loop, независимая задача, не через очередь) успевал
+        # пройти обе проверки (_in_flight уже снят, _recently_routed ещё не
+        # выставлен - тот ставится только НИЖЕ, после успешного PATCH) и
+        # тоже посчитать решение, пока этот PATCH ещё летит по сети.
+        tags = list(amo_service.get_tags(lead)) + [{"name": TAG_LEAD_DISTRIBUTION_ROUTED}]
+        result = await amo_service.patch_lead(lid, responsible_user_id=target, tags=tags)
+        if not result.get("ok"):
+            await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
+            return "failed-patch"
+
+        _mark_routed(lid)
     finally:
         _in_flight.discard(lid)
 
-    if target is None:
-        # Пул пуст, дежурного нет — ждём reconciliation (не ошибка).
-        return "no-candidate-waiting"
-
-    tags = list(amo_service.get_tags(lead)) + [{"name": TAG_LEAD_DISTRIBUTION_ROUTED}]
-    result = await amo_service.patch_lead(lid, responsible_user_id=target, tags=tags)
-    if not result.get("ok"):
-        await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
-        return "failed-patch"
-
-    _mark_routed(lid)
     _clear_fail(lid)
     logger.info(
         "lead_distribution %s: профиль=%s → пользователь=%s (source=%s, правило=%s)",
