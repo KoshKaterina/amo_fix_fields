@@ -8,6 +8,24 @@ DELIVERY_PREFIXES = (
     "Наценка за наложенный платеж"
 )
 
+# Строка доставки из МС всегда имеет вид «<описание>, <количество>[ <ед.
+# изм.>], <сумма> <валюта>» — количество это ВСЕГДА предпоследний сегмент
+# между запятыми (само по себе, «1», или с единицей, «1 шт»). Убираем его
+# везде: у «Наценка за наложенный платеж, 1 , 273.00 рубля» голое «1»
+# читается клиентами как разделитель тысяч («1 273.00»), а «1 шт» у CDEK/
+# курьера просто не несёт смысла для клиента (у наценки количество ей же
+# всегда 1). Сумма (последний сегмент) может содержать пробел как разделитель
+# тысяч («1 000.00 рублей»), но не запятую — поэтому split(',') её не портит.
+_QUANTITY_SEGMENT_RE = re.compile(r'^\d+(?:[.,]\d+)?\s*[^\d,]{0,15}$')
+
+
+def _strip_quantity_segment(line: str) -> str:
+    parts = [p.strip() for p in line.split(',')]
+    if len(parts) >= 3 and _QUANTITY_SEGMENT_RE.match(parts[-2]):
+        del parts[-2]
+    return ', '.join(parts)
+
+
 async def parse_the_cart_field(data: str):
     items = re.findall(r'^\s*\d+\.\s*(.+)$', data, flags=re.MULTILINE)
 
@@ -19,7 +37,7 @@ async def parse_the_cart_field(data: str):
 
         # 2. Classify based on the delivery prefixes
         if line.startswith(DELIVERY_PREFIXES):
-            deliveries.append(line)
+            deliveries.append(_strip_quantity_segment(line))
         else:
             products.append(line)
 
