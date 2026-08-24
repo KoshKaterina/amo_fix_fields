@@ -714,40 +714,57 @@ _pending_fail: dict[int, dict] = {}
 
 # Защита от двойного распределения одного лида (найдено вживую 19-20.08.2026):
 # amgroup дозаполняет поля сразу после создания сделки несколькими вебхуками
-# подряд - каждый пере-ставит её в очередь lead_distribution. Тег
-# TAG_LEAD_DISTRIBUTION_ROUTED сам по себе НЕ надёжная идемпотентность здесь:
-# между PATCH одного прогона и свежим GET следующего amoCRM может ещё не
-# отдавать только что записанный тег (read-after-write задержка на их
-# стороне) - второй прогон читает сделку "как будто ещё не распределена" и
-# принимает решение заново, задваивая счётчик нагрузки (реальный кейс:
-# сделка 36538301, 20.08.2026 - засчиталась дважды за 1-9 секунд).
+# подряд - каждый пере-ставит её в очередь lead_distribution.
 #
-# Два уровня защиты поверх тега:
-# 1. _in_flight - блокирует ПЕРЕСЕКАЮЩИЕСЯ по времени прогоны одного lead_id:
-#    держится только на время самого decide_and_record, снимается сразу после
-#    (успех ИЛИ пустой пул) - не блокирует легитимный повторный заход
-#    reconciliation, если пул был пуст.
-# 2. _recently_routed - после УСПЕШНОГО PATCH+тега держит короткое окно памяти
-#    в этом процессе: следующий прогон того же lead_id в это окно не читает
-#    amoCRM заново вообще, просто выходит - страховка именно от
-#    read-after-write задержки, которую тег на свежем GET не ловит.
+# 25.08.2026, решение Тианы: новые сделки визуальный тег «распределено
+# автоматически» больше не получают (старые, уже помеченные, тег сохраняют -
+# см. проверку ниже). Раньше именно ЭТОТ тег был единственной идемпотентностью,
+# и она была ненадёжной: между PATCH одного прогона и свежим GET следующего
+# amoCRM могла ещё не отдавать только что записанный тег (read-after-write
+# задержка на их стороне) - второй прогон читал сделку "как будто ещё не
+# распределена" и решал заново, задваивая счётчик нагрузки (реальный кейс:
+# сделка 36538301, 20.08.2026 - засчиталась дважды за 1-9 секунд). Без тега
+# вообще эта проблема была бы постоянной, а не редкой гонкой.
+#
+# Замена - _routed_ids: постоянная локальная запись (var/, тот же приём, что
+# у счётчиков/ротации), проверяется РАНЬШЕ тега и не зависит от amoCRM на
+# чтение вообще - свой же процесс видит свою же запись мгновенно и без сети,
+# сама причина гонки исчезает, а не просто сужается до окна. Тег для СТАРЫХ
+# сделок по-прежнему проверяется отдельно (см. process_lead_distribution) -
+# идемпотентность для них не теряется при переходе на новый механизм.
+#
+# _in_flight - вторая, отдельная защита: блокирует ПЕРЕСЕКАЮЩИЕСЯ по времени
+# прогоны одного lead_id (держится на весь цикл решение→PATCH→запись, не
+# только на decide_and_record - см. коммит 20.08.2026, сделка 36538563).
 _in_flight: set[int] = set()
-_recently_routed: dict[int, float] = {}
-_ROUTE_DEDUP_WINDOW_S = 60.0
+
+_ROUTED_IDS_PATH = pathlib.Path(os.getenv("LEAD_DISTRIBUTION_ROUTED_IDS_PATH", "var/lead_distribution_routed_ids.json"))
+_routed_ids: set[int] | None = None  # None до первой загрузки (лениво, как _cache в profiles_client)
 
 
-def _was_recently_routed(lead_id: int) -> bool:
-    ts = _recently_routed.get(lead_id)
-    if ts is None:
-        return False
-    if time.monotonic() - ts >= _ROUTE_DEDUP_WINDOW_S:
-        del _recently_routed[lead_id]
-        return False
-    return True
+def _load_routed_ids() -> set[int]:
+    if not _ROUTED_IDS_PATH.exists():
+        return set()
+    try:
+        return {int(x) for x in json.loads(_ROUTED_IDS_PATH.read_text(encoding="utf-8"))}
+    except (ValueError, OSError, TypeError):
+        logger.exception("lead_distribution: не удалось прочитать %s", _ROUTED_IDS_PATH)
+        return set()
 
 
-def _mark_routed(lead_id: int) -> None:
-    _recently_routed[lead_id] = time.monotonic()
+def _is_locally_routed(lead_id: int) -> bool:
+    global _routed_ids
+    if _routed_ids is None:
+        _routed_ids = _load_routed_ids()
+    return lead_id in _routed_ids
+
+
+def _mark_locally_routed(lead_id: int) -> None:
+    global _routed_ids
+    if _routed_ids is None:
+        _routed_ids = _load_routed_ids()
+    _routed_ids.add(lead_id)
+    _atomic_write_json(_ROUTED_IDS_PATH, sorted(_routed_ids))
 
 
 def _spawn(coro) -> None:
@@ -803,8 +820,8 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         return "failed-lead-read"
 
     # Нормализуем сразу - lead_id приходит то int (reconcile), то str (очередь,
-    # из payload вебхука), а _in_flight/_recently_routed ниже ключуются им же:
-    # разнотипица тихо сломала бы дедуп (int(1) и "1" - разные ключи словаря).
+    # из payload вебхука), а _in_flight/_routed_ids ниже ключуются им же:
+    # разнотипица тихо сломала бы дедуп (int(1) и "1" - разные ключи/элементы).
     lid = int(lead["id"])
 
     # Ответственный ДО этого решения - PATCH ниже меняет его только на стороне
@@ -825,17 +842,13 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         # сделка вообще не считается вошедшей в диспетчер.
         return "skipped-office-delivery"
 
-    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED):
-        # Идемпотентно: решение уже зафиксировано в amoCRM, повторный вебхук
-        # (в т.ч. эхо от нашего же PATCH) — no-op.
+    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or _is_locally_routed(lid):
+        # Идемпотентно: решение уже зафиксировано - тег (старые сделки, им
+        # его ещё ставили) или локальная запись (новые - тег больше не
+        # ставим, см. _routed_ids выше). Повторный вебхук (в т.ч. эхо от
+        # нашего же PATCH) — no-op.
         _clear_fail(lid)
         return "skipped-already-routed"
-
-    if _was_recently_routed(lid):
-        # Тег на свежем GET ещё не виден (read-after-write задержка amoCRM),
-        # но этот же процесс уже успешно распределил лид секунды назад —
-        # см. докстринг _recently_routed. Не трогаем счётчики повторно.
-        return "skipped-recently-routed"
 
     contacts = (lead.get("_embedded") or {}).get("contacts") or []
     if not contacts:
@@ -861,16 +874,19 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         # 36538563: снятие _in_flight сразу после decide_and_record и ДО этого
         # await оставляло незащищённую щель - параллельный вызов (обычно из
         # _contact_wait_loop, независимая задача, не через очередь) успевал
-        # пройти обе проверки (_in_flight уже снят, _recently_routed ещё не
-        # выставлен - тот ставится только НИЖЕ, после успешного PATCH) и
-        # тоже посчитать решение, пока этот PATCH ещё летит по сети.
-        tags = list(amo_service.get_tags(lead)) + [{"name": TAG_LEAD_DISTRIBUTION_ROUTED}]
-        result = await amo_service.patch_lead(lid, responsible_user_id=target, tags=tags)
+        # пройти обе проверки и тоже посчитать решение, пока этот PATCH ещё
+        # летит по сети).
+        #
+        # tags не передаём вообще (25.08.2026) - новым сделкам тег «распределено
+        # автоматически» больше не ставим, только назначаем ответственного;
+        # amo_service.patch_lead без tags вообще не трогает _embedded.tags в
+        # запросе, существующие теги сделки (напр. «тест», «Горячий») не задеты.
+        result = await amo_service.patch_lead(lid, responsible_user_id=target)
         if not result.get("ok"):
             await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
             return "failed-patch"
 
-        _mark_routed(lid)
+        _mark_locally_routed(lid)
     finally:
         _in_flight.discard(lid)
 
@@ -986,8 +1002,9 @@ async def _created_in_status_leads(pipeline_id: int, status_id: int, ts_from: in
     путь) эту сделку ловит нормально (webhooks.py читает leads[add][0][status_id]
     точно так же, как leads[update][0][status_id]) — а вот reconciliation как
     страховка от ПРОПУЩЕННОГО вебхука эту сделку раньше не подстраховывал.
-    Идемпотентность (TAG_LEAD_DISTRIBUTION_ROUTED) делает пересечение с
-    _entered_status_leads безопасным — задвоенная обработка просто no-op."""
+    Идемпотентность (тег для старых сделок / _routed_ids для новых, см.
+    process_lead_distribution) делает пересечение с _entered_status_leads
+    безопасным — задвоенная обработка просто no-op."""
     leads: set[int] = set()
     page = 1
     while True:

@@ -57,11 +57,12 @@ def setup_function(_=None):
     ldpc._cache = {}
     ld.COUNTERS_PATH = _TMP / f"counters_{time.monotonic_ns()}.json"
     ld.ROTATION_PATH = _TMP / f"rotation_{time.monotonic_ns()}.json"
+    ld._ROUTED_IDS_PATH = _TMP / f"routed_ids_{time.monotonic_ns()}.json"
+    ld._routed_ids = set()
     ld._pending_fail.clear()
     ld._contact_wait_pending.clear()
     ld._bg_tasks.clear()
     ld._in_flight.clear()
-    ld._recently_routed.clear()
     ld.LEAD_DISTRIBUTION_ENABLED = True
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (0, 24)  # все всегда «на месте» по умолчанию
     ld.LEAD_DISTRIBUTION_FAIRNESS_GAP = 2
@@ -826,10 +827,11 @@ def test_no_matching_profile_is_noop():
 # отдаёт только что записанный тег (read-after-write задержка на их стороне) - живой
 # кейс: сделка 36538301 распределилась дважды за секунды, счётчик нагрузки задвоился.
 
-def test_recently_routed_lead_is_not_processed_again_within_window():
+def test_locally_routed_lead_is_not_processed_again():
     """Фейковое хранилище _lead_by_id НЕ мутируется PATCH'ем - как и настоящий
-    amoCRM какое-то время после записи, повторный GET видит сделку БЕЗ тега.
-    Тег тут бессилен - должно сработать окно памяти _recently_routed."""
+    amoCRM какое-то время после записи, повторный GET видит сделку БЕЗ тега
+    (25.08.2026: новым сделкам тег вообще больше не ставится). Идемпотентность
+    держит _routed_ids - постоянная локальная запись, без окна/истечения."""
     _reset_fakes()
     _seed_profile(name="Dedup", participant_ids=[1, 2])
     lead = _lead(lead_id=320, source_id=1, contacts=[{"id": 500}])
@@ -839,24 +841,40 @@ def test_recently_routed_lead_is_not_processed_again_within_window():
     first = run(ld.process_lead_distribution(320))
     assert first == "routed"
     assert len(_patch_calls) == 1
+    assert 320 in ld._routed_ids
 
     second = run(ld.process_lead_distribution(320))
-    assert second == "skipped-recently-routed"
+    assert second == "skipped-already-routed"
     assert len(_patch_calls) == 1, "второй прогон не должен был патчить ещё раз"
 
 
-def test_recently_routed_window_expires_and_allows_retry():
+def test_new_lead_patch_does_not_add_routed_tag():
+    """Решение Тианы 25.08.2026: новые сделки визуальный тег не получают -
+    только назначение ответственного. tags вообще не передаётся в PATCH, чтобы
+    amo_service.patch_lead не трогал _embedded.tags и не задел уже стоящие
+    на сделке теги (напр. «тест»)."""
     _reset_fakes()
-    _seed_profile(name="DedupExpire", participant_ids=[1, 2])
-    lead = _lead(lead_id=321, source_id=1, contacts=[{"id": 500}])
-    _lead_by_id[321] = lead
+    _seed_profile(name="NoTag", participant_ids=[1, 2])
+    lead = _lead(lead_id=324, source_id=1, tags=[{"name": "тест"}], contacts=[{"id": 500}])
+    _lead_by_id[324] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
-    run(ld.process_lead_distribution(321))
-    assert len(_patch_calls) == 1
-    ld._recently_routed[321] -= (ld._ROUTE_DEDUP_WINDOW_S + 1)  # эмулируем истечение окна
-    outcome = run(ld.process_lead_distribution(321))
+    outcome = run(ld.process_lead_distribution(324))
     assert outcome == "routed"
-    assert len(_patch_calls) == 2
+    assert "tags" not in _patch_calls[0]
+
+
+def test_old_tag_still_recognized_for_idempotency():
+    """Обратная совместимость: сделки, помеченные ДО 25.08.2026 (тег уже стоит),
+    по-прежнему считаются распределёнными - тег с них не снимаем и не задваиваем
+    решение, даже если их lead_id никогда не попадал в _routed_ids."""
+    _reset_fakes()
+    _seed_profile(name="OldTag")
+    lead = _lead(lead_id=325, source_id=1, tags=[{"name": ld.TAG_LEAD_DISTRIBUTION_ROUTED}])
+    _lead_by_id[325] = lead
+    assert 325 not in ld._routed_ids
+    outcome = run(ld.process_lead_distribution(325))
+    assert outcome == "skipped-already-routed"
+    assert not _patch_calls
 
 
 def test_in_flight_lead_is_not_processed_concurrently():
