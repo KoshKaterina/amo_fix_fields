@@ -14,6 +14,7 @@ _seed_profile(), который пишет прямо в кэш lead_distributio
 """
 import asyncio
 import datetime
+import json
 import pathlib
 import tempfile
 import time
@@ -57,8 +58,6 @@ def setup_function(_=None):
     ldpc._cache = {}
     ld.COUNTERS_PATH = _TMP / f"counters_{time.monotonic_ns()}.json"
     ld.ROTATION_PATH = _TMP / f"rotation_{time.monotonic_ns()}.json"
-    ld._ROUTED_IDS_PATH = _TMP / f"routed_ids_{time.monotonic_ns()}.json"
-    ld._routed_ids = set()
     ld._pending_fail.clear()
     ld._contact_wait_pending.clear()
     ld._bg_tasks.clear()
@@ -841,7 +840,7 @@ def test_locally_routed_lead_is_not_processed_again():
     first = run(ld.process_lead_distribution(320))
     assert first == "routed"
     assert len(_patch_calls) == 1
-    assert 320 in ld._routed_ids
+    assert 320 in ld._load_counters_state().get("routed_ids", [])
 
     second = run(ld.process_lead_distribution(320))
     assert second == "skipped-already-routed"
@@ -863,15 +862,37 @@ def test_new_lead_patch_does_not_add_routed_tag():
     assert "tags" not in _patch_calls[0]
 
 
+def test_routed_ids_reset_with_daily_counters():
+    """routed_ids живёт внутри суточного состояния счётчиков, не отдельным
+    вечно растущим файлом (по вопросу Тианы 25.08.2026: рост стоимости записи
+    без потолка был бы проблемой, суточного окна с огромным запасом хватает,
+    чтобы пережить саму гонку read-after-write - та разрешается за секунды)."""
+    _reset_fakes()
+    _seed_profile(name="RoutedIdsReset", participant_ids=[1, 2])
+    lead = _lead(lead_id=326, source_id=1, contacts=[{"id": 500}])
+    _lead_by_id[326] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    run(ld.process_lead_distribution(326))
+    assert 326 in ld._load_counters_state().get("routed_ids", [])
+
+    # эмулируем наступление нового дня - _load_counters_state сам сбрасывает
+    # всё состояние целиком (counts/assignments/routed_ids), как уже делает
+    # для дневных счётчиков нагрузки.
+    stale = json.loads(ld.COUNTERS_PATH.read_text(encoding="utf-8"))
+    stale["date"] = "2000-01-01"
+    ld.COUNTERS_PATH.write_text(json.dumps(stale), encoding="utf-8")
+    assert 326 not in ld._load_counters_state().get("routed_ids", [])
+
+
 def test_old_tag_still_recognized_for_idempotency():
     """Обратная совместимость: сделки, помеченные ДО 25.08.2026 (тег уже стоит),
     по-прежнему считаются распределёнными - тег с них не снимаем и не задваиваем
-    решение, даже если их lead_id никогда не попадал в _routed_ids."""
+    решение, даже если их lead_id никогда не попадал в routed_ids."""
     _reset_fakes()
     _seed_profile(name="OldTag")
     lead = _lead(lead_id=325, source_id=1, tags=[{"name": ld.TAG_LEAD_DISTRIBUTION_ROUTED}])
     _lead_by_id[325] = lead
-    assert 325 not in ld._routed_ids
+    assert 325 not in ld._load_counters_state().get("routed_ids", [])
     outcome = run(ld.process_lead_distribution(325))
     assert outcome == "skipped-already-routed"
     assert not _patch_calls

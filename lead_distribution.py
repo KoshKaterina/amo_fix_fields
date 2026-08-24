@@ -320,19 +320,23 @@ def _today_msk() -> str:
 
 
 def _load_counters_state() -> dict:
-    """{"date": "YYYY-MM-DD", "counts": {user_id: {source_id: n}}, "assignments": {lead_id: {...}}}.
-    Дата в файле отличается от сегодняшней → пустое состояние (вчерашние
-    счётчики просто перестают использоваться, явного сброса не нужно)."""
+    """{"date": "YYYY-MM-DD", "counts": {user_id: {source_id: n}}, "assignments": {lead_id: {...}},
+    "routed_ids": [lead_id, ...]}. Дата в файле отличается от сегодняшней → пустое
+    состояние (вчерашние счётчики просто перестают использоваться, явного сброса
+    не нужно) - routed_ids (см. _is_locally_routed/_mark_locally_routed) едет тем
+    же рейсом, суточного окна с огромным запасом хватает на саму задачу (пережить
+    read-after-write задержку amoCRM, которая разрешается за секунды)."""
     today = _today_msk()
+    empty = {"date": today, "counts": {}, "assignments": {}, "routed_ids": []}
     if not COUNTERS_PATH.exists():
-        return {"date": today, "counts": {}, "assignments": {}}
+        return empty
     try:
         state = json.loads(COUNTERS_PATH.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         logger.exception("lead_distribution: не удалось прочитать %s", COUNTERS_PATH)
-        return {"date": today, "counts": {}, "assignments": {}}
+        return empty
     if state.get("date") != today:
-        return {"date": today, "counts": {}, "assignments": {}}
+        return empty
     return state
 
 
@@ -726,45 +730,41 @@ _pending_fail: dict[int, dict] = {}
 # сделка 36538301, 20.08.2026 - засчиталась дважды за 1-9 секунд). Без тега
 # вообще эта проблема была бы постоянной, а не редкой гонкой.
 #
-# Замена - _routed_ids: постоянная локальная запись (var/, тот же приём, что
-# у счётчиков/ротации), проверяется РАНЬШЕ тега и не зависит от amoCRM на
-# чтение вообще - свой же процесс видит свою же запись мгновенно и без сети,
-# сама причина гонки исчезает, а не просто сужается до окна. Тег для СТАРЫХ
-# сделок по-прежнему проверяется отдельно (см. process_lead_distribution) -
+# Замена - routed_ids внутри lead_distribution_counters.json (не отдельный
+# файл): проверяется РАНЬШЕ тега и не зависит от amoCRM на чтение вообще -
+# свой же процесс видит свою же запись мгновенно и без сети, сама причина
+# гонки исчезает, а не просто сужается до окна. Тег для СТАРЫХ сделок
+# по-прежнему проверяется отдельно (см. process_lead_distribution) -
 # идемпотентность для них не теряется при переходе на новый механизм.
+#
+# 25.08.2026, по вопросу Тианы: отдельный вечно растущий файл был бы плохой
+# идеей (каждая запись перезаписывала бы ВЕСЬ список целиком - линейный рост
+# стоимости записи без потолка). Настоящая задача - пережить гонку
+# read-after-write, которая разрешается за секунды; суточного окна с огромным
+# запасом достаточно. lead_distribution_counters.json и так сбрасывается
+# каждую полночь МСК (_load_counters_state) - routed_ids просто едет тем же
+# рейсом, тот же _counters_lock, тот же атомарный write, никакого нового
+# механизма не потребовалось.
 #
 # _in_flight - вторая, отдельная защита: блокирует ПЕРЕСЕКАЮЩИЕСЯ по времени
 # прогоны одного lead_id (держится на весь цикл решение→PATCH→запись, не
 # только на decide_and_record - см. коммит 20.08.2026, сделка 36538563).
 _in_flight: set[int] = set()
 
-_ROUTED_IDS_PATH = pathlib.Path(os.getenv("LEAD_DISTRIBUTION_ROUTED_IDS_PATH", "var/lead_distribution_routed_ids.json"))
-_routed_ids: set[int] | None = None  # None до первой загрузки (лениво, как _cache в profiles_client)
+
+async def _is_locally_routed(lead_id: int) -> bool:
+    async with _counters_lock:
+        state = _load_counters_state()
+        return lead_id in (state.get("routed_ids") or [])
 
 
-def _load_routed_ids() -> set[int]:
-    if not _ROUTED_IDS_PATH.exists():
-        return set()
-    try:
-        return {int(x) for x in json.loads(_ROUTED_IDS_PATH.read_text(encoding="utf-8"))}
-    except (ValueError, OSError, TypeError):
-        logger.exception("lead_distribution: не удалось прочитать %s", _ROUTED_IDS_PATH)
-        return set()
-
-
-def _is_locally_routed(lead_id: int) -> bool:
-    global _routed_ids
-    if _routed_ids is None:
-        _routed_ids = _load_routed_ids()
-    return lead_id in _routed_ids
-
-
-def _mark_locally_routed(lead_id: int) -> None:
-    global _routed_ids
-    if _routed_ids is None:
-        _routed_ids = _load_routed_ids()
-    _routed_ids.add(lead_id)
-    _atomic_write_json(_ROUTED_IDS_PATH, sorted(_routed_ids))
+async def _mark_locally_routed(lead_id: int) -> None:
+    async with _counters_lock:
+        state = _load_counters_state()
+        routed = state.setdefault("routed_ids", [])
+        if lead_id not in routed:
+            routed.append(lead_id)
+        _save_counters_state(state)
 
 
 def _spawn(coro) -> None:
@@ -842,7 +842,7 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         # сделка вообще не считается вошедшей в диспетчер.
         return "skipped-office-delivery"
 
-    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or _is_locally_routed(lid):
+    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
         # Идемпотентно: решение уже зафиксировано - тег (старые сделки, им
         # его ещё ставили) или локальная запись (новые - тег больше не
         # ставим, см. _routed_ids выше). Повторный вебхук (в т.ч. эхо от
@@ -886,7 +886,7 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
             await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
             return "failed-patch"
 
-        _mark_locally_routed(lid)
+        await _mark_locally_routed(lid)
     finally:
         _in_flight.discard(lid)
 
