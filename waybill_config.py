@@ -792,15 +792,6 @@ LEAD_DISTRIBUTION_STALE_ALERT_MIN = int(os.getenv("LEAD_DISTRIBUTION_STALE_ALERT
 LEAD_DISTRIBUTION_CONTACT_WAIT_S = int(os.getenv("LEAD_DISTRIBUTION_CONTACT_WAIT_S", "10"))
 LEAD_DISTRIBUTION_CONTACT_POLL_S = float(os.getenv("LEAD_DISTRIBUTION_CONTACT_POLL_S", "2"))
 
-# Источник UIS (телефония): тег «Успешный звонок»/«пропущенный» ставит UIS уже
-# ПОСЛЕ создания сделки (минута, иногда дольше) — на входе в точку профиля тега
-# обычно ещё нет. Активное ожидание тем же приёмом, что и контакт-гонка выше,
-# но с более широким бюджетом. Не дождались — назначаем как обычно (решение
-# Тианы 24.08.2026: лучше отдать живому клиенту менеджера, чем держать без
-# ответственного из-за одной лишь задержки вебхука UIS).
-LEAD_DISTRIBUTION_UIS_TAG_WAIT_S = int(os.getenv("LEAD_DISTRIBUTION_UIS_TAG_WAIT_S", "180"))
-LEAD_DISTRIBUTION_UIS_TAG_POLL_S = float(os.getenv("LEAD_DISTRIBUTION_UIS_TAG_POLL_S", "15"))
-
 # Разница в сегодняшних счётчиках (по источнику / по общему кол-ву), после
 # которой алгоритм «по нагрузке» перестаёт отдавать приоритет исходному
 # кандидату — см. lead_distribution._pick_load_balanced.
