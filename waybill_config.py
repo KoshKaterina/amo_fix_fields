@@ -649,6 +649,7 @@ OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER",
 OFFICE_TRANSFER_RULE_UR_RESERVE = os.getenv("OFFICE_TRANSFER_RULE_UR_RESERVE", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
+OFFICE_TRANSFER_RULE_ZNR_OPT = os.getenv("OFFICE_TRANSFER_RULE_ZNR_OPT", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").strip() == "1"
 
 # Воронка ОПТ как ИСТОЧНИК переноса (09.08.2026). Отдельный флаг, а не правило:
@@ -717,6 +718,7 @@ OFFICE_TRANSFER_WAREHOUSES = {
 # 577623 (= DUP_REASON_FIELD_ID выше, живое имя «Причина ЗИН») — доп. enum_id для office-transfer
 REASON_WAITLIST = 1041245  # Лист ожидания
 REASON_ACADEMY = 1041243   # Академия
+REASON_OPT = 1041905       # Опт (сверено live 25.08.2026)
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
 # Самовывоз бывает двух видов: из офиса (как было) и из шоурума (с 06.08.2026, свой склад).
@@ -746,9 +748,21 @@ STATUS_WAITLIST = 83669950  # «Лист ожидания»
 PIPELINE_ACADEMY = 8642410
 STATUS_ACADEMY_FIRST_CONTACT = 70070966  # «Первичный контакт»
 
+# Целевые этапы воронки ОПТ (PIPELINE_OPT уже определена выше) — причина ЗИН=Опт
+# (постановка Тианы 25.08.2026): контакт без других сделок → «Первичный контакт»;
+# контакт уже встречался (есть другие сделки) → «Найден контакт».
+STATUS_OPT_PRIMARY_CONTACT = 80276162  # «Первичный контакт» (новый контакт)
+STATUS_OPT_CONTACT_FOUND = 86989418    # «Найден контакт» (контакт уже был)
+
 # Ответственный при переносе в Офис — Екатерина Зубалий. ⚠️ id 13962422 — деактивированный
 # дубль аккаунта (is_active=false, сверено live 30.07.2026) — НЕ использовать.
 RESPONSIBLE_OFFICE_MANAGER_USER_ID = 13963494
+
+# Ответственный при переносе в ОПТ (причина ЗИН=Опт) — Артём Коннов, B2B/ОПТ-менеджер
+# (id из WAZZUP_TG_HANDLES ниже). Решение Тианы 25.08.2026: у lead_distribution.py
+# нет точки входа в воронке ОПТ, без явной смены сделка осталась бы на прежнем
+# розничном МОПе.
+RESPONSIBLE_OPT_MANAGER_USER_ID = 13822630
 
 # Тег зависшего/неудавшегося переноса. Информационный — НЕ блокирует повторные
 # попытки reconciliation (по образцу TAG_KONTROL_ERROR).

@@ -32,14 +32,18 @@ from waybill_config import (
     PIPELINE_OPT,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
+    REASON_OPT,
     REASON_WAITLIST,
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
+    RESPONSIBLE_OPT_MANAGER_USER_ID,
     STATUS_ACADEMY_FIRST_CONTACT,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
     STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_OFFICE_RESERVE,
+    STATUS_OPT_CONTACT_FOUND,
+    STATUS_OPT_PRIMARY_CONTACT,
     STATUS_SUCCESS,
     STATUS_WAITLIST,
     TAG_OFFICE_TRANSFER_ERROR,
@@ -94,6 +98,7 @@ for _flag in (
     "OFFICE_TRANSFER_RULE_UR_RESERVE",
     "OFFICE_TRANSFER_RULE_ZNR_WAITLIST",
     "OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "OFFICE_TRANSFER_RULE_UR_POST",
+    "OFFICE_TRANSFER_RULE_ZNR_OPT",
 ):
     setattr(office_transfer, _flag, True)
 
@@ -174,11 +179,11 @@ print("✓ УР-6 Резерв: тип доставки не смотрим, в�
 # ЭРМС-склад не должен матчиться ни одним правилом, розничный склад — должен.
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_ERMS_MAIN,
              delivery_text="СДЭК до ПВЗ")
-assert office_transfer._match_rules(lead, STATUS_SUCCESS) is None, (
+assert run(office_transfer._match_rules(lead, STATUS_SUCCESS)) is None, (
     "ЭРМС больше не маршрут: после выпила Фулфилмента правила его не берут")
 lead2 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
               delivery_text="СДЭК до ПВЗ")
-assert office_transfer._match_rules(lead2, STATUS_SUCCESS) == (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL), (
+assert run(office_transfer._match_rules(lead2, STATUS_SUCCESS)) == (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL), (
     "склад — единственное отличие от предыдущей сделки, розничный обязан матчиться")
 print("✓ УР(ЭРМС): не матчится ни одним правилом, розничный склад матчится")
 
@@ -195,6 +200,42 @@ assert office_transfer._match_znr_academy(lead) == (PIPELINE_ACADEMY, STATUS_ACA
 lead2 = _lead(status_id=STATUS_CLOSED_LOST, reason=REASON_WAITLIST)
 assert office_transfer._match_znr_academy(lead2) is None
 print("✓ ЗНР Академия")
+
+# ЗНР Опт — новый контакт → Первичный контакт, повторный → Найден контакт
+_orig_get_contact = office_transfer.amo_service.get_contact_by_id
+
+
+async def _fake_contact_no_leads(cid, with_=()):
+    return {"id": cid, "_embedded": {"leads": []}}
+
+
+async def _fake_contact_only_current(cid, with_=()):
+    return {"id": cid, "_embedded": {"leads": [{"id": 42}]}}  # только сама текущая сделка
+
+
+async def _fake_contact_other_lead(cid, with_=()):
+    return {"id": cid, "_embedded": {"leads": [{"id": 42}, {"id": 999}]}}
+
+
+lead = _lead(status_id=STATUS_CLOSED_LOST, reason=REASON_OPT)
+lead["_embedded"] = {"contacts": [{"id": 501}]}
+
+office_transfer.amo_service.get_contact_by_id = _fake_contact_no_leads
+assert run(office_transfer._match_znr_opt(lead)) == (PIPELINE_OPT, STATUS_OPT_PRIMARY_CONTACT), (
+    "новый контакт, других сделок нет — Первичный контакт")
+
+office_transfer.amo_service.get_contact_by_id = _fake_contact_only_current
+assert run(office_transfer._match_znr_opt(lead)) == (PIPELINE_OPT, STATUS_OPT_PRIMARY_CONTACT), (
+    "у контакта в списке только ТЕКУЩАЯ сделка (id=42) — не считается «другой», Первичный контакт")
+
+office_transfer.amo_service.get_contact_by_id = _fake_contact_other_lead
+assert run(office_transfer._match_znr_opt(lead)) == (PIPELINE_OPT, STATUS_OPT_CONTACT_FOUND), (
+    "есть ДРУГАЯ сделка (id=999) — Найден контакт")
+
+lead_wrong_reason = _lead(status_id=STATUS_CLOSED_LOST, reason=REASON_WAITLIST)
+lead_wrong_reason["_embedded"] = {"contacts": [{"id": 501}]}
+assert run(office_transfer._match_znr_opt(lead_wrong_reason)) is None, "причина не Опт — не матчит"
+print("✓ ЗНР Опт: новый контакт → Первичный контакт, повторный → Найден контакт")
 
 # правило выключено флагом — не матчит, даже если условия подходят
 office_transfer.OFFICE_TRANSFER_RULE_UR_DELIVERY = False
@@ -367,6 +408,22 @@ _install_dispatcher_mocks(lead)
 run(office_transfer.process_office_transfer(42))
 assert "responsible_user_id" not in _patches[0], _patches
 print("✓ перенос в Академию: ответственный не меняется")
+
+_reset()
+lead = _lead(status_id=STATUS_CLOSED_LOST, reason=REASON_OPT, responsible_user_id=999)
+lead["_embedded"] = {"contacts": [{"id": 501}]}
+_install_dispatcher_mocks(lead)
+office_transfer.amo_service.get_contact_by_id = _fake_contact_no_leads
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert _patches[0]["pipeline_id"] == PIPELINE_OPT
+assert _patches[0]["status_id"] == STATUS_OPT_PRIMARY_CONTACT
+assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OPT_MANAGER_USER_ID, (
+    "перенос в ОПТ по причине Опт — ответственный меняется на Артёма Коннова")
+assert "custom_fields" not in _patches[0], "578151 не трогаем при переносе в ОПТ (только для Офиса)"
+print("✓ перенос в ОПТ (причина Опт): ответственный → Артём Коннов, 578151 не тронут")
+
+office_transfer.amo_service.get_contact_by_id = _orig_get_contact
 
 
 # ── 4) путь отказа: тег + примечание сразу, алерт по порогу с дедупом ───────

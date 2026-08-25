@@ -42,9 +42,20 @@ select-поля сверяются по enum_id, не по тексту, что�
     2. Причина ЗИН=Академия → воронка «Академия»/«Первичный контакт»
        (переносим РЕАЛЬНУЮ сделку со всей историей — подтверждено Катей, а не
        создаём пустую копию, как делала прежняя нативная автоматика)
+    3. Причина ЗИН=Опт → воронка ОПТ (постановка Тианы 25.08.2026): контакт
+       БЕЗ других сделок (новый человек) → «Первичный контакт»; у контакта
+       ЕСТЬ другие сделки (в любом статусе/воронке, тот же permissive-принцип
+       учёта, что у amo_service.find_other_deal_responsible) → «Найден
+       контакт». Единственное ЗНР-правило с асинхронным матчером
+       (_match_znr_opt/_contact_has_other_leads) — эмбед контактов на самой
+       сделке (with_=("contacts",)) списка ИХ сделок не содержит, нужен
+       отдельный GET /api/v4/contacts/{id}?with=leads на каждый контакт.
 
-Смена ответственного на Екатерину Зубалий (RESPONSIBLE_OFFICE_MANAGER_USER_ID)
-+ прежний ответственный в поле 578151 — ТОЛЬКО при переносе в Офис. Остальные
+Смена ответственного — ТОЛЬКО при переносе в Офис (на Екатерину Зубалий,
+RESPONSIBLE_OFFICE_MANAGER_USER_ID, + прежний ответственный в поле 578151) и
+при переносе в ОПТ по причине «Опт» (на Артёма Коннова,
+RESPONSIBLE_OPT_MANAGER_USER_ID, без записи прежнего в 578151 — то поле
+зарезервировано под гейт «уже переносили» именно для Офиса). Остальные
 воронки (Фулфилмент/Лист ожидания/Академия) — ответственный не меняется.
 
 «Онлайн чат» (реактивация клиента, пишущего в закрытую УР/ЗНР сделку) — ВНЕ
@@ -111,6 +122,7 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_UR_POST,
     OFFICE_TRANSFER_RULE_UR_WAYBILL,
     OFFICE_TRANSFER_RULE_ZNR_ACADEMY,
+    OFFICE_TRANSFER_RULE_ZNR_OPT,
     OFFICE_TRANSFER_RULE_ZNR_WAITLIST,
     OFFICE_TRANSFER_SINCE_TS,
     OFFICE_TRANSFER_SOURCE_OPT,
@@ -122,14 +134,18 @@ from waybill_config import (
     PIPELINE_OPT,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
+    REASON_OPT,
     REASON_WAITLIST,
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
+    RESPONSIBLE_OPT_MANAGER_USER_ID,
     STATUS_ACADEMY_FIRST_CONTACT,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
     STATUS_OFFICE_DELIVERY,
     STATUS_OFFICE_PREORDER_PAID,
     STATUS_OFFICE_RESERVE,
+    STATUS_OPT_CONTACT_FOUND,
+    STATUS_OPT_PRIMARY_CONTACT,
     STATUS_SUCCESS,
     STATUS_WAITLIST,
     TAG_OFFICE_TRANSFER_ERROR,
@@ -299,16 +315,63 @@ def _match_znr_academy(lead: dict, *, ignore_flags: bool = False) -> tuple[int, 
     return (PIPELINE_ACADEMY, STATUS_ACADEMY_FIRST_CONTACT)
 
 
+async def _contact_has_other_leads(lead: dict) -> bool:
+    """Хотя бы у одного контакта сделки есть ДРУГИЕ сделки (кроме текущей).
+    Эмбед контактов на самой сделке (with_=("contacts",), как читает
+    process_office_transfer) содержит только id/ссылки — без списка ИХ
+    сделок, поэтому каждый контакт дочитывается отдельно
+    (with_=("leads",)), по образцу amo_service.find_other_deal_responsible.
+    Статус/воронка сделок не фильтруются — тот же permissive-принцип, что и
+    там. Контакт не дочитался (get_contact_by_id вернул None) — пропускаем
+    его, не роняем матчинг."""
+    lead_id = int(lead.get("id") or 0)
+    contacts = (lead.get("_embedded") or {}).get("contacts") or []
+    for c in contacts:
+        cid = c.get("id")
+        if not cid:
+            continue
+        full = await amo_service.get_contact_by_id(cid, with_=("leads",))
+        if not full:
+            continue
+        other_leads = (full.get("_embedded") or {}).get("leads") or []
+        if any(l.get("id") is not None and int(l["id"]) != lead_id for l in other_leads):
+            return True
+    return False
+
+
+async def _match_znr_opt(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Причина ЗИН=Опт → воронка ОПТ (постановка Тианы 25.08.2026): новый
+    контакт (других сделок нет) → «Первичный контакт»; контакт уже
+    встречался (есть другие сделки) → «Найден контакт». Единственный
+    асинхронный матчер в _ZNR_RULES/_UR_RULES — см. _match_rules ниже,
+    которая умеет и синхронные, и асинхронные правила вперемешку."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_OPT:
+        return None
+    if _reason_enum(lead) != REASON_OPT:
+        return None
+    if await _contact_has_other_leads(lead):
+        return (PIPELINE_OPT, STATUS_OPT_CONTACT_FOUND)
+    return (PIPELINE_OPT, STATUS_OPT_PRIMARY_CONTACT)
+
+
 _ZNR_RULES = (
     _match_znr_waitlist,
     _match_znr_academy,
+    _match_znr_opt,
 )
 
 
-def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+async def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Матчеры бывают синхронные (все _UR_RULES, большинство _ZNR_RULES) и
+    асинхронные (_match_znr_opt — нужен I/O за контактом). Вызываем каждый
+    БЕЗ await, и если результат — корутина (асинхронный матчер), дожидаемся
+    её отдельно: так не пришлось переписывать сигнатуры уже существующих
+    синхронных правил ради одного нового."""
     rules = _UR_RULES if status_id == STATUS_SUCCESS else _ZNR_RULES if status_id == STATUS_CLOSED_LOST else ()
     for fn in rules:
         target = fn(lead, ignore_flags=ignore_flags)
+        if asyncio.iscoroutine(target):
+            target = await target
         if target is not None:
             return target
     return None
@@ -421,7 +484,7 @@ async def _no_match_ur(lead: dict) -> str:
     «Заказ + склад на месте, а Тип доставки пуст» (менеджеру достаточно
     дозаполнить одно поле) и «всё остальное» (нет типа заявки/склада,
     чужой склад, нераспознанная доставка вроде «мэйлру»)."""
-    if _match_rules(lead, STATUS_SUCCESS, ignore_flags=True) is not None:
+    if await _match_rules(lead, STATUS_SUCCESS, ignore_flags=True) is not None:
         logger.info(
             "office_transfer %s: подошла бы под выключенное правило — ведёт нативка, молчим",
             lead.get("id"),
@@ -510,7 +573,7 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         _clear_fail(lead_id)
         return "skipped-already-transferred"
 
-    target = _match_rules(lead, status_id)
+    target = await _match_rules(lead, status_id)
     if target is None:
         if status_id == STATUS_SUCCESS:
             return await _no_match_ur(lead)
@@ -549,6 +612,13 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
             patch_kwargs["custom_fields"] = {
                 FIELD_FORMER_RESPONSIBLE: former_name or (str(current_responsible) if current_responsible else ""),
             }
+    elif target_pipeline_id == PIPELINE_OPT:
+        # Причина ЗИН=Опт (решение Тианы 25.08.2026): распределение лидов не
+        # смотрит на воронку ОПТ, без явной смены сделка осталась бы на
+        # прежнем розничном МОПе. Прежнего сюда не пишем — 578151 занято
+        # гейтом «уже переносили» именно для Офиса.
+        if lead.get("responsible_user_id") != RESPONSIBLE_OPT_MANAGER_USER_ID:
+            patch_kwargs["responsible_user_id"] = RESPONSIBLE_OPT_MANAGER_USER_ID
 
     result = await amo_service.patch_lead(lead_id, **patch_kwargs)
     if not result.get("ok"):
@@ -699,6 +769,8 @@ _RULE_TARGETS = (
     (OFFICE_TRANSFER_RULE_UR_RESERVE, PIPELINE_OFFICE, STATUS_OFFICE_RESERVE, "УР→Офис/Отложенный резерв (Резерв)"),
     (OFFICE_TRANSFER_RULE_ZNR_WAITLIST, PIPELINE_WAITLIST, STATUS_WAITLIST, "ЗНР→Лист ожидания"),
     (OFFICE_TRANSFER_RULE_ZNR_ACADEMY, PIPELINE_ACADEMY, STATUS_ACADEMY_FIRST_CONTACT, "ЗНР→Академия"),
+    (OFFICE_TRANSFER_RULE_ZNR_OPT, PIPELINE_OPT, STATUS_OPT_PRIMARY_CONTACT, "ЗНР→ОПТ/Первичный контакт (новый)"),
+    (OFFICE_TRANSFER_RULE_ZNR_OPT, PIPELINE_OPT, STATUS_OPT_CONTACT_FOUND, "ЗНР→ОПТ/Найден контакт (повторный)"),
 )
 
 
