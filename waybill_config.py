@@ -646,6 +646,7 @@ OFFICE_TRANSFER_RULE_UR_DELIVERY = os.getenv("OFFICE_TRANSFER_RULE_UR_DELIVERY",
 OFFICE_TRANSFER_RULE_UR_PICKUP = os.getenv("OFFICE_TRANSFER_RULE_UR_PICKUP", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_WAYBILL = os.getenv("OFFICE_TRANSFER_RULE_UR_WAYBILL", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_PREORDER = os.getenv("OFFICE_TRANSFER_RULE_UR_PREORDER", "").strip() == "1"
+OFFICE_TRANSFER_RULE_UR_RESERVE = os.getenv("OFFICE_TRANSFER_RULE_UR_RESERVE", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_WAITLIST = os.getenv("OFFICE_TRANSFER_RULE_ZNR_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_RULE_ZNR_ACADEMY = os.getenv("OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "").strip() == "1"
 OFFICE_TRANSFER_RULE_UR_POST = os.getenv("OFFICE_TRANSFER_RULE_UR_POST", "").strip() == "1"
@@ -701,6 +702,7 @@ FIELD_FORMER_RESPONSIBLE = 578151  # Ответственный МОП (text) �
 # 577671 «Тип заявки» — enum_id
 APPLICATION_TYPE_ORDER = 1041237     # Заказ
 APPLICATION_TYPE_PREORDER = 1041239  # Предзаказ
+APPLICATION_TYPE_RESERVE = 1041903   # Резерв (сверено live 25.08.2026)
 
 # 576723 «Склад заказа» — enum_id, нужные для office-transfer (у поля есть и другие значения)
 WAREHOUSE_SUNSCRYPT_MAIN = 1040201    # Sunscrypt Основной
@@ -789,6 +791,15 @@ LEAD_DISTRIBUTION_STALE_ALERT_MIN = int(os.getenv("LEAD_DISTRIBUTION_STALE_ALERT
 # проверками (не блокирующее воркер очереди) до этого бюджета, затем — алерт.
 LEAD_DISTRIBUTION_CONTACT_WAIT_S = int(os.getenv("LEAD_DISTRIBUTION_CONTACT_WAIT_S", "10"))
 LEAD_DISTRIBUTION_CONTACT_POLL_S = float(os.getenv("LEAD_DISTRIBUTION_CONTACT_POLL_S", "2"))
+
+# Источник UIS (телефония): тег «Успешный звонок»/«пропущенный» ставит UIS уже
+# ПОСЛЕ создания сделки (минута, иногда дольше) — на входе в точку профиля тега
+# обычно ещё нет. Активное ожидание тем же приёмом, что и контакт-гонка выше,
+# но с более широким бюджетом. Не дождались — назначаем как обычно (решение
+# Тианы 24.08.2026: лучше отдать живому клиенту менеджера, чем держать без
+# ответственного из-за одной лишь задержки вебхука UIS).
+LEAD_DISTRIBUTION_UIS_TAG_WAIT_S = int(os.getenv("LEAD_DISTRIBUTION_UIS_TAG_WAIT_S", "180"))
+LEAD_DISTRIBUTION_UIS_TAG_POLL_S = float(os.getenv("LEAD_DISTRIBUTION_UIS_TAG_POLL_S", "15"))
 
 # Разница в сегодняшних счётчиках (по источнику / по общему кол-ву), после
 # которой алгоритм «по нагрузке» перестаёт отдавать приоритет исходному

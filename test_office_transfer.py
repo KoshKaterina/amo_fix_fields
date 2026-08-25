@@ -20,6 +20,7 @@ import office_transfer
 from waybill_config import (
     APPLICATION_TYPE_ORDER,
     APPLICATION_TYPE_PREORDER,
+    APPLICATION_TYPE_RESERVE,
     DUP_REASON_FIELD_ID,
     FIELD_APPLICATION_TYPE,
     FIELD_DELIVERY_TYPE,
@@ -90,6 +91,7 @@ office_transfer.OFFICE_TRANSFER_ENABLED = True
 for _flag in (
     "OFFICE_TRANSFER_RULE_UR_DELIVERY", "OFFICE_TRANSFER_RULE_UR_PICKUP",
     "OFFICE_TRANSFER_RULE_UR_WAYBILL", "OFFICE_TRANSFER_RULE_UR_PREORDER",
+    "OFFICE_TRANSFER_RULE_UR_RESERVE",
     "OFFICE_TRANSFER_RULE_ZNR_WAITLIST",
     "OFFICE_TRANSFER_RULE_ZNR_ACADEMY", "OFFICE_TRANSFER_RULE_UR_POST",
 ):
@@ -155,6 +157,16 @@ assert office_transfer._match_ur_preorder(lead) == (PIPELINE_OFFICE, STATUS_OFFI
 lead2 = _lead(application_type=APPLICATION_TYPE_ORDER)
 assert office_transfer._match_ur_preorder(lead2) is None
 print("✓ УР-4 Предзаказ")
+
+# УР-6 Резерв — условие только по Тип заявки, тип доставки НЕ смотрим (Катя 25.08.2026)
+lead = _lead(application_type=APPLICATION_TYPE_RESERVE)
+assert office_transfer._match_ur_reserve(lead) == (PIPELINE_OFFICE, STATUS_OFFICE_RESERVE)
+lead2 = _lead(application_type=APPLICATION_TYPE_RESERVE, delivery_text="CDEK: Самовывоз")
+assert office_transfer._match_ur_reserve(lead2) == (PIPELINE_OFFICE, STATUS_OFFICE_RESERVE), (
+    "тип доставки любой — не влияет на маршрут")
+lead3 = _lead(application_type=APPLICATION_TYPE_ORDER)
+assert office_transfer._match_ur_reserve(lead3) is None, "Заказ — не Резерв, не матчит"
+print("✓ УР-6 Резерв: тип доставки не смотрим, ведёт в «Отложенный/резерв товар»")
 
 # УР(ЭРМС): маршрута в Фулфилмент БОЛЬШЕ НЕТ (воронка разобрана 05.08.2026).
 # ⚠️ Этот блок был выпотрошен вместе с правилом: остались две присвоенные сделки
@@ -280,6 +292,19 @@ assert len(_patches) == 1, _patches
 assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
 assert _patches[0]["status_id"] == STATUS_OFFICE_DELIVERY
 print("✓ подходящая сделка переносится одним PATCH")
+
+# Резерв: сквозной прогон через диспетчер, склад/доставка не заданы (не участвуют)
+_reset()
+lead = _lead(application_type=APPLICATION_TYPE_RESERVE, responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert len(_patches) == 1, _patches
+assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
+assert _patches[0]["status_id"] == STATUS_OFFICE_RESERVE
+assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID, (
+    "Резерв едет в Офис — ответственный меняется на Зубалий, как у остальных правил Офиса")
+print("✓ Резерв: сквозной перенос через диспетчер, ответственный → Зубалий")
 
 # нет ни одного правила (чужой склад + нераспознанная доставка) — с 31.07.2026
 # это алерт «заказ заполнен некорректно»: тег + примечание + ТГ, PATCH не шлём

@@ -32,6 +32,10 @@ select-поля сверяются по enum_id, не по тексту, что�
        «КОНТРОЛЬ». Воронка Фулфилмент разобрана, правила в _UR_RULES больше нет:
        заказ с ЭРМС-склада теперь никуда не переносится и уходит в алерт
        заполнения — если такие заказы ещё появляются, это сигнал, а не маршрут.
+    6. Тип заявки=Резерв (Тип доставки не смотрим) → Офис/«Отложенный/резерв
+       товар» (25.08.2026, постановка Кати): товар отложен под клиента, но ещё
+       не выдан — тот же целевой этап, что у правила 2 для ОПТ+самовывоз из
+       шоурума (STATUS_OFFICE_RESERVE), маршрут туда же, вход другой.
 
   ЗНР (143), поле «Причина ЗИН» (577623, он же DUP_REASON_FIELD_ID):
     1. Причина ЗИН=Лист ожидания → воронка «Лист ожидания»/«Лист ожидания»
@@ -87,6 +91,7 @@ import telegram_bot
 from waybill_config import (
     APPLICATION_TYPE_ORDER,
     APPLICATION_TYPE_PREORDER,
+    APPLICATION_TYPE_RESERVE,
     DELIVERY_CDEK_MARKERS,
     DELIVERY_COURIER_MOSCOW_MARKER,
     DELIVERY_RUSSIAN_POST_MARKER,
@@ -102,6 +107,7 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_UR_DELIVERY,
     OFFICE_TRANSFER_RULE_UR_PICKUP,
     OFFICE_TRANSFER_RULE_UR_PREORDER,
+    OFFICE_TRANSFER_RULE_UR_RESERVE,
     OFFICE_TRANSFER_RULE_UR_POST,
     OFFICE_TRANSFER_RULE_UR_WAYBILL,
     OFFICE_TRANSFER_RULE_ZNR_ACADEMY,
@@ -255,6 +261,17 @@ def _match_ur_preorder(lead: dict, *, ignore_flags: bool = False) -> tuple[int, 
     return (PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID)
 
 
+def _match_ur_reserve(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Тип заявки=Резерв → Офис/«Отложенный/резерв товар», тип доставки не
+    смотрим (постановка Кати 25.08.2026): товар отложен под клиента, но ещё не
+    выдан — тот же целевой этап, что у ОПТ+самовывоз из шоурума в
+    _match_ur_pickup, только вход по другому значению «Типа заявки»."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_UR_RESERVE:
+        return None
+    if _application_type(lead) != APPLICATION_TYPE_RESERVE:
+        return None
+    return (PIPELINE_OFFICE, STATUS_OFFICE_RESERVE)
+
 
 _UR_RULES = (
     _match_ur_delivery,
@@ -262,6 +279,7 @@ _UR_RULES = (
     _match_ur_waybill,
     _match_ur_post,
     _match_ur_preorder,
+    _match_ur_reserve,
 )
 
 
@@ -678,6 +696,7 @@ _RULE_TARGETS = (
     (OFFICE_TRANSFER_RULE_UR_PICKUP, PIPELINE_OFFICE, STATUS_OFFICE_RESERVE, "УР→Офис/Отложенный резерв (ОПТ+шоурум)"),
     (OFFICE_TRANSFER_RULE_UR_WAYBILL, PIPELINE_OFFICE, STATUS_CREATE_WAYBILL, "УР→Офис/Сделать накладную"),
     (OFFICE_TRANSFER_RULE_UR_PREORDER, PIPELINE_OFFICE, STATUS_OFFICE_PREORDER_PAID, "УР→Офис/Предзаказ оплачен"),
+    (OFFICE_TRANSFER_RULE_UR_RESERVE, PIPELINE_OFFICE, STATUS_OFFICE_RESERVE, "УР→Офис/Отложенный резерв (Резерв)"),
     (OFFICE_TRANSFER_RULE_ZNR_WAITLIST, PIPELINE_WAITLIST, STATUS_WAITLIST, "ЗНР→Лист ожидания"),
     (OFFICE_TRANSFER_RULE_ZNR_ACADEMY, PIPELINE_ACADEMY, STATUS_ACADEMY_FIRST_CONTACT, "ЗНР→Академия"),
 )
