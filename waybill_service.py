@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Awaitable, Callable
 
@@ -31,6 +32,7 @@ from waybill_config import (
     TARIFFS_PVZ,
     WAYBILL_ZERO_COST_PLACEHOLDER,
     build_cdek_item_name,
+    country_code_from_phone,
     extract_pvz_code,
     is_cod_payment,
     is_prepaid_payment,
@@ -306,10 +308,51 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     elif tariff == TARIFF_DOOR:
         if not delivery_address:
             return await _fail(lead_id, "пустой адрес доставки (поле 576719)", source, current_tags)
-        order["to_location"] = {
-            "address": delivery_address,
-            "country_code": "RU",
-        }
+        recipient_country = country_code_from_phone(recipient_phone)
+        if recipient_country == "RU":
+            order["to_location"] = {
+                "address": delivery_address,
+                "country_code": "RU",
+            }
+        else:
+            # Получатель за границей (номер контакта не РФ) — раньше страна была
+            # захардкожена RU для ЛЮБОГО адреса, из-за чего СДЭК искал город
+            # получателя только в России и мог перепутать зарубежный город с
+            # российским тёзкой (см. комментарий у PHONE_COUNTRY_PREFIXES в
+            # waybill_config.py). Пин по явному коду города СДЭК убирает саму
+            # возможность такой путаницы — код города достаём отдельным запросом.
+            city_guess = re.sub(
+                r"^г\.?\s+", "", delivery_address.split(",", 1)[0].strip(), flags=re.IGNORECASE
+            )
+            try:
+                city_matches = await cdek_client.find_city(city_guess, country_code=recipient_country)
+            except cdek_client.CdekError as exc:
+                return await _fail(
+                    lead_id,
+                    f"не удалось проверить город получателя «{city_guess}» ({recipient_country}) "
+                    f"в СДЭК: {exc}",
+                    source, current_tags,
+                )
+            if not city_matches:
+                return await _fail(
+                    lead_id,
+                    f"город получателя «{city_guess}» не найден в СДЭК для страны {recipient_country} "
+                    f"(адрес: {delivery_address!r}, телефон {recipient_phone!r}) — проверьте "
+                    f"написание города или создайте накладную вручную",
+                    source, current_tags,
+                )
+            if len(city_matches) > 1:
+                return await _fail(
+                    lead_id,
+                    f"город получателя «{city_guess}» неоднозначен в СДЭК для страны "
+                    f"{recipient_country} ({len(city_matches)} совпадений) — создайте накладную "
+                    f"вручную, указав нужный код города",
+                    source, current_tags,
+                )
+            order["to_location"] = {
+                "code": city_matches[0]["code"],
+                "address": delivery_address,
+            }
 
     # 6. СДЭК API: создание заказа
     try:
