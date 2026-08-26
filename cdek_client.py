@@ -152,6 +152,18 @@ class CdekClient:
             return entity[0]
         return None
 
+    async def find_city(self, name: str, country_code: str | None = None) -> list[dict]:
+        """GET /location/cities по имени города, опционально с фильтром по стране
+        (country_codes). Возвращает список кандидатов «как есть» — СДЭК держит
+        разные города под одним именем (в т.ч. внутри одной страны, проверено
+        живьём 26.08.2026: «Гомель» в Беларуси — два разных city_uuid), поэтому
+        дизамбигуация — забота вызывающего кода, не клиента."""
+        params: dict[str, str] = {"city": name, "size": "20"}
+        if country_code:
+            params["country_codes"] = country_code
+        data = await self._request("GET", "/location/cities", params=params)
+        return data if isinstance(data, list) else []
+
     async def get_webhooks(self) -> list[dict]:
         data = await self._request("GET", "/webhooks")
         # СДЭК возвращает либо массив, либо объект с entity
@@ -252,6 +264,10 @@ async def get_barcodes_batch_pdf(order_uuids: list[str], format_: str = "A6") ->
 
 async def get_order_by_cdek_number(cdek_number: str) -> dict | None:
     return await _ensure().get_order_by_cdek_number(cdek_number)
+
+
+async def find_city(name: str, country_code: str | None = None) -> list[dict]:
+    return await _ensure().find_city(name, country_code=country_code)
 
 
 async def get_webhooks() -> list[dict]:
