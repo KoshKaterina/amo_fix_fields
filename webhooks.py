@@ -17,6 +17,7 @@ import lead_distribution
 import lead_distribution_profiles_client
 import metrika_sync
 import migration_freeze
+import new_lead_watch
 import ms_client
 import office_transfer
 import order_watchdog
@@ -103,6 +104,8 @@ async def lifespan(app):
     team_panel_client.start()
     await showroom_store.init()
     await order_watchdog.init()
+    await uis_missed_call.init()
+    await new_lead_watch.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -111,6 +114,8 @@ async def lifespan(app):
     await unmiss_tag.shutdown()
     await showroom_store.shutdown()
     await order_watchdog.shutdown()
+    await uis_missed_call.shutdown()
+    await new_lead_watch.shutdown()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await team_panel_client.stop()
@@ -385,6 +390,12 @@ async def lead_change(request: Request):
     pipeline_update = await get_nested(nested, ["leads", "update", "0", "pipeline_id"])
     pipeline_add = await get_nested(nested, ["leads", "add", "0", "pipeline_id"])
     incoming_pipeline = pipeline_update if pipeline_update is not None else pipeline_add
+
+    # «Новый лид не взяли в работу» (Катя 28.08.2026): счётчик рабочего времени на входе
+    # воронки. Здесь только словарь в памяти, без сети — вебхук ходит на каждое изменение
+    # сделки, и лишний запрос в amo отсюда стоил бы дорого. Проверка и отправка — в
+    # собственном цикле new_lead_watch.
+    new_lead_watch.note_lead(lead_id, incoming_pipeline, incoming_status)
 
 
     # Office Transfer: сделка воронки-источника зашла в УР(142)/ЗНР(143) →

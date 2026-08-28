@@ -52,6 +52,7 @@ from waybill_config import (
     WAZZUP_ENSURE_WEBHOOK,
     WAZZUP_RESPONSIBLE_TIMEOUT_S,
     WAZZUP_SLA_ENABLED,
+    WAZZUP_SLA_ESCALATE_MINUTES,
     WAZZUP_SLA_MINUTES,
     WAZZUP_SLA_PICKUP_MINUTES,
     WAZZUP_SLA_POLL_INTERVAL_S,
@@ -64,7 +65,9 @@ from waybill_config import (
 from tg_recipients import (
     NOTIFY_CHAT_ID,
     NOTIFY_THREAD_ID,
+    ROP_CHAT_ID,
     SLA_PICKUP_TAG,
+    manager_name,
     mentions_for,
 )
 
@@ -324,7 +327,9 @@ async def _sweep(threshold_s: int) -> None:
     gate_s = min(threshold_s, pickup_s)
 
     # чистка протухших + сбор тех, кто дожил хотя бы до нижнего порога
+    escalate_s = WAZZUP_SLA_ESCALATE_MINUTES * 60
     due: list[tuple[tuple[str, str], dict, float]] = []
+    overdue: list[tuple[tuple[str, str], dict, float]] = []
     for key, st in list(_pending.items()):
         age = now_mono - st["waiting_since"]
         if age >= _TTL_SECONDS:
@@ -332,8 +337,13 @@ async def _sweep(threshold_s: int) -> None:
             continue
         if not st["alerted"] and age >= gate_s:
             due.append((key, st, age))
+        # Второй порог: менеджерам написали, клиенту так и не ответили. Ожидание живёт в
+        # словаре и после первого алерта — снимает его только ответ, — значит эскалацию
+        # видно без отдельного хранилища состояния.
+        elif st["alerted"] and not st.get("escalated") and age >= escalate_s:
+            overdue.append((key, st, age))
 
-    if not due:
+    if not due and not overdue:
         return
     if not in_window:
         # Вне окна не досылаем (решение Кати). Ждём следующего прохода в окне.
@@ -376,6 +386,38 @@ async def _sweep(threshold_s: int) -> None:
             )
         except Exception:
             logger.exception("Wazzup SLA: ошибка отправки алерта (беседа %s)", st.get("chat_id"))
+
+    for key, st, age in overdue:
+        try:
+            await _escalate(key, st, age)
+        except Exception:
+            logger.exception("Wazzup SLA: ошибка эскалации (беседа %s)", st.get("chat_id"))
+
+
+async def _escalate(key, st: dict, age_s: float) -> None:
+    """Второй контур: клиенту не ответили и после напоминания менеджерам.
+
+    Проверки те же, что у первого алерта, и порядок важен: сперва спрашиваем amo,
+    не закрыта ли беседа («Ответ не требуется»), и только потом дёргаем руководство.
+    Ложная эскалация дороже пропущенной: чат руководства держится на доверии, и пара
+    сообщений «а на самом деле ответили» выключит его целиком.
+    """
+    if ROP_CHAT_ID is None:
+        return
+    if await _talk_closed_safe(st):
+        _pending.pop(key, None)
+        return
+
+    st["escalated"] = True
+    ok = await telegram_bot.send_alert(
+        _build_escalation(st, int(age_s // 60)),
+        parse_mode="HTML",
+        chat_id=ROP_CHAT_ID,
+    )
+    logger.info(
+        "Wazzup SLA: эскалация %s (беседа %s, %s мин без ответа)",
+        "отправлена" if ok else "НЕ отправлена", st.get("chat_id"), int(age_s // 60),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +573,31 @@ def _build_message(st: dict, lead_id, mentions: str,
         lines.append(f"«{_esc(st['text'])}»")
     if lead_id:
         lines.append(f'🔗 <a href="{BASE_URL}/leads/detail/{lead_id}">Открыть сделку</a>')
+    return "\n".join(lines)
+
+
+def _build_escalation(st: dict, wait_min: int) -> str:
+    """Текст для чата руководства. Отличается от алерта менеджерам намеренно.
+
+    Там — «ответьте» и @тег, здесь — «не ответили» и ИМЯ человека: руководителю нужен не
+    призыв к действию, а факт и виновник. Ников и ID нет (правило Кати 03.08.2026),
+    точек посередине нет (правило Кати 26.08.2026).
+    """
+    who = st.get("contact_name") or "клиент без имени в карточке"
+    lines = [
+        f"🚨 Клиенту не ответили {wait_min} минут",
+        f"Менеджер: {_esc(manager_name(st.get('responsible_id')))}",
+        f"Клиент: {_esc(who)}",
+    ]
+    chan = st.get("chat_type") or ""
+    if chan:
+        lines.append(f"Канал: {_esc(chan)}")
+    if st.get("text"):
+        lines.append("")
+        lines.append(f"«{_esc(st['text'])}»")
+    if st.get("lead_id"):
+        lines.append("")
+        lines.append(f'<a href="{BASE_URL}/leads/detail/{st["lead_id"]}">Открыть сделку</a>')
     return "\n".join(lines)
 
 

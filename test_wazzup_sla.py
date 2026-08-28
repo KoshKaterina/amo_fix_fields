@@ -59,6 +59,7 @@ def _msg(chat_id="79990000000", is_echo=False, status=None, text="привет",
 _ORIG_IN_WINDOW = W._in_window
 _ORIG_RESOLVE = W._resolve_lead_safe
 _ORIG_TALK_CLOSED = W._talk_closed_safe
+_ORIG_ROP_CHAT = W.ROP_CHAT_ID
 
 
 async def _resolve_nothing(chat_id):
@@ -73,6 +74,7 @@ def setup_function(_=None):
     W._in_window = _ORIG_IN_WINDOW
     W._resolve_lead_safe = _resolve_nothing
     W._talk_closed_safe = _ORIG_TALK_CLOSED
+    W.ROP_CHAT_ID = _ORIG_ROP_CHAT
 
 
 def test_inbound_starts_timer():
@@ -469,6 +471,126 @@ def test_talk_closed_safe_swallows_errors():
 
     W.amo_service.find_contacts_by_query = boom
     assert asyncio.run(W._talk_closed_safe(_st_waiting())) is False
+
+
+
+# ─────────────────── эскалация к руководству (Катя 28.08.2026) ───────────────────
+# Второй порог: менеджерам уже написали, клиенту так и не ответили. Такой алерт уходит в
+# отдельную группу «ОП срочные уведомления», и цена ошибки здесь выше, чем в чате ОП:
+# пара ложных сообщений — и руководство перестанет читать чат целиком.
+
+
+def _wait_state(minutes_ago: int, *, alerted=True, responsible=13929334):
+    """Ожидание, которое уже провисело столько-то минут и по которому менеджерам
+    (обычно) уже написали."""
+    W._pending.clear()
+    W.handle_webhook({"messages": [_msg(is_echo=False, text="когда привезёте?")]})
+    st = next(iter(W._pending.values()))
+    st["waiting_since"] -= minutes_ago * 60
+    st["alerted"] = alerted
+    st["responsible_id"] = responsible
+    st["lead_resolved"] = True
+    return st
+
+
+def _catch_sends():
+    sent = []
+
+    async def fake_send(text, **kw):
+        sent.append((text, kw.get("chat_id")))
+        return True
+
+    W.telegram_bot.send_alert = fake_send
+    W._in_window = lambda now=None: True
+    return sent
+
+
+def test_escalation_goes_to_leadership_chat_after_second_threshold():
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+    _wait_state(31)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    assert len(sent) == 1, "после второго порога руководству уходит ровно одно сообщение"
+    text, chat = sent[0]
+    assert chat == -5358037627, "эскалация обязана уйти в чат руководства, а не в чат ОП"
+    assert "не ответили" in text
+
+
+def test_escalation_names_the_manager_instead_of_tagging_him():
+    """В чате руководства менеджеров нет: @ник там мусор, нужно имя человека."""
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+    _wait_state(31)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    text = sent[0][0]
+    assert "Егор Константинов" in text
+    assert "@" not in text, "тегов в чате руководства быть не должно"
+    assert "·" not in text, "точка посередине запрещена (правило Кати 26.08.2026)"
+
+
+def test_escalation_is_sent_once():
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+    _wait_state(31)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    assert len(sent) == 1, "повторять эскалацию по тому же ожиданию нельзя"
+
+
+def test_no_escalation_before_second_threshold():
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+    _wait_state(20)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    assert sent == []
+
+
+def test_no_escalation_without_first_alert():
+    """Порядок контуров: сперва шанс менеджеру, и только потом руководство. Ожидание,
+    по которому первый алерт не уходил (например, оно родилось вне окна), эскалации не
+    получает - иначе руководитель узнаёт о проблеме раньше исполнителя."""
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+    _wait_state(31, alerted=False)
+    W._resolve_lead_safe = _resolve_nothing
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    assert len(sent) == 1, "это первый алерт менеджерам, а не эскалация"
+    assert sent[0][1] == W.NOTIFY_CHAT_ID
+
+
+def test_escalation_silent_when_chat_not_configured():
+    """Выключатель: пустой ROP_CHAT_ID означает «эскалации нет», а не «шлём куда-нибудь»."""
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = None
+    _wait_state(31)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    assert sent == []
+
+
+def test_closed_talk_cancels_escalation():
+    """«Ответ не требуется» снимает и эскалацию: менеджер закрыл беседу в amo, дёргать
+    руководство не за что."""
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+
+    async def closed(st):
+        return True
+
+    W._talk_closed_safe = closed
+    _wait_state(31)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    assert sent == []
+    assert W._pending == {}, "закрытая беседа снимается с ожидания"
+
+
+def test_unknown_manager_is_named_in_words_not_by_id():
+    sent = _catch_sends()
+    W.ROP_CHAT_ID = -5358037627
+    _wait_state(31, responsible=999999)
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    text = sent[0][0]
+    assert "менеджер не определён" in text
+    assert "999999" not in text
 
 
 if __name__ == "__main__":
