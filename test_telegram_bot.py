@@ -369,3 +369,44 @@ def test_udachnaya_otpravka_obnulyaet_seriyu_podavlennyh(monkeypatch):
 
     assert telegram_bot._state["suppressed_streak"] == 0
     assert telegram_bot._state["suppressed"] == 1, "накопительный счётчик не обнуляем"
+
+
+# --- Ревью 29.08: GET / открыт наружу, секретам и адресам чатов там не место ---
+
+def test_parol_shlyuza_ne_utekaet_v_sostoyanie_kontura():
+    """`GET /` интеграции отдаёт 200 кому угодно (team.sunscrypt.ru/amo/ проверено
+    живьём 29.08). Текст исключения пишем не мы: aiohttp и python_socks кладут в него
+    адрес прокси вместе с логином и паролем. 28.08 токен и пароль уже утекли в
+    systemd-журнал через argv - тем же путём второй раз не ходим."""
+    _reset(bot=None)
+    telegram_bot._state["last_error"] = (
+        "network: Cannot connect to proxy http://sunscrypt:SuperSecret123@82.97.249.88:18080"
+    )
+
+    health = telegram_bot.telegram_health()
+    assert "SuperSecret123" not in health["last_error"]
+    assert "sunscrypt:" not in health["last_error"]
+    assert "82.97.249.88" in health["last_error"], "адрес шлюза для диагностики нужен"
+
+
+def test_token_bota_ne_utekaet_v_sostoyanie_kontura():
+    _reset(bot=None)
+    telegram_bot._state["last_error"] = (
+        "getMe: ClientError: https://api.telegram.org/bot7123456789:AAF-realTokenLooksLikeThis/getMe"
+    )
+
+    health = telegram_bot.telegram_health()
+    assert "AAF-realTokenLooksLikeThis" not in health["last_error"]
+    assert "7123456789" not in health["last_error"]
+
+
+def test_adresa_chatov_naruzhu_ne_uhodyat():
+    """Переезд группы диагностировать надо, но chat_id наружу отдавать незачем -
+    хватает признака «переезд был», сами адреса лежат в логе уровнем ERROR."""
+    _reset(bot=None)
+    telegram_bot._state["chat_remap"] = {"-5358037627": -1005358037627}
+
+    health = telegram_bot.telegram_health()
+    assert health["chat_remapped"] == 1
+    assert "chat_remap" not in health
+    assert "5358037627" not in str(health)

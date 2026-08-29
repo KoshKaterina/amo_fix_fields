@@ -46,6 +46,7 @@ _bot: Bot | None = None
 _dp: Dispatcher | None = None
 _polling_task: asyncio.Task | None = None
 _reconnect_task: asyncio.Task | None = None
+_drop_task: asyncio.Task | None = None
 _print_lock = asyncio.Lock()
 _init_lock = asyncio.Lock()
 _last_lazy_attempt: float = 0.0
@@ -169,7 +170,7 @@ async def _start_bot_once(reason: str) -> bool:
     try:
         me = await bot.get_me()
     except Exception as exc:
-        _state["last_error"] = f"getMe: {type(exc).__name__}: {exc}"
+        _state["last_error"] = _redact(f"getMe: {type(exc).__name__}: {exc}")
         _state["last_fail_ts"] = time.time()
         try:
             await bot.session.close()
@@ -342,6 +343,22 @@ def _redact_proxy(url: str) -> str:
     return re.sub(r"://[^@]+@", "://***:***@", url)
 
 
+def _redact(text: str) -> str:
+    """Чистит текст от секретов перед тем, как он уйдёт в лог или в GET /.
+    Текст исключения - не наш: aiohttp и python_socks кладут в него адрес прокси
+    целиком, вместе с логином и паролем шлюза. GET / у интеграции открыт наружу
+    (team.sunscrypt.ru/amo/ отдаёт 200 кому угодно), поэтому сюда секрет попасть
+    не должен ни разу. 28.08.2026 токен и пароль шлюза уже утекли в systemd-журнал
+    через argv - второй раз тем же путём не ходим."""
+    if not text:
+        return text
+    out = _redact_proxy(str(text))
+    out = re.sub(r"(bot)\d+:[A-Za-z0-9_-]{20,}", r"\1***", out)
+    if TG_BOT_TOKEN:
+        out = out.replace(TG_BOT_TOKEN, "***")
+    return out
+
+
 async def _run_polling() -> None:
     assert _bot is not None and _dp is not None
     try:
@@ -350,11 +367,16 @@ async def _run_polling() -> None:
         _state["polling"] = False
         raise
     except Exception:
-        # Polling умер, а отправка ещё может работать: помечаем контур глухим на
-        # приём, чтобы это было видно в GET /, а не только в трейсбеке.
+        # Polling умер - контур глухой на приём. Отправка ещё может работать, но
+        # оставлять так нельзя: это ровно та одноразовость, из-за которой 28.08
+        # молчали сутки, только с другой стороны. Гасим бота и отдаём его фоновому
+        # переподъёму - он поднимет и polling.
         _state["polling"] = False
         _state["last_error"] = "polling crashed"
         logger.exception("Telegram polling crashed")
+        global _drop_task
+        # ссылку держим: задачу без ссылки сборщик мусора вправе убрать на полпути
+        _drop_task = asyncio.create_task(_drop_bot("polling упал"))
     else:
         _state["polling"] = False
 
@@ -478,7 +500,7 @@ async def _send_with_retry(
             await asyncio.sleep(wait)
             continue
         except TelegramNetworkError as exc:
-            _state["last_error"] = f"network: {exc}"
+            _state["last_error"] = _redact(f"network: {exc}")
             if attempt < attempts:
                 delay = TG_SEND_BACKOFF_S * attempt
                 logger.warning(
@@ -500,22 +522,22 @@ async def _send_with_retry(
                     redirects_left -= 1
                     attempt -= 1
                 continue
-            _state["last_error"] = f"bad request: {exc}"
+            _state["last_error"] = _redact(f"bad request: {exc}")
             logger.error("Telegram отклонил сообщение (chat=%s): %s | текст: %s", target, exc, text)
             break
         except TelegramUnauthorizedError as exc:
-            _state["last_error"] = f"unauthorized: {exc}"
+            _state["last_error"] = _redact(f"unauthorized: {exc}")
             await _drop_bot(f"токен не принят ({exc}) - ротировали ключ?")
             break
         except (TelegramForbiddenError, TelegramNotFound) as exc:
-            _state["last_error"] = f"{type(exc).__name__}: {exc}"
+            _state["last_error"] = _redact(f"{type(exc).__name__}: {exc}")
             logger.error(
                 "Telegram отказал по чату %s (бота выгнали или чат удалён): %s | текст: %s",
                 target, exc, text,
             )
             break
         except Exception as exc:
-            _state["last_error"] = f"{type(exc).__name__}: {exc}"
+            _state["last_error"] = _redact(f"{type(exc).__name__}: {exc}")
             logger.exception("send_alert failed (chat=%s): %s", target, text)
             break
 
@@ -539,8 +561,10 @@ def telegram_health() -> dict:
         "suppressed_streak": _state["suppressed_streak"],
         "init_attempts": _state["init_attempts"],
         "seconds_since_last_ok": round(time.time() - ok_ts, 1) if ok_ts else None,
-        "last_error": _state["last_error"],
-        "chat_remap": dict(_state["chat_remap"]),
+        "last_error": _redact(_state["last_error"]) if _state["last_error"] else None,
+        # Сами chat_id наружу не отдаём - GET / открыт без авторизации. Сторожу
+        # хватает признака «переезд был», адреса лежат в логе уровнем ERROR.
+        "chat_remapped": len(_state["chat_remap"]),
     }
 
 
