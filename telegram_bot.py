@@ -2,11 +2,23 @@
 
 import asyncio
 import logging
+import os
+import re
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramNetworkError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
@@ -15,10 +27,47 @@ from waybill_config import TG_ALLOWED_CHAT_ID, TG_BOT_TOKEN, TG_PROXY_URL
 
 logger = logging.getLogger("uvicorn")
 
+# --- Устойчивость контура уведомлений (инцидент 28-29.08.2026) ---------------
+# 28.08 в 21:51 МСК на старте контейнера getMe не прошёл через венский прокси
+# (ConnectionResetError). Бот выключился и БОЛЬШЕ НЕ ПЫТАЛСЯ подняться: все
+# событийные алерты подавлялись молча почти сутки, 44 штуки. Снаружи всё
+# выглядело здоровым - контейнер Up, прокси отвечает, ошибок отправки в логе
+# нет, потому что до sendMessage дело не доходило вовсе.
+# Ручки вынесены в окружение, но у всех есть рабочие значения по умолчанию:
+# .env править не обязательно.
+TG_INIT_RETRIES = int(os.getenv("TG_INIT_RETRIES", "5"))
+TG_INIT_BACKOFF_S = float(os.getenv("TG_INIT_BACKOFF_S", "3"))
+TG_RECONNECT_INTERVAL_S = float(os.getenv("TG_RECONNECT_INTERVAL_S", "60"))
+TG_LAZY_REINIT_MIN_GAP_S = float(os.getenv("TG_LAZY_REINIT_MIN_GAP_S", "30"))
+TG_SEND_ATTEMPTS = int(os.getenv("TG_SEND_ATTEMPTS", "3"))
+TG_SEND_BACKOFF_S = float(os.getenv("TG_SEND_BACKOFF_S", "2"))
+
 _bot: Bot | None = None
 _dp: Dispatcher | None = None
 _polling_task: asyncio.Task | None = None
+_reconnect_task: asyncio.Task | None = None
 _print_lock = asyncio.Lock()
+_init_lock = asyncio.Lock()
+_last_lazy_attempt: float = 0.0
+_reconnect_failures: int = 0
+
+# Состояние контура. Его отдаёт GET / - чтобы «бот молчит» было ВИДНО снаружи
+# одним запросом, а не лежало сорока строками WARNING в логе контейнера.
+_state: dict = {
+    "configured": False,      # токен и чат заданы
+    "enabled": False,         # бот поднят, getMe прошёл
+    "polling": False,         # long-poll жив
+    "sent": 0,
+    "failed": 0,
+    "suppressed": 0,          # алерты, которые некуда было отправить
+    "suppressed_streak": 0,   # подряд; обнуляется первой удачной отправкой
+    "init_attempts": 0,
+    "last_ok_ts": None,
+    "last_fail_ts": None,
+    "last_suppressed_ts": None,
+    "last_error": None,
+    "chat_remap": {},         # старый chat_id -> новый после переезда в супергруппу
+}
 
 
 def _ts() -> str:
@@ -111,45 +160,163 @@ def _build_dispatcher() -> Dispatcher:
     return dp
 
 
-async def init_telegram_bot() -> None:
+async def _start_bot_once(reason: str) -> bool:
+    """Одна попытка поднять бота: сессия -> getMe -> polling.
+    True - поднялся. Ошибка кладётся в состояние, наружу не бросается."""
     global _bot, _dp, _polling_task
-    if not TG_BOT_TOKEN:
-        logger.warning("⚠ TG_BOT_TOKEN not set in .env — Telegram bot DISABLED")
-        return
-    if TG_ALLOWED_CHAT_ID is None:
-        logger.warning("⚠ TG_ALLOWED_CHAT_ID not set in .env — Telegram bot DISABLED")
-        return
-
     session = _build_session()
-    _bot = Bot(token=TG_BOT_TOKEN, session=session) if session else Bot(token=TG_BOT_TOKEN)
-    _dp = _build_dispatcher()
-    waybill_service.set_alert_callback(send_alert)
-    # Сначала валидируем токен/сеть синхронно — если getMe упадёт, polling
-    # не стартуем и пишем понятную ошибку. Иначе фоновая задача упадёт молча.
+    bot = Bot(token=TG_BOT_TOKEN, session=session) if session else Bot(token=TG_BOT_TOKEN)
     try:
-        me = await _bot.get_me()
-    except Exception:
-        logger.exception(
-            "Telegram getMe FAILED — токен невалиден или сеть до api.telegram.org недоступна "
-            "(Telegram заблокирован в РФ — задай TG_PROXY_URL в .env). "
-            "Polling не стартую, бот выключен."
-        )
+        me = await bot.get_me()
+    except Exception as exc:
+        _state["last_error"] = f"getMe: {type(exc).__name__}: {exc}"
+        _state["last_fail_ts"] = time.time()
         try:
-            await _bot.session.close()
+            await bot.session.close()
         except Exception:
             pass
-        _bot = None
-        _dp = None
-        return
+        return False
 
+    _bot = bot
+    _dp = _build_dispatcher()
+    waybill_service.set_alert_callback(send_alert)
     _polling_task = asyncio.create_task(_run_polling())
+    _state["enabled"] = True
+    _state["polling"] = True
+    _state["last_error"] = None
     proxy_note = f" via proxy {_redact_proxy(TG_PROXY_URL)}" if TG_PROXY_URL else ""
     logger.info(
-        "Telegram bot started: @%s (id=%s) polling%s, allowed_chat_id=%s. "
-        "ВАЖНО: Privacy Mode должен быть ВЫКЛЮЧЕН в @BotFather (Bot Settings → "
-        "Group Privacy → Turn off).",
-        me.username, me.id, proxy_note, TG_ALLOWED_CHAT_ID,
+        "Telegram bot started (%s): @%s (id=%s) polling%s, allowed_chat_id=%s. "
+        "ВАЖНО: Privacy Mode должен быть ВЫКЛЮЧЕН в @BotFather (Bot Settings -> "
+        "Group Privacy -> Turn off).",
+        reason, me.username, me.id, proxy_note, TG_ALLOWED_CHAT_ID,
     )
+    return True
+
+
+def _log_alert_targets() -> None:
+    """Пустая переменная = контур молча выключен. Решение осознанное, но раз так -
+    пусть на старте будет ВИДНО, какие адресаты пусты: иначе выключенный контур
+    неотличим от сломанного."""
+    targets: list[tuple[str, object]] = [
+        ("технический чат (TG_ALLOWED_CHAT_ID)", TG_ALLOWED_CHAT_ID),
+        ("руководство (ROP_ALERT_CHAT_ID)", os.getenv("ROP_ALERT_CHAT_ID") or None),
+        ("отгрузки (SHIPMENT_ALERT_CHAT_ID)", os.getenv("SHIPMENT_ALERT_CHAT_ID") or None),
+    ]
+    try:
+        import tg_recipients
+        targets.append(("отдел продаж, топик УВЕДОМЛЕНИЯ", tg_recipients.NOTIFY_CHAT_ID))
+        targets.append(("отдел продаж, топик ШОУРУМ", tg_recipients.SHOWROOM_ALERT_THREAD_ID))
+    except Exception:
+        logger.warning("tg_recipients не прочитался - адресаты отдела продаж в сводке не показаны")
+    on = [name for name, val in targets if val]
+    off = [name for name, val in targets if not val]
+    logger.info("Адресаты уведомлений заданы: %s", ", ".join(on) or "НИ ОДНОГО")
+    if off:
+        logger.warning("Адресаты уведомлений ПУСТЫ (контур выключен): %s", ", ".join(off))
+
+
+async def init_telegram_bot() -> None:
+    global _reconnect_failures
+    if not TG_BOT_TOKEN:
+        logger.warning("TG_BOT_TOKEN not set in .env - Telegram bot DISABLED")
+        return
+    if TG_ALLOWED_CHAT_ID is None:
+        logger.warning("TG_ALLOWED_CHAT_ID not set in .env - Telegram bot DISABLED")
+        return
+    _state["configured"] = True
+    _log_alert_targets()
+
+    async with _init_lock:
+        for attempt in range(1, max(1, TG_INIT_RETRIES) + 1):
+            _state["init_attempts"] += 1
+            if await _start_bot_once(f"старт, попытка {attempt}"):
+                return
+            if attempt < TG_INIT_RETRIES:
+                delay = TG_INIT_BACKOFF_S * (2 ** (attempt - 1))
+                logger.warning(
+                    "Telegram getMe не прошёл (попытка %s из %s): %s. Повтор через %.0f с.",
+                    attempt, TG_INIT_RETRIES, _state["last_error"], delay,
+                )
+                await asyncio.sleep(delay)
+
+    _reconnect_failures = 0
+    logger.error(
+        "Telegram НЕ поднялся за %s попыток: %s. Уведомления пока подавляются, но "
+        "контур НЕ сдался: фоновый переподъём каждые %.0f с плюс попытка на каждой "
+        "отправке. Состояние - GET / поле telegram.enabled.",
+        TG_INIT_RETRIES, _state["last_error"], TG_RECONNECT_INTERVAL_S,
+    )
+    _start_reconnect_loop()
+
+
+def _start_reconnect_loop() -> None:
+    global _reconnect_task
+    if _bot is not None:
+        return
+    if _reconnect_task is not None and not _reconnect_task.done():
+        return
+    try:
+        _reconnect_task = asyncio.create_task(_reconnect_loop())
+    except RuntimeError:
+        # Нет running loop (например, в синхронном тесте) - переподъём останется
+        # на отправке, это допустимая деградация.
+        _reconnect_task = None
+
+
+async def _reconnect_loop() -> None:
+    """Фоновый переподъём. Главное отличие от прежнего поведения: секундный сбой
+    сети на старте больше НЕ выключает уведомления навсегда."""
+    global _reconnect_failures
+    try:
+        while _bot is None:
+            await asyncio.sleep(TG_RECONNECT_INTERVAL_S)
+            if _bot is not None:
+                return
+            async with _init_lock:
+                if _bot is not None:
+                    return
+                _state["init_attempts"] += 1
+                ok = await _start_bot_once("фоновый переподъём")
+            if ok:
+                logger.error(
+                    "Telegram ожил фоновым переподъёмом. За время молчания подавлено "
+                    "%s алертов - они НЕ восстановятся, нигде не буферизуются.",
+                    _state["suppressed_streak"],
+                )
+                _reconnect_failures = 0
+                return
+            _reconnect_failures += 1
+            # Не сорим в лог каждую минуту: раз в 10 неудач - громкая строка.
+            if _reconnect_failures % 10 == 0:
+                logger.error(
+                    "Telegram не поднимается %s попыток подряд: %s. Подавлено алертов: %s.",
+                    _reconnect_failures, _state["last_error"], _state["suppressed_streak"],
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Telegram reconnect loop crashed")
+
+
+async def _ensure_bot_lazy() -> None:
+    """Переподъём прямо на отправке - вторая линия после фонового цикла.
+    Троттлится, чтобы шквал алертов не устроил шквал getMe."""
+    global _last_lazy_attempt
+    if _bot is not None or not _state["configured"]:
+        return
+    now = time.monotonic()
+    if now - _last_lazy_attempt < TG_LAZY_REINIT_MIN_GAP_S:
+        return
+    _last_lazy_attempt = now
+    if _init_lock.locked():
+        return
+    async with _init_lock:
+        if _bot is not None:
+            return
+        _state["init_attempts"] += 1
+        await _start_bot_once("переподъём на отправке")
+    _start_reconnect_loop()
 
 
 def _build_session() -> AiohttpSession | None:
@@ -172,7 +339,6 @@ def _build_session() -> AiohttpSession | None:
 
 def _redact_proxy(url: str) -> str:
     """Скрывает user:pass в URL для логов."""
-    import re
     return re.sub(r"://[^@]+@", "://***:***@", url)
 
 
@@ -181,13 +347,29 @@ async def _run_polling() -> None:
     try:
         await _dp.start_polling(_bot, handle_signals=False)
     except asyncio.CancelledError:
+        _state["polling"] = False
         raise
     except Exception:
+        # Polling умер, а отправка ещё может работать: помечаем контур глухим на
+        # приём, чтобы это было видно в GET /, а не только в трейсбеке.
+        _state["polling"] = False
+        _state["last_error"] = "polling crashed"
         logger.exception("Telegram polling crashed")
+    else:
+        _state["polling"] = False
 
 
 async def shutdown_telegram_bot() -> None:
-    global _bot, _dp, _polling_task
+    global _bot, _dp, _polling_task, _reconnect_task
+    if _reconnect_task is not None:
+        _reconnect_task.cancel()
+        try:
+            await _reconnect_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("reconnect task shutdown failed")
+        _reconnect_task = None
     if _dp is not None:
         try:
             await _dp.stop_polling()
@@ -210,7 +392,156 @@ async def shutdown_telegram_bot() -> None:
             logger.exception("bot.session.close failed")
         _bot = None
     _dp = None
+    _state["enabled"] = False
+    _state["polling"] = False
     logger.info("Telegram bot stopped")
+
+
+def _suppress(text: str, why: str) -> bool:
+    _state["suppressed"] += 1
+    _state["suppressed_streak"] += 1
+    _state["last_suppressed_ts"] = time.time()
+    logger.warning("send_alert suppressed (%s; подряд %s): %s", why, _state["suppressed_streak"], text)
+    return False
+
+
+async def _drop_bot(why: str) -> None:
+    """Гасим заведомо нерабочего бота и просим фоновый цикл поднять нового."""
+    global _bot, _dp, _polling_task
+    logger.error("Гашу телеграм-бота: %s. Включаю фоновый переподъём.", why)
+    bot, _bot = _bot, None
+    _state["enabled"] = False
+    _state["polling"] = False
+    if _polling_task is not None:
+        _polling_task.cancel()
+        _polling_task = None
+    _dp = None
+    if bot is not None:
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+    _start_reconnect_loop()
+
+
+async def _send_with_retry(
+    target: int,
+    text: str,
+    parse_mode: str | None,
+    thread_id: int | None,
+) -> bool:
+    """Отправка с повторами. Разбирает ИМЕННО те отказы, на которых контур молчал:
+    переезд группы в супергруппу, пропавший топик, сеть, флуд-лимит, битый токен."""
+    attempts = max(1, TG_SEND_ATTEMPTS)
+    attempt = 0
+    # Переезд чата и пропавший топик попытку не тратят - но крутиться на них
+    # бесконечно нельзя: цепочка переездов замкнётся, и сервис повиснет на одном
+    # алерте. Три перенаправления - потолок.
+    redirects_left = 3
+    while attempt < attempts:
+        attempt += 1
+        bot = _bot
+        if bot is None:
+            return _suppress(text, "бот выключен на повторе")
+        try:
+            await bot.send_message(
+                chat_id=target,
+                text=text,
+                parse_mode=parse_mode,
+                message_thread_id=thread_id,
+            )
+            _state["sent"] += 1
+            _state["last_ok_ts"] = time.time()
+            _state["last_error"] = None
+            _state["suppressed_streak"] = 0
+            return True
+        except TelegramMigrateToChat as exc:
+            # Обычную группу конвертировали в супергруппу - старый chat_id умер.
+            # Молча терять алерты здесь нельзя: новый адрес приезжает в ошибке.
+            new_id = exc.migrate_to_chat_id
+            _state["chat_remap"][str(target)] = new_id
+            logger.error(
+                "Чат %s переехал в супергруппу %s. Шлю по новому адресу и запомнил его "
+                "до перезапуска. ВПИШИ новый chat_id в .env, иначе после рестарта "
+                "уведомления снова замолчат молча.",
+                target, new_id,
+            )
+            target = new_id
+            thread_id = None  # топиков старого чата в новом не существует
+            if redirects_left > 0:
+                redirects_left -= 1
+                attempt -= 1  # переезд не тратит попытку
+            continue
+        except TelegramRetryAfter as exc:
+            wait = min(float(getattr(exc, "retry_after", 5) or 5), 30.0)
+            logger.warning("Telegram просит подождать %.0f с (флуд-лимит), повторяю.", wait)
+            await asyncio.sleep(wait)
+            continue
+        except TelegramNetworkError as exc:
+            _state["last_error"] = f"network: {exc}"
+            if attempt < attempts:
+                delay = TG_SEND_BACKOFF_S * attempt
+                logger.warning(
+                    "Сеть до Telegram (попытка %s из %s): %s. Повтор через %.0f с.",
+                    attempt, attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+        except TelegramBadRequest as exc:
+            if thread_id is not None and "thread not found" in str(exc).lower():
+                logger.error(
+                    "Топик %s в чате %s не найден (удалён или переехал) - шлю в общую "
+                    "ленту чата, чтобы алерт не пропал.",
+                    thread_id, target,
+                )
+                thread_id = None
+                if redirects_left > 0:
+                    redirects_left -= 1
+                    attempt -= 1
+                continue
+            _state["last_error"] = f"bad request: {exc}"
+            logger.error("Telegram отклонил сообщение (chat=%s): %s | текст: %s", target, exc, text)
+            break
+        except TelegramUnauthorizedError as exc:
+            _state["last_error"] = f"unauthorized: {exc}"
+            await _drop_bot(f"токен не принят ({exc}) - ротировали ключ?")
+            break
+        except (TelegramForbiddenError, TelegramNotFound) as exc:
+            _state["last_error"] = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "Telegram отказал по чату %s (бота выгнали или чат удалён): %s | текст: %s",
+                target, exc, text,
+            )
+            break
+        except Exception as exc:
+            _state["last_error"] = f"{type(exc).__name__}: {exc}"
+            logger.exception("send_alert failed (chat=%s): %s", target, text)
+            break
+
+    _state["failed"] += 1
+    _state["last_fail_ts"] = time.time()
+    return False
+
+
+def telegram_health() -> dict:
+    """Срез контура уведомлений для GET /. Сторож должен смотреть СЮДА, а не в
+    логи: молчащий бот внутри живого контейнера иначе неотличим от тишины по
+    отсутствию событий."""
+    ok_ts = _state["last_ok_ts"]
+    return {
+        "configured": _state["configured"],
+        "enabled": _state["enabled"],
+        "polling": _state["polling"],
+        "sent": _state["sent"],
+        "failed": _state["failed"],
+        "suppressed": _state["suppressed"],
+        "suppressed_streak": _state["suppressed_streak"],
+        "init_attempts": _state["init_attempts"],
+        "seconds_since_last_ok": round(time.time() - ok_ts, 1) if ok_ts else None,
+        "last_error": _state["last_error"],
+        "chat_remap": dict(_state["chat_remap"]),
+    }
 
 
 async def send_alert(
@@ -224,17 +555,12 @@ async def send_alert(
     message_thread_id — топик супергруппы-форума (None → General).
     parse_mode="HTML" — для кликабельных ссылок (uis_missed_call)."""
     target = chat_id if chat_id is not None else TG_ALLOWED_CHAT_ID
-    if _bot is None or target is None:
-        logger.warning("send_alert suppressed (bot disabled): %s", text)
-        return False
-    try:
-        await _bot.send_message(
-            chat_id=target,
-            text=text,
-            parse_mode=parse_mode,
-            message_thread_id=message_thread_id,
-        )
-        return True
-    except Exception:
-        logger.exception("send_alert failed (chat=%s): %s", target, text)
-        return False
+    if target is None:
+        return _suppress(text, "адресат не задан")
+    if _bot is None:
+        # Раньше контур здесь сдавался навсегда. Теперь - пробуем поднять бота.
+        await _ensure_bot_lazy()
+    if _bot is None:
+        return _suppress(text, "бот выключен")
+    target = _state["chat_remap"].get(str(target), target)
+    return await _send_with_retry(target, text, parse_mode, message_thread_id)
