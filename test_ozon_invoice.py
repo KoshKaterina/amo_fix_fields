@@ -616,6 +616,49 @@ assert status == "" and "не найден" in err, (status, err)
 ozon_invoice._client = None
 print("✓ платёж не найден ни по одному id: ошибка, а не «не оплачен»")
 
+# ── 26б) отказ по СРЕДНЕМУ ключу не обрывает каскад (боевой случай 29.08.2026)
+class _RespDenied:
+    status_code = 403
+    text = '{"code":7, "message":"недостаточно прав"}'
+    def json(self):
+        return {}
+
+class _ClientDeniedMiddle:
+    """Как боевой Ozon 29.08: по paymentId пусто (карта), по extId платежа —
+    «нет прав», статус лежит только под extId ЗАКАЗА."""
+    def __init__(self):
+        self.asked = []
+    async def post(self, url, json=None):
+        value = json.get("id") or json.get("extId")
+        self.asked.append(value)
+        if value == "pay-403":
+            return _RespDetails({"items": []})
+        if value == "amo-36544371-1788004604":
+            return _RespDenied()
+        return _RespDetails({"items": [{"status": "PAYMENT_COMPLETED",
+                                        "amount": {"value": "1036300"}}]})
+
+_denied = _ClientDeniedMiddle()
+ozon_invoice._client = _denied
+status, kopecks, err = run(ozon_invoice.get_payment_status(
+    "pay-403", "amo-36544371-1788004604", "06930_amo-36544371-1788004604"))
+assert (status, kopecks, err) == ("PAYMENT_COMPLETED", 1036300, ""), (status, kopecks, err)
+assert _denied.asked == ["pay-403", "amo-36544371-1788004604",
+                         "06930_amo-36544371-1788004604"], _denied.asked
+ozon_invoice._client = None
+print("✓ отказ по одному ключу не мешает найти платёж по extId заказа")
+
+# ── 26в) отказ по ВСЕМ ключам → возвращаем отказ, а не «не найден» ──────────
+class _ClientAllDenied:
+    async def post(self, url, json=None):
+        return _RespDenied()
+
+ozon_invoice._client = _ClientAllDenied()
+status, _, err = run(ozon_invoice.get_payment_status("p", "e", "o"))
+assert status == "" and "403" in err, (status, err)
+ozon_invoice._client = None
+print("✓ отказ по всем ключам: в ошибке видно 403, а не «платёж не найден»")
+
 # ── 27) orderExtId живёт в примечании и читается сверкой ───────────────────
 assert ozon_invoice.build_order_ext_id("amo-9-1", "05748") == "05748_amo-9-1"
 assert ozon_invoice.build_order_ext_id("amo-9-1", "") == "ord-9-1"

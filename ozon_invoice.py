@@ -621,18 +621,30 @@ async def get_payment_status(
     наш остаётся пустышкой. Первый ответ со статусом побеждает; что именно
     сработало — видно в логе (это и есть разведка по order-флоу)."""
     tried: list[str] = []
+    last_err = ""
     for key, value in (("id", payment_id), ("extId", ext_id), ("extId", order_ext_id)):
         if not value or value in tried:
             continue
         tried.append(value)
         data, err = await _details_request(key, value)
         if err:
-            return "", None, err
+            # Отказ по ОДНОМУ ключу не повод бросать поиск. Боевой случай
+            # 29.08.2026: по paymentId Ozon отдал пустоту (карта, штатно), по
+            # extId платежа — «недостаточно прав», и каскад обрывался, не дойдя
+            # до extId ЗАКАЗА — единственного ключа, по которому карточный
+            # платёж вообще находится. Сделка висела на «Ссылка отправлена», а
+            # сверка каждые три минуты ломилась в ту же стену.
+            last_err = err
+            logger.info("ozon сверка: по %s=%s спросить не вышло (%s) — пробую следующий ключ",
+                        key, value, err)
+            continue
         status, kopecks = _extract_status(data or {})
         if status:
             logger.info("ozon сверка: статус %r по %s=%s", status, key, value)
             return status, kopecks, ""
         logger.info("ozon сверка: по %s=%s платёж не найден: %s", key, value, str(data)[:300])
+    if last_err:
+        return "", None, last_err
     return "", None, "платёж не найден ни по paymentId, ни по extId"
 
 
