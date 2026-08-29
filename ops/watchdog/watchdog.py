@@ -586,6 +586,14 @@ WATCH_TIMERS = [t.strip() for t in (ENV.get("WATCH_TIMERS") or
 UNIT_LOG_FILES = {"tg-analytics-daily.service": "/opt/tg-analytics/logs/daily.log"}
 CONTAINER_GRACE_SEC = 20  # даём подняться, если попали на пересборку при выкатке
 
+# Контур телеграм-уведомлений интеграции amo. Смотреть на него надо СНАРУЖИ:
+# сам бот пожаловаться на себя не может - жалоба ушла бы ровно тем каналом,
+# который и сломался. 28.08.2026 бот не поднялся при старте пересобранного
+# контейнера и сутки молча глушил алерты отдела продаж (53 штуки: невзятые
+# лиды, пропущенные звонки, неоплаченные счета) - узнали от продажников.
+# Контейнер при этом был жив и здоров, проверка контейнера ничего не заметила.
+AMO_HEALTH_URL = ENV.get("AMO_HEALTH_URL") or "http://127.0.0.1:8010/"
+
 
 def _sh(cmd, timeout=60):
     """Возвращает (код, stdout). Ошибку запуска приравниваем к пустому ответу."""
@@ -646,8 +654,40 @@ def _container_alive(name, second_try=False):
     return False, f"состояние: {out or 'непонятное'}"
 
 
+def telegram_contour_check():
+    """(имя, ок, почему) по контуру телеграм-уведомлений или None, если смотреть нечего.
+
+    Молчим (None), когда состояние взять неоткуда: контейнер лежит - об этом
+    скажет проверка контейнера, дублировать незачем; версия интеграции старая -
+    контур состояния не отдаёт; контур намеренно не настроен.
+    """
+    name = "Телеграм-бот · интеграция amo"
+    code, body = http(AMO_HEALTH_URL, timeout=15)
+    if code != 200:
+        return None
+    try:
+        tg = (json.loads(body) or {}).get("telegram") or {}
+    except json.JSONDecodeError:
+        return name, False, "состояние контура пришло не в JSON"
+    if not tg or not tg.get("configured"):
+        return None
+    if not tg.get("enabled"):
+        return name, False, ("бот ВЫКЛЮЧЕН - уведомления глушатся молча. "
+                             "Лечится рестартом контейнера amo-fix-fields")
+    if not tg.get("polling"):
+        return name, False, "бот включён, но опрос Telegram не идёт - команды и ответы не принимаются"
+    streak = int(tg.get("suppressed_streak") or 0)
+    if streak:
+        return name, False, f"подряд не отправлено сообщений: {streak}"
+    return name, True, "опрос идёт, подавленных нет"
+
+
 def services_checks():
     checks = []
+
+    tg_contour = telegram_contour_check()
+    if tg_contour:
+        checks.append(tg_contour)
 
     _, out = _sh(["systemctl", "list-units", "--state=failed", "--no-legend",
                   "--plain", "--no-pager"])
