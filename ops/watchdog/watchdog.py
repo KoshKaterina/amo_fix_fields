@@ -77,18 +77,37 @@ def save_state(state):
 
 
 # --------------------------------------------------------------------- telegram
+def curl_cfg(key, value):
+    """Строка конфига curl. Всё секретное отдаём curl через stdin, а не аргументами:
+    argv любого процесса читает `ps` от имени ЛЮБОГО пользователя машины, а stdin
+    виден только самому процессу. Значение берём в кавычки - внутри них curl понимает
+    escape-последовательности, поэтому обратный слэш, кавычку и перевод строки экранируем."""
+    v = (str(value).replace("\\", "\\\\").replace('"', '\\"')
+         .replace("\n", "\\n").replace("\r", "\\r"))
+    return f'{key} = "{v}"'
+
+
+def curl_run(config, args, timeout):
+    """curl с секретной частью запроса из stdin. `-K -` ставим ПОСЛЕДНИМ: так конфиг
+    читается после флагов, и --globoff успевает отключить глоббинг до разбора URL."""
+    return subprocess.run(["curl"] + args + ["-K", "-"],
+                          input="\n".join(config) + "\n",
+                          capture_output=True, text=True, timeout=timeout)
+
+
 def tg_send(text):
     token, chat = secret("TG_BOT_TOKEN"), secret("TG_ALLOWED_CHAT_ID")
     if not token or not chat:
         log("некуда слать: нет TG_BOT_TOKEN или TG_ALLOWED_CHAT_ID")
         return False
-    cmd = ["curl", "-s", "--max-time", "30", "-o", "/dev/null", "-w", "%{http_code}",
-           "-d", f"chat_id={chat}", "--data-urlencode", f"text={text}",
-           f"https://api.telegram.org/bot{token}/sendMessage"]
+    # токен бота сидит в самом URL, а пароль шлюза - в строке прокси: оба в stdin
+    cfg = [curl_cfg("url", f"https://api.telegram.org/bot{token}/sendMessage")]
     proxy = secret("TG_PROXY_URL")
     if proxy:  # Telegram из РФ - только через наш шлюз
-        cmd = cmd[:1] + ["--proxy", proxy] + cmd[1:]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        cfg.append(curl_cfg("proxy", proxy))
+    args = ["-s", "--max-time", "30", "-o", "/dev/null", "-w", "%{http_code}",
+            "-d", f"chat_id={chat}", "--data-urlencode", f"text={text}"]
+    p = curl_run(cfg, args, timeout=60)
     ok = (p.stdout or "").strip() == "200"
     if not ok:
         log(f"telegram не принял: {p.stdout!r}")
@@ -97,18 +116,20 @@ def tg_send(text):
 
 # ------------------------------------------------------------------------- http
 def http(url, headers=None, method="GET", data=None, timeout=30):
-    """Возвращает (код, тело). Секреты идут в заголовках, в лог не попадают."""
-    # --location нужен RDAP: rdap.org отвечает редиректом на сервер нужной зоны
-    cmd = ["curl", "-s", "--globoff", "--compressed", "--location", "--max-time", str(timeout),
-           "-w", "\n%{http_code}"]
-    if method != "GET":
-        cmd += ["-X", method]
+    """Возвращает (код, тело). URL, заголовки и тело уходят в curl через stdin: токены
+    живут во всех трёх (Bearer в заголовке, ключи Woo прямо в URL, секрет СДЭК в теле),
+    а аргументы командной строки видны в `ps` всем. В лог они тоже не попадают."""
+    cfg = [curl_cfg("url", url)]
     for h in headers or []:
-        cmd += ["-H", h]
+        cfg.append(curl_cfg("header", h))
     if data:
-        cmd += ["-d", data]
-    cmd.append(url)
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 30)
+        cfg.append(curl_cfg("data", data))
+    # --location нужен RDAP: rdap.org отвечает редиректом на сервер нужной зоны
+    args = ["-s", "--globoff", "--compressed", "--location", "--max-time", str(timeout),
+            "-w", "\n%{http_code}"]
+    if method != "GET":
+        args += ["-X", method]
+    p = curl_run(cfg, args, timeout=timeout + 30)
     out = p.stdout or ""
     nl = out.rfind("\n")
     body, code = (out[:nl], out[nl + 1:].strip()) if nl >= 0 else ("", out.strip())
