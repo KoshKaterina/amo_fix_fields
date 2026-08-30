@@ -488,7 +488,7 @@ def _next_work_moment(profile: Profile, now: datetime.datetime) -> datetime.date
     return datetime.datetime.combine(tomorrow, datetime.time(start_h, start_m), tzinfo=_MSK)
 
 
-async def _upcoming_pool(profile: Profile) -> list[int]:
+async def _upcoming_pool(profile: Profile, *, meta: dict | None = None) -> list[int]:
     """Участники профиля, которые будут на месте в БЛИЖАЙШИЙ будущий момент
     начала интервала work_hours (_next_work_moment) - используется вместо
     eligible_pool, когда прямо сейчас пул пуст или рабочий день на сегодня уже
@@ -497,6 +497,10 @@ async def _upcoming_pool(profile: Profile) -> list[int]:
     началом смены внутри того же интервала теоретически может быть пропущен -
     известное ограничение, не критично для типичного графика."""
     at = _next_work_moment(profile, datetime.datetime.now(_MSK))
+    if meta is not None:
+        # Для журнала распределений: "смотрим ближайшую смену - завтра в 10:00".
+        # Момент считается здесь и только здесь, второй раз его не пересчитываем.
+        meta["pool_at"] = at.isoformat()
     statuses = await team_panel_client.fetch_for_datetime(set(profile.participant_ids), at)
     return [uid for uid in profile.participant_ids if statuses.get(uid)]
 
@@ -541,7 +545,7 @@ def _weight(profile: Profile, uid: int) -> int:
 def _decide_load_balanced(
     state: dict, profile: Profile, pool: list[int],
     repeat_responsible: int | None, source_id: int | None,
-    is_available=None,
+    is_available=None, trace: dict | None = None,
 ) -> int | None:
     """Сравнения ведутся не по сырым счётчикам, а по отношению count/вес
     (Fraction, для точных сравнений без ошибок округления) — при весе 1 у всех
@@ -557,10 +561,24 @@ def _decide_load_balanced(
     свою, когда пул построен не на "сейчас", а на ближайшую будущую смену:
     _is_on_shift за пределами рабочих часов всегда False, и приоритет
     повторного клиента молча пропадал (18.08.2026 — тот же баг, что уже чинили
-    для режима always через _repeat_on_shift, ветку load тогда пропустили)."""
+    для режима always через _repeat_on_shift, ветку load тогда пропустили).
+
+    `trace` — опциональный out-параметр (30.08.2026, журнал распределений):
+    какая именно ветка дала ответ. Ветка — единственное, что нельзя достоверно
+    восстановить постфактум по счётчикам (по одним и тем же числам сходятся
+    разные пути), поэтому пишем её здесь, у места решения, а не угадываем
+    потом на фронте: trace["reason"] ∈ repeat_priority | min_source |
+    min_source_within_gap | min_total | duty | no_source, плюс trace["tied"] —
+    среди кого бросался жребий (_tie_break)."""
     gap = LEAD_DISTRIBUTION_FAIRNESS_GAP
     if is_available is None:
         is_available = _is_on_shift
+
+    def _mark(reason: str, tied: list[int] | None = None) -> None:
+        if trace is not None:
+            trace["reason"] = reason
+            if tied is not None and len(tied) > 1:
+                trace["tied"] = list(tied)
 
     def source_ratio(uid: int) -> Fraction:
         return Fraction(_source_count(state, uid, source_id), _weight(profile, uid))
@@ -572,15 +590,18 @@ def _decide_load_balanced(
         r_ratio = source_ratio(repeat_responsible)
         others = [uid for uid in pool if uid != repeat_responsible]
         if not others or all(abs(r_ratio - source_ratio(uid)) <= gap for uid in others):
+            _mark("repeat_priority")
             return repeat_responsible
         # иначе R остаётся рядовым кандидатом пула — просто без приоритета,
         # продолжаем обычный подбор ниже.
 
     if not pool:
+        _mark("duty")
         return profile.duty_user_id
     if source_id is None:
         # На сделке не определился источник (нетипичный случай) — алгоритм
         # «по нагрузке» неприменим без source_id, решает вызывающий (round-robin).
+        _mark("no_source")
         return None
 
     min_source = min(source_ratio(uid) for uid in pool)
@@ -590,13 +611,16 @@ def _decide_load_balanced(
     min_total = min(totals.values())
     x_at_min_total = [uid for uid in candidates_x if totals[uid] == min_total]
     if x_at_min_total:
+        _mark("min_source", x_at_min_total)
         return _tie_break(x_at_min_total)
 
     best_x_total = min(totals[uid] for uid in candidates_x)
     if best_x_total - min_total <= gap:
         tied = [uid for uid in candidates_x if totals[uid] == best_x_total]
+        _mark("min_source_within_gap", tied)
         return _tie_break(tied)
     tied = [uid for uid in pool if totals[uid] == min_total]
+    _mark("min_total", tied)
     return _tie_break(tied)
 
 
@@ -613,6 +637,19 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     ДРУГИМ сделкам контакта, см. _find_repeat_responsible) и
     meta["contact_name"]/meta["contact_phone"] - для лога распределений.
 
+    30.08.2026 туда же кладётся полный СНИМОК РЕШЕНИЯ для человекочитаемого
+    разбора в журнале team-panel (/journal → разворот строки): mode,
+    participants, pool, pool_is_future, pool_at, work_hours, duty_user_id,
+    weights, counters + counter_kind + fairness_gap, reason/tied,
+    repeat_in_profile/repeat_available. Смысл - строка журнала должна
+    объясняться сама, без похода в amoCRM и без чтения кода: восстановить
+    решение постфактум нельзя (счётчики сбрасываются каждую полночь МСК, а при
+    use_open_deals_counter их вообще нет на диске - живой запрос к amoCRM;
+    график смен и состав профиля с тех пор тоже могли поменяться). Снимок
+    пишется В МОМЕНТ решения и дальше неизменен. Текст из него собирает фронт
+    (frontend/src/journal/explain.ts) - не бэкенд: имена сотрудников/источников
+    живут в team-panel, а формулировки так правятся без бэкфилла старых строк.
+
     Пул на "сейчас" (eligible_pool) используется, только если он НЕ пуст И
     рабочий день профиля ещё не закончился формально (_work_day_ended) - иначе
     (пул пуст ПРЯМО СЕЙЧАС - до первого интервала, в перерыве, или день уже
@@ -620,16 +657,31 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     сегодня или завтра. До 17.08.2026 форвардинг срабатывал только по второму
     условию - пустой пул до начала первого интервала/в перерыве молча ждал
     наступления часов, вместо того чтобы сразу посмотреть на ближайшую смену."""
+    if meta is not None:
+        # Снимок настроек профиля на момент решения - профиль потом могут
+        # переименовать/перенастроить/удалить, а строка журнала должна остаться
+        # самообъяснимой (тот же принцип, что денормализованный profile_name).
+        meta["mode"] = profile.repeat_contact_mode
+        meta["participants"] = list(profile.participant_ids)
+        meta["duty_user_id"] = profile.duty_user_id
+        meta["work_hours"] = profile.work_hours
+        weights = {str(uid): _weight(profile, uid) for uid in profile.participant_ids}
+        if any(w != 1 for w in weights.values()):
+            meta["weights"] = weights  # веса по умолчанию (все 1) не пишем - шум
+
     if profile.work_hours:
         today_pool = eligible_pool(profile)
         if today_pool and not _work_day_ended(profile):
             pool, pool_is_future = today_pool, False
         else:
-            pool = await _upcoming_pool(profile)
+            pool = await _upcoming_pool(profile, meta=meta)
             pool_is_future = True
     else:
         pool = eligible_pool(profile)
         pool_is_future = False
+    if meta is not None:
+        meta["pool"] = list(pool)
+        meta["pool_is_future"] = pool_is_future
     repeat_responsible = await _find_repeat_responsible(lead, meta=meta)
     source_id = _lead_source_id(lead)
 
@@ -681,9 +733,15 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
                 target = profile.duty_user_id
                 rule = "duty_fallback"
         else:  # "load"
+            load_trace: dict = {}
             target = _decide_load_balanced(
-                state, profile, pool, repeat_priority_candidate, source_id, is_available=_repeat_on_shift,
+                state, profile, pool, repeat_priority_candidate, source_id,
+                is_available=_repeat_on_shift, trace=load_trace,
             )
+            if meta is not None and load_trace:
+                meta["reason"] = load_trace.get("reason")
+                if load_trace.get("tied"):
+                    meta["tied"] = load_trace["tied"]
             # _decide_load_balanced сам возвращает profile.duty_user_id, когда pool
             # пуст (единственный путь, где это отличимо от «настоящего» load-подбора).
             rule = "duty_fallback" if (not pool and target == profile.duty_user_id) else "load"
@@ -698,6 +756,23 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         if pool_is_future and target is not None and rule != "duty_fallback":
             rule = "tomorrow_shift_fallback"
 
+        if meta is not None and profile.repeat_contact_mode == "load":
+            # Снимок счётчиков ДО _apply_assignment ниже - в журнале нужны числа,
+            # на которые смотрел алгоритм, а не уже увеличенные этим же решением.
+            # Только для "load": в always/random счётчики решение не определяют.
+            meta["counter_kind"] = "open_deals" if open_deals_state is not None else "daily"
+            meta["fairness_gap"] = LEAD_DISTRIBUTION_FAIRNESS_GAP
+            counter_uids = list(dict.fromkeys(
+                [*pool, *([repeat_priority_candidate] if repeat_priority_candidate is not None else [])]
+            ))
+            meta["counters"] = {
+                str(uid): {
+                    "source": _source_count(state, uid, source_id) if source_id is not None else None,
+                    "total": _total_count(state, uid),
+                }
+                for uid in counter_uids
+            }
+
         if target is not None and source_id is not None and open_deals_state is None:
             # open_deals_state: писать некуда и незачем - источник правды amoCRM,
             # следующее решение просто перезапросит его живьём (уже с учётом
@@ -707,7 +782,142 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         if meta is not None:
             meta["rule"] = rule
             meta["repeat_responsible_user_id"] = repeat_responsible
+            # Прежний ответственный НАЙДЕН, но приоритет повторного клиента ему
+            # не достался - две разные причины, и в журнале их надо различать:
+            # его нет среди участников профиля (repeat_priority_candidate is None,
+            # см. комментарий выше) либо он не на смене. Флаг снимает у читателя
+            # журнала вопрос "почему повторный клиент ушёл не к своему".
+            if repeat_responsible is not None:
+                meta["repeat_in_profile"] = repeat_priority_candidate is not None
+                meta["repeat_available"] = (
+                    repeat_priority_candidate is not None and _repeat_on_shift(repeat_priority_candidate)
+                )
         return target
+
+
+# ════════════════ журнал распределений (team-panel) ════════════════
+#
+# Какие ИСХОДЫ попадают в журнал. "routed" - состоявшееся назначение (так было
+# с 11.08.2026), остальные - причины, по которым сделка ответственного НЕ
+# получила (30.08.2026, задание Тианы): «почему сделка не распределилась» -
+# такой же законный вопрос к журналу, как «почему ушла этому человеку».
+#
+# Намеренно НЕ логируются - это шум, а не причины:
+#   no-profile ........ лид в воронке/этапе, где профиля нет вообще. Это не
+#                       «не распределилась», а «не наша сделка»: под условие
+#                       попадает весь поток amoCRM, журнал утонул бы.
+#   already-routed .... эхо нашего же PATCH и повторные вебхуки одного шквала;
+#                       решение по этой сделке уже записано отдельной строкой.
+#   in-flight ......... пересекающийся по времени заход по тому же лиду.
+#   waiting-for-contact переходное состояние на секунды, строка устарела бы
+#                       раньше, чем её кто-то прочитает. Плохой исход ожидания
+#                       логируется отдельно, как contact_missing.
+#   failed-lead-read .. сделка не прочиталась: неизвестно даже, наша ли она
+#                       (профиль подбирается по её же полям).
+OUTCOME_ROUTED = "routed"
+OUTCOME_NO_CANDIDATE = "no_candidate"
+OUTCOME_OFFICE_DELIVERY = "office_delivery"
+OUTCOME_PATCH_FAILED = "patch_failed"
+OUTCOME_CONTACT_MISSING = "contact_missing"
+
+
+async def _outcome_already_logged(lead_id: int, outcome: str) -> bool:
+    """Дедуп строк журнала по паре (сделка, исход) в пределах суток.
+
+    Без него reconciliation (раз в LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S)
+    писала бы «никого нет на месте» по одному и тому же лиду до конца дня, а
+    вебхучный шквал amgroup - по строке «самовывоз» на каждый свой вебхук.
+    Едет тем же рейсом, что routed_ids: lead_distribution_counters.json,
+    тот же _counters_lock, сброс каждую полночь МСК (_load_counters_state).
+    Суток достаточно: журнал отвечает на вопрос «что было с этой сделкой
+    сегодня», а назавтра ситуация уже другая и новая строка уместна.
+
+    Состоявшееся назначение через дедуп не проводим - оно и так происходит
+    ровно один раз, дальше срабатывает _routed_ids."""
+    key = f"{lead_id}:{outcome}"
+    async with _counters_lock:
+        state = _load_counters_state()
+        logged = state.setdefault("outcomes_logged", [])
+        if key in logged:
+            return True
+        logged.append(key)
+        _save_counters_state(state)
+        return False
+
+
+async def _contact_brief(lead: dict, meta: dict | None) -> tuple[int | None, str | None, str | None]:
+    """id/имя/телефон первого контакта сделки для строки журнала.
+
+    На пути routed это уже прочитано - _find_repeat_responsible кладёт имя и
+    телефон в meta по дороге, второй раз в сеть не идём. На путях-пропусках
+    (самовывоз) до него не доходит, и без одного GET в журнале была бы строка
+    с прочерком вместо клиента - её нельзя было бы найти поиском по
+    имени/телефону наравне с остальными."""
+    contacts = (lead.get("_embedded") or {}).get("contacts") or []
+    cid = contacts[0].get("id") if contacts else None
+    if meta is not None and "contact_name" in meta:
+        return cid, meta.get("contact_name"), meta.get("contact_phone")
+    if cid is None:
+        return None, None, None
+    full = await amo_service.get_contact_by_id(cid)
+    if not full:
+        return cid, None, None
+    return cid, (full.get("name") or "").strip() or None, amo_service.get_custom_field_value(full, FIELD_PHONE)
+
+
+async def _log_decision(
+    lead: dict, profile: Profile, *, outcome: str,
+    assigned_user_id: int | None = None,
+    rule: str = "",
+    meta: dict | None = None,
+    prev_responsible_user_id: int | None = None,
+    extra_detail: dict | None = None,
+) -> None:
+    """Одна строка журнала распределений. Best-effort, как и раньше: сама
+    сделка уже обработана корректно независимо от того, доехала ли строка."""
+    if outcome != OUTCOME_ROUTED and await _outcome_already_logged(int(lead["id"]), outcome):
+        return
+    meta = meta or {}
+    contact_id, contact_name, contact_phone = await _contact_brief(lead, meta)
+    # v=2 (30.08.2026): к двум прежним полям добавлен снимок решения (см.
+    # decide_and_record). Версия нужна фронту, чтобы отличить старую строку
+    # (объяснения нет и взяться ему неоткуда) от новой с пустым полем - и не
+    # врать про "никого не было в пуле" там, где пул просто не записывался.
+    detail_blob = {"v": 2, **{k: v for k, v in {
+        "repeat_responsible_user_id": meta.get("repeat_responsible_user_id"),
+        "prev_responsible_user_id": prev_responsible_user_id,
+        "mode": meta.get("mode"),
+        "participants": meta.get("participants"),
+        "pool": meta.get("pool"),
+        "pool_is_future": meta.get("pool_is_future"),
+        "pool_at": meta.get("pool_at"),
+        "work_hours": meta.get("work_hours"),
+        "duty_user_id": meta.get("duty_user_id"),
+        "weights": meta.get("weights"),
+        "counters": meta.get("counters"),
+        "counter_kind": meta.get("counter_kind"),
+        "fairness_gap": meta.get("fairness_gap"),
+        "reason": meta.get("reason"),
+        "tied": meta.get("tied"),
+        "repeat_in_profile": meta.get("repeat_in_profile"),
+        "repeat_available": meta.get("repeat_available"),
+        **(extra_detail or {}),
+    }.items() if v is not None}}
+    await lead_distribution_log_client.send({
+        "lead_id": int(lead["id"]),
+        "contact_id": contact_id,
+        "assigned_user_id": assigned_user_id,
+        "outcome": outcome,
+        "profile_id": profile.id,
+        "profile_name": profile.name,
+        "source_id": _lead_source_id(lead),
+        "rule": rule,
+        "pipeline_id": int(lead.get("pipeline_id") or 0) or None,
+        "status_id": int(lead.get("status_id") or 0) or None,
+        "contact_name": contact_name,
+        "contact_phone": contact_phone,
+        "detail": detail_blob,
+    })
 
 
 # ════════════════ диспетчер ════════════════
@@ -838,8 +1048,11 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
 
     if _is_office_delivery(lead):
         # Самовывоз из офиса — ведёт офис-менеджер напрямую, не пул профиля
-        # (решение Тианы 19.08.2026). Без тега и без записи в лог распределений:
-        # сделка вообще не считается вошедшей в диспетчер.
+        # (решение Тианы 19.08.2026). Тег по-прежнему не ставим, но строку в
+        # журнал с 30.08.2026 пишем: раньше такая сделка просто исчезала из
+        # виду, и на вопрос «почему её никому не раздали» ответить было нечем.
+        _spawn(_log_decision(lead, profile, outcome=OUTCOME_OFFICE_DELIVERY,
+                             prev_responsible_user_id=prev_responsible_user_id))
         return "skipped-office-delivery"
 
     if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
@@ -867,7 +1080,11 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         meta: dict = {}
         target = await decide_and_record(lead, profile, meta=meta)
         if target is None:
-            # Пул пуст, дежурного нет — ждём reconciliation (не ошибка).
+            # Пул пуст, дежурного нет — ждём reconciliation (не ошибка, но
+            # сделка висит без ответственного, и это должно быть видно).
+            _spawn(_log_decision(lead, profile, outcome=OUTCOME_NO_CANDIDATE,
+                                 rule=meta.get("rule", ""), meta=meta,
+                                 prev_responsible_user_id=prev_responsible_user_id))
             return "no-candidate-waiting"
 
         # PATCH остаётся ПОД _in_flight (найдено вживую 20.08.2026, сделка
@@ -884,6 +1101,14 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         result = await amo_service.patch_lead(lid, responsible_user_id=target)
         if not result.get("ok"):
             await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
+            # Ответственный ВЫБРАН, но amoCRM его не принял - в журнале это
+            # отдельный исход, а не «никого не нашли»: intended_user_id
+            # показывает, кому сделка должна была уйти.
+            _spawn(_log_decision(lead, profile, outcome=OUTCOME_PATCH_FAILED,
+                                 rule=meta.get("rule", ""), meta=meta,
+                                 prev_responsible_user_id=prev_responsible_user_id,
+                                 extra_detail={"intended_user_id": target,
+                                               "patch_status_code": result.get("status_code")}))
             return "failed-patch"
 
         await _mark_locally_routed(lid)
@@ -895,25 +1120,9 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
         "lead_distribution %s: профиль=%s → пользователь=%s (source=%s, правило=%s)",
         lead_id, profile.id, target, source, meta.get("rule"),
     )
-    contact_id = contacts[0].get("id") if contacts else None
-    detail_blob = {k: v for k, v in {
-        "repeat_responsible_user_id": meta.get("repeat_responsible_user_id"),
-        "prev_responsible_user_id": prev_responsible_user_id,
-    }.items() if v is not None}
-    _spawn(lead_distribution_log_client.send({
-        "lead_id": lead_id,
-        "contact_id": contact_id,
-        "assigned_user_id": target,
-        "profile_id": profile.id,
-        "profile_name": profile.name,
-        "source_id": source_id,
-        "rule": meta.get("rule", ""),
-        "pipeline_id": pipeline_id,
-        "status_id": status_id,
-        "contact_name": meta.get("contact_name"),
-        "contact_phone": meta.get("contact_phone"),
-        "detail": detail_blob or None,
-    }))
+    _spawn(_log_decision(lead, profile, outcome=OUTCOME_ROUTED, assigned_user_id=target,
+                         rule=meta.get("rule", ""), meta=meta,
+                         prev_responsible_user_id=prev_responsible_user_id))
     return "routed"
 
 
@@ -947,6 +1156,15 @@ async def _contact_wait_loop(lead_id: int, source: str) -> None:
                 lead,
                 f"контакт не привязан за {LEAD_DISTRIBUTION_CONTACT_WAIT_S}с ожидания (гонка amgroup?)",
             )
+            # Профиль пересобираем локально (match_profile - чистая функция над
+            # уже прочитанной сделкой, без сети): сюда мы попали из
+            # process_lead_distribution, но она свой profile наружу не отдаёт.
+            profile = match_profile(
+                int(lead.get("pipeline_id") or 0), int(lead.get("status_id") or 0), _lead_source_id(lead),
+            )
+            if profile is not None:
+                _spawn(_log_decision(lead, profile, outcome=OUTCOME_CONTACT_MISSING,
+                                     extra_detail={"contact_wait_s": LEAD_DISTRIBUTION_CONTACT_WAIT_S}))
         else:
             logger.warning(
                 "lead_distribution %s: контакт не появился, и сделка не прочиталась на таймауте", lead_id,
