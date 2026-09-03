@@ -56,6 +56,10 @@ def _clean(monkeypatch, tmp_path):
     # модуль или сухой режим - переопределяет флаг в своём тесте явно.
     monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True, raising=False)
     monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_DRY_RUN", False, raising=False)
+    # Пауза перед отгрузкой (фора живому amgroup) в тестах - ноль, иначе каждый
+    # вызов handle_lead_status_change ждёт настоящие 5 минут. Тест самой паузы
+    # ставит своё значение явно.
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_GRACE_SEC", 0, raising=False)
     amgroup_shipment._created.clear()
     amgroup_shipment._lead_locks.clear()
     amgroup_shipment._bg_tasks.clear()
@@ -523,3 +527,53 @@ def test_bg_task_lovit_isklyuchenie(monkeypatch):
     asyncio.run(_run())
 
     assert amgroup_shipment._bg_tasks == set()
+
+
+# ── пауза перед отгрузкой: даём живому amgroup сделать её самому ──
+
+def test_pauza_idyot_do_chteniya_sdelki_i_gate_vidit_otgruzku_amgroup(monkeypatch):
+    """Вебхук смены этапа: сперва пауза AMGROUP_SHIPMENT_GRACE_SEC, ПОТОМ чтение
+    сделки. За паузу живой amgroup успел записать «ID Отгрузки» - гейт 1 видит
+    поле заполненным, отгрузку не создаём. Снимок сделки до паузы был бы
+    пустым и обманул бы гейт."""
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_GRACE_SEC", 7, raising=False)
+    calls = _wire(monkeypatch, template=_DEMAND_TEMPLATE, created_demand=_CREATED_DEMAND)
+    order = []
+
+    async def fake_sleep(seconds):
+        order.append(("sleep", seconds))
+
+    async def fake_get_lead_full(lead_id, with_=("contacts", "companies")):
+        order.append(("read", lead_id))
+        return _lead(PIPELINE_OFFICE, STATUS_WAYBILL_READY, shipment_id="demand-by-amgroup", lead_id=lead_id)
+
+    monkeypatch.setattr(amgroup_shipment.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(amgroup_shipment.amo_service, "get_lead_full", fake_get_lead_full)
+
+    result = asyncio.run(amgroup_shipment.handle_lead_status_change(2002, STATUS_WAYBILL_READY, PIPELINE_OFFICE))
+
+    assert result is None
+    assert order == [("sleep", 7), ("read", 2002)]
+    assert calls["post"] == []
+
+
+def test_chuzhoy_etap_bez_pauzy_i_bez_chteniya(monkeypatch):
+    """Не целевой этап - выходим до паузы и до сети: вебхук приходит на каждое
+    изменение любой сделки."""
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_GRACE_SEC", 7, raising=False)
+    touched = []
+
+    async def fake_sleep(seconds):
+        touched.append("sleep")
+
+    async def fake_get_lead_full(lead_id, with_=("contacts", "companies")):
+        touched.append("read")
+        return None
+
+    monkeypatch.setattr(amgroup_shipment.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(amgroup_shipment.amo_service, "get_lead_full", fake_get_lead_full)
+
+    asyncio.run(amgroup_shipment.handle_lead_status_change(2003, 83537714, PIPELINE_OFFICE))
+
+    assert touched == []
+

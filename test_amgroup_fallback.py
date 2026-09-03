@@ -99,7 +99,7 @@ def test_sklad_ne_otvetil_nichego_ne_delaem(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="uvicorn"):
         result = asyncio.run(amgroup_fallback.check_once())
 
-    assert result == {"ms_answered": False, "amo_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
+    assert result == {"ms_answered": False, "amo_answered": True, "total": 0, "excluded": 0, "too_young": 0, "with_deal": 0, "missing": 0}
     assert any("не ответил" in rec.message for rec in caplog.records)
 
 
@@ -108,7 +108,7 @@ def test_zakaz_ozona_po_kanalu_otseivaetsya(monkeypatch):
     order = _ms_order("uuid-1", "07200", channel="Маркетплейс")
     result = _run(monkeypatch, [[order]])
 
-    assert result == {"ms_answered": True, "amo_answered": True, "total": 1, "excluded": 1, "with_deal": 0, "missing": 0}
+    assert result == {"ms_answered": True, "amo_answered": True, "total": 1, "excluded": 1, "too_young": 0, "with_deal": 0, "missing": 0}
 
 
 def test_zakaz_ozona_po_kontragentu_otseivaetsya(monkeypatch):
@@ -141,7 +141,7 @@ def test_zakaz_so_sdelkoy_v_missing_ne_popadaet(monkeypatch):
 
     result = _run(monkeypatch, [[order]], amo_leads_by_query=amo_leads)
 
-    assert result == {"ms_answered": True, "amo_answered": True, "total": 1, "excluded": 0, "with_deal": 1, "missing": 0}
+    assert result == {"ms_answered": True, "amo_answered": True, "total": 1, "excluded": 0, "too_young": 0, "with_deal": 1, "missing": 0}
 
 
 def test_polnotekstovyy_poisk_ne_obmanyvaet(monkeypatch):
@@ -334,4 +334,55 @@ def test_pustoy_sklad_eto_chestnyy_nol(monkeypatch):
     """Склад ответил и правда вернул пустой список - это НЕ ошибка, а
     легитимный «заказов за окно нет»."""
     result = _run(monkeypatch, [[]])
-    assert result == {"ms_answered": True, "amo_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
+    assert result == {"ms_answered": True, "amo_answered": True, "total": 0, "excluded": 0, "too_young": 0, "with_deal": 0, "missing": 0}
+
+
+# ── порог возраста: живой amgroup успевает за секунды, дублёр не лезет вперёд ──
+
+def _created_min_ago(minutes):
+    msk = datetime.timezone(datetime.timedelta(hours=3))
+    t = datetime.datetime.now(msk) - datetime.timedelta(minutes=minutes)
+    return t.strftime("%Y-%m-%d %H:%M:%S.000")
+
+
+def test_zakaz_molozhe_poroga_ne_schitaetsya_bez_sdelki(monkeypatch):
+    """Заказ создан 2 минуты назад, сделки нет - это ещё не «без сделки», amgroup
+    просто не успел (у живого 4-6 секунд). В amo за ним не ходим, в missing
+    не кладём, посмотрим на следующем проходе."""
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_MIN_AGE_MIN", 10, raising=False)
+    asked = []
+
+    def by_query(query):
+        asked.append(query)
+        return []
+
+    order = _ms_order("uuid-y1", "07301", channel="Магазин")
+    order["created"] = _created_min_ago(2)
+    result = _run(monkeypatch, [[order]], amo_leads_by_query=by_query)
+
+    assert result["missing"] == 0
+    assert result["too_young"] == 1
+    assert asked == []
+
+
+def test_zakaz_starshe_poroga_bez_sdelki_popadaet_v_missing(monkeypatch):
+    """Заказу 30 минут, сделки нет - amgroup за полчаса не пришёл, это уже сбой."""
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_MIN_AGE_MIN", 10, raising=False)
+    order = _ms_order("uuid-y2", "07302", channel="Магазин")
+    order["created"] = _created_min_ago(30)
+    result = _run(monkeypatch, [[order]])
+
+    assert result["missing"] == 1
+    assert result["too_young"] == 0
+
+
+def test_zakaz_bez_daty_sozdaniya_porog_ne_derzhit(monkeypatch):
+    """Поле created пустое или кривое - порог не применяем: лучше лишняя
+    проверка в amo, чем заказ, который порог прячет вечно."""
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_MIN_AGE_MIN", 10, raising=False)
+    order = _ms_order("uuid-y3", "07303", channel="Магазин")
+    order["created"] = "вчера"
+    result = _run(monkeypatch, [[order]])
+
+    assert result["missing"] == 1
+

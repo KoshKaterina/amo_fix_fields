@@ -79,6 +79,7 @@ import ms_client
 from waybill_config import (
     AMGROUP_SHIPMENT_DRY_RUN,
     AMGROUP_SHIPMENT_ENABLED,
+    AMGROUP_SHIPMENT_GRACE_SEC,
     FIELD_MOYSKLAD_ORDER_UUID,
     MS_API_URL,
     PIPELINE_OFFICE,
@@ -452,6 +453,19 @@ async def handle_lead_status_change(lead_id: int | str, status_id, pipeline_id) 
         return None
     if _as_int(pipeline_id) != PIPELINE_OFFICE or _as_int(status_id) not in _TRIGGER_STATUSES:
         return None
+
+    # Пауза - ДО чтения сделки (03.09.2026): живой amgroup делает отгрузку сам
+    # за 7-15 секунд после перехода на этап. Даём ему фору, потом читаем
+    # сделку заново - если он успел, гейт «ID Отгрузки уже заполнено» и
+    # проверка отгрузок в МойСкладе нас остановят. Прочитать сделку до паузы
+    # нельзя: снимок был бы сделан до того, как amgroup дописал поля.
+    if AMGROUP_SHIPMENT_GRACE_SEC > 0:
+        logger.info(
+            "amgroup_shipment: сделка %s на целевом этапе - ждём %s с, даём amgroup "
+            "сделать отгрузку самому",
+            lead_id, AMGROUP_SHIPMENT_GRACE_SEC,
+        )
+        await asyncio.sleep(AMGROUP_SHIPMENT_GRACE_SEC)
 
     lead = await amo_service.get_lead_full(lead_id)
     if not lead:

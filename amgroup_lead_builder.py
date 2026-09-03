@@ -49,13 +49,16 @@ from typing import Any
 
 import amo_service
 import api
+import lead_distribution
 import ms_client
 from api_helpers import sanitize_custom_field_value
 from waybill_config import (
     AMGROUP_FALLBACK_TAG,
     AMGROUP_LEAD_RESPONSIBLE_USER_ID,
     FIELD_MOYSKLAD_ORDER_UUID,
+    LEAD_DISTRIBUTION_ENABLED,
     PIPELINE_CLEVER,
+    RESPONSIBLE_OFFICE_MANAGER_USER_ID,
     STATUS_CLEVER_NEW_LEAD,
 )
 
@@ -282,20 +285,72 @@ async def _find_existing_lead(
     return None
 
 
+def _new_lead_profile() -> "lead_distribution.Profile | None":
+    """Включённый профиль распределителя с точкой входа «Основная / Новый лид» -
+    тот же, что раздаёт сделки amgroup. Матчинг распределителя (match_profile)
+    обойти приходится сознательно: он узнаёт сделку по источнику (source_id),
+    а сделка, созданная нашим ключом, источника не несёт - через вебхук
+    распределитель её не увидит никогда (проверено 03.09.2026: у сделок
+    ручного переноса источник пуст, правило их пропустило)."""
+    for p in lead_distribution.list_profiles():
+        if p.enabled and lead_distribution._matches_entry(p, PIPELINE_CLEVER, STATUS_CLEVER_NEW_LEAD):
+            return p
+    return None
+
+
+async def pick_responsible(lead_id: int) -> tuple[int | None, str]:
+    """Кого ставить ответственным на сделку протеза (03.09.2026, после того как
+    amgroup ожил и стало видно, откуда у живых сделок берётся ответственный).
+    Порядок:
+      1. самовывоз из офиса - офис-менеджер (правило Кати 03.09: Екатерине
+         самовывоз, остальное дежурному);
+      2. иначе - распределитель лидов, тот же, что раздаёт сделки amgroup: по
+         смене из ростера панели, после конца дня - тому, кто на смене завтра;
+      3. распределитель выключен, профиля нет или он никого не выбрал -
+         константа AMGROUP_LEAD_RESPONSIBLE_USER_ID, запасной ход.
+    Возвращает (id пользователя или None, откуда взяли - для лога)."""
+    if not LEAD_DISTRIBUTION_ENABLED:
+        return AMGROUP_LEAD_RESPONSIBLE_USER_ID, "константа (распределитель выключен)"
+    lead = await amo_service.get_lead_full(lead_id, with_=("contacts", "tags"))
+    if not lead:
+        return AMGROUP_LEAD_RESPONSIBLE_USER_ID, "константа (сделка не прочиталась)"
+    if lead_distribution._is_office_delivery(lead):
+        return RESPONSIBLE_OFFICE_MANAGER_USER_ID, "самовывоз из офиса - офис-менеджер"
+    profile = _new_lead_profile()
+    if profile is None:
+        return AMGROUP_LEAD_RESPONSIBLE_USER_ID, "константа (нет включённого профиля на «Новый лид»)"
+    meta: dict = {}
+    try:
+        target = await lead_distribution.decide_and_record(lead, profile, meta=meta)
+    except Exception:
+        logger.exception(
+            "amgroup_lead_builder: распределитель упал на сделке %s - берём запасного", lead_id,
+        )
+        target = None
+    if target:
+        return int(target), f"распределитель, профиль «{profile.name}», правило {meta.get('rule')}"
+    return AMGROUP_LEAD_RESPONSIBLE_USER_ID, "константа (распределитель никого не выбрал)"
+
+
 async def assign_responsible(lead_id: int, responsible_user_id: int | None = None) -> bool:
     """Отдельный явный шаг - боты amoCRM не реагируют на сделки, созданные не
-    через amgroup (проверено 03.09.2026 на двенадцати сделках), значит
-    распределения на дежурного не будет и ответственного нужно проставить
-    самим. responsible_user_id не передан - берём из настроек модуля
-    (AMGROUP_LEAD_RESPONSIBLE_USER_ID). Возвращает True при успехе."""
-    uid = responsible_user_id or AMGROUP_LEAD_RESPONSIBLE_USER_ID
+    через amgroup (проверено 03.09.2026 на двенадцати сделках), а распределитель
+    лидов такую сделку через вебхук не узнаёт (у неё нет источника). Значит
+    ответственного проставляем сами: responsible_user_id не передан - выбор
+    делает pick_responsible (самовывоз → офис-менеджер, иначе распределитель
+    по смене, иначе константа). Возвращает True при успехе."""
+    if responsible_user_id:
+        uid, origin = responsible_user_id, "передан явно"
+    else:
+        uid, origin = await pick_responsible(lead_id)
     if not uid:
         logger.warning(
             "amgroup_lead_builder: не проставлен ответственный на сделке %s - "
-            "AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан в настройках модуля",
-            lead_id,
+            "AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан в настройках модуля (%s)",
+            lead_id, origin,
         )
         return False
+    logger.info("amgroup_lead_builder: ответственный на сделке %s - %s (%s)", lead_id, uid, origin)
     result = await amo_service.patch_lead(lead_id, responsible_user_id=int(uid))
     ok = bool(result and result.get("ok"))
     if not ok:
@@ -399,12 +454,12 @@ async def create_lead_for_order(order: dict) -> int | None:
         )
         return dup.get("id")
 
-    if not AMGROUP_LEAD_RESPONSIBLE_USER_ID:
+    if not AMGROUP_LEAD_RESPONSIBLE_USER_ID and not LEAD_DISTRIBUTION_ENABLED:
         logger.error(
-            "amgroup_lead_builder: AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан - "
-            "сделка по заказу %s НЕ создаётся (без ответственного её никто не "
-            "увидит: боты amoCRM на сделки протеза не реагируют, распределения "
-            "на дежурного не будет)",
+            "amgroup_lead_builder: AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан и "
+            "распределитель лидов выключен - сделка по заказу %s НЕ создаётся "
+            "(без ответственного её никто не увидит: боты amoCRM на сделки "
+            "протеза не реагируют)",
             order_number,
         )
         return None

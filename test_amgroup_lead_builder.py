@@ -12,6 +12,7 @@ test_amgroup_fallback.py.
 import asyncio
 import os
 import sys
+import types
 
 import pytest
 
@@ -20,7 +21,25 @@ os.environ.setdefault("PUBLIC_BASE_URL", "https://example.invalid")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def _install_stubs():
+    # aiogram (зависимость telegram_bot.py, который тянет lead_distribution)
+    # в тестовом окружении не стоит - подменяем модуль целиком, как
+    # test_amgroup_duplicate_watch.py и test_order_watchdog.py.
+    if "telegram_bot" not in sys.modules:
+        tg = types.ModuleType("telegram_bot")
+
+        async def send_alert(text, parse_mode=None, chat_id=None, message_thread_id=None):
+            return True
+
+        tg.send_alert = send_alert
+        sys.modules["telegram_bot"] = tg
+
+
+_install_stubs()
+
 import amgroup_lead_builder as builder  # noqa: E402
+import lead_distribution  # noqa: E402
 
 
 def _ms_order(uuid, number, *, site="12345", phone="+79991234567", agent_name="Иван Иванов"):
@@ -397,3 +416,107 @@ def test_oshibka_sozdaniya_kontakta_ne_svetit_telefon_v_loge(monkeypatch, caplog
     error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
     assert any("не создался контакт" in m and "07311" in m for m in error_messages)
     assert not any("9261234567" in m or "Иван Иванов" in m for m in error_messages)
+
+
+# ── выбор ответственного: самовывоз → офис-менеджер, иначе распределитель ──
+
+def _amo_lead_for_pick(lead_id=777, *, delivery="CDEK: Курьер"):
+    return {
+        "id": lead_id,
+        "pipeline_id": builder.PIPELINE_CLEVER,
+        "status_id": builder.STATUS_CLEVER_NEW_LEAD,
+        "custom_fields_values": [
+            {"field_id": lead_distribution.FIELD_DELIVERY_TYPE, "values": [{"value": delivery}]},
+        ],
+        "_embedded": {"contacts": [{"id": 555}], "tags": []},
+    }
+
+
+def _wire_distribution(monkeypatch, *, lead, decision, profile_enabled=True):
+    """Распределитель включён, профиль на «Основная / Новый лид» есть,
+    decide_and_record отдаёт decision (None - никого не выбрал)."""
+    calls = {"decide": []}
+    profile = lead_distribution.Profile(
+        id="p1", name="Основное правило", enabled=profile_enabled,
+        entry_points=[{"pipeline_id": builder.PIPELINE_CLEVER,
+                       "status_ids": [builder.STATUS_CLEVER_NEW_LEAD]}],
+        source_ids=[23478413], participant_ids=[9291546, 13929334],
+    )
+
+    async def fake_get_lead_full(lead_id, with_=("contacts", "companies")):
+        return lead
+
+    async def fake_decide(lead_, profile_, *, meta=None):
+        calls["decide"].append(profile_.id)
+        if meta is not None:
+            meta["rule"] = "load"
+        return decision
+
+    monkeypatch.setattr(builder, "LEAD_DISTRIBUTION_ENABLED", True, raising=False)
+    monkeypatch.setattr(builder.amo_service, "get_lead_full", fake_get_lead_full)
+    monkeypatch.setattr(builder.lead_distribution, "list_profiles", lambda: [profile])
+    monkeypatch.setattr(builder.lead_distribution, "decide_and_record", fake_decide)
+    return calls
+
+
+def test_otvetstvennogo_vybiraet_raspredelitel_po_smene(monkeypatch):
+    """Обычная доставка, распределитель включён - ответственный тот, кого
+    выбрал распределитель по смене (как у сделок amgroup), а не константа."""
+    order = _ms_order("uuid-r1", "07401")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=777)
+    dist = _wire_distribution(monkeypatch, lead=_amo_lead_for_pick(), decision=9291546)
+
+    result = asyncio.run(builder.create_lead_for_order({"id": "uuid-r1", "name": "07401"}))
+
+    assert result == 777
+    assert dist["decide"] == ["p1"]
+    assert calls["patch"][-1] == (777, {"responsible_user_id": 9291546})
+
+
+def test_samovyvoz_iz_ofisa_uhodit_ofis_menedzheru_bez_raspredelitelya(monkeypatch):
+    """Самовывоз из офиса - офис-менеджер напрямую (правило Кати 03.09.2026),
+    распределитель даже не спрашиваем."""
+    order = _ms_order("uuid-r2", "07402")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=778)
+    dist = _wire_distribution(
+        monkeypatch, lead=_amo_lead_for_pick(778, delivery="Самовывоз из офиса Sunscrypt"), decision=9291546,
+    )
+
+    asyncio.run(builder.create_lead_for_order({"id": "uuid-r2", "name": "07402"}))
+
+    assert dist["decide"] == []
+    assert calls["patch"][-1] == (778, {"responsible_user_id": builder.RESPONSIBLE_OFFICE_MANAGER_USER_ID})
+
+
+def test_raspredelitel_nikogo_ne_vybral_beryom_konstantu(monkeypatch):
+    """Пул пуст, дежурного нет - запасной ход: константа из настроек."""
+    order = _ms_order("uuid-r3", "07403")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=779)
+    _wire_distribution(monkeypatch, lead=_amo_lead_for_pick(779), decision=None)
+
+    asyncio.run(builder.create_lead_for_order({"id": "uuid-r3", "name": "07403"}))
+
+    assert calls["patch"][-1] == (779, {"responsible_user_id": 999})
+
+
+def test_bez_konstanty_no_s_raspredelitelem_sdelka_sozdaetsya(monkeypatch):
+    """Константа не задана, но распределитель включён - сделка создаётся,
+    ответственного даёт распределитель."""
+    monkeypatch.setattr(builder, "AMGROUP_LEAD_RESPONSIBLE_USER_ID", None, raising=False)
+    order = _ms_order("uuid-r4", "07404")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=780)
+    _wire_distribution(monkeypatch, lead=_amo_lead_for_pick(780), decision=13929334)
+
+    result = asyncio.run(builder.create_lead_for_order({"id": "uuid-r4", "name": "07404"}))
+
+    assert result == 780
+    assert calls["patch"][-1] == (780, {"responsible_user_id": 13929334})
+

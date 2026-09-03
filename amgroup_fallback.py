@@ -51,6 +51,7 @@ from waybill_config import (
     AMGROUP_FALLBACK_ENABLED,
     AMGROUP_FALLBACK_INTERVAL_SEC,
     AMGROUP_FALLBACK_LOOKBACK_HOURS,
+    AMGROUP_FALLBACK_MIN_AGE_MIN,
     FIELD_MOYSKLAD_ORDER_UUID,
 )
 
@@ -192,6 +193,21 @@ async def _fetch_orders(since_utc: datetime.datetime) -> list[dict] | None:
     return orders
 
 
+def _order_age_min(order: dict, now_utc: datetime.datetime) -> float | None:
+    """Возраст заказа в минутах по полю created. МойСклад отдаёт московское
+    время без зоны, вид «2026-09-03 17:32:00.138». None - поле пустое или не
+    разобралось: такой заказ порог не держит (лучше лишняя проверка в amo, чем
+    заказ, который порог прячет вечно)."""
+    raw = str(order.get("created") or "").strip()
+    if not raw:
+        return None
+    try:
+        created = datetime.datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+    except ValueError:
+        return None
+    return (now_utc - created).total_seconds() / 60
+
+
 def _exclusion_reason(order: dict) -> str | None:
     """Причина исключить заказ из проверки, или None - заказ идём проверять
     дальше. Названия канала/контрагента берём из expand в _fetch_orders."""
@@ -253,10 +269,11 @@ async def check_once() -> dict:
             "не значит «заказов нет»)",
             AMGROUP_FALLBACK_LOOKBACK_HOURS,
         )
-        return {"ms_answered": False, "amo_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
+        return {"ms_answered": False, "amo_answered": True, "total": 0, "excluded": 0, "too_young": 0, "with_deal": 0, "missing": 0}
 
     _load_deal_state()
     excluded = 0
+    too_young = 0
     with_deal = 0
     missing: list[dict] = []
     newly_confirmed: list[str] = []
@@ -269,6 +286,13 @@ async def check_once() -> dict:
         order_uuid = str(order.get("id") or "")
         order_number = str(order.get("name") or "").strip()
         if not order_uuid:
+            continue
+        # Порог возраста: живому amgroup хватает секунд, чтобы завести сделку.
+        # Заказ моложе порога ещё не «без сделки» - смотрим на следующем
+        # проходе, в amo за ним сейчас даже не ходим.
+        age = _order_age_min(order, now)
+        if age is not None and age < AMGROUP_FALLBACK_MIN_AGE_MIN:
+            too_young += 1
             continue
         # Память «сделка уже подтверждена» - не спрашиваем amo повторно про
         # заказ, который на прошлом проходе уже нашёлся (см. докстринг
@@ -302,13 +326,13 @@ async def check_once() -> dict:
         await _handle_missing(missing)
 
     logger.info(
-        "amgroup_fallback: заказов МС %s, отсеяно %s, сделка уже есть %s, без сделки %s%s",
-        len(orders), excluded, with_deal, len(missing),
+        "amgroup_fallback: заказов МС %s, отсеяно %s, моложе %s мин %s, сделка уже есть %s, без сделки %s%s",
+        len(orders), excluded, AMGROUP_FALLBACK_MIN_AGE_MIN, too_young, with_deal, len(missing),
         "" if amo_answered else " (проход прерван сбоем amoCRM, не полный)",
     )
     return {
         "ms_answered": True, "amo_answered": amo_answered, "total": len(orders), "excluded": excluded,
-        "with_deal": with_deal, "missing": len(missing),
+        "too_young": too_young, "with_deal": with_deal, "missing": len(missing),
     }
 
 
