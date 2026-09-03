@@ -21,6 +21,16 @@
 заказа подряд, и без кэша созданных контактов в рамках одного запуска
 получается дубль человека в amoCRM. _contact_cache ниже - защита от этого.
 
+⚠️ Побочный эффект, который эта правка НЕ выключает (находка приёмки
+безопасности 03.09.2026): сделка протеза создаётся сразу с заполненным полем
+«Состав заказа» (FIELD["sostav"]), а webhooks.py на изменение этого поля
+ставит резерв в МойСкладе - и воронка/этап, куда протез кладёт сделку
+(PIPELINE_CLEVER/STATUS_CLEVER_NEW_LEAD), входит в зону резервирования.
+Значит включение протеза сделок ОДНОВРЕМЕННО включает простановку резервов по
+заказам, которым на момент находки может быть уже до AMGROUP_FALLBACK_LOOKBACK_HOURS
+часов и которые к этому моменту могли быть уже отгружены. Код здесь не
+трогаем (webhooks.py - чужой файл), гасить резерв или нет - решает Катя.
+
 Пишем в amoCRM только через существующие функции сервиса (amo_service.py,
 api.py) - они уже идут через общую очередь с ограничением частоты и
 circuit breaker, свой HTTP-клиент здесь не заводим. Читаем МойСклад только
@@ -34,15 +44,16 @@ FIELD_MOYSKLAD_ORDER_UUID, AMGROUP_FALLBACK_TAG) и импортируется �
 """
 
 import logging
-import os
 import re
 from typing import Any
 
 import amo_service
 import api
 import ms_client
+from api_helpers import sanitize_custom_field_value
 from waybill_config import (
     AMGROUP_FALLBACK_TAG,
+    AMGROUP_LEAD_RESPONSIBLE_USER_ID,
     FIELD_MOYSKLAD_ORDER_UUID,
     PIPELINE_CLEVER,
     STATUS_CLEVER_NEW_LEAD,
@@ -50,18 +61,23 @@ from waybill_config import (
 
 logger = logging.getLogger("uvicorn")
 
+
+class _AmoSearchFailed(Exception):
+    """amoCRM не ответил на поиск (сделки или контакта) - вызывающий код
+    обязан прервать создание, а не читать сбой как «дубля нет» (см. докстринг
+    модуля и amo_service.find_leads_by_query/find_contacts_by_query)."""
+
+
 # «№ Заказа» - второе поле связки, дублирует amgroup_fallback.FIELD_MOYSKLAD_ORDER_NUMBER
 # (там не экспортировано под этим именем - своя копия, свести на сшивке).
 FIELD_MOYSKLAD_ORDER_NUMBER = 576697
 
-# Кому проставлять ответственного, если assign_responsible вызвали без явного
-# параметра. Свести на сшивке с остальными настройками модуля - сейчас это
-# единственная настройка, которой нет в waybill_config.
-_raw_responsible = os.getenv("AMGROUP_LEAD_RESPONSIBLE_USER_ID", "").strip()
-try:
-    AMGROUP_LEAD_RESPONSIBLE_USER_ID: int | None = int(_raw_responsible) if _raw_responsible else None
-except ValueError:
-    AMGROUP_LEAD_RESPONSIBLE_USER_ID = None
+# Лимит полнотекстового поиска amo при дедупе. Больше дефолтных 50/10:
+# короткий номер заказа и цифры телефона цепляют много постороннего, и без
+# запаса нужная сделка/контакт может не попасть в первую страницу выдачи
+# (находка приёмки безопасности 03.09.2026).
+_LEAD_SEARCH_LIMIT = 250
+_CONTACT_SEARCH_LIMIT = 100
 
 # Карта полей сделки (field_id) - точь-в-точь из прототипа, сверена на живых
 # сделках amgroup 03.09.2026.
@@ -98,9 +114,12 @@ _EXPAND = "positions.assortment,agent,organization,store,salesChannel"
 
 
 def _rub(kop: float) -> str:
-    """13990.0 (в рублях, не копейках - сумма МойСклад уже приходит в рублях
-    из entity/customerorder) -> '13 990.00 рублей' со склонением, как у
-    amgroup. Перенесено из прототипа без изменений."""
+    """1399000 (В КОПЕЙКАХ - МойСклад отдаёт суммы entity/customerorder в
+    копейках, не в рублях) -> '13 990.00 рублей' со склонением, как у amgroup.
+    ⚠️ Код ниже (v = kop / 100) прав, деление не трогать - более ранняя версия
+    этого докстринга утверждала обратное («сумма уже в рублях») и приглашала
+    убрать деление, отчего все суммы протеза уехали бы в сто раз. Перенесено
+    из прототипа, сама формула без изменений."""
     v = kop / 100
     n = int(v)
     last = n % 10
@@ -185,19 +204,31 @@ async def _fetch_full_order(order_uuid: str) -> dict | None:
 _contact_cache: dict[str, int] = {}
 
 
-async def _find_or_create_contact(phone: str | None, name: str | None) -> int | None:
+async def _find_or_create_contact(
+    phone: str | None, name: str | None, *, order_number: str = ""
+) -> int | None:
     """Ищет контакт по последним 10 цифрам телефона среди значений поля
     PHONE (полнотекстовый поиск amo цепляет и посторонние совпадения, поэтому
     сверяем само значение поля - как в amgroup_fallback._find_existing_lead).
     Не нашёл - создаёт новый контакт через api.create_contact (общая очередь).
-    Кэш процесса - защита от дубля при двух заказах одного клиента подряд."""
+    Кэш процесса - защита от дубля при двух заказах одного клиента подряд.
+
+    Может raise _AmoSearchFailed, если amoCRM не ответил на поиск - тогда
+    нельзя молча переходить к созданию нового контакта: не увидели
+    существующий из-за сбоя - не значит, что его нет (см. докстринг модуля).
+    order_number - только для лога, персональные данные (телефон, имя) в лог
+    не пишем."""
     digits = _normalize_phone_digits(phone)
     if not digits:
         return None
     if digits in _contact_cache:
         return _contact_cache[digits]
 
-    for contact in await amo_service.find_contacts_by_query(digits):
+    contacts = await amo_service.find_contacts_by_query(digits, limit=_CONTACT_SEARCH_LIMIT)
+    if contacts is None:
+        raise _AmoSearchFailed("find_contacts_by_query")
+
+    for contact in contacts:
         for f in contact.get("custom_fields_values") or []:
             if f.get("field_code") != "PHONE":
                 continue
@@ -212,17 +243,40 @@ async def _find_or_create_contact(phone: str | None, name: str | None) -> int | 
     if contact_id:
         _contact_cache[digits] = contact_id
     else:
-        logger.error("amgroup_lead_builder: не создался контакт для телефона %s", digits)
+        logger.error("amgroup_lead_builder: не создался контакт по заказу %s", order_number)
     return contact_id
 
 
-async def _find_existing_lead_by_name(lead_name: str, query: str) -> dict | None:
-    """Защита от дубля перед созданием: ищет сделку с ТЕМ ЖЕ именем (полное
-    совпадение, не только попадание в полнотекстовый поиск - см. прототип и
-    тот же приём в amgroup_fallback._find_existing_lead)."""
-    if not query:
+async def _find_existing_lead(
+    order_uuid: str, order_number: str, lead_name: str, name_query: str
+) -> dict | None:
+    """Защита от дубля перед созданием. Основной ключ - поле «ID Заказа»
+    (order_uuid, FIELD_MOYSKLAD_ORDER_UUID) и «№ Заказа» (order_number,
+    FIELD_MOYSKLAD_ORDER_NUMBER) - тот же надёжный приём, что уже используется
+    в amgroup_fallback._find_existing_lead: найденное в полнотекстовом поиске
+    всегда сверяем со значением самого поля, а не доверяем факту попадания в
+    выдачу. Имя сделки (name_query, полное совпадение) - запасной путь на
+    случай, если у сделки ещё не проставлено ни одно из полей связки.
+
+    Может raise _AmoSearchFailed - см. докстринг модуля, вызывающий код
+    обязан прервать создание, а не считать сбой поиска отсутствием дубля."""
+    for value, field_id in ((order_uuid, FIELD_MOYSKLAD_ORDER_UUID), (order_number, FIELD_MOYSKLAD_ORDER_NUMBER)):
+        if not value:
+            continue
+        leads = await amo_service.find_leads_by_query(value, limit=_LEAD_SEARCH_LIMIT)
+        if leads is None:
+            raise _AmoSearchFailed("find_leads_by_query")
+        for lead in leads:
+            found = str(amo_service.get_custom_field_value(lead, field_id) or "").strip()
+            if found.casefold() == str(value).strip().casefold():
+                return lead
+
+    if not name_query:
         return None
-    for lead in await amo_service.find_leads_by_query(query):
+    leads = await amo_service.find_leads_by_query(name_query, limit=_LEAD_SEARCH_LIMIT)
+    if leads is None:
+        raise _AmoSearchFailed("find_leads_by_query")
+    for lead in leads:
         if lead.get("name") == lead_name:
             return lead
     return None
@@ -254,13 +308,17 @@ async def assign_responsible(lead_id: int, responsible_user_id: int | None = Non
 
 def _custom_fields(order: dict, b: dict, site: str) -> list[dict]:
     """Собирает custom_fields_values для POST /leads. t() - текстовые поля,
-    e() - select/enum. Пустые значения не добавляются (как в прототипе)."""
+    e() - select/enum. Пустые значения не добавляются (как в прототипе).
+    t() режет значение через sanitize_custom_field_value (потолок 256
+    символов, как и у остальных записей сервиса) - без этого «Состав заказа»
+    на заказе из нескольких позиций легко перевалит за потолок amoCRM, и вся
+    сделка не запишется (находка приёмки безопасности 03.09.2026)."""
     ag = order.get("agent") or {}
     cf: list[dict] = []
 
     def t(key: str, val: Any) -> None:
         if val not in (None, "", []):
-            cf.append({"field_id": FIELD[key], "values": [{"value": str(val)}]})
+            cf.append({"field_id": FIELD[key], "values": [{"value": sanitize_custom_field_value(val)}]})
 
     def e(key: str, val: Any) -> None:
         eid = ENUM[key].get(val)
@@ -304,10 +362,12 @@ async def create_lead_for_order(order: dict) -> int | None:
     заказ покупателя МойСклад, как отдаёт amgroup_fallback._fetch_orders
     (раскрыты agent, salesChannel). Возвращает id созданной (или уже
     существующей - см. дедуп) сделки, либо None при любой неудаче -
-    ничего не глотаем молча, каждая причина уходит в лог."""
+    ничего не глотаем молча, каждая причина уходит в лог. Персональные
+    данные заказа (имя, телефон, адрес, комментарий клиента) в лог не
+    пишем нигде в этой функции - только номер заказа и id сделки."""
     order_uuid = str(order.get("id") or "")
     if not order_uuid:
-        logger.error("amgroup_lead_builder: у заказа нет id, пропускаю: %s", order)
+        logger.error("amgroup_lead_builder: у заказа нет id, пропускаю (номер %s)", order.get("name"))
         return None
 
     full = await _fetch_full_order(order_uuid)
@@ -323,19 +383,45 @@ async def create_lead_for_order(order: dict) -> int | None:
     order_number = str(full.get("name") or "").strip()
     lead_name = f"Заказ №{site}" if site else f"Заказ МС {order_number}"
 
-    dup = await _find_existing_lead_by_name(lead_name, site or order_number)
+    try:
+        dup = await _find_existing_lead(order_uuid, order_number, lead_name, site or order_number)
+    except _AmoSearchFailed:
+        logger.warning(
+            "amgroup_lead_builder: amoCRM не ответил при поиске дубля сделки по "
+            "заказу %s - сделку не создаю в этом проходе, лучше повтор, чем дубль",
+            order_number,
+        )
+        return None
     if dup is not None:
         logger.info(
-            "amgroup_lead_builder: сделка «%s» уже есть (id %s), не создаю повторно",
-            lead_name, dup.get("id"),
+            "amgroup_lead_builder: сделка по заказу %s уже есть (id %s), не создаю повторно",
+            order_number, dup.get("id"),
         )
         return dup.get("id")
+
+    if not AMGROUP_LEAD_RESPONSIBLE_USER_ID:
+        logger.error(
+            "amgroup_lead_builder: AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан - "
+            "сделка по заказу %s НЕ создаётся (без ответственного её никто не "
+            "увидит: боты amoCRM на сделки протеза не реагируют, распределения "
+            "на дежурного не будет)",
+            order_number,
+        )
+        return None
 
     b = _build_fields(full)
     cf = _custom_fields(full, b, site)
 
     ag = full.get("agent") or {}
-    contact_id = await _find_or_create_contact(ag.get("phone"), ag.get("name"))
+    try:
+        contact_id = await _find_or_create_contact(ag.get("phone"), ag.get("name"), order_number=order_number)
+    except _AmoSearchFailed:
+        logger.warning(
+            "amgroup_lead_builder: amoCRM не ответил при поиске контакта по заказу "
+            "%s - сделку не создаю в этом проходе, лучше повтор, чем дубль контакта",
+            order_number,
+        )
+        return None
 
     price = int((full.get("sum") or 0) / 100)
     lead_id = await api.create_lead_direct(
@@ -357,6 +443,18 @@ async def create_lead_for_order(order: dict) -> int | None:
         "amgroup_lead_builder: создана сделка %s по заказу %s (сайт %s, %s ₽, контакт %s)",
         lead_id, order_number, site, price, contact_id,
     )
+
+    # Бюджет - отдельным PATCH, тем же приёмом, что и ответственный ниже:
+    # у api.create_lead_direct нет параметра суммы (api.py не трогаем), а без
+    # него все сделки протеза уезжали бы с ценой 0 (находка приёмки
+    # безопасности 03.09.2026) - amgroup эту сумму проставлял, наш протез
+    # обязан делать то же самое, иначе ломается отчётность отдела продаж.
+    budget_result = await amo_service.patch_lead(lead_id, price=price)
+    if not (budget_result and budget_result.get("ok")):
+        logger.error(
+            "amgroup_lead_builder: не проставился бюджет на сделке %s (заказ %s): %s",
+            lead_id, order_number, budget_result,
+        )
 
     # Отдельный явный шаг - см. докстринг assign_responsible.
     await assign_responsible(lead_id)

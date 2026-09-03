@@ -30,10 +30,18 @@ amgroup_fallback.py). Опасность: amgroup может ожить в лю�
 пересборка контейнера не запускала рассылку заново. Появилась в группе третья
 сделка - набор id меняется, и это уже другая ситуация, о ней сообщаем заново.
 
-Свои константы (поле «№ Заказа», список воронок, флаги) держим В ЭТОМ файле -
+Свои константы (поле «№ Заказа», список воронок) держим В ЭТОМ файле -
 общего реестра полей и воронок в проекте нет, а над waybill_config.py,
 amgroup_fallback.py и amgroup_lead_builder.py параллельно работают другие
-агенты. Пометка: свести в общий конфиг на сшивке.
+агенты. Пометка: свести в общий конфиг на сшивке. ⚠️ Флаги (включён/выключен,
+интервал, окно поиска, сухой режим) свои os.getenv НЕ заводят - берутся из
+waybill_config.py, как у остальных модулей контура amgroup (находка ревью
+03.09.2026: было наоборот, с перевёрнутым умолчанием и разъехавшимся именем
+интервала - после выката сторож стартовал бы сам).
+
+Отчёт в тех.чат: без имени клиента (тех.чат читают не только те, кому
+положено видеть клиентов) - номер заказа, ссылки на сделки в amoCRM, время.
+Имя клиента посмотрит тот, у кого есть доступ к самой сделке по ссылке.
 """
 
 import asyncio
@@ -45,6 +53,10 @@ import os
 import amo_service
 import telegram_bot
 from waybill_config import (
+    AMGROUP_DUP_WATCH_DRY_RUN,
+    AMGROUP_DUP_WATCH_ENABLED,
+    AMGROUP_DUP_WATCH_INTERVAL_SEC,
+    AMGROUP_DUP_WATCH_LOOKBACK_H,
     AMGROUP_FALLBACK_TAG,
     FIELD_MOYSKLAD_ORDER_UUID,
     PIPELINE_CLEVER,
@@ -73,14 +85,17 @@ DUP_TAG = AMGROUP_FALLBACK_TAG
 
 AMO_DOMAIN = "https://new5a2e8ea7b16b4.amocrm.ru"
 
-AMGROUP_DUP_WATCH_ENABLED = os.getenv("AMGROUP_DUP_WATCH_ENABLED", "1") == "1"
-AMGROUP_DUP_WATCH_INTERVAL_S = int(os.getenv("AMGROUP_DUP_WATCH_INTERVAL_S", "600"))
-AMGROUP_DUP_WATCH_LOOKBACK_H = int(os.getenv("AMGROUP_DUP_WATCH_LOOKBACK_H", "48"))
+# Флаги и таймауты - ТОЛЬКО из waybill_config.py (находка ревью 03.09.2026:
+# модуль заводил свои os.getenv с перевёрнутым умолчанием и разъехавшимся
+# именем интервала - сторож стартовал бы сам сразу после выката).
 
 _task: asyncio.Task | None = None
 _REPORTED_PATH = os.getenv(
     "AMGROUP_DUP_WATCH_REPORTED_PATH", "/app/var/amgroup_duplicate_watch_reported.json")
-_reported: set[str] = set()
+# Порядок вставки, не множество: обрезка по капу должна ронять САМЫЕ СТАРЫЕ
+# записи, а не случайные по алфавиту (баг ревью 03.09.2026, образец
+# исправления - amgroup_shipment.py, _created/_STATE_CAP).
+_reported: dict[str, bool] = {}
 _reported_loaded = False
 _REPORTED_CAP = 2000
 
@@ -94,7 +109,13 @@ def _load_reported() -> None:
     _reported_loaded = True
     try:
         with open(_REPORTED_PATH, encoding="utf-8") as f:
-            _reported.update(str(x) for x in json.load(f))
+            data = json.load(f)
+        if isinstance(data, dict):
+            _reported.update({str(k): True for k in data})
+        else:
+            # Старый формат файла - список без гарантии порядка. Читаем как
+            # есть, порядок вставки восстановить нечем, но записи не теряем.
+            _reported.update({str(x): True for x in data})
     except FileNotFoundError:
         pass
     except Exception:
@@ -105,8 +126,12 @@ def _save_reported() -> None:
     try:
         os.makedirs(os.path.dirname(_REPORTED_PATH), exist_ok=True)
         tmp = f"{_REPORTED_PATH}.tmp"
+        # Кап по числу записей режем по ПОРЯДКУ ВСТАВКИ (dict его хранит),
+        # а не по алфавиту - иначе обрезка выкидывает случайные записи
+        # вместо самых старых, как это было раньше.
+        trimmed = dict(list(_reported.items())[-_REPORTED_CAP:])
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(sorted(_reported)[-_REPORTED_CAP:], f)
+            json.dump(trimmed, f, ensure_ascii=False)
         os.replace(tmp, _REPORTED_PATH)
     except Exception:
         logger.exception("Сторож дублей amgroup: не записался %s", _REPORTED_PATH)
@@ -138,9 +163,16 @@ def _group_duplicates(leads: list[dict]) -> list[list[dict]]:
     for i, lead in enumerate(leads):
         for kind, field_id in (("uuid", FIELD_MOYSKLAD_ORDER_UUID), ("num", FIELD_ORDER_NUMBER)):
             value = amo_service.get_custom_field_value(lead, field_id)
-            if not value:
+            if value is None:
                 continue
-            key = (kind, str(value).strip())
+            # Проверяем значение БЕЗ пробелов по краям, а не сам факт, что оно
+            # есть: номер заказа из одних пробелов даёт пустой ключ, и тогда
+            # все такие сделки склеиваются в одну ложную группу (баг ревью
+            # 03.09.2026).
+            stripped = str(value).strip()
+            if not stripped:
+                continue
+            key = (kind, stripped)
             has_key[i] = True
             if key in seen_at:
                 union(i, seen_at[key])
@@ -168,28 +200,6 @@ def _order_label(leads: list[dict]) -> str:
     return "без номера"
 
 
-async def _client_names(leads: list[dict]) -> dict[int, str]:
-    contact_ids: list[int] = []
-    for lead in leads:
-        for c in (lead.get("_embedded") or {}).get("contacts") or []:
-            cid = c.get("id")
-            if cid:
-                contact_ids.append(int(cid))
-    if not contact_ids:
-        return {}
-    contacts = await amo_service.get_contacts_by_ids(contact_ids)
-    return {cid: (c.get("name") or "").strip() for cid, c in contacts.items()}
-
-
-def _lead_client_name(lead: dict, contacts: dict[int, str]) -> str:
-    for c in (lead.get("_embedded") or {}).get("contacts") or []:
-        cid = c.get("id")
-        name = contacts.get(int(cid)) if cid else None
-        if name:
-            return name
-    return (lead.get("name") or "").strip() or "имя не указано"
-
-
 async def _creator_names(leads: list[dict]) -> dict[int, str]:
     names: dict[int, str] = {}
     for lead in leads:
@@ -209,7 +219,7 @@ def _fmt_dt(ts) -> str:
         return "дата неизвестна"
 
 
-def _lead_line(lead: dict, contacts: dict[int, str], creators: dict[int, str]) -> str:
+def _lead_line(lead: dict, creators: dict[int, str]) -> str:
     creator = creators.get(lead.get("created_by")) or "неизвестно"
     created = _fmt_dt(lead.get("created_at"))
     if amo_service.has_tag(lead, DUP_TAG):
@@ -227,7 +237,9 @@ async def check_once() -> dict | None:
 
     all_leads: list[dict] = []
     for pipeline_id in _PIPELINES:
-        batch = await amo_service.get_leads_updated_since(pipeline_id, since_ts, with_=("contacts",))
+        # Контакты больше не запрашиваем: имя клиента в сообщение не идёт
+        # (тех.чат читают не только те, кому положено видеть клиентов).
+        batch = await amo_service.get_leads_updated_since(pipeline_id, since_ts)
         if batch is None:
             logger.warning(
                 "Сторож дублей amgroup: amoCRM не ответил (воронка %s) — проход пропущен, молчим",
@@ -248,10 +260,20 @@ async def check_once() -> dict | None:
         fresh.append((group, dedup_key))
 
     if fresh:
-        await _report(fresh)
-        for _, dedup_key in fresh:
-            _reported.add(dedup_key)
-        _save_reported()
+        # Помечаем отправленным ТОЛЬКО после подтверждённой отправки - иначе
+        # непринятое Телеграмом сообщение тонет молча, и про пару больше не
+        # напомнят никогда (баг ревью 03.09.2026).
+        ok = await _report(fresh)
+        if ok:
+            for _, dedup_key in fresh:
+                _reported[dedup_key] = True
+            _save_reported()
+        else:
+            logger.warning(
+                "Сторож дублей amgroup: отправка не подтверждена, %s пар(ы) "
+                "останутся непомеченными - напомним на следующем проходе",
+                len(fresh),
+            )
 
     logger.info(
         "Сторож дублей amgroup: сделок %s, групп-дублей %s, новых пар %s",
@@ -260,9 +282,12 @@ async def check_once() -> dict | None:
     return {"leads": len(all_leads), "groups": len(dup_groups), "new": len(fresh)}
 
 
-async def _report(fresh: list[tuple[list[dict], str]]) -> None:
+async def _report(fresh: list[tuple[list[dict], str]]) -> bool:
+    """Формирует и отправляет отчёт. Возвращает True только если отчёт можно
+    считать доставленным (боевая отправка подтверждена ИЛИ сухой режим, где
+    отправки нет по определению) - от этого зависит, помечать ли пары
+    отправленными (см. check_once)."""
     flat = [lead for group, _ in fresh for lead in group]
-    contacts = await _client_names(flat)
     creators = await _creator_names(flat)
 
     head = ("Похоже, задвоилась сделка по заказу, возможно, ожил amgroup поверх нашего протеза."
@@ -271,18 +296,41 @@ async def _report(fresh: list[tuple[list[dict], str]]) -> None:
     lines = [head, ""]
     for group, _ in fresh:
         order_label = _order_label(group)
-        client = _lead_client_name(group[0], contacts)
-        lines.append(f"Заказ {order_label}, клиент {client}")
+        # Имя клиента в текст НЕ идёт: тех.чат читают не только те, кому
+        # положено видеть клиентов. Кому нужно имя - откроет сделку по ссылке
+        # и увидит его там, если у него есть доступ.
+        lines.append(f"Заказ {order_label}")
         for lead in group:
-            lines.append(_lead_line(lead, contacts, creators))
+            lines.append(_lead_line(lead, creators))
         lines.append("")
     lines.append("Сами мы ничего не удаляли и не двигали, только посмотрели, решите, что делать, и закройте лишнюю сделку руками.")
+    # Разведка office_transfer.py (строки 78-89 на 03.09.2026): до переноса
+    # УР/ЗНР сделок вместо перемещения делали КОПИЮ (оригинал в основной
+    # воронке + копия в Офисе/Фулфилменте), связанную тем же полем «ID
+    # Заказа». Если такую архивную пару задело массовой правкой (например,
+    # переносом воронки), она попадёт в окно поиска и будет выглядеть как
+    # свежий дубль. Устойчивого признака «это архив, а не свежая пара» в
+    # системе НЕТ - ни тега, ни отдельного поля, а время создания/воронка
+    # ненадёжны (office_transfer включали по правилам постепенно, единой
+    # границы отсечения на проде не задано). Поэтому не отсеиваем, а зовём
+    # человека проверить руками.
+    lines.append("Пара может быть архивной копией старого переноса в Офис (office_transfer) - устойчивого признака отличить архив от свежего дубля нет, сверьте воронки и время создания, прежде чем поднимать тревогу.")
 
-    ok = await telegram_bot.send_alert("\n".join(lines).strip())
+    text = "\n".join(lines).strip()
+
+    if AMGROUP_DUP_WATCH_DRY_RUN:
+        logger.warning(
+            "Сторож дублей amgroup [сухой режим]: %s пар(ы), в Телеграм не отправляем:\n%s",
+            len(fresh), text,
+        )
+        return True
+
+    ok = await telegram_bot.send_alert(text)
     logger.warning(
         "Сторож дублей amgroup: %s пар(ы), сообщение %s",
         len(fresh), "отправлено" if ok else "НЕ отправлено",
     )
+    return bool(ok)
 
 
 async def _loop() -> None:
@@ -294,7 +342,7 @@ async def _loop() -> None:
             await check_once()
         except Exception:
             logger.exception("Сторож дублей amgroup: проход не удался")
-        await asyncio.sleep(AMGROUP_DUP_WATCH_INTERVAL_S)
+        await asyncio.sleep(AMGROUP_DUP_WATCH_INTERVAL_SEC)
 
 
 async def init() -> None:
@@ -304,8 +352,9 @@ async def init() -> None:
         return
     _task = asyncio.create_task(_loop())
     logger.info(
-        "Сторож дублей amgroup запущен: раз в %s мин, окно %s ч",
-        AMGROUP_DUP_WATCH_INTERVAL_S // 60, AMGROUP_DUP_WATCH_LOOKBACK_H,
+        "Сторож дублей amgroup запущен: раз в %s мин, окно %s ч, режим %s",
+        AMGROUP_DUP_WATCH_INTERVAL_SEC // 60, AMGROUP_DUP_WATCH_LOOKBACK_H,
+        "сухой" if AMGROUP_DUP_WATCH_DRY_RUN else "боевой",
     )
 
 

@@ -1,10 +1,15 @@
 """Тесты протеза amgroup (amgroup_fallback) - скелет: чтение МойСклада,
 отсев Озона/TangemShop, поиск существующей сделки. Сборку и создание сделки
-делает соседний срез, здесь не тестируем.
+делает соседний срез (amgroup_lead_builder), здесь используем простую
+async-заглушку и проверяем только контракт (когда её зовут, когда нет, когда
+результат помечает заказ обработанным).
 
 Написаны по инциденту 02-03.09.2026: сторонняя интеграция МойСклад -> amoCRM
 встала, и по ложному алерту order_watchdog в тот же день - склад НЕ ОТВЕТИВШИЙ
-нельзя читать как «заказов нет».
+нельзя читать как «заказов нет». Дополнены 03.09.2026 находками приёмки
+безопасности: та же путаница на пути записи (поиск сделки в amoCRM), сухой
+режим не должен отравлять состояние, сбой создания не должен хоронить заказ
+навсегда.
 
 Запуск: python3 -m pytest test_amgroup_fallback.py -q
 """
@@ -49,18 +54,21 @@ def _amo_lead(lead_id, order_uuid):
 def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(amgroup_fallback, "_STATE_PATH", str(tmp_path / "logged.json"), raising=False)
     monkeypatch.setattr(amgroup_fallback, "_logged_loaded", False, raising=False)
+    monkeypatch.setattr(amgroup_fallback, "_DEAL_STATE_PATH", str(tmp_path / "has_deal.json"), raising=False)
+    monkeypatch.setattr(amgroup_fallback, "_deal_loaded", False, raising=False)
     monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_DRY_RUN", True, raising=False)
     amgroup_fallback._logged.clear()
+    amgroup_fallback._known_with_deal.clear()
     yield
     amgroup_fallback._logged.clear()
+    amgroup_fallback._known_with_deal.clear()
 
 
 def _run(monkeypatch, ms_pages, amo_leads_by_query=None):
     """ms_pages: список страниц entity/customerorder (каждая - список rows,
     последняя короче limit=100 сигналит конец). amo_leads_by_query: функция
-    query -> list[dict] для find_leads_by_query, по умолчанию всегда пусто."""
-    calls = {"offset": 0}
-
+    query -> list[dict] | None для find_leads_by_query (None = amoCRM не
+    ответил), по умолчанию всегда пусто (честный «не найдено»)."""
     async def fake_get(path, params=None):
         offset = (params or {}).get("offset", 0)
         idx = offset // 100
@@ -68,7 +76,7 @@ def _run(monkeypatch, ms_pages, amo_leads_by_query=None):
             return {"rows": []}
         return {"rows": ms_pages[idx]}
 
-    async def fake_find(query, with_=()):
+    async def fake_find(query, with_=(), limit=50):
         if amo_leads_by_query is None:
             return []
         return amo_leads_by_query(query)
@@ -86,12 +94,12 @@ def test_sklad_ne_otvetil_nichego_ne_delaem(monkeypatch, caplog):
 
     monkeypatch.setattr(amgroup_fallback.ms_client, "get", fake_get)
     monkeypatch.setattr(amgroup_fallback.amo_service, "find_leads_by_query",
-                         lambda query, with_=(): pytest.fail("amo не должен опрашиваться"))
+                         lambda query, with_=(), limit=50: pytest.fail("amo не должен опрашиваться"))
 
     with caplog.at_level("WARNING", logger="uvicorn"):
         result = asyncio.run(amgroup_fallback.check_once())
 
-    assert result == {"ms_answered": False, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
+    assert result == {"ms_answered": False, "amo_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
     assert any("не ответил" in rec.message for rec in caplog.records)
 
 
@@ -100,7 +108,7 @@ def test_zakaz_ozona_po_kanalu_otseivaetsya(monkeypatch):
     order = _ms_order("uuid-1", "07200", channel="Маркетплейс")
     result = _run(monkeypatch, [[order]])
 
-    assert result == {"ms_answered": True, "total": 1, "excluded": 1, "with_deal": 0, "missing": 0}
+    assert result == {"ms_answered": True, "amo_answered": True, "total": 1, "excluded": 1, "with_deal": 0, "missing": 0}
 
 
 def test_zakaz_ozona_po_kontragentu_otseivaetsya(monkeypatch):
@@ -133,7 +141,7 @@ def test_zakaz_so_sdelkoy_v_missing_ne_popadaet(monkeypatch):
 
     result = _run(monkeypatch, [[order]], amo_leads_by_query=amo_leads)
 
-    assert result == {"ms_answered": True, "total": 1, "excluded": 0, "with_deal": 1, "missing": 0}
+    assert result == {"ms_answered": True, "amo_answered": True, "total": 1, "excluded": 0, "with_deal": 1, "missing": 0}
 
 
 def test_polnotekstovyy_poisk_ne_obmanyvaet(monkeypatch):
@@ -152,9 +160,16 @@ def test_polnotekstovyy_poisk_ne_obmanyvaet(monkeypatch):
 
 def test_zakaz_bez_sdelki_popadaet_v_missing_i_ne_sozdaetsya_v_suhom_rezhime(monkeypatch):
     """Обычный заказ без сделки - попадает в missing; в сухом режиме
-    (по умолчанию в тестах) точка расширения не зовётся."""
+    (по умолчанию в тестах) точка расширения не зовётся и заказ НЕ
+    помечается обработанным (иначе переход в боевой режим его бы не поймал -
+    находка приёмки безопасности 03.09.2026)."""
     called = []
-    amgroup_fallback.create_lead_for_order = lambda order: called.append(order)
+
+    async def fake_create(order):
+        called.append(order)
+        return 1
+
+    amgroup_fallback.create_lead_for_order = fake_create
 
     order = _ms_order("uuid-6", "07205", channel="Магазин")
     result = _run(monkeypatch, [[order]])
@@ -162,13 +177,47 @@ def test_zakaz_bez_sdelki_popadaet_v_missing_i_ne_sozdaetsya_v_suhom_rezhime(mon
     amgroup_fallback.create_lead_for_order = None
     assert result["missing"] == 1
     assert called == []
+    assert amgroup_fallback._logged == set()
+
+
+def test_suhoy_rezhim_ne_otravlyaet_sostoyanie_boevoy_podhvatyvaet(monkeypatch):
+    """Заказ увиден в сухом режиме (ничего не создалось) -> переключаем на
+    боевой режим -> тот же заказ на следующем проходе ДОЛЖЕН создаться, а не
+    считаться уже обработанным."""
+    calls = []
+
+    async def fake_create(order):
+        calls.append(order)
+        return 999
+
+    amgroup_fallback.create_lead_for_order = fake_create
+    order = _ms_order("uuid-dry2combat", "07210", channel="Магазин")
+
+    # проход 1: сухой режим (по умолчанию в _clean)
+    _run(monkeypatch, [[order]])
+    assert calls == []
+    assert amgroup_fallback._logged == set()
+
+    # проход 2: боевой режим - тот же заказ должен подхватиться
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_DRY_RUN", False, raising=False)
+    _run(monkeypatch, [[order]])
+
+    amgroup_fallback.create_lead_for_order = None
+    assert len(calls) == 1
+    assert calls[0]["id"] == "uuid-dry2combat"
+    assert "uuid-dry2combat" in amgroup_fallback._logged
 
 
 def test_missing_ne_povtoryaetsya_kazhdyy_prohod(monkeypatch):
-    """Дедуп на диске: тот же заказ без сделки не должен звать создание
-    сделки повторно на следующем проходе (пока список заказов не изменился)."""
+    """Дедуп на диске: заказ, по которому сделка УСПЕШНО создалась, не должен
+    звать создание сделки повторно на следующем проходе."""
     calls = []
-    amgroup_fallback.create_lead_for_order = lambda order: calls.append(order)
+
+    async def fake_create(order):
+        calls.append(order)
+        return 555  # успех - вернули id созданной сделки
+
+    amgroup_fallback.create_lead_for_order = fake_create
     monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_DRY_RUN", False, raising=False)
 
     order = _ms_order("uuid-7", "07206", channel="Магазин")
@@ -179,8 +228,110 @@ def test_missing_ne_povtoryaetsya_kazhdyy_prohod(monkeypatch):
     assert len(calls) == 1
 
 
+def test_sboy_sozdaniya_ne_hooronit_zakaz_navsegda(monkeypatch):
+    """create_lead_for_order вернул None (сбой, ничего не глотаем молча) -
+    заказ НЕ помечается обработанным и на следующем проходе создание
+    вызывается повторно, пока не получится (находка приёмки безопасности
+    03.09.2026 - раньше любой сбой хоронил заказ навсегда)."""
+    calls = []
+    results = iter([None, 777])  # первый проход - сбой, второй - успех
+
+    async def fake_create(order):
+        calls.append(order)
+        return next(results)
+
+    amgroup_fallback.create_lead_for_order = fake_create
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_DRY_RUN", False, raising=False)
+
+    order = _ms_order("uuid-8", "07207", channel="Магазин")
+    _run(monkeypatch, [[order]])
+    assert amgroup_fallback._logged == set()  # сбой - не помечен
+
+    _run(monkeypatch, [[order]])
+    amgroup_fallback.create_lead_for_order = None
+
+    assert len(calls) == 2  # повтор случился
+    assert "uuid-8" in amgroup_fallback._logged  # второй раз - успех, помечен
+
+
+def test_ischeklyucheniye_pri_sozdanii_tozhe_ne_hooronit_zakaz(monkeypatch):
+    """create_lead_for_order упал исключением - заказ тоже не помечается
+    обработанным (не только «тихий None»)."""
+    calls = []
+
+    async def fake_create(order):
+        calls.append(order)
+        raise RuntimeError("boom")
+
+    amgroup_fallback.create_lead_for_order = fake_create
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_DRY_RUN", False, raising=False)
+
+    order = _ms_order("uuid-9", "07208", channel="Магазин")
+    _run(monkeypatch, [[order]])
+
+    amgroup_fallback.create_lead_for_order = None
+    assert len(calls) == 1
+    assert amgroup_fallback._logged == set()
+
+
+def test_amo_ne_otvetil_pri_poiske_sdelki_prohod_preryvaetsya(monkeypatch, caplog):
+    """amoCRM не ответил на поиск существующей сделки (find_leads_by_query
+    вернул None, не пустой список) - проход прерывается ЦЕЛИКОМ, точка
+    расширения не зовётся вовсе (лучше повтор, чем дубль сделки)."""
+    called = []
+
+    async def fake_create(order):
+        called.append(order)
+        return 1
+
+    amgroup_fallback.create_lead_for_order = fake_create
+    monkeypatch.setattr(amgroup_fallback, "AMGROUP_FALLBACK_DRY_RUN", False, raising=False)
+
+    order = _ms_order("uuid-10", "07209", channel="Магазин")
+
+    async def fake_get(path, params=None):
+        return {"rows": [order]} if (params or {}).get("offset", 0) == 0 else {"rows": []}
+
+    async def fake_find(query, with_=(), limit=50):
+        return None  # amoCRM не ответил
+
+    monkeypatch.setattr(amgroup_fallback.ms_client, "get", fake_get)
+    monkeypatch.setattr(amgroup_fallback.amo_service, "find_leads_by_query", fake_find)
+
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        result = asyncio.run(amgroup_fallback.check_once())
+
+    amgroup_fallback.create_lead_for_order = None
+    assert result["amo_answered"] is False
+    assert called == []  # ни одной попытки создать сделку
+    assert amgroup_fallback._logged == set()
+    assert amgroup_fallback._known_with_deal == set()
+    assert any("не ответил" in rec.message and "amoCRM" in rec.message for rec in caplog.records)
+
+
+def test_podtverzhdennaya_sdelka_ne_pereproveryaetsya_na_sleduyushem_prohode(monkeypatch):
+    """Заказ, для которого сделка уже НАЙДЕНА, на следующем проходе не должен
+    снова спрашивать amoCRM (память «сделка уже есть» - иначе каждый заказ
+    окна опрашивается пожизненно и это лишняя нагрузка, способная выбить
+    предохранитель, см. докстринг модуля)."""
+    order = _ms_order("uuid-11", "07211", channel="Магазин")
+    find_calls = {"n": 0}
+
+    def amo_leads(query):
+        find_calls["n"] += 1
+        return [_amo_lead(321, "uuid-11")]
+
+    result1 = _run(monkeypatch, [[order]], amo_leads_by_query=amo_leads)
+    assert result1["with_deal"] == 1
+    assert find_calls["n"] == 1  # искали по UUID один раз
+
+    result2 = _run(monkeypatch, [[order]], amo_leads_by_query=amo_leads)
+    assert result2["with_deal"] == 1
+    assert find_calls["n"] == 1  # второй раз amo вообще не спрашивали
+
+
 def test_pustoy_sklad_eto_chestnyy_nol(monkeypatch):
     """Склад ответил и правда вернул пустой список - это НЕ ошибка, а
     легитимный «заказов за окно нет»."""
     result = _run(monkeypatch, [[]])
-    assert result == {"ms_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
+    assert result == {"ms_answered": True, "amo_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}

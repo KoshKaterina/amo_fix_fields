@@ -125,8 +125,18 @@ async def put(path: str, body: dict, retries: int = 3) -> dict | None:
 
 async def post(path: str, body: dict, retries: int = 3) -> dict | None:
     """POST к МС - создание сущностей (заведён для протеза amgroup, сама
-    сборка и вызов - в соседних срезах). Ретраи, rate-limit и заголовки -
-    ровно как в put(), ничего не меняем в get()/put() рядом.
+    сборка и вызов - в соседних срезах). Rate-limit и заголовки - ровно как
+    в put(), ничего не меняем в get()/put() рядом.
+
+    ⚠️ МЕТОД НЕИДЕМПОТЕНТНЫЙ: POST создаёт документ, повторный вызов с тем
+    же телом создаёт ВТОРОЙ. Поэтому, в отличие от get()/put(), при сетевой
+    ошибке (обрыв соединения, таймаут) здесь НЕ ретраим (правка по итогам
+    ревью 03.09.2026) - таймаут чтения наступает и тогда, когда МойСклад
+    запрос уже выполнил и документ уже создан, а мы об этом не узнали;
+    повтор в этом случае создаёт вторую отгрузку. Пятисотку тоже не ретраим: 502 и 504 приходят от балансировщика и не
+    говорят, дошёл ли запрос до склада. Ретрай оставлен только при 429
+    (слишком много запросов) - он безопасен, потому что запрос ещё не был
+    исполнен.
 
     ⚠️ Как и get()/put(), при ошибке соединения или ответе с кодом ошибки
     возвращает None - и это НЕ значит «склад ответил пусто». 03.09.2026 на
@@ -150,17 +160,22 @@ async def post(path: str, body: dict, retries: int = 3) -> dict | None:
         except asyncio.CancelledError:
             raise
         except httpx.RequestError as exc:
-            logger.warning("MS POST %s ошибка (%s/%s): %s", path, attempt, retries, exc.__class__.__name__)
-            if attempt < retries:
-                await asyncio.sleep(2 ** attempt)
-                continue
+            logger.warning(
+                "MS POST %s ошибка соединения: %s - не ретраим (метод неидемпотентный, "
+                "повтор мог бы создать второй документ)", path, exc.__class__.__name__,
+            )
             return None
         if resp.status_code == 429:
             await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
             continue
-        if resp.status_code >= 500 and attempt < retries:
-            await asyncio.sleep(2 ** attempt)
-            continue
+        if resp.status_code >= 500:
+            # Пятисотку тоже НЕ ретраим: 502 и 504 приходят от балансировщика
+            # и не говорят, дошёл ли запрос до склада. Документ мог создаться.
+            logger.error(
+                "MS POST %s → %s: %s - не ретраим (метод неидемпотентный, склад "
+                "мог документ создать)", path, resp.status_code, resp.text[:300],
+            )
+            return None
         if resp.status_code >= 400:
             logger.error("MS POST %s → %s: %s", path, resp.status_code, resp.text[:300])
             return None

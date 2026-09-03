@@ -679,6 +679,10 @@ async def _resolve_lead_safe(query: str):
 
 async def _resolve_lead(query: str):
     leads = await amo_service.find_leads_by_query(query)
+    if leads is None:
+        # Молчание amoCRM - не «сделок нет», сообщение не привязываем.
+        logger.warning("wazzup_delivery: amoCRM не ответила на поиск сделки")
+        return None, None
     open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
     if not open_leads:
         return None, None

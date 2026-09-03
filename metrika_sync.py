@@ -347,7 +347,9 @@ async def _resolve_clever(dup_lead: dict) -> dict | None:
     uuid = str(_cf(dup_lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
     if not uuid:
         return None
-    for cand in await amo_service.find_leads_by_query(uuid, with_=("contacts",)):
+    # find_leads_by_query теперь возвращает None при сбое запроса (не только
+    # пустой список) - or [] сохраняет прежнее поведение (сбой = нет сиблинга).
+    for cand in await amo_service.find_leads_by_query(uuid, with_=("contacts",)) or []:
         if cand.get("pipeline_id") == PIPELINE_CLEVER and str(
             _cf(cand, FIELD_MOYSKLAD_ORDER_UUID) or ""
         ).strip() == uuid:

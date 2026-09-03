@@ -492,23 +492,21 @@ async def get_leads_by_status(status_id: int, with_: tuple[str, ...] = ("contact
     return leads
 
 
-async def find_leads_by_query(query: str, with_: tuple[str, ...] = ()) -> list[dict]:
-    """Полнотекстовый поиск сделок (query ищет и по значениям custom-полей)."""
-    params: list[tuple[str, str]] = [("query", query), ("limit", "50")]
+async def find_leads_by_query(query: str, with_: tuple[str, ...] = (), limit: int = 50) -> list[dict] | None:
+    """Полнотекстовый поиск сделок (query ищет и по значениям custom-полей).
+
+    Возвращает None при СБОЕ запроса (сеть/429/5xx/открытый брейкер - _do_get
+    вернул None) - молчание amoCRM нельзя путать с честным «не найдено»,
+    иначе протез amgroup читает сбой как «сделки нет» и заводит дубль (см.
+    get_leads_updated_since выше, тот же приём). Пустой список - легитимно
+    «ничего не нашлось» (200 с пустой выдачей или 204 -> {})."""
+    params: list[tuple[str, str]] = [("query", query), ("limit", str(limit))]
     if with_:
         params.append(("with", ",".join(with_)))
     data = await _do_get("/api/v4/leads", params)
-    if not data:
-        return []
+    if data is None:
+        return None
     return (data.get("_embedded") or {}).get("leads") or []
-
-
-async def find_contacts_by_query(query: str, limit: int = 10) -> list[dict]:
-    """Полнотекстовый поиск контактов (query ищет и по телефонам)."""
-    data = await _do_get("/api/v4/contacts", [("query", query), ("limit", str(limit))])
-    if not data:
-        return []
-    return (data.get("_embedded") or {}).get("contacts") or []
 
 
 async def get_talks_by_contact(contact_id: int | str) -> list[dict]:
@@ -617,6 +615,7 @@ async def patch_lead(
     pipeline_id: int | None = None,
     tags: list[dict] | None = None,
     responsible_user_id: int | None = None,
+    price: int | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
     if custom_fields:
@@ -634,6 +633,8 @@ async def patch_lead(
         body.setdefault("_embedded", {})["tags"] = _tags_payload(tags)
     if responsible_user_id is not None:
         body["responsible_user_id"] = responsible_user_id
+    if price is not None:
+        body["price"] = int(price)
     if not body:
         return {"ok": True, "status_code": 204, "retryable": False}
     return await _do_patch(f"/api/v4/leads/{lead_id}", body)
@@ -761,11 +762,15 @@ async def move_to_ready_and_clear_error(
     return await patch_lead(lead_id, status_id=target_status, tags=new_tags)
 
 
-async def find_contacts_by_query(query: str, limit: int = 10) -> list[dict]:
-    """Полнотекстовый поиск контактов (query ищет и по телефонам)."""
+async def find_contacts_by_query(query: str, limit: int = 10) -> list[dict] | None:
+    """Полнотекстовый поиск контактов (query ищет и по телефонам).
+
+    Возвращает None при СБОЕ запроса - то же самое различие «сбой vs честный
+    ноль», что и у find_leads_by_query выше, той же ценой: молчание тут может
+    прочитаться как «контакта нет» и завести дубль человека."""
     data = await _do_get("/api/v4/contacts", [("query", query), ("limit", str(limit))])
-    if not data:
-        return []
+    if data is None:
+        return None
     return (data.get("_embedded") or {}).get("contacts") or []
 
 

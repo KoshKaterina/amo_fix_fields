@@ -77,12 +77,44 @@ def _stub_ms_ok(monkeypatch, order):
 
 
 def _stub_amo_empty(monkeypatch, *, contacts=None, leads=None):
-    """По умолчанию amo не находит ни контактов, ни сделок."""
+    """По умолчанию amo не находит ни контактов, ни сделок. contacts=None
+    (не "не найдено") зовёт _AmoSearchFailed - для теста молчания amoCRM на
+    пути поиска контакта. Так же leads=None - молчание на пути поиска сделки."""
+    async def fake_find_contacts(query, limit=10):
+        if contacts is None:
+            return []
+        return contacts
+
+    async def fake_find_leads(query, with_=(), limit=50):
+        if leads is None:
+            return []
+        return leads
+
+    monkeypatch.setattr(builder.amo_service, "find_contacts_by_query", fake_find_contacts)
+    monkeypatch.setattr(builder.amo_service, "find_leads_by_query", fake_find_leads)
+
+
+def _stub_amo_leads_silent(monkeypatch, *, contacts=None):
+    """amoCRM не отвечает на поиск СДЕЛКИ (find_leads_by_query -> None) -
+    поиск контакта при этом отвечает как обычно."""
     async def fake_find_contacts(query, limit=10):
         return contacts or []
 
-    async def fake_find_leads(query, with_=()):
-        return leads or []
+    async def fake_find_leads(query, with_=(), limit=50):
+        return None
+
+    monkeypatch.setattr(builder.amo_service, "find_contacts_by_query", fake_find_contacts)
+    monkeypatch.setattr(builder.amo_service, "find_leads_by_query", fake_find_leads)
+
+
+def _stub_amo_contacts_silent(monkeypatch):
+    """Дедуп сделки отвечает честным «не найдено», а поиск КОНТАКТА молчит
+    (find_contacts_by_query -> None)."""
+    async def fake_find_contacts(query, limit=10):
+        return None
+
+    async def fake_find_leads(query, with_=(), limit=50):
+        return []
 
     monkeypatch.setattr(builder.amo_service, "find_contacts_by_query", fake_find_contacts)
     monkeypatch.setattr(builder.amo_service, "find_leads_by_query", fake_find_leads)
@@ -180,7 +212,9 @@ def test_sozdaet_sdelku_i_stavit_otvetstvennogo(monkeypatch):
     assert calls["last_lead_kwargs"]["tags"] == [builder.AMGROUP_FALLBACK_TAG]
     # ответственный - отдельный PATCH после создания, не часть тела создания
     assert "responsible_user_id" not in calls["last_lead_kwargs"]
-    assert calls["patch"] == [(777, {"responsible_user_id": 999})]
+    # бюджет - тоже отдельный PATCH (у create_lead_direct нет параметра суммы,
+    # api.py не трогаем), уходит ПЕРЕД проставлением ответственного
+    assert calls["patch"] == [(777, {"price": 13990}), (777, {"responsible_user_id": 999})]
 
 
 def test_povtornyy_vyzov_na_tom_zhe_zakaze_ne_sozdaet_sdelku(monkeypatch):
@@ -238,22 +272,26 @@ def test_dva_zakaza_odnogo_klienta_odin_kontakt(monkeypatch):
     assert builder._contact_cache["79997654321"] == 555
 
 
-def test_bez_otvetstvennogo_v_nastroykah_sdelka_vse_ravno_sozdaetsya(monkeypatch, caplog):
-    """AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан - сделка всё равно
-    создаётся (не глотаем результат), но простановка ответственного не
-    происходит и это видно в логе как явная недоделка, а не тишина."""
+def test_bez_otvetstvennogo_v_nastroykah_sdelka_ne_sozdaetsya(monkeypatch, caplog):
+    """AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан - сделка НЕ создаётся вовсе
+    (находка приёмки безопасности 03.09.2026: без ответственного боты amoCRM
+    на сделку не реагируют, распределения не будет, и она молча оседает на
+    пользователе интеграции - раньше это была только WARNING в лог, теперь
+    явный отказ от создания, видный как ERROR)."""
     monkeypatch.setattr(builder, "AMGROUP_LEAD_RESPONSIBLE_USER_ID", None, raising=False)
     order = _ms_order("uuid-5", "07306")
     _stub_ms_ok(monkeypatch, order)
     _stub_amo_empty(monkeypatch)
     calls = _stub_create(monkeypatch, contact_id=555, lead_id=777)
 
-    with caplog.at_level("WARNING", logger="uvicorn"):
+    with caplog.at_level("ERROR", logger="uvicorn"):
         result = asyncio.run(builder.create_lead_for_order({"id": "uuid-5", "name": "07306"}))
 
-    assert result == 777
+    assert result is None
+    assert calls["leads"] == 0
+    assert calls["contacts"] == 0
     assert calls["patch"] == []
-    assert any("не проставлен ответственный" in rec.message for rec in caplog.records)
+    assert any("AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан" in rec.message for rec in caplog.records)
 
 
 def test_ne_sozdalas_sdelka_vozvrashaet_none(monkeypatch, caplog):
@@ -270,3 +308,92 @@ def test_ne_sozdalas_sdelka_vozvrashaet_none(monkeypatch, caplog):
     assert result is None
     assert calls["patch"] == []
     assert any("не создалась сделка" in rec.message for rec in caplog.records)
+
+
+def test_amo_ne_otvetil_pri_poiske_dublya_sdelku_ne_sozdaem(monkeypatch, caplog):
+    """amoCRM не ответил на поиск дубля сделки (find_leads_by_query -> None) -
+    создание прерывается ЦЕЛИКОМ: ни контакт, ни сделка не заводятся, лучше
+    повтор на следующем проходе, чем риск дубля."""
+    order = _ms_order("uuid-7", "07308")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_leads_silent(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=777)
+
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        result = asyncio.run(builder.create_lead_for_order({"id": "uuid-7", "name": "07308"}))
+
+    assert result is None
+    assert calls["leads"] == 0
+    assert calls["contacts"] == 0
+    assert any("amoCRM не ответил" in rec.message and "дубля сделки" in rec.message for rec in caplog.records)
+
+
+def test_amo_ne_otvetil_pri_poiske_kontakta_sdelku_ne_sozdaem(monkeypatch, caplog):
+    """Дедуп сделки прошёл честно (сделки нет), а поиск КОНТАКТА молчит
+    (find_contacts_by_query -> None) - сделка тоже не создаётся: не увидели
+    существующий контакт из-за сбоя не значит, что его нет."""
+    order = _ms_order("uuid-8", "07309")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_contacts_silent(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=777)
+
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        result = asyncio.run(builder.create_lead_for_order({"id": "uuid-8", "name": "07309"}))
+
+    assert result is None
+    assert calls["leads"] == 0
+    assert calls["contacts"] == 0
+    assert any("amoCRM не ответил" in rec.message and "поиске контакта" in rec.message for rec in caplog.records)
+
+
+def test_dlinnyy_sostav_zakaza_obrezaetsya_potolkom_polya(monkeypatch):
+    """Заказ из многих позиций даёт длинный «Состав заказа» - t() обязана
+    резать его sanitize_custom_field_value (потолок 256 символов), иначе
+    amoCRM отклонит всю сделку целиком (находка приёмки безопасности
+    03.09.2026)."""
+    order = _ms_order("uuid-9", "07310")
+    many_positions = [
+        {
+            "quantity": 1,
+            "price": 100000,
+            "assortment": {
+                "name": f"Товар с очень длинным названием номер {i} для теста обрезки поля",
+                "weight": 0.01,
+                "volume": 0.001,
+                "meta": {"type": "product"},
+            },
+        }
+        for i in range(20)
+    ]
+    order["positions"] = {"rows": many_positions}
+
+    b = builder._build_fields(order)
+    assert len(b["sostav"]) > 256  # исходное значение точно длиннее потолка
+
+    cf = builder._custom_fields(order, b, "12345")
+    by_field = {f["field_id"]: f["values"][0] for f in cf}
+    sostav_value = by_field[builder.FIELD["sostav"]]["value"]
+
+    assert len(sostav_value) <= 256
+
+
+def test_oshibka_sozdaniya_kontakta_ne_svetit_telefon_v_loge(monkeypatch, caplog):
+    """Контакт не создался (api.create_contact вернул None) - сделка всё
+    равно создаётся без привязки к контакту (contact_id=None, ничего не
+    глотаем), но в логе про сбой контакта - только номер заказа, сырой
+    телефон клиента светить нельзя (находка приёмки безопасности 03.09.2026:
+    PII в логах)."""
+    order = _ms_order("uuid-10", "07311", phone="+79261234567")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=None, lead_id=777)
+
+    with caplog.at_level("ERROR", logger="uvicorn"):
+        result = asyncio.run(builder.create_lead_for_order({"id": "uuid-10", "name": "07311"}))
+
+    assert result == 777
+    assert calls["leads"] == 1
+    assert calls["last_lead_kwargs"]["contact_id"] is None
+    error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
+    assert any("не создался контакт" in m and "07311" in m for m in error_messages)
+    assert not any("9261234567" in m or "Иван Иванов" in m for m in error_messages)

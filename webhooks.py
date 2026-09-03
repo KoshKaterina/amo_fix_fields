@@ -8,6 +8,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from starlette.status import HTTP_200_OK
 
+import amgroup_duplicate_watch
+import amgroup_fallback
+import amgroup_lead_builder
+import amgroup_shipment
 import amo_service
 import cdek_client
 import cdek_status_sync
@@ -106,6 +110,13 @@ async def lifespan(app):
     await order_watchdog.init()
     await uis_missed_call.init()
     await new_lead_watch.init()
+    # Протез amgroup (03.09.2026): их интеграция МойСклад -> amoCRM встала 02.09.
+    # Сборку сделки подключаем точкой расширения, чтобы протез искал заказы, а
+    # создавал их отдельный модуль - оба выключены флагами по умолчанию.
+    amgroup_fallback.create_lead_for_order = amgroup_lead_builder.create_lead_for_order
+    await amgroup_fallback.init()
+    await amgroup_shipment.init()
+    await amgroup_duplicate_watch.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -116,6 +127,9 @@ async def lifespan(app):
     await order_watchdog.shutdown()
     await uis_missed_call.shutdown()
     await new_lead_watch.shutdown()
+    await amgroup_fallback.shutdown()
+    await amgroup_shipment.shutdown()
+    await amgroup_duplicate_watch.shutdown()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await team_panel_client.stop()
@@ -399,6 +413,13 @@ async def lead_change(request: Request):
     # сделки, и лишний запрос в amo отсюда стоил бы дорого. Проверка и отправка — в
     # собственном цикле new_lead_watch.
     new_lead_watch.note_lead(lead_id, incoming_pipeline, incoming_status)
+
+    # Протез отгрузок: пока amgroup лежит, отгрузку в МойСкладе не создаёт никто
+    # и товар не списывается. Вешаемся на те же этапы воронки «Офис», на которых
+    # её создавала amgroup (сверено на 22 сделках 03.09.2026). Модуль сам первым
+    # делом смотрит флаг, воронку и этап и выходит без единого запроса в сеть -
+    # вебхук приходит на каждое изменение любой сделки.
+    amgroup_shipment.handle_lead_status_change_bg(lead_id, incoming_status, incoming_pipeline)
 
 
     # Office Transfer: сделка воронки-источника зашла в УР(142)/ЗНР(143) →

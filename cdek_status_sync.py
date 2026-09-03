@@ -209,7 +209,13 @@ async def _find_leads(cdek_number: str | None, order_uuid: str | None) -> list[d
     wanted = {v for v in (cdek_number, order_uuid) if v}
     found: dict[int, dict] = {}
     for query in wanted:
-        for lead in await amo_service.find_leads_by_query(query):
+        leads = await amo_service.find_leads_by_query(query)
+        if leads is None:
+            # Молчание amoCRM - не «сделок нет». Пропускаем запрос, а не считаем
+            # сделку ненайденной: иначе статус СДЭК уедет не туда.
+            logger.warning("cdek_status_sync: amoCRM не ответила на поиск %s", query)
+            continue
+        for lead in leads:
             value = amo_service.get_custom_field_value(lead, FIELD_CDEK_ORDER_NUMBER)
             if value is not None and str(value).strip() in wanted:
                 lid = lead.get("id")

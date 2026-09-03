@@ -46,11 +46,29 @@ md/documents/_common_info.md и _demand.md, раздел «Шаблон Отгр
     2. МойСклад уже знает отгрузку по этому заказу покупателя -> выходим молча;
     3. состояние на диске (/app/var) - эта сделка уже отгружена в прошлом
        проходе -> выходим молча.
-Диск пишем СРАЗУ после успешного создания в МойСкладе, ДО записи полей в
-amoCRM - отгрузка необратимо списывает товар, а провал последующей записи в
-amo лечится ручной допиской полей, а не риском пересоздать отгрузку.
+
+⚠️ Все три гейта выше только ЧИТАЮТ состояние - между чтением и финальной
+записью в МойСклад идут два сетевых вызова, и без дополнительной защиты
+конкурентный вебхук по той же сделке успевает пройти те же гейты, пока первый
+ждёт сеть (авария на разборе 03.09.2026: гонка двух вебхуков создавала две
+отгрузки). Закрыто ДВУМЯ слоями:
+    - замок на lead_id (_lock_for) - конкурентный вызов create_shipment_for_lead
+      по той же сделке ждёт, пока первый пройдёт всё целиком;
+    - синхронное занятие слота на гейте 3 (диск) - тем же приёмом, что
+      showroom_alert._is_new: проверка и запись идут ОДНИМ действием, без
+      await между ними, поэтому гонка невозможна даже без замка.
+Не состоялось создание - слот освобождается (см. create_shipment_for_lead),
+иначе одна сетевая икота навсегда заблокирует отгрузку по этой сделке.
+
+Диск пишем СРАЗУ после получения id и номера документа от МойСклада - до
+запроса имени склада (_resolve_store_name, тоже сетевой) и ДО записи полей в
+amoCRM: отгрузка необратимо списывает товар, а обрыв на любом из двух
+следующих сетевых вызовов не должен терять память о том, что документ уже
+реален. Провал записи полей лечится ручной допиской, а не риском пересоздать
+отгрузку.
 """
 
+import asyncio
 import datetime
 import json
 import logging
@@ -59,6 +77,8 @@ import os
 import amo_service
 import ms_client
 from waybill_config import (
+    AMGROUP_SHIPMENT_DRY_RUN,
+    AMGROUP_SHIPMENT_ENABLED,
     FIELD_MOYSKLAD_ORDER_UUID,
     MS_API_URL,
     PIPELINE_OFFICE,
@@ -73,7 +93,25 @@ logger = logging.getLogger("uvicorn")
 # см. докстринг модуля).
 FIELD_SHIPMENT_ID = 576691          # «ID Отгрузки»
 FIELD_SHIPMENT_NUMBER = 576699      # «№ Отгрузки»
-FIELD_SHIPMENT_WAREHOUSE = 576675   # «Склад отгрузки»
+FIELD_SHIPMENT_WAREHOUSE = 576675   # «Склад отгрузки» - ВЫПАДАЮЩИЙ СПИСОК, не текст
+
+# Варианты выпадающего списка «Склад отгрузки» - сверено с amoCRM 03.09.2026.
+# Поле select, поэтому в него пишется НЕ имя склада, а идентификатор варианта:
+# на обычный value amo отвечает отказом NotSupportedChoice.
+WAREHOUSE_ENUMS = {
+    "Sunscrypt Основной": 1040157,
+    "Sunscrypt Брак": 1040155,
+    "Sunscrypt Вскрытые": 1040163,
+    "Sunscrypt временный": 1041515,
+    "Tangem Russia Основной": 1040161,
+    "Tangem Russia Брак": 1040159,
+    "Tangem Russia Вскрытые": 1040167,
+    "OZON ДаркСтор Казань": 1040153,
+    "OZON ДаркСтор СПБ": 1040165,
+    "OZON ДаркСтор Краснодар": 1040171,
+    "ЭРМС_Основной": 1041665,
+    "корректировка": 1040169,
+}
 
 # Целевые этапы воронки «Офис» - см. докстринг модуля. Все три уже определены
 # в waybill_config.py, здесь только собираем набор для проверки.
@@ -81,10 +119,12 @@ _TRIGGER_STATUSES = {STATUS_WAYBILL_READY, STATUS_OFFICE_COURIER_OWN, STATUS_SUC
 
 # Разведка 03.09.2026: во всех трёх случаях отгрузка идёт с этого склада и от
 # этого юрлица (ИП Перфилов - в поля сделки не пишем, туда просят только
-# идентификатор/номер/склад отгрузки). Имя склада читаем живьём у МойСклада
-# (_resolve_store_name) - эта строка только запасной ход, если склад не
-# ответил на уточняющий запрос имени.
-DEFAULT_STORE_NAME = "Sunscrypt Основной"
+# идентификатор/номер/склад отгрузки). Имя склада читаем ЖИВЬЁМ у МойСклада
+# (_resolve_store_name) - молчание склада НЕ читаем как «Основной»: правка по
+# итогам ревью 03.09.2026, раньше здесь был запасной ход DEFAULT_STORE_NAME =
+# "Sunscrypt Основной", и он молча проходил проверку по вариантам списка
+# незамеченным. Незнакомое или неопределённое имя склада - это пустое поле
+# сделки и предупреждение в лог, а не знакомое имя наугад.
 
 # Состояние на диске - третий, самый дешёвый по цепочке, но обязательный гейт
 # от повторного создания отгрузки (см. докстринг модуля). Каталог /app/var -
@@ -93,6 +133,24 @@ _STATE_PATH = os.getenv("AMGROUP_SHIPMENT_STATE_PATH", "/app/var/amgroup_shipmen
 _created: dict[str, dict] = {}
 _state_loaded = False
 _STATE_CAP = 5000
+
+# Фоновые задачи вебхука (handle_lead_status_change_bg) - ссылку держим, иначе
+# event loop хранит только слабую ссылку и сборщик мусора может срезать задачу
+# на любом await (тем же приёмом, что showroom_tag/unmiss_tag/reserve_service).
+_bg_tasks: set = set()
+
+# Замок на lead_id - защита от гонки двух вебхуков по одной сделке (см.
+# докстринг модуля). Создаётся лениво, на первое обращение к сделке.
+_lead_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(lead_id) -> asyncio.Lock:
+    key = str(lead_id)
+    lock = _lead_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _lead_locks[key] = lock
+    return lock
 
 
 def _load_state() -> None:
@@ -157,38 +215,74 @@ async def _find_existing_demand(order_uuid: str) -> list[dict] | None:
     return data.get("rows") or []
 
 
-async def _resolve_store_name(store_ref: dict | None) -> str:
-    """Человекочитаемое имя склада отгрузки - читаем живьём у МойСклада, а не
-    жёстко кодируем: DEFAULT_STORE_NAME только запасной ход, если сам склад
-    не ответил на уточняющий запрос (см. факт разведки у константы)."""
+async def _resolve_store_name(store_ref: dict | None) -> str | None:
+    """Человекочитаемое имя склада отгрузки - читаем ЖИВЬЁМ у МойСклада.
+
+    Склад не ответил или в шаблоне вовсе нет ссылки на склад - возвращаем
+    None. Молча подставлять знакомое имя («Sunscrypt Основной») опаснее, чем
+    оставить поле сделки пустым: незнакомое имя не пишем вовсе (правка по
+    итогам ревью 03.09.2026, см. докстринг модуля)."""
     href = ((store_ref or {}).get("meta") or {}).get("href") or ""
     store_id = href.rsplit("/", 1)[-1].split("?")[0]
     if not store_id:
-        return DEFAULT_STORE_NAME
+        logger.warning(
+            "amgroup_shipment: в шаблоне отгрузки нет ссылки на склад - "
+            "поле «Склад отгрузки» в сделке останется пустым",
+        )
+        return None
     store = await ms_client.get(f"entity/store/{store_id}")
     if store and store.get("name"):
         return str(store["name"])
     logger.warning(
-        "amgroup_shipment: не удалось получить имя склада %s у МойСклада - "
-        "в поле сделки пишем название по умолчанию (%s)",
-        store_id, DEFAULT_STORE_NAME,
+        "amgroup_shipment: МойСклад не ответил на запрос имени склада %s - "
+        "поле «Склад отгрузки» в сделке останется пустым, «Sunscrypt Основной» "
+        "молча не подставляем",
+        store_id,
     )
-    return DEFAULT_STORE_NAME
+    return None
 
 
 async def write_shipment_fields_to_lead(lead_id: int | str, result: dict) -> bool:
     """Дописывает в сделку три поля отгрузки одним PATCH через amo_service -
     свой HTTP-клиент не заводим. Ошибка записи НЕ откатывает отгрузку в
     МойСкладе (см. докстринг модуля): товар уже списан, это необратимо."""
+    # Два текстовых поля идут обычным путём.
     patched = await amo_service.patch_lead(
         lead_id,
         custom_fields={
             FIELD_SHIPMENT_ID: result["shipment_id"],
             FIELD_SHIPMENT_NUMBER: result["shipment_number"],
-            FIELD_SHIPMENT_WAREHOUSE: result["warehouse"],
         },
     )
     ok = bool(patched.get("ok"))
+
+    # Склад отгрузки - выпадающий список, ему нужен идентификатор варианта.
+    # patch_lead умеет только value, поэтому патчим напрямую, тем же приёмом,
+    # что и showroom_store.py. Незнакомое имя склада не пишем вовсе: молча
+    # подставить "Основной" опаснее, чем оставить поле пустым.
+    enum_id = WAREHOUSE_ENUMS.get(result.get("warehouse"))
+    if enum_id is None:
+        if result.get("warehouse") is None:
+            logger.warning(
+                "amgroup_shipment: склад отгрузки не определён (МойСклад не ответил "
+                "или в шаблоне нет ссылки на склад) - поле сделки %s не заполняем",
+                lead_id,
+            )
+        else:
+            logger.warning(
+                "amgroup_shipment: склад %r нет в списке вариантов поля сделки, "
+                "поле не заполнено (сделка %s)", result.get("warehouse"), lead_id,
+            )
+    else:
+        body = {"custom_fields_values": [
+            {"field_id": FIELD_SHIPMENT_WAREHOUSE, "values": [{"enum_id": enum_id}]}]}
+        res = await amo_service._do_patch(f"/api/v4/leads/{lead_id}", body)
+        if not res.get("ok"):
+            ok = False
+            logger.error(
+                "amgroup_shipment: склад отгрузки не записался в сделку %s (%r)",
+                lead_id, res,
+            )
     if not ok:
         logger.error(
             "amgroup_shipment: отгрузка создана в МойСкладе (ID %s, № %s, склад %s), "
@@ -205,10 +299,26 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
     три поля сделки (write_shipment_fields_to_lead) и возвращает
     {"shipment_id", "shipment_number", "warehouse"}. При любом отказе -
     None, и в МойСкладе ничего не создано (кроме самого последнего шага -
-    после успешного POST отгрузка уже реальна и назад не откатывается)."""
+    после успешного POST отгрузка уже реальна и назад не откатывается).
+
+    Гонка двух конкурентных вызовов по одной сделке (см. докстринг модуля)
+    закрыта замком на lead_id (_lock_for) - второй вызов ждёт, пока первый
+    пройдёт всё целиком, и видит уже занятый или закрытый гейт 3."""
     lead_id = lead.get("id")
     if lead_id is None:
         logger.error("amgroup_shipment: у сделки нет id, отгрузку не создаём")
+        return None
+
+    # Флаг проверяем и здесь, а не только в двух точках входа
+    # (handle_lead_status_change / handle_lead_status_change_bg) - функция
+    # публичная, вызов мимо них не должен обходить выключатель (находка
+    # приёмки безопасности 03.09.2026).
+    if not AMGROUP_SHIPMENT_ENABLED:
+        logger.info(
+            "amgroup_shipment: модуль выключен флагом AMGROUP_SHIPMENT_ENABLED, "
+            "отгрузку по сделке %s не создаём",
+            lead_id,
+        )
         return None
 
     pipeline_id = _as_int(lead.get("pipeline_id"))
@@ -233,67 +343,180 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
         )
         return None
 
-    # Гейт 3 (диск): эту сделку уже отгружали в прошлом проходе. Дешевле сети,
-    # поэтому спрашиваем раньше склада.
-    _load_state()
-    if str(lead_id) in _created:
-        logger.info(
-            "amgroup_shipment: сделка %s уже отмечена отгруженной локально, повторно не создаём",
-            lead_id,
-        )
+    async with _lock_for(lead_id):
+        key = str(lead_id)
+
+        # Гейт 3 (диск) + занятие слота. Раньше гейт только ЧИТАЛ _created -
+        # конкурентный вызов читал «пусто» и тоже ехал в сеть, пока первый ждал
+        # ответ (авария, см. докстринг модуля). Проверка и запись идут ОДНИМ
+        # синхронным действием, без await между ними - под замком это
+        # дополнительный, а не единственный слой защиты.
+        _load_state()
+        if key in _created:
+            logger.info(
+                "amgroup_shipment: сделка %s уже отмечена отгруженной локально, повторно не создаём",
+                lead_id,
+            )
+            return None
+        _created[key] = {"pending": True, "order_uuid": order_uuid}
+        _save_state()
+
+        try:
+            # Гейт 2: спрашиваем склад, нет ли уже отгрузки по этому заказу покупателя.
+            existing = await _find_existing_demand(order_uuid)
+            if existing is None:
+                logger.warning(
+                    "amgroup_shipment: МойСклад не ответил на проверку существующих отгрузок по "
+                    "заказу %s (сделка %s) - ничего не создаём (пустой ответ никогда не значит "
+                    "«отгрузки нет»)",
+                    order_uuid, lead_id,
+                )
+                return None
+            if existing:
+                logger.info(
+                    "amgroup_shipment: по заказу %s уже есть отгрузка в МойСкладе (%s) - выходим, сделка %s",
+                    order_uuid, existing[0].get("name"), lead_id,
+                )
+                return None
+
+            # Шаблон отгрузки на основе заказа (см. докстринг модуля) - PUT ничего не
+            # создаёт, только возвращает предзаполненный JSON.
+            template = await ms_client.put(
+                "entity/demand/new", {"customerOrder": _customerorder_meta(order_uuid)},
+            )
+            if template is None:
+                logger.error(
+                    "amgroup_shipment: МойСклад не отдал шаблон отгрузки по заказу %s (сделка %s)",
+                    order_uuid, lead_id,
+                )
+                return None
+
+            if AMGROUP_SHIPMENT_DRY_RUN:
+                # Сухой режим (находка приёмки безопасности 03.09.2026): все гейты
+                # пройдены, шаблон у МойСклада собран, но саму запись (POST в
+                # МойСклад, PATCH в amoCRM) не делаем - только лог, что создали бы.
+                positions = ((template.get("positions") or {}).get("rows") or [])
+                store_href = ((template.get("store") or {}).get("meta") or {}).get("href") or "?"
+                logger.info(
+                    "amgroup_shipment: СУХОЙ РЕЖИМ - создал бы отгрузку по заказу %s "
+                    "(сделка %s), позиций в шаблоне %s, склад в шаблоне %s - в МойСклад "
+                    "и amoCRM не пишем",
+                    order_uuid, lead_id, len(positions), store_href,
+                )
+                return None
+
+            # Сам документ появляется только здесь - реальное списание товара.
+            demand = await ms_client.post("entity/demand", template)
+            if not demand or not demand.get("id"):
+                logger.error(
+                    "amgroup_shipment: МойСклад не создал отгрузку по заказу %s (сделка %s): %r",
+                    order_uuid, lead_id, demand,
+                )
+                return None
+
+            shipment_id = str(demand["id"])
+            shipment_number = str(demand.get("name") or "")
+
+            # Диск - СРАЗУ после успешного создания, ДО запроса имени склада и
+            # ДО записи полей в amo (см. докстринг модуля): обрыв на любом из
+            # двух следующих сетевых вызовов не должен терять память о том,
+            # что документ в МойСкладе уже реален.
+            _created[key] = {
+                "shipment_id": shipment_id,
+                "shipment_number": shipment_number,
+                "order_uuid": order_uuid,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            _save_state()
+
+            warehouse_name = await _resolve_store_name(demand.get("store"))
+            result = {"shipment_id": shipment_id, "shipment_number": shipment_number, "warehouse": warehouse_name}
+            await write_shipment_fields_to_lead(lead_id, result)
+            return result
+        finally:
+            # Слот освобождаем ТОЛЬКО если реальная отгрузка не состоялась -
+            # запись выше (после успешного POST) уже без "pending", её не
+            # трогаем. Не освободить при отказе - одна сетевая икота навсегда
+            # заблокирует отгрузку по этой сделке (требование ревью 03.09.2026).
+            if _created.get(key, {}).get("pending"):
+                del _created[key]
+                _save_state()
+
+
+async def handle_lead_status_change(lead_id: int | str, status_id, pipeline_id) -> dict | None:
+    """Точка входа из вебхука смены этапа. Сперва отсекает по дешёвым признакам
+    (флаг, воронка, этап) и только потом лезет в сеть за сделкой: вебхук
+    приходит на каждое изменение любой сделки, и лишний запрос в amoCRM отсюда
+    стоил бы дорого - тем же соображением живёт new_lead_watch."""
+    if not AMGROUP_SHIPMENT_ENABLED:
+        return None
+    if _as_int(pipeline_id) != PIPELINE_OFFICE or _as_int(status_id) not in _TRIGGER_STATUSES:
         return None
 
-    # Гейт 2: спрашиваем склад, нет ли уже отгрузки по этому заказу покупателя.
-    existing = await _find_existing_demand(order_uuid)
-    if existing is None:
+    lead = await amo_service.get_lead_full(lead_id)
+    if not lead:
         logger.warning(
-            "amgroup_shipment: МойСклад не ответил на проверку существующих отгрузок по "
-            "заказу %s (сделка %s) - ничего не создаём (пустой ответ никогда не значит "
-            "«отгрузки нет»)",
-            order_uuid, lead_id,
+            "amgroup_shipment: сделку %s не удалось прочитать, отгрузку не создаём", lead_id,
         )
         return None
-    if existing:
-        logger.info(
-            "amgroup_shipment: по заказу %s уже есть отгрузка в МойСкладе (%s) - выходим, сделка %s",
-            order_uuid, existing[0].get("name"), lead_id,
-        )
-        return None
+    return await create_shipment_for_lead(lead)
 
-    # Шаблон отгрузки на основе заказа (см. докстринг модуля) - PUT ничего не
-    # создаёт, только возвращает предзаполненный JSON.
-    template = await ms_client.put(
-        "entity/demand/new", {"customerOrder": _customerorder_meta(order_uuid)},
+
+def handle_lead_status_change_bg(lead_id, status_id, pipeline_id) -> None:
+    """Быстрая обёртка для вебхука: планирует фон и сразу возвращает - тем же
+    приёмом, что unmiss_tag.maybe_remove_bg. Вебхук не должен ждать ни склад,
+    ни amoCRM: ответ на вебхук держит соединение amo.
+
+    Ссылку на задачу держим в _bg_tasks (как showroom_tag/unmiss_tag/
+    reserve_service) - event loop иначе хранит только слабую ссылку, и
+    сборщик мусора может срезать задачу на любом await. Хуже всего срез
+    между созданием отгрузки и записью состояния (см. докстринг модуля) -
+    товар уже списан, памяти об этом нет."""
+    if lead_id is None or not AMGROUP_SHIPMENT_ENABLED:
+        return
+    if _as_int(pipeline_id) != PIPELINE_OFFICE or _as_int(status_id) not in _TRIGGER_STATUSES:
+        return
+    task = asyncio.create_task(_handle_lead_status_change_bg(lead_id, status_id, pipeline_id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _handle_lead_status_change_bg(lead_id, status_id, pipeline_id) -> None:
+    """Тело фоновой задачи - обёрнуто в try/except, иначе исключение всплывёт
+    безымянной строкой при сборке мусора (как у showroom_tag._apply)."""
+    try:
+        await handle_lead_status_change(lead_id, status_id, pipeline_id)
+    except Exception:
+        logger.exception(
+            "amgroup_shipment: фоновая отгрузка упала на сделке %s", lead_id,
+        )
+
+
+async def init() -> None:
+    """Регистрация в жизненном цикле (lifespan, webhooks.py). Отдельного
+    состояния поднимать не нужно (клиент МойСклада и amo уже живут к этому
+    моменту) - только сообщаем в лог, в каком режиме модуль стартовал."""
+    logger.info(
+        "amgroup_shipment: подключён к жизненному циклу - AMGROUP_SHIPMENT_ENABLED=%s, "
+        "AMGROUP_SHIPMENT_DRY_RUN=%s",
+        AMGROUP_SHIPMENT_ENABLED, AMGROUP_SHIPMENT_DRY_RUN,
     )
-    if template is None:
-        logger.error(
-            "amgroup_shipment: МойСклад не отдал шаблон отгрузки по заказу %s (сделка %s)",
-            order_uuid, lead_id,
+
+
+async def shutdown() -> None:
+    """Дождаться незавершённых фоновых отгрузок перед остановкой (образец -
+    unmiss_tag.shutdown, строки 88-101). Срез между созданием отгрузки в
+    МойСкладе и записью состояния на диск - самый опасный момент модуля (см.
+    докстринг): товар уже списан, а память об этом ещё не сохранена."""
+    pending = [t for t in _bg_tasks if not t.done()]
+    if not pending:
+        return
+    _done, still_pending = await asyncio.wait(pending, timeout=15)
+    if still_pending:
+        logger.warning(
+            "amgroup_shipment: %d фоновых отгрузок не успели на shutdown - "
+            "возможна отгрузка без полей в сделке, проверьте вручную",
+            len(still_pending),
         )
-        return None
-
-    # Сам документ появляется только здесь - реальное списание товара.
-    demand = await ms_client.post("entity/demand", template)
-    if not demand or not demand.get("id"):
-        logger.error(
-            "amgroup_shipment: МойСклад не создал отгрузку по заказу %s (сделка %s): %r",
-            order_uuid, lead_id, demand,
-        )
-        return None
-
-    shipment_id = str(demand["id"])
-    shipment_number = str(demand.get("name") or "")
-    warehouse_name = await _resolve_store_name(demand.get("store"))
-
-    # Диск - до записи в amo, см. докстринг модуля.
-    _created[str(lead_id)] = {
-        "shipment_id": shipment_id,
-        "shipment_number": shipment_number,
-        "order_uuid": order_uuid,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    _save_state()
-
-    result = {"shipment_id": shipment_id, "shipment_number": shipment_number, "warehouse": warehouse_name}
-    await write_shipment_fields_to_lead(lead_id, result)
-    return result
+        for t in still_pending:
+            t.cancel()

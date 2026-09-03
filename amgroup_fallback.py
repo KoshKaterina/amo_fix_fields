@@ -25,8 +25,16 @@ WORKLOG.md): канал продаж «Маркетплейс» и контра�
 проход прерывается и это видно в логе, ничего не считаем потерянным и не
 создаём.
 
-Состояние (уже залогированные заказы) - на диске в /app/var, чтобы пересборка
-контейнера не повторяла один и тот же список каждые AMGROUP_FALLBACK_INTERVAL_SEC.
+⚠️ Та же путаница на пути ЗАПИСИ дороже, чем на пути чтения: пустой ответ
+amoCRM при поиске сделки - не то же самое, что «сделки нет». Молчание amoCRM
+(сеть/429/5xx/открытый брейкер) отличаем от честного нуля так же, как и
+молчание склада выше - см. amo_service.find_leads_by_query/find_contacts_by_query
+и _AmoSearchFailed ниже. Цена ошибки здесь другая: не ложный алерт, а дубль
+сделки и дубль контакта у живого клиента.
+
+Состояние (уже залогированные заказы, а также заказы с подтверждённой
+сделкой - _known_with_deal) - на диске в /app/var, чтобы пересборка
+контейнера не повторяла одну и ту же работу каждые AMGROUP_FALLBACK_INTERVAL_SEC.
 """
 
 import asyncio
@@ -48,11 +56,23 @@ from waybill_config import (
 
 logger = logging.getLogger("uvicorn")
 
+
+class _AmoSearchFailed(Exception):
+    """amoCRM не ответил на поиск сделки - вызывающий код обязан прервать
+    проход, а не читать сбой как «сделки нет» (см. докстринг модуля)."""
+
+
 # «№ Заказа» - человекочитаемый номер заказа МойСклад вида «07182», второе
 # поле связки сделки с заказом (первое - FIELD_MOYSKLAD_ORDER_UUID = 576689 из
 # waybill_config). Определён локально, как и соседний FIELD_MS_ORDER_UUID в
 # showroom_store.py - общего реестра полей amoCRM в проекте нет.
 FIELD_MOYSKLAD_ORDER_NUMBER = 576697
+
+# Лимит полнотекстового поиска amo при проверке дубля. Больше дефолтных 50:
+# короткий номер заказа цепляет много постороннего, без запаса нужная сделка
+# может не попасть в первую страницу выдачи (находка приёмки безопасности
+# 03.09.2026, тот же приём в amgroup_lead_builder._LEAD_SEARCH_LIMIT).
+_LEAD_SEARCH_LIMIT = 250
 
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -63,14 +83,35 @@ _EXCLUDED_AGENT_MARKER = "интернет решения"  # ООО «ИНТЕ�
 
 # Точка расширения: соседний срез подставит сюда свою async-функцию сборки и
 # создания сделки. Пока не подставлена (или включён сухой режим) - модуль
-# только считает и логирует, ничего не создавая.
-create_lead_for_order: Callable[[dict], Awaitable[None]] | None = None
+# только считает и логирует, ничего не создавая. Возвращает id сделки (успех,
+# новая или уже существующая) или None (неудача) - _handle_missing обязан
+# читать этот результат, а не считать любой вызов успешным (см. её докстринг).
+create_lead_for_order: Callable[[dict], Awaitable[int | None]] | None = None
 
 _task: asyncio.Task | None = None
 _STATE_PATH = os.getenv("AMGROUP_FALLBACK_STATE_PATH", "/app/var/amgroup_fallback_logged.json")
 _logged: set[str] = set()
 _logged_loaded = False
 _LOGGED_CAP = 2000
+# Потолок на ОДИН проход и пауза между заказами (03.09.2026, по итогам приёмки
+# безопасности). Без них первый боевой проход заводит сделку на каждый заказ
+# двухсуточного окна разом - сотня сделок за минуту, менеджеры получают вал,
+# а очередь запросов в amoCRM забивается и отодвигает накладные СДЭК и
+# распределение лидов. Остаток окна разбирается следующими проходами.
+_CREATE_PER_PASS_CAP = int(os.getenv("AMGROUP_FALLBACK_PER_PASS_CAP", "25"))
+_CREATE_PAUSE_SEC = float(os.getenv("AMGROUP_FALLBACK_PAUSE_SEC", "1"))
+
+# Отдельная память «по этому заказу сделка уже подтверждена» (не путать с
+# _logged выше - тот про заказы БЕЗ сделки). Без неё каждый заказ окна
+# (по умолчанию 48ч) перепроверяется в amoCRM на КАЖДОМ проходе (по умолчанию
+# раз в 3 мин) пожизненно, включая давно найденные - лишняя нагрузка на amo,
+# которая сама способна выбить предохранитель (см. докстринг модуля).
+_DEAL_STATE_PATH = os.getenv(
+    "AMGROUP_FALLBACK_DEAL_STATE_PATH", "/app/var/amgroup_fallback_has_deal.json",
+)
+_known_with_deal: set[str] = set()
+_deal_loaded = False
+_DEAL_CAP = 20000
 
 
 def _load_state() -> None:
@@ -96,6 +137,31 @@ def _save_state() -> None:
         os.replace(tmp, _STATE_PATH)
     except Exception:
         logger.exception("amgroup_fallback: не записался %s", _STATE_PATH)
+
+
+def _load_deal_state() -> None:
+    global _deal_loaded
+    if _deal_loaded:
+        return
+    _deal_loaded = True
+    try:
+        with open(_DEAL_STATE_PATH, encoding="utf-8") as f:
+            _known_with_deal.update(str(x) for x in json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception("amgroup_fallback: не прочитался %s - начинаем с нуля", _DEAL_STATE_PATH)
+
+
+def _save_deal_state() -> None:
+    try:
+        os.makedirs(os.path.dirname(_DEAL_STATE_PATH), exist_ok=True)
+        tmp = f"{_DEAL_STATE_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(_known_with_deal)[-_DEAL_CAP:], f)
+        os.replace(tmp, _DEAL_STATE_PATH)
+    except Exception:
+        logger.exception("amgroup_fallback: не записался %s", _DEAL_STATE_PATH)
 
 
 async def _fetch_orders(since_utc: datetime.datetime) -> list[dict] | None:
@@ -144,7 +210,11 @@ async def _find_existing_lead(order_uuid: str, order_number: str) -> dict | None
     amgroup мог успеть заполнить любое из них до своей поломки. Полнотекстовый
     поиск amo цепляет и соседние сделки (тот же приём, что в showroom_store.py
     и metrika_sync.py), поэтому найденное всегда сверяем со значением самого
-    поля, а не доверяем факту попадания в выдачу."""
+    поля, а не доверяем факту попадания в выдачу.
+
+    Может raise _AmoSearchFailed, если amoCRM не ответил ни на один запрос -
+    вызывающий код (check_once) обязан прервать проход, а не читать сбой как
+    «сделки нет» - иначе на каждый сбой поиска протез заведёт дубль."""
     candidates = (
         (order_uuid, FIELD_MOYSKLAD_ORDER_UUID),
         (order_number, FIELD_MOYSKLAD_ORDER_NUMBER),
@@ -152,7 +222,10 @@ async def _find_existing_lead(order_uuid: str, order_number: str) -> dict | None
     for value, field_id in candidates:
         if not value:
             continue
-        for lead in await amo_service.find_leads_by_query(value):
+        leads = await amo_service.find_leads_by_query(value, limit=_LEAD_SEARCH_LIMIT)
+        if leads is None:
+            raise _AmoSearchFailed(value)
+        for lead in leads:
             found = str(amo_service.get_custom_field_value(lead, field_id) or "").strip()
             if found.casefold() == str(value).strip().casefold():
                 return lead
@@ -163,8 +236,12 @@ async def check_once() -> dict:
     """Один проход. Возвращает счётчики - по ним же удобно тестировать.
 
     ms_answered=False значит «склад не ответил, проход пропущен» - это не то
-    же самое, что missing=0 («ответил, разрывов нет»). Смешивать эти два
-    случая нельзя, см. докстринг модуля."""
+    же самое, что missing=0 («ответил, разрывов нет»). amo_answered=False -
+    тот же смысл, но про amoCRM: поиск сделки сорвался хотя бы на одном
+    заказе, проход прерван БЕЗ создания (см. _AmoSearchFailed выше) - вместо
+    неполного/сомнительного missing лучше повтор на следующем проходе, чем
+    риск дубля. Смешивать все три случая с честным «ничего не найдено»
+    нельзя, см. докстринг модуля."""
     now = datetime.datetime.now(datetime.timezone.utc)
     since = now - datetime.timedelta(hours=AMGROUP_FALLBACK_LOOKBACK_HOURS)
 
@@ -176,11 +253,14 @@ async def check_once() -> dict:
             "не значит «заказов нет»)",
             AMGROUP_FALLBACK_LOOKBACK_HOURS,
         )
-        return {"ms_answered": False, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
+        return {"ms_answered": False, "amo_answered": True, "total": 0, "excluded": 0, "with_deal": 0, "missing": 0}
 
+    _load_deal_state()
     excluded = 0
     with_deal = 0
     missing: list[dict] = []
+    newly_confirmed: list[str] = []
+    amo_answered = True
     for order in orders:
         reason = _exclusion_reason(order)
         if reason:
@@ -190,28 +270,66 @@ async def check_once() -> dict:
         order_number = str(order.get("name") or "").strip()
         if not order_uuid:
             continue
-        lead = await _find_existing_lead(order_uuid, order_number)
+        # Память «сделка уже подтверждена» - не спрашиваем amo повторно про
+        # заказ, который на прошлом проходе уже нашёлся (см. докстринг
+        # _known_with_deal выше): лишняя нагрузка способна сама выбить
+        # предохранитель и обрушить весь проход.
+        if order_uuid in _known_with_deal:
+            with_deal += 1
+            continue
+        try:
+            lead = await _find_existing_lead(order_uuid, order_number)
+        except _AmoSearchFailed:
+            logger.warning(
+                "amgroup_fallback: amoCRM не ответил при поиске сделки по заказу "
+                "%s - проход прерван, чтобы не завести дубль; остаток окна "
+                "проверим на следующем проходе",
+                order.get("name"),
+            )
+            amo_answered = False
+            break
         if lead is not None:
             with_deal += 1
+            newly_confirmed.append(order_uuid)
             continue
         missing.append(order)
 
-    if missing:
+    if newly_confirmed:
+        _known_with_deal.update(newly_confirmed)
+        _save_deal_state()
+
+    if missing and amo_answered:
         await _handle_missing(missing)
 
     logger.info(
-        "amgroup_fallback: заказов МС %s, отсеяно %s, сделка уже есть %s, без сделки %s",
+        "amgroup_fallback: заказов МС %s, отсеяно %s, сделка уже есть %s, без сделки %s%s",
         len(orders), excluded, with_deal, len(missing),
+        "" if amo_answered else " (проход прерван сбоем amoCRM, не полный)",
     )
     return {
-        "ms_answered": True, "total": len(orders), "excluded": excluded,
+        "ms_answered": True, "amo_answered": amo_answered, "total": len(orders), "excluded": excluded,
         "with_deal": with_deal, "missing": len(missing),
     }
 
 
 async def _handle_missing(missing: list[dict]) -> None:
     """Заказы без сделки: логируем (раз на заказ, дедуп на диске) и, если не
-    сухой режим и точка расширения подключена, зовём создание сделки."""
+    сухой режим и точка расширения подключена, зовём создание сделки.
+
+    Обработанным (_logged) заказ помечаем ТОЛЬКО после подтверждённого
+    успеха create_lead_for_order (вернул truthy id) - не после исключения и
+    не после тихого None, и НЕ в сухом режиме (там ничего не создавалось).
+    Раньше это было не так: заказ попадал в _logged безусловно, включая
+    сухой прогон и сбой создания - находка приёмки безопасности 03.09.2026,
+    цена бага двойная:
+    - сухой режим отравлял состояние - весь разрыв, накопленный за время
+      наблюдения, не закрывался при переходе в боевой режим никогда, только
+      руками по одному;
+    - одна сетевая икота на одном заказе (например склад не ответил на
+      карточку заказа - самый частый отказ create_lead_for_order) навсегда
+      выводила этот заказ из-под защиты модуля - он существует именно затем,
+      чтобы ловить такие заказы, и молча терял ровно те, на которых
+      споткнулся."""
     _load_state()
     fresh = [o for o in missing if str(o.get("id")) not in _logged]
     if not fresh:
@@ -226,27 +344,56 @@ async def _handle_missing(missing: list[dict]) -> None:
     )
 
     if AMGROUP_FALLBACK_DRY_RUN:
-        logger.info("amgroup_fallback: сухой режим - сделки не создаём, только считаем")
-    elif create_lead_for_order is None:
+        logger.info(
+            "amgroup_fallback: сухой режим - сделки не создаём, только считаем; "
+            "заказы НЕ помечаем обработанными, чтобы боевой режим потом их подхватил"
+        )
+        return
+
+    if create_lead_for_order is None:
         logger.info(
             "amgroup_fallback: боевой режим включён, но создание сделки делает "
             "соседний срез - точка расширения create_lead_for_order ещё не подключена"
         )
-    else:
-        for order in fresh:
-            try:
-                await create_lead_for_order(order)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "amgroup_fallback: не удалось создать сделку по заказу %s",
-                    order.get("name"),
-                )
+        return
 
-    for order in fresh:
-        _logged.add(str(order.get("id")))
-    _save_state()
+    created: list[str] = []
+    batch = fresh[:_CREATE_PER_PASS_CAP]
+    if len(fresh) > len(batch):
+        logger.warning(
+            "amgroup_fallback: за проход берём %s заказов из %s - остальные "
+            "разберём следующими проходами, чтобы не завалить менеджеров и "
+            "очередь запросов в amoCRM",
+            len(batch), len(fresh),
+        )
+    for idx, order in enumerate(batch):
+        if idx:
+            await asyncio.sleep(_CREATE_PAUSE_SEC)
+        order_id = str(order.get("id"))
+        try:
+            result = await create_lead_for_order(order)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "amgroup_fallback: не удалось создать сделку по заказу %s - "
+                "заказ останется в очереди на следующий проход",
+                order.get("name"),
+            )
+            continue
+        if not result:
+            logger.warning(
+                "amgroup_fallback: create_lead_for_order не подтвердил успех по "
+                "заказу %s (вернул пусто) - заказ останется в очереди на "
+                "следующий проход",
+                order.get("name"),
+            )
+            continue
+        created.append(order_id)
+
+    if created:
+        _logged.update(created)
+        _save_state()
 
 
 async def _loop() -> None:

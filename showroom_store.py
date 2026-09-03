@@ -100,6 +100,10 @@ async def _sync_lead_field(order_uuid: str, store_id: str) -> None:
     enum_id = (WAREHOUSE_SUNSCRYPT_SHOWROOM if store_id == MS_STORE_SHOWROOM_ID
                else WAREHOUSE_SUNSCRYPT_MAIN)
     leads = await amo_service.find_leads_by_query(order_uuid)
+    if leads is None:
+        # Молчание amoCRM - не «сделок нет». Молча ничего не меняем.
+        logger.warning("showroom_store: amoCRM не ответила на поиск по заказу, пропускаем")
+        return
     for lead in leads:
         if str(amo_service.get_custom_field_value(lead, FIELD_MS_ORDER_UUID) or "").lower() \
                 != order_uuid.lower():

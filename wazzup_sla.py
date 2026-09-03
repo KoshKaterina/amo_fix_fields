@@ -483,6 +483,10 @@ async def _resolve_lead(chat_id: str):
     if not chat_id:
         return None, None, False
     leads = await amo_service.find_leads_by_query(chat_id)
+    if leads is None:
+        # Молчание amoCRM - не «сделок нет». Тревогу по SLA не поднимаем.
+        logger.warning("wazzup_sla: amoCRM не ответила на поиск сделки по чату")
+        return None, None, False
     open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
     if not open_leads:
         return None, None, False
@@ -528,6 +532,10 @@ async def _talk_closed(st: dict) -> bool:
         return False
     since_ts = int(st["wall_since"].timestamp()) - _TALK_MATCH_SLACK_S
     contacts = await amo_service.find_contacts_by_query(chat_id)
+    if contacts is None:
+        # Молчание amoCRM - не «контактов нет».
+        logger.warning("wazzup_sla: amoCRM не ответила на поиск контакта по чату")
+        return False
     for contact in contacts[:3]:
         contact_id = contact.get("id")
         if not contact_id:

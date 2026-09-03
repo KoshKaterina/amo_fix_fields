@@ -294,6 +294,11 @@ async def _find_lead(phone: str):
         return None, None
     try:
         leads = await amo_service.find_leads_by_query(phone)
+        if leads is None:
+            # Молчание amoCRM - не «сделок нет». Привязывать пропущенный звонок
+            # наугад нельзя, выходим ни с чем.
+            logger.warning("uis_missed_call: amoCRM не ответила на поиск по телефону")
+            return None, None
         open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
         if not open_leads:
             return None, None
