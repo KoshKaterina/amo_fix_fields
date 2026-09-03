@@ -121,3 +121,51 @@ async def put(path: str, body: dict, retries: int = 3) -> dict | None:
         except ValueError:
             return {}
     return None
+
+
+async def post(path: str, body: dict, retries: int = 3) -> dict | None:
+    """POST к МС - создание сущностей (заведён для протеза amgroup, сама
+    сборка и вызов - в соседних срезах). Ретраи, rate-limit и заголовки -
+    ровно как в put(), ничего не меняем в get()/put() рядом.
+
+    ⚠️ Как и get()/put(), при ошибке соединения или ответе с кодом ошибки
+    возвращает None - и это НЕ значит «склад ответил пусто». 03.09.2026 на
+    этой путанице сгорел order_watchdog: get() вернул None из-за обрыва сети,
+    вызывающий код прочитал None как пустой список и объявил живые заказы
+    потерянными. Вызывающий код обязан отличать None (склад не ответил) от
+    настоящего успешного ответа, а не смешивать их."""
+    global _last_request
+    if _client is None:
+        logger.error("MS client не инициализирован")
+        return None
+    url = f"{MS_API_URL}/{path.lstrip('/')}"
+    for attempt in range(1, retries + 1):
+        async with _lock:
+            elapsed = time.monotonic() - _last_request
+            if elapsed < _min_interval:
+                await asyncio.sleep(_min_interval - elapsed)
+            _last_request = time.monotonic()
+        try:
+            resp = await _client.post(url, json=body)
+        except asyncio.CancelledError:
+            raise
+        except httpx.RequestError as exc:
+            logger.warning("MS POST %s ошибка (%s/%s): %s", path, attempt, retries, exc.__class__.__name__)
+            if attempt < retries:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None
+        if resp.status_code == 429:
+            await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
+            continue
+        if resp.status_code >= 500 and attempt < retries:
+            await asyncio.sleep(2 ** attempt)
+            continue
+        if resp.status_code >= 400:
+            logger.error("MS POST %s → %s: %s", path, resp.status_code, resp.text[:300])
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
+    return None

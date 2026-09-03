@@ -393,6 +393,21 @@ ORDER_WATCHDOG_LOOKBACK_H = int(os.getenv("ORDER_WATCHDOG_LOOKBACK_H", "24"))
 ORDER_WATCHDOG_MIN_AGE_MIN = int(os.getenv("ORDER_WATCHDOG_MIN_AGE_MIN", "15"))
 FIELD_FF_TREK = 571657
 
+# Протез amgroup (amgroup_fallback): сторонняя интеграция МойСклад -> amoCRM
+# встала 02.09.2026 (истёк сертификат *.amgbp.ru, потом лёг сам сервер), с
+# 02.09 около 19:30 новые сделки не создаются вовсе. Пока мост чужой не
+# починен, модуль сам находит заказы покупателя без сделки и заводит её.
+# По умолчанию ВЫКЛЮЧЕН - включаем осознанно, когда решаем, что дублирование
+# сделок безопаснее их отсутствия. Сухой режим по умолчанию ВКЛЮЧЁН - сначала
+# смотрим лог, что модуль бы сделал, и только потом разрешаем запись.
+AMGROUP_FALLBACK_ENABLED = os.getenv("AMGROUP_FALLBACK_ENABLED", "0") == "1"
+AMGROUP_FALLBACK_DRY_RUN = os.getenv("AMGROUP_FALLBACK_DRY_RUN", "1") == "1"
+AMGROUP_FALLBACK_INTERVAL_SEC = int(os.getenv("AMGROUP_FALLBACK_INTERVAL_SEC", "180"))
+# Насколько назад смотрим заказы МойСклада на каждом проходе.
+AMGROUP_FALLBACK_LOOKBACK_HOURS = int(os.getenv("AMGROUP_FALLBACK_LOOKBACK_HOURS", "48"))
+# Тег на сделку-протез - чтобы отличить от сделок, которые создал бы amgroup сам.
+AMGROUP_FALLBACK_TAG = os.getenv("AMGROUP_FALLBACK_TAG", "сбой МС")
+
 # ---------------------------------------------------------------------------
 # Склад шоурума (задача Кати 06.08.2026). Кирилл отгружает из отдельного склада
 # «Sunscrypt Шоурум», заведённого в МойСкладе 03.08.

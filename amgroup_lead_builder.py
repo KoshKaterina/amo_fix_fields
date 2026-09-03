@@ -1,0 +1,364 @@
+# -*- coding: utf-8 -*-
+"""Сборка и создание сделки-протеза amgroup (МойСклад -> amoCRM).
+
+Точка расширения amgroup_fallback.create_lead_for_order - этот модуль её
+реализует. amgroup_fallback находит заказ покупателя МойСклад без сделки и
+зовёт create_lead_for_order(order); эта функция собирает набор полей, находит
+или заводит контакт, создаёт сделку и проставляет ответственного (боты amo
+на такую сделку не реагируют - см. ниже), возвращает id сделки или None.
+
+Логика и карта полей перенесены из боевого прототипа backfill_leads.py
+(Катя, 03.09.2026) - им в тот же день созданы десять боевых сделок, набор
+полей сверен с живыми сделками amgroup. Формулы/ID полей ниже не придуманы
+заново, а перенесены оттуда.
+
+⚠️ Факт, проверенный 03.09.2026 на двенадцати сделках: боты amoCRM не
+реагируют на сделки, созданные не через amgroup - распределение на дежурного
+и шаблон сообщения клиенту НЕ запускаются. Поэтому assign_responsible ниже -
+ОТДЕЛЬНЫЙ явный шаг после создания сделки, а не часть тела создания.
+
+⚠️ Мина, на которой Катя подорвалась 03.09.2026: у одного клиента бывает два
+заказа подряд, и без кэша созданных контактов в рамках одного запуска
+получается дубль человека в amoCRM. _contact_cache ниже - защита от этого.
+
+Пишем в amoCRM только через существующие функции сервиса (amo_service.py,
+api.py) - они уже идут через общую очередь с ограничением частоты и
+circuit breaker, свой HTTP-клиент здесь не заводим. Читаем МойСклад только
+через ms_client.get - и, как и в amgroup_fallback, None от него значит
+«склад не ответил», а не «данных нет» (см. докстринг amgroup_fallback.py).
+
+Константы полей/воронки ниже свести в общий конфиг на сшивке - часть уже
+живёт в waybill_config.py (PIPELINE_CLEVER, STATUS_CLEVER_NEW_LEAD,
+FIELD_MOYSKLAD_ORDER_UUID, AMGROUP_FALLBACK_TAG) и импортируется оттуда,
+остальное (карта полей сделки, ENUM выпадающих списков) - своё, локальное.
+"""
+
+import logging
+import os
+import re
+from typing import Any
+
+import amo_service
+import api
+import ms_client
+from waybill_config import (
+    AMGROUP_FALLBACK_TAG,
+    FIELD_MOYSKLAD_ORDER_UUID,
+    PIPELINE_CLEVER,
+    STATUS_CLEVER_NEW_LEAD,
+)
+
+logger = logging.getLogger("uvicorn")
+
+# «№ Заказа» - второе поле связки, дублирует amgroup_fallback.FIELD_MOYSKLAD_ORDER_NUMBER
+# (там не экспортировано под этим именем - своя копия, свести на сшивке).
+FIELD_MOYSKLAD_ORDER_NUMBER = 576697
+
+# Кому проставлять ответственного, если assign_responsible вызвали без явного
+# параметра. Свести на сшивке с остальными настройками модуля - сейчас это
+# единственная настройка, которой нет в waybill_config.
+_raw_responsible = os.getenv("AMGROUP_LEAD_RESPONSIBLE_USER_ID", "").strip()
+try:
+    AMGROUP_LEAD_RESPONSIBLE_USER_ID: int | None = int(_raw_responsible) if _raw_responsible else None
+except ValueError:
+    AMGROUP_LEAD_RESPONSIBLE_USER_ID = None
+
+# Карта полей сделки (field_id) - точь-в-точь из прототипа, сверена на живых
+# сделках amgroup 03.09.2026.
+FIELD: dict[str, int] = {
+    "pvz": 572209, "pay": 577373, "site": 577415, "ym": 578015,
+    "comment": 576711, "addr": 576719, "channel": 576725, "store": 576723,
+    "currency": 576729, "order_uuid": FIELD_MOYSKLAD_ORDER_UUID,
+    "order_num": FIELD_MOYSKLAD_ORDER_NUMBER, "agent_uuid": 576695,
+    "order_url": 576721, "sostav": 576703, "weight": 576705, "volume": 576707,
+    "paystatus": 576669, "agent": 576671, "org": 576673, "created_by": 576683,
+    "msinfo": 576717, "type": 577671, "basket": 577313, "delivery": 577315,
+    "promo": 570661, "points": 576667, "basket_old": 570641,
+}
+
+# Значения выпадающих списков (enum_id) - тоже из прототипа.
+ENUM: dict[str, dict[str, int]] = {
+    "channel": {"Магазин": 1040221, "Маркетплейс": 1040217, "ОПТ": 1040219, "TangemShop": 1041663},
+    "store": {
+        "Sunscrypt Основной": 1040201, "Sunscrypt Шоурум": 1041885,
+        "Sunscrypt Вскрытые": 1040207, "Sunscrypt контроль": 1041779,
+        "Sunscrypt временный": 1041419, "ЭРМС_Основной": 1041653,
+    },
+    "currency": {"руб": 1040233, "доллар": 1040235},
+    "paystatus": {"Не оплачен": 1040147, "Частично оплачен": 1040149, "Оплачен": 1040151},
+    "created_by": {"Через виджет": 1040193, "Из МойСклад": 1040195},
+    "type": {"Заказ": 1041237, "Предзаказ": 1041239, "Резерв": 1041903},
+}
+
+# «Инфо по МС» - служебное поле, amgroup всегда пишет туда курсы валют на
+# момент создания; для протеза достаточно константы (сами мы курсы не считаем).
+MSINFO = '{"currenciesRates":{"0e5aa71e-c413-11ee-0a80-13fd002f63fe":1,"593c92c3-dd4f-11ef-0a80-04160006e47a":89.268837}}'
+
+_EXPAND = "positions.assortment,agent,organization,store,salesChannel"
+
+
+def _rub(kop: float) -> str:
+    """13990.0 (в рублях, не копейках - сумма МойСклад уже приходит в рублях
+    из entity/customerorder) -> '13 990.00 рублей' со склонением, как у
+    amgroup. Перенесено из прототипа без изменений."""
+    v = kop / 100
+    n = int(v)
+    last = n % 10
+    last2 = n % 100
+    if last == 1 and last2 != 11:
+        word = "рубль"
+    elif last in (2, 3, 4) and last2 not in (12, 13, 14):
+        word = "рубля"
+    else:
+        word = "рублей"
+    return f"{n:,}".replace(",", " ") + f".{int(round((v - n) * 100)):02d} {word}"
+
+
+def _attr(order: dict, name: str) -> Any:
+    """Значение доп. поля заказа МойСклад по человекочитаемому имени.
+    Доп. поля приходят в ответе всегда, expand для них не нужен (в отличие
+    от positions/agent/store — это ссылочные поля)."""
+    for a in order.get("attributes") or []:
+        if a.get("name") == name:
+            return a.get("value")
+    return None
+
+
+def _build_fields(order: dict) -> dict:
+    """Собирает состав заказа, вес/объём и статус оплаты из позиций. Позиции
+    заказа читаются из positions.rows - в прототипе получены через expand
+    прямо на entity/customerorder, здесь так же (см. _fetch_full_order)."""
+    pos = (order.get("positions") or {}).get("rows") or []
+    goods: list[str] = []
+    services: list[tuple[str, float, str]] = []
+    weight = 0.0
+    volume = 0.0
+    for p in pos:
+        a = p.get("assortment") or {}
+        nm = a.get("name") or "?"
+        qty = int(p.get("quantity") or 0)
+        line = f"{nm}, {qty} шт, {_rub(p.get('price') or 0)}"
+        if (a.get("meta") or {}).get("type") == "service":
+            services.append((nm, p.get("price") or 0, line))
+        else:
+            goods.append(line)
+            weight += (a.get("weight") or 0) * qty
+            volume += (a.get("volume") or 0) * qty
+    moment = (order.get("moment") or "")[:10]
+    dt = ".".join(reversed(moment.split("-"))) if moment else ""
+    lines = [f"{i}. {t}" for i, t in enumerate(goods + [s[2] for s in services], 1)]
+    sostav = (
+        f"Заказ № {order.get('name')} от {dt}:\n" + "\n".join(lines)
+        + f"\nНДС: 0.00 рублей\nИтого: {_rub(order.get('sum') or 0)}"
+    )
+    paid = order.get("payedSum") or 0
+    total = order.get("sum") or 0
+    paystatus = "Оплачен" if paid >= total > 0 else ("Частично оплачен" if paid > 0 else "Не оплачен")
+    return {
+        "goods": goods, "services": services, "sostav": sostav,
+        "weight": round(weight, 3), "volume": round(volume, 4), "paystatus": paystatus,
+    }
+
+
+def _normalize_phone_digits(phone: str | None) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return digits
+
+
+async def _fetch_full_order(order_uuid: str) -> dict | None:
+    """Полная карточка заказа с раскрытыми позициями, агентом, организацией,
+    складом и каналом продаж. amgroup_fallback отдаёт заказ с раскрытыми
+    только agent/salesChannel (свой набор под свою задачу) - для сборки
+    сделки нужно больше, поэтому здесь отдельный запрос по id.
+
+    None - склад не ответил (ms_client.get так и возвращает при обрыве или
+    ошибке), это НЕ значит «заказа нет» - вызывающий код обязан прерваться,
+    не создавать сделку и не считать это фактом об отсутствии заказа."""
+    return await ms_client.get(f"entity/customerorder/{order_uuid}", params={"expand": _EXPAND})
+
+
+# Кэш «цифры телефона -> id контакта» в рамках процесса. Без него у клиента с
+# двумя заказами подряд второй заказ не находит контакт (amoCRM не успевает
+# проиндексировать только что созданный) и заводит дубль человека.
+_contact_cache: dict[str, int] = {}
+
+
+async def _find_or_create_contact(phone: str | None, name: str | None) -> int | None:
+    """Ищет контакт по последним 10 цифрам телефона среди значений поля
+    PHONE (полнотекстовый поиск amo цепляет и посторонние совпадения, поэтому
+    сверяем само значение поля - как в amgroup_fallback._find_existing_lead).
+    Не нашёл - создаёт новый контакт через api.create_contact (общая очередь).
+    Кэш процесса - защита от дубля при двух заказах одного клиента подряд."""
+    digits = _normalize_phone_digits(phone)
+    if not digits:
+        return None
+    if digits in _contact_cache:
+        return _contact_cache[digits]
+
+    for contact in await amo_service.find_contacts_by_query(digits):
+        for f in contact.get("custom_fields_values") or []:
+            if f.get("field_code") != "PHONE":
+                continue
+            for v in f.get("values") or []:
+                if re.sub(r"\D", "", str(v.get("value") or ""))[-10:] == digits[-10:]:
+                    cid = contact.get("id")
+                    if cid:
+                        _contact_cache[digits] = cid
+                        return cid
+
+    contact_id = await api.create_contact(name or digits, "+" + digits, None)
+    if contact_id:
+        _contact_cache[digits] = contact_id
+    else:
+        logger.error("amgroup_lead_builder: не создался контакт для телефона %s", digits)
+    return contact_id
+
+
+async def _find_existing_lead_by_name(lead_name: str, query: str) -> dict | None:
+    """Защита от дубля перед созданием: ищет сделку с ТЕМ ЖЕ именем (полное
+    совпадение, не только попадание в полнотекстовый поиск - см. прототип и
+    тот же приём в amgroup_fallback._find_existing_lead)."""
+    if not query:
+        return None
+    for lead in await amo_service.find_leads_by_query(query):
+        if lead.get("name") == lead_name:
+            return lead
+    return None
+
+
+async def assign_responsible(lead_id: int, responsible_user_id: int | None = None) -> bool:
+    """Отдельный явный шаг - боты amoCRM не реагируют на сделки, созданные не
+    через amgroup (проверено 03.09.2026 на двенадцати сделках), значит
+    распределения на дежурного не будет и ответственного нужно проставить
+    самим. responsible_user_id не передан - берём из настроек модуля
+    (AMGROUP_LEAD_RESPONSIBLE_USER_ID). Возвращает True при успехе."""
+    uid = responsible_user_id or AMGROUP_LEAD_RESPONSIBLE_USER_ID
+    if not uid:
+        logger.warning(
+            "amgroup_lead_builder: не проставлен ответственный на сделке %s - "
+            "AMGROUP_LEAD_RESPONSIBLE_USER_ID не задан в настройках модуля",
+            lead_id,
+        )
+        return False
+    result = await amo_service.patch_lead(lead_id, responsible_user_id=int(uid))
+    ok = bool(result and result.get("ok"))
+    if not ok:
+        logger.error(
+            "amgroup_lead_builder: не проставился ответственный %s на сделке %s: %s",
+            uid, lead_id, result,
+        )
+    return ok
+
+
+def _custom_fields(order: dict, b: dict, site: str) -> list[dict]:
+    """Собирает custom_fields_values для POST /leads. t() - текстовые поля,
+    e() - select/enum. Пустые значения не добавляются (как в прототипе)."""
+    ag = order.get("agent") or {}
+    cf: list[dict] = []
+
+    def t(key: str, val: Any) -> None:
+        if val not in (None, "", []):
+            cf.append({"field_id": FIELD[key], "values": [{"value": str(val)}]})
+
+    def e(key: str, val: Any) -> None:
+        eid = ENUM[key].get(val)
+        if eid:
+            cf.append({"field_id": FIELD[key], "values": [{"enum_id": eid}]})
+
+    t("site", site)
+    t("pay", _attr(order, "Способ оплаты"))
+    t("pvz", _attr(order, "Код ПВЗ"))
+    t("promo", _attr(order, "Промокод"))
+    t("ym", _attr(order, "ClientID Яндекс.Метрики"))
+    t("addr", order.get("shipmentAddress"))
+    t("comment", order.get("description"))
+    e("channel", (order.get("salesChannel") or {}).get("name"))
+    e("store", (order.get("store") or {}).get("name"))
+    e("currency", "руб")
+    e("paystatus", b["paystatus"])
+    e("created_by", "Из МойСклад")
+    e("type", "Заказ")
+    t("order_uuid", order.get("id"))
+    t("order_num", order.get("name"))
+    t("agent_uuid", ag.get("id"))
+    t("order_url", f"https://online.moysklad.ru/app/#customerorder/edit?id={order.get('id')}")
+    t("sostav", b["sostav"])
+    t("weight", b["weight"])
+    t("volume", b["volume"])
+    t("agent", ag.get("name"))
+    t("org", (order.get("organization") or {}).get("name"))
+    t("msinfo", MSINFO)
+    basket = "\n".join(b["goods"])
+    t("basket", basket)
+    t("basket_old", basket)
+    deliv = "; ".join(f"{s[0]}, {_rub(s[1])}" for s in b["services"])
+    t("delivery", deliv)
+    t("points", "0")
+    return cf
+
+
+async def create_lead_for_order(order: dict) -> int | None:
+    """Точка расширения amgroup_fallback.create_lead_for_order. order -
+    заказ покупателя МойСклад, как отдаёт amgroup_fallback._fetch_orders
+    (раскрыты agent, salesChannel). Возвращает id созданной (или уже
+    существующей - см. дедуп) сделки, либо None при любой неудаче -
+    ничего не глотаем молча, каждая причина уходит в лог."""
+    order_uuid = str(order.get("id") or "")
+    if not order_uuid:
+        logger.error("amgroup_lead_builder: у заказа нет id, пропускаю: %s", order)
+        return None
+
+    full = await _fetch_full_order(order_uuid)
+    if full is None:
+        logger.warning(
+            "amgroup_lead_builder: МойСклад не ответил на карточку заказа %s "
+            "(id %s) - сделку не создаю, это не значит «заказа нет»",
+            order.get("name"), order_uuid,
+        )
+        return None
+
+    site = str(_attr(full, "Номер заказа на сайте") or "").strip()
+    order_number = str(full.get("name") or "").strip()
+    lead_name = f"Заказ №{site}" if site else f"Заказ МС {order_number}"
+
+    dup = await _find_existing_lead_by_name(lead_name, site or order_number)
+    if dup is not None:
+        logger.info(
+            "amgroup_lead_builder: сделка «%s» уже есть (id %s), не создаю повторно",
+            lead_name, dup.get("id"),
+        )
+        return dup.get("id")
+
+    b = _build_fields(full)
+    cf = _custom_fields(full, b, site)
+
+    ag = full.get("agent") or {}
+    contact_id = await _find_or_create_contact(ag.get("phone"), ag.get("name"))
+
+    price = int((full.get("sum") or 0) / 100)
+    lead_id = await api.create_lead_direct(
+        name=lead_name,
+        pipeline_id=PIPELINE_CLEVER,
+        status_id=STATUS_CLEVER_NEW_LEAD,
+        custom_fields_values=cf,
+        contact_id=contact_id,
+        tags=[AMGROUP_FALLBACK_TAG],
+    )
+    if lead_id is None:
+        logger.error(
+            "amgroup_lead_builder: не создалась сделка по заказу %s (сайт %s, %s ₽)",
+            order_number, site, price,
+        )
+        return None
+
+    logger.info(
+        "amgroup_lead_builder: создана сделка %s по заказу %s (сайт %s, %s ₽, контакт %s)",
+        lead_id, order_number, site, price, contact_id,
+    )
+
+    # Отдельный явный шаг - см. докстринг assign_responsible.
+    await assign_responsible(lead_id)
+
+    return lead_id
