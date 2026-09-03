@@ -24,6 +24,7 @@ import migration_freeze
 import new_lead_watch
 import ms_client
 import office_transfer
+import order_note
 import order_watchdog
 import ozon_invoice
 import reserve_service
@@ -393,6 +394,14 @@ async def lead_change(request: Request):
     # теги в вебхук). На любом изменении сделки в фоне сверяем теги: если есть
     # «Успешный звонок» И «пропущенный» — снимаем «пропущенный» (сделка + контакты).
     unmiss_tag.maybe_remove_bg(lead_id)
+
+    # Контакты из заказа примечанием в ленту (костыль, см. order_note): amgroup
+    # затирает email в карточке контрагента МойСклада через секунды после того,
+    # как его туда записала woocommerce-sklad. Только на СОЗДАНИИ сделки — на
+    # обычных изменениях писать нечего, примечание уже стоит. Выключено флагом
+    # ORDER_NOTE_ENABLED по умолчанию.
+    if await get_nested(nested, ["leads", "add", "0", "id"]) is not None:
+        order_note.post_bg(lead_id)
 
     status_update = await get_nested(nested, ["leads", "update", "0", "status_id"])
     status_add = await get_nested(nested, ["leads", "add", "0", "status_id"])
