@@ -250,6 +250,24 @@ async def check_once() -> dict | None:
 
     dup_groups = _group_duplicates(all_leads)
 
+    # Свежесть пары меряем по дате СОЗДАНИЯ, а не изменения. Выборка выше идёт
+    # по времени изменения (иначе сделку, которую amgroup дописал, не увидеть),
+    # но в окно из-за этого попадает и архив: первый сухой проход 03.09.2026
+    # поднял пару от 30-31 марта - обе сделки задела массовая правка 01.09 в
+    # одну и ту же минуту. Настоящий дубль от ожившего amgroup такой фильтр
+    # переживает: его сделка свежая по определению. Архивные пары, где обе
+    # сделки старше окна, - не наш случай, о них молчим.
+    archive_groups = [
+        g for g in dup_groups
+        if not any(int(l.get("created_at") or 0) >= since_ts for l in g)
+    ]
+    if archive_groups:
+        logger.info(
+            "Сторож дублей amgroup: архивных групп (обе сделки созданы до окна) %s - пропускаем",
+            len(archive_groups),
+        )
+        dup_groups = [g for g in dup_groups if g not in archive_groups]
+
     _load_reported()
     fresh: list[tuple[list[dict], str]] = []
     for group in dup_groups:

@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import types
+import time
 
 import pytest
 
@@ -71,8 +72,15 @@ def _cf(field_id, value):
     return {"field_id": field_id, "values": [{"value": value}]}
 
 
+# Дата создания по умолчанию - «сейчас»: сторож считает пару свежей, только
+# если хотя бы одна сделка создана в окне. Архивную пару тесты задают явно.
+_NOW = int(time.time())
+
+
 def _lead(lead_id, *, uuid=None, number=None, tagged=False, created_by=1,
-          created_at=1_000_000, contact_id=None, name="Заказ"):
+          created_at=None, contact_id=None, name="Заказ"):
+    if created_at is None:
+        created_at = _NOW
     cfv = []
     if uuid is not None:
         cfv.append(_cf(watch.FIELD_MOYSKLAD_ORDER_UUID, uuid))
@@ -318,6 +326,37 @@ def test_obrezka_sostoyaniya_po_poryadku_vstavki(monkeypatch, tmp_path):
     # выбросила бы dup:a-newer - она первая по алфавиту, но не самая старая.
     assert "dup:z-old" not in saved
     assert set(saved) == {"dup:a-newer", "dup:m-newest", "dup:b-brandnew"}
+
+
+def test_arhivnaya_para_ne_trevozhit(monkeypatch):
+    """Первый сухой проход 03.09.2026 поднял пару от 30-31 марта: обе сделки
+    задела массовая правка 01.09, и по времени ИЗМЕНЕНИЯ они попали в окно.
+    Обе созданы задолго до окна - это архив, о нём молчим."""
+    march = _NOW - 150 * 24 * 3600
+    leads = [
+        _lead(111, uuid="ms-uuid-1", number="02160", created_at=march),
+        _lead(222, uuid="ms-uuid-1", number="02160", created_at=march + 3600),
+    ]
+
+    result = _run(leads, monkeypatch)
+
+    assert result == {"leads": 2, "groups": 0, "new": 0}
+    assert _sent == []
+
+
+def test_svezhaya_sdelka_poverh_staroy_lovitsya(monkeypatch):
+    """Настоящий случай ожившего amgroup: наша сделка-протез старше окна не
+    бывает, но даже если старая сделка есть, свежая поверх неё - дубль."""
+    old = _NOW - 30 * 24 * 3600
+    leads = [
+        _lead(111, uuid="ms-uuid-1", number="07182", created_at=old, tagged=True),
+        _lead(222, uuid="ms-uuid-1", number="07182", created_at=_NOW - 60),
+    ]
+
+    result = _run(leads, monkeypatch)
+
+    assert result == {"leads": 2, "groups": 1, "new": 1}
+    assert len(_sent) == 1
 
 
 def test_nikakih_udaleniy_v_module():
