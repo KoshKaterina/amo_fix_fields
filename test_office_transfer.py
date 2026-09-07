@@ -1097,4 +1097,59 @@ print("✓ картотека: сделка с пустыми полями да�
 
 office_transfer.OFFICE_TRANSFER_SOURCE_DB_WORK = _DB_FLAG_WAS
 
+# ── картотека и заказ на сайте: комиссия рефералки должна начисляться ───────
+# Woo спрашивает «оплачено?» у metrika_sync._classify, поэтому ветка живёт там.
+assert metrika_sync._classify(PIPELINE_DB_WORK, STATUS_SUCCESS, False) == ("PAID", False)
+assert metrika_sync._classify(PIPELINE_DB_WORK, STATUS_SUCCESS, True) == (None, False), (
+    "наложку картотеки ждём закрытой в Офисе, как и розничную")
+# CANCELLED у картотеки резолвит оригинал (как любая не-розничная воронка) —
+# на Woo это не влияет, он реагирует только на PAID.
+assert metrika_sync._classify(PIPELINE_DB_WORK, STATUS_CLOSED_LOST, False) == ("CANCELLED", True)
+print("✓ _classify: продажа в картотеке = PAID, наложка ждёт Офиса")
+
+# ⚠️ Сторож: расширение _classify НЕ включает отправку в Метрику — у неё свой
+# гейт воронок раньше по коду. Катя просила Метрику не трогать.
+_ym_rows: list = []
+
+async def _catch_upload(counter_id, row, **kw):
+    _ym_rows.append(row)
+    return True
+
+_saved_upload = metrika_sync.metrika_client.upload_simple_order
+metrika_sync.metrika_client.upload_simple_order = _catch_upload
+_saved_enabled = metrika_sync._enabled
+metrika_sync._enabled = True
+
+
+async def _fake_contact_info(lead):
+    return 5001, "a@b.c", "+79990000000"
+
+_saved_contact_info = metrika_sync._contact_info
+metrika_sync._contact_info = _fake_contact_info
+
+
+def _ym_lead(pipeline_id):
+    lead = _lead(pipeline_id=pipeline_id, status_id=STATUS_SUCCESS)
+    lead["custom_fields_values"].append(_cf(metrika_sync.FIELD_PAYMENT_METHOD, value="Онлайн-оплата"))
+    lead["custom_fields_values"].append(_cf(metrika_sync.FIELD_YM_CLIENT_ID, value="1700000000000000000"))
+    lead["created_at"] = int(time.time())
+    return lead
+
+_db_lead = _ym_lead(PIPELINE_DB_WORK)
+run(metrika_sync.process_sync({"lead_id": 42}, lead=_db_lead))
+assert not _ym_rows, ("картотека не должна уезжать в Метрику — Катя просила не трогать", _ym_rows)
+
+# Контроль, чтобы сторож выше не был ложно-зелёным: та же сделка из РОЗНИЦЫ
+# доходит до отправки. Если бы process_sync выходил раньше по другой причине
+# (флаг, заморозка миграции), пустым оказался бы и этот случай.
+_ym_rows.clear()
+_retail_lead = _ym_lead(PIPELINE_CLEVER_MAIN)
+run(metrika_sync.process_sync({"lead_id": 42}, lead=_retail_lead))
+assert _ym_rows, "розница обязана уезжать в Метрику — иначе сторож выше ничего не проверяет"
+
+metrika_sync.metrika_client.upload_simple_order = _saved_upload
+metrika_sync._contact_info = _saved_contact_info
+metrika_sync._enabled = _saved_enabled
+print("✓ Метрика картотеку не видит, а розницу отправляет — гейт воронок работает")
+
 print("\noffice_transfer: все тесты прошли")

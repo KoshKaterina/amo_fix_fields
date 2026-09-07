@@ -32,6 +32,7 @@ from waybill_config import (
     FIELD_PAYMENT_METHOD,
     FIELD_SITE_ORDER_NUMBER,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_DB_WORK,
     PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
     WOO_COMPLETED_STATUS,
@@ -112,7 +113,11 @@ async def resolve_target(payload: dict, lead: dict | None = None) -> dict | None
 
     pipeline_id = lead.get("pipeline_id")
     status_id = lead.get("status_id")
-    if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+    # Картотека «Работа с базой» (07.09.2026): продажу доводит менеджер обзвона,
+    # а заказ на сайте всё равно надо закрыть — на статусе «выполнен» висит
+    # начисление реферальной комиссии Easy Affiliate.
+    if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE,
+                           PIPELINE_FULFILLMENT, PIPELINE_DB_WORK):
         return None
 
     payment = _cf(lead, FIELD_PAYMENT_METHOD)

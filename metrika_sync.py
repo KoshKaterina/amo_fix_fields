@@ -43,6 +43,7 @@ from waybill_config import (
     METRIKA_SINCE_TS,
     METRIKA_TOKEN,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_DB_WORK,
     PIPELINE_OFFICE,
     STATUS_CLOSED_LOST,
     STATUS_SUCCESS,
@@ -194,7 +195,13 @@ def _classify(pipeline_id, status_id, cod: bool) -> tuple[str | None, bool]:
     if status_id == STATUS_CLOSED_LOST:
         return "CANCELLED", pipeline_id != PIPELINE_CLEVER_MAIN
 
-    if pipeline_id == PIPELINE_CLEVER_MAIN:
+    # Картотека «Работа с базой» (07.09.2026) считается так же, как розница:
+    # менеджер обзвона доводит продажу на месте, и закрытие там — та же продажа.
+    # ⚠️ На Метрику это НЕ влияет: у неё свой гейт воронок в process_sync ниже,
+    # и картотеки там нет — конверсии продолжают уходить только из розницы и
+    # Офиса. Ветка нужна Woo: он спрашивает «оплачено?» именно здесь, а от
+    # статуса заказа на сайте зависит начисление реферальной комиссии.
+    if pipeline_id in (PIPELINE_CLEVER_MAIN, PIPELINE_DB_WORK):
         if status_id == STATUS_SUCCESS and not cod:
             return "PAID", False
         if status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
