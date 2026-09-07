@@ -992,4 +992,109 @@ assert res is clever_orig, "старая копия по-прежнему рез
 metrika_sync.amo_service.find_leads_by_query = _orig_find
 print("✓ _resolve_clever: фолбэк «сама себе оригинал», старые копии не тронуты")
 
+# ══════════ картотека «Работа с базой»: перенос только на УР ══════════
+# Постановка Кати 07.09.2026: «при УР должно происходить всё то же, что в ОП».
+# А вот ЗНР картотеке запрещён — карточка обзвона обязана остаться на месте.
+from waybill_config import PIPELINE_DB_WORK  # noqa: E402
+
+_DB_FLAG_WAS = office_transfer.OFFICE_TRANSFER_SOURCE_DB_WORK
+assert _DB_FLAG_WAS is False, "OFFICE_TRANSFER_SOURCE_DB_WORK должен быть выключен по умолчанию"
+
+# флаг выключен → сделку не трогаем и НЕ алертим (её пока ведёт человек)
+_reset()
+lead = _lead(pipeline_id=PIPELINE_DB_WORK, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ",
+             responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "skipped-not-applicable", res
+assert not _patches and not _tags, (_patches, _tags)
+assert office_transfer.is_source_pipeline(PIPELINE_DB_WORK) is False
+print("✓ картотека: флаг выключен → сделка не трогается и не алертит")
+
+office_transfer.OFFICE_TRANSFER_SOURCE_DB_WORK = True
+assert office_transfer.is_source_pipeline(PIPELINE_DB_WORK) is True
+assert office_transfer.is_source_pipeline(str(PIPELINE_DB_WORK)) is True
+
+# УР: тот же маршрут, что у розницы с такой же доставкой
+_reset()
+lead = _lead(pipeline_id=PIPELINE_DB_WORK, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ",
+             responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
+assert _patches[0]["status_id"] == STATUS_CREATE_WAYBILL, (
+    "заказ из картотеки обязан ехать в тот же этап, что розничный с той же доставкой")
+assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
+assert _patches[0]["custom_fields"][FIELD_FORMER_RESPONSIBLE] == "Иван Иванов"
+print("✓ картотека/142 СДЭК → Офис/«Сделать накладную», как из розницы")
+
+# ⚠️ ГЛАВНЫЙ тест задачи: ЗНР картотеки НИКУДА не едет
+_reset()
+lead = _lead(pipeline_id=PIPELINE_DB_WORK, status_id=STATUS_CLOSED_LOST,
+             reason=REASON_WAITLIST, responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match", res
+assert not _patches, ("карточка обзвона обязана остаться в картотеке", _patches)
+print("✓ картотека/143 «Лист ожидания» → остаётся на месте, ЗНР-правила ей не даны")
+
+# контроль: та же причина из РОЗНИЦЫ по-прежнему уезжает
+_reset()
+lead = _lead(pipeline_id=PIPELINE_CLEVER_MAIN, status_id=STATUS_CLOSED_LOST,
+             reason=REASON_WAITLIST, responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert _patches[0]["pipeline_id"] == PIPELINE_WAITLIST, _patches[0]
+print("✓ контроль: та же причина ЗИН из розницы уезжает в Лист ожидания, как раньше")
+
+# ЗНР=Опт для картотеки: асинхронный матчер даже не должен вызываться —
+# иначе на каждую закрытую карточку уходил бы лишний GET по контактам
+_reset()
+_contact_calls: list = []
+
+async def _count_contact(cid, with_=()):
+    _contact_calls.append(cid)
+    return {"id": cid, "_embedded": {"leads": [{"id": 777}]}}
+
+_saved_get_contact = office_transfer.amo_service.get_contact_by_id
+office_transfer.amo_service.get_contact_by_id = _count_contact
+
+lead = _lead(pipeline_id=PIPELINE_DB_WORK, status_id=STATUS_CLOSED_LOST,
+             reason=REASON_OPT, responsible_user_id=999)
+lead["_embedded"] = {"contacts": [{"id": 5001}]}
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match", res
+assert not _contact_calls, ("ЗНР-матчеры картотеке не даны — лишних GET по контактам быть не должно",
+                            _contact_calls)
+
+# контроль: та же сделка из розницы контакт дочитывает и едет в ОПТ
+_reset()
+_contact_calls.clear()
+lead = _lead(pipeline_id=PIPELINE_CLEVER_MAIN, status_id=STATUS_CLOSED_LOST,
+             reason=REASON_OPT, responsible_user_id=999)
+lead["_embedded"] = {"contacts": [{"id": 5001}]}
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert _contact_calls == [5001], _contact_calls
+office_transfer.amo_service.get_contact_by_id = _saved_get_contact
+print("✓ картотека/143 «Опт»: матчер не вызывается и контакты не дочитываются, розница — как была")
+
+# _no_match_ur жив: пустые поля дают понятный алерт, а не тишину
+_reset()
+lead = _lead(pipeline_id=PIPELINE_DB_WORK, application_type=None,
+             warehouse=None, delivery_text="", responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match-bad-fill", res
+assert _tags and _tags[0][1] == TAG_BAD_FILL, _tags
+print("✓ картотека: сделка с пустыми полями даёт тег и понятный алерт, а не тишину")
+
+office_transfer.OFFICE_TRANSFER_SOURCE_DB_WORK = _DB_FLAG_WAS
+
 print("\noffice_transfer: все тесты прошли")

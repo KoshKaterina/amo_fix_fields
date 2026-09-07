@@ -9,6 +9,12 @@ OFFICE_TRANSFER_SOURCE_OPT (09.08.2026, решение Кати). Правила
 шоурума (см. правило 2 ниже, решение Кати 10.08.2026). Список источников — в
 _source_pipelines(), гейт для вебхука — is_source_pipeline().
 
+Третий источник — картотека «Работа с базой» за флагом
+OFFICE_TRANSFER_SOURCE_DB_WORK (07.09.2026, постановка Кати: «при УР должно
+происходить всё то же, что в ОП»). ⚠️ Ей разрешена ТОЛЬКО ветка УР: сделка,
+закрытая в картотеке как «не реализовано», обязана остаться там — это карточка
+обзвона, а не брак заказа. Разводку держит _allowed_branches().
+
 Правила (условия читаются по СВЕЖЕЙ дочитанной сделке, не по телу вебхука —
 select-поля сверяются по enum_id, не по тексту, чтобы не зависеть от того, как
 менеджер видит подпись значения):
@@ -125,11 +131,13 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_ZNR_OPT,
     OFFICE_TRANSFER_RULE_ZNR_WAITLIST,
     OFFICE_TRANSFER_SINCE_TS,
+    OFFICE_TRANSFER_SOURCE_DB_WORK,
     OFFICE_TRANSFER_SOURCE_OPT,
     OFFICE_TRANSFER_STALE_ALERT_MIN,
     OFFICE_TRANSFER_WAREHOUSES,
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_DB_WORK,
     PIPELINE_OFFICE,
     PIPELINE_OPT,
     PIPELINE_WAITLIST,
@@ -367,7 +375,13 @@ async def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False
     БЕЗ await, и если результат — корутина (асинхронный матчер), дожидаемся
     её отдельно: так не пришлось переписывать сигнатуры уже существующих
     синхронных правил ради одного нового."""
-    rules = _UR_RULES if status_id == STATUS_SUCCESS else _ZNR_RULES if status_id == STATUS_CLOSED_LOST else ()
+    allowed = _allowed_branches(_pipeline_id(lead))
+    if status_id == STATUS_SUCCESS and _BRANCH_UR in allowed:
+        rules = _UR_RULES
+    elif status_id == STATUS_CLOSED_LOST and _BRANCH_ZNR in allowed:
+        rules = _ZNR_RULES
+    else:
+        rules = ()
     for fn in rules:
         target = fn(lead, ignore_flags=ignore_flags)
         if asyncio.iscoroutine(target):
@@ -379,7 +393,8 @@ async def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False
 
 def _source_pipelines() -> tuple[int, ...]:
     """Воронки, ИЗ которых переносим. Розница — всегда, ОПТ — за флагом
-    OFFICE_TRANSFER_SOURCE_OPT (09.08.2026).
+    OFFICE_TRANSFER_SOURCE_OPT (09.08.2026), картотека «Работа с базой» — за
+    OFFICE_TRANSFER_SOURCE_DB_WORK (07.09.2026).
 
     Читаем флаг на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
     подменённый в тестах (и в консоли при разборе инцидента), не подействовал бы.
@@ -387,10 +402,38 @@ def _source_pipelines() -> tuple[int, ...]:
     Правила у опта те же пять, что у розницы, — отдельного матчера нет по
     построению. Условия правил читаются с полей сделки («Тип заявки», «Склад
     заказа», «Тип доставки»), а они у опта заполняются так же, поэтому опт-заказ
-    едет в тот же этап Офиса, что и розничный с такой же доставкой."""
+    едет в тот же этап Офиса, что и розничный с такой же доставкой. С картотекой
+    так же — но ей разрешена только ветка УР, см. _allowed_branches()."""
+    out = [PIPELINE_CLEVER_MAIN]
     if OFFICE_TRANSFER_SOURCE_OPT:
-        return (PIPELINE_CLEVER_MAIN, PIPELINE_OPT)
-    return (PIPELINE_CLEVER_MAIN,)
+        out.append(PIPELINE_OPT)
+    if OFFICE_TRANSFER_SOURCE_DB_WORK:
+        out.append(PIPELINE_DB_WORK)
+    return tuple(out)
+
+
+_BRANCH_UR = "ur"
+_BRANCH_ZNR = "znr"
+
+
+def _allowed_branches(pipeline_id) -> frozenset[str]:
+    """Какие ветки правил разрешены воронке-источнику.
+
+    Картотека «Работа с базой» — ТОЛЬКО УР. Сделка, закрытая там как «не
+    реализовано», обязана ОСТАТЬСЯ в картотеке: это карточка обзвона менеджера,
+    а не брак заказа. ЗНР-правила увезли бы её в Лист ожидания / Академию / ОПТ,
+    и человек потерял бы её из своего списка (постановка Кати 07.09.2026).
+
+    Ограничение бизнесовое, а не переходное, поэтому оно НЕ снимается
+    ignore_flags: теневой матчинг в _no_match_ur гасит флаги правил, но ветку
+    ЗНР картотеке не открывает."""
+    try:
+        pid = int(pipeline_id)
+    except (TypeError, ValueError):
+        return frozenset({_BRANCH_UR, _BRANCH_ZNR})
+    if pid == PIPELINE_DB_WORK:
+        return frozenset({_BRANCH_UR})
+    return frozenset({_BRANCH_UR, _BRANCH_ZNR})
 
 
 def is_source_pipeline(pipeline_id) -> bool:
