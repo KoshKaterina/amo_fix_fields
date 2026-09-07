@@ -52,14 +52,14 @@ from waybill_config import (
     OZON_ALERT_WINDOW_END_H,
     OZON_ALERT_WINDOW_START_H,
     OZON_STALE_ALERT_MIN,
+    OZON_INVOICE_DB_WORK,
+    OZON_PAYMENT_STAGES,
     OZON_STALE_ESCALATE_CHAT_ID,
     OZON_STALE_ESCALATE_DAYS,
     OZON_STALE_EVENING_H,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_DB_WORK,
     PUBLIC_BASE_URL,
-    STATUS_LINK_SENT,
-    STATUS_PAYMENT_RECEIVED,
-    STATUS_PAYMENT_REQUESTED,
     TAG_INVOICE_ERROR,
     looks_like_uuid,
 )
@@ -77,10 +77,86 @@ _recent: dict[str, float] = {}
 
 _client: httpx.AsyncClient | None = None
 
+# Разовые фоновые задачи старта (валидация этапов). Держим ссылки, иначе
+# asyncio может собрать задачу сборщиком мусора на полпути.
+_init_tasks: set = set()
+
 
 def is_enabled() -> bool:
     """Гейт для вебхука: флаг включён И ключи Ozon заданы."""
     return OZON_INVOICE_ENABLED and bool(OZON_PAY_ACCESS_KEY and OZON_PAY_SECRET_KEY)
+
+
+def _invoice_pipelines() -> tuple[int, ...]:
+    """Воронки, где выставляем счёт. Розница всегда, картотека «Работа с базой» —
+    за флагом OZON_INVOICE_DB_WORK (07.09.2026).
+
+    Флаг читаем на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
+    подменённый в тестах (и в консоли при разборе инцидента), не подействовал бы.
+    Тот же приём, что в office_transfer._source_pipelines()."""
+    if OZON_INVOICE_DB_WORK:
+        return (PIPELINE_CLEVER_MAIN, PIPELINE_DB_WORK)
+    return (PIPELINE_CLEVER_MAIN,)
+
+
+def _stages(pipeline_id, *, flagged: bool = True) -> tuple[int, int, int] | None:
+    """Тройка этапов оплаты воронки: (тех-этап входа, ссылка отправлена, оплата
+    получена). None — воронка не наша.
+
+    flagged=False снимает проверку флага и оставляет только «воронка вообще
+    умеет в оплату». Нужно там, где деньги клиента уже списаны: выключенный
+    флаг не должен мешать довести оплаченную сделку до конца."""
+    try:
+        pid = int(pipeline_id)
+    except (TypeError, ValueError):
+        return None
+    if flagged and pid not in _invoice_pipelines():
+        return None
+    return OZON_PAYMENT_STAGES.get(pid)
+
+
+def is_invoice_entry(pipeline_id, status_id) -> bool:
+    """Публичный гейт для webhooks.py: сделка вошла в тех-этап воронки, где мы
+    выставляем счёт. Воронки в вебхуке может не быть — тех-этапы у розницы и
+    картотеки разные, по одному этапу решение однозначно, а process_invoice_lead
+    всё равно перечитает сделку и проверит пару целиком."""
+    try:
+        sid = int(status_id)
+    except (TypeError, ValueError):
+        return False
+    if pipeline_id is None:
+        return any(
+            (stages := OZON_PAYMENT_STAGES.get(pid)) and sid == stages[0]
+            for pid in _invoice_pipelines()
+        )
+    stages = _stages(pipeline_id)
+    return stages is not None and sid == stages[0]
+
+
+async def _validate_stages() -> None:
+    """Этапы из карты существуют в amo? Кэш воронок к этому моменту прогрет
+    (lifespan зовёт warm_pipeline_cache раньше), запросов не стоит.
+
+    Ловит опечатку в ID и переименование этапа заказчиком до того, как это
+    заметит менеджер по молчащему счёту: без этапа гейт просто никогда не
+    совпадёт, и фича будет тихо мертва."""
+    missing = []
+    for pipeline_id in _invoice_pipelines():
+        for status_id in OZON_PAYMENT_STAGES.get(pipeline_id) or ():
+            if amo_service.get_status_sort(status_id, pipeline_id) is None:
+                missing.append(f"{pipeline_id}/{status_id}")
+    if missing:
+        msg = (
+            "ozon_invoice: не найдены в прогретом кэше воронок этапы оплаты: "
+            f"{', '.join(missing)} — проверьте ID в waybill_config.py "
+            "(переименовали/пересоздали этап?)"
+        )
+        logger.error(msg)
+        await telegram_bot.send_alert(
+            f"⚠️ {msg}",
+            chat_id=tg_recipients.NOTIFY_CHAT_ID,
+            message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        )
 
 
 def init() -> None:
@@ -88,6 +164,10 @@ def init() -> None:
     фоновую сверку оплат: ей нужен работающий event loop."""
     global _client
     _client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=30.0))
+    if is_enabled():
+        task = asyncio.create_task(_validate_stages())
+        _init_tasks.add(task)
+        task.add_done_callback(_init_tasks.discard)
     start_reconcile()
 
 
@@ -270,10 +350,11 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         return "failed-lead-read"
 
     # Сделка могла уехать с этапа, пока задача ждала в очереди — не слать.
-    if int(lead.get("status_id") or 0) != STATUS_PAYMENT_REQUESTED or \
-       int(lead.get("pipeline_id") or 0) != PIPELINE_CLEVER_MAIN:
+    # Воронку берём со сделки: тех-этапы розницы и картотеки разные, но обе наши.
+    stages = _stages(lead.get("pipeline_id"))
+    if stages is None or int(lead.get("status_id") or 0) != stages[0]:
         logger.info(
-            "Lead %s: уже не на «Оплата запрошена» CLEVER (status=%s pipeline=%s) — скип",
+            "Lead %s: уже не на тех-этапе «Оплата запрошена» (status=%s pipeline=%s) — скип",
             lead_id, lead.get("status_id"), lead.get("pipeline_id"),
         )
         return "skipped-moved"
@@ -335,11 +416,13 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     # Атомарно: ссылка в 577617 + перевод в «Ссылка отправлена» одним PATCH.
     # DP-боты этапа сработают на переход и прочитают сделку с уже заполненным
     # полем. Упал PATCH → сделка осталась на тех-этапе, ссылка — менеджеру.
+    # Воронка — СО СДЕЛКИ (она уже провалидирована гейтом выше): в картотеке
+    # сделка обязана остаться в картотеке, а не уехать в розницу.
     patched = await amo_service.patch_lead(
         lead_id,
         custom_fields={FIELD_PAYMENT_LINK: pay_link},
-        status_id=STATUS_LINK_SENT,
-        pipeline_id=PIPELINE_CLEVER_MAIN,
+        status_id=stages[1],
+        pipeline_id=int(lead.get("pipeline_id")),
     )
     if not patched.get("ok"):
         await _fail(lead, "Ссылка создана, но не записалась в сделку - отправьте клиенту вручную",
@@ -462,13 +545,19 @@ def handle_notification_bg(payload: dict) -> None:
 
 async def _mark_paid(lead: dict, rub_str: str, marker: str, source: str) -> str:
     """Общий путь «оплата подтверждена» для вебхука и сверки: перевести сделку
-    в «Оплата получена» + примечание. Сделка уже дальше — только примечание."""
+    в «Оплата получена» + примечание. Сделка уже дальше — только примечание.
+
+    ⚠️ Флаг воронки здесь НЕ проверяем (flagged=False) осознанно: сюда попадают
+    только по нашему же extId, а его порождает единственный путь — создание счёта,
+    который под флагом. Зато при выключении флага уже выставленные счета доводятся
+    до конца: деньги клиент списал, оставить сделку висеть на «ссылка отправлена»
+    с одним примечанием нельзя."""
     lead_id = lead.get("id")
     cur_status = int(lead.get("status_id") or 0)
-    if cur_status in (STATUS_PAYMENT_REQUESTED, STATUS_LINK_SENT) and \
-       int(lead.get("pipeline_id") or 0) == PIPELINE_CLEVER_MAIN:
+    stages = _stages(lead.get("pipeline_id"), flagged=False)
+    if stages is not None and cur_status in (stages[0], stages[1]):
         patched = await amo_service.patch_lead(
-            lead_id, status_id=STATUS_PAYMENT_RECEIVED, pipeline_id=PIPELINE_CLEVER_MAIN,
+            lead_id, status_id=stages[2], pipeline_id=int(lead.get("pipeline_id")),
         )
         if patched.get("ok"):
             await amo_service.add_note(
@@ -785,39 +874,48 @@ async def _reconcile_once() -> str:
     """Один проход: сделки с выставленным счётом на этапах оплаты → спросить
     Ozon → Completed двигаем, зависшие подсвечиваем алертом."""
     checked = moved = 0
-    for status_id in (STATUS_LINK_SENT, STATUS_PAYMENT_REQUESTED):
-        for lead in await amo_service.get_leads_by_status(status_id, with_=()):
-            if int(lead.get("pipeline_id") or 0) != PIPELINE_CLEVER_MAIN:
-                continue
-            link = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_LINK) or "").strip()
-            if not link:
-                continue  # счёта нет — сверять нечего (менеджер ещё не запросил оплату)
+    # Пары «воронка + этап»: сверка ходит только по включённым воронкам, иначе
+    # выключенный флаг всё равно стоил бы двух лишних запросов на проход.
+    for pipeline_id in _invoice_pipelines():
+        stages = OZON_PAYMENT_STAGES.get(pipeline_id)
+        if not stages:
+            continue
+        for status_id in (stages[1], stages[0]):
+            for lead in await amo_service.get_leads_by_status(status_id, with_=()):
+                # Перестраховка: get_leads_by_status резолвит воронку сама по кэшу
+                # этапов, но если константа этапа разъедется с amo, отрезолвит
+                # чужую — и мы двинем чужую сделку.
+                if int(lead.get("pipeline_id") or 0) != pipeline_id:
+                    continue
+                link = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_LINK) or "").strip()
+                if not link:
+                    continue  # счёта нет — сверять нечего (менеджер ещё не запросил оплату)
 
-            lead_id = lead.get("id")
-            payment_id, ext_id, order_ext_id, created_at, last_alert_at = await _payment_ref(lead_id)
-            if not payment_id:
-                # Счёт выставлен руками/старым виджетом — paymentId неизвестен.
-                continue
-            if (ext_id or payment_id) in _paid_recent:
-                continue
+                lead_id = lead.get("id")
+                payment_id, ext_id, order_ext_id, created_at, last_alert_at = await _payment_ref(lead_id)
+                if not payment_id:
+                    # Счёт выставлен руками/старым виджетом — paymentId неизвестен.
+                    continue
+                if (ext_id or payment_id) in _paid_recent:
+                    continue
 
-            checked += 1
-            status, kopecks, err = await get_payment_status(payment_id, ext_id, order_ext_id)
-            if err:
-                logger.warning("ozon сверка: lead %s paymentId %s — %s", lead_id, payment_id, err)
-                continue
+                checked += 1
+                status, kopecks, err = await get_payment_status(payment_id, ext_id, order_ext_id)
+                if err:
+                    logger.warning("ozon сверка: lead %s paymentId %s — %s", lead_id, payment_id, err)
+                    continue
 
-            if not is_paid_status(status):
-                await _stale_alert(lead, created_at, status, last_alert_at)
-                continue
+                if not is_paid_status(status):
+                    await _stale_alert(lead, created_at, status, last_alert_at)
+                    continue
 
-            _seen_paid(ext_id or payment_id)
-            rub = (kopecks or 0) / 100
-            rub_str = f"{rub:.2f}".rstrip("0").rstrip(".") if kopecks else "?"
-            marker = f"extId {ext_id}" if ext_id else f"paymentId {payment_id}"
-            if await _mark_paid(lead, rub_str, marker, "сверка") == "moved":
-                moved += 1
-                _stale_alerted.pop(lead_id, None)
+                _seen_paid(ext_id or payment_id)
+                rub = (kopecks or 0) / 100
+                rub_str = f"{rub:.2f}".rstrip("0").rstrip(".") if kopecks else "?"
+                marker = f"extId {ext_id}" if ext_id else f"paymentId {payment_id}"
+                if await _mark_paid(lead, rub_str, marker, "сверка") == "moved":
+                    moved += 1
+                    _stale_alerted.pop(lead_id, None)
 
     logger.info("Ozon сверка: проверено счетов %s, переведено сделок %s", checked, moved)
     return f"checked={checked} moved={moved}"

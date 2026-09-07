@@ -60,10 +60,8 @@ from queue_manager import (
 )
 from waybill_config import (
     OFFICE_TRANSFER_ENABLED,
-    PIPELINE_CLEVER_MAIN,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
-    STATUS_PAYMENT_REQUESTED,
     STATUS_SUCCESS,
     UIS_WEBHOOK_SECRET,
     WAZZUP_WEBHOOK_SECRET,
@@ -486,19 +484,21 @@ async def lead_change(request: Request):
     if lead_id is not None and responsible_update is not None:
         lead_distribution.correct_reassignment_bg(lead_id, responsible_update)
 
-    # Счёт СБП (MAG-285): сделка зашла на тех-этап «Оплата запрошена» (CLEVER
-    # Основная) → создаём платёжную ссылку Ozon из суммы заказа МС и одним PATCH
-    # пишем её в 577617 + переводим сделку в «Ссылка отправлена», где штатные
-    # боты шлют шаблон. Обработчик перечитывает сделку (гейт по воронке/этапу
-    # повторяется там). Мастер-флаг OZON_INVOICE_ENABLED.
+    # Счёт СБП (MAG-285): сделка зашла на тех-этап «Оплата запрошена» → создаём
+    # платёжную ссылку Ozon из суммы заказа МС и одним PATCH пишем её в 577617 +
+    # переводим сделку в «Ссылка отправлена», где штатные боты шлют шаблон.
+    # Воронок две — розница и картотека «Работа с базой» (07.09.2026), список
+    # спрашиваем у ozon_invoice, чтобы гейты вебхука и обработчика не разъехались.
+    # Обработчик перечитывает сделку и проверяет пару воронка+этап заново.
+    # Мастер-флаг OZON_INVOICE_ENABLED, картотека — ещё и OZON_INVOICE_DB_WORK.
     if (
         lead_id is not None
         and incoming_status is not None
-        and str(incoming_status) == str(STATUS_PAYMENT_REQUESTED)
-        and (incoming_pipeline is None or str(incoming_pipeline) == str(PIPELINE_CLEVER_MAIN))
+        and ozon_invoice.is_invoice_entry(incoming_pipeline, incoming_status)
         and ozon_invoice.is_enabled()
     ):
-        logger.info("Lead %s entered STATUS_PAYMENT_REQUESTED — enqueue ozon invoice", lead_id)
+        logger.info("Lead %s вошла в тех-этап оплаты (pipeline %s) — enqueue ozon invoice",
+                    lead_id, incoming_pipeline)
         enqueue_invoice(lead_id, source="webhook")
 
     # Резерв товара в МойСклад (перенос с amGroup) — сделка сменила статус в

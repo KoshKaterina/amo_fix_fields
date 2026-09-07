@@ -24,7 +24,7 @@ import woo_client
 import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from waybill_config import (
-    PIPELINE_CLEVER,
+    PIPELINE_CLEVER_MAIN,
     PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
     WOO_COMPLETED_STATUS,
@@ -57,7 +57,7 @@ async def main(limit: int | None, apply: bool, skip_cancelled: bool) -> None:
     try:
         since = WOO_STATUS_SINCE_TS
         leads_by_id: dict[int, dict] = {}
-        for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+        for pipeline in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
             batch = await amo_service.get_leads_updated_since(pipeline, since, with_=())
             if batch is None:
                 print(f"⚠️ Выборка воронки {pipeline} не удалась — скан неполный, прерываю.")

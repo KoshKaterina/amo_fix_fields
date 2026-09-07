@@ -33,6 +33,7 @@ from waybill_config import (  # noqa: E402
     FIELD_PAYMENT_LINK,
     PIPELINE_CLEVER_MAIN,
     STATUS_LINK_SENT,
+    STATUS_PAYMENT_RECEIVED,
     STATUS_PAYMENT_REQUESTED,
     TAG_INVOICE_ERROR,
 )
@@ -320,7 +321,7 @@ _reset(); ozon_invoice._paid_recent.clear()
 _install_mocks(_lead(status=STATUS_LINK_SENT))
 res = run(ozon_invoice._handle_notification(_notif()))
 assert res == "moved", res
-assert _patches and _patches[0].get("status_id") == ozon_invoice.STATUS_PAYMENT_RECEIVED, _patches
+assert _patches and _patches[0].get("status_id") == STATUS_PAYMENT_RECEIVED, _patches
 assert any("Оплата подтверждена" in n[1] and "7590 ₽" in n[1] for n in _notes), _notes
 print("✓ Completed: сделка со «Ссылка отправлена» уехала в «Оплата получена» + примечание")
 
@@ -397,7 +398,7 @@ card_notif["requestSign"] = hashlib.sha256(
 ).hexdigest()
 res = run(ozon_invoice._handle_notification(card_notif))
 assert res == "moved", res
-assert [p for p in _patches if p.get("status_id") == ozon_invoice.STATUS_PAYMENT_RECEIVED], _patches
+assert [p for p in _patches if p.get("status_id") == STATUS_PAYMENT_RECEIVED], _patches
 print("✓ вебхук картой: сделка найдена по extOrderID, а не только по платежу")
 
 # ── 19) getPaymentDetails: подпись и разбор статуса ─────────────────────────
@@ -466,7 +467,7 @@ ozon_invoice.get_payment_status = fake_status_completed
 
 res = run(ozon_invoice._reconcile_once())
 assert "moved=1" in res, res
-assert [p for p in _patches if p.get("status_id") == ozon_invoice.STATUS_PAYMENT_RECEIVED], _patches
+assert [p for p in _patches if p.get("status_id") == STATUS_PAYMENT_RECEIVED], _patches
 assert any("сверка" in n[1] for n in _notes), _notes
 # второй проход не должен двигать повторно
 _patches.clear()
@@ -717,5 +718,114 @@ assert due(2000, _ts(3, 12), _at(4, _H - 1)) == ""
 # и второе за те же сутки не уходит
 assert due(2000, _ts(4, _H), _at(4, _H + 1)) == ""
 print(f"✓ частота: первое через {порог} мин, дальше не чаще раза в сутки и только с {_H}:00")
+
+# ══════════ картотека «Работа с базой»: та же цепочка во второй воронке ══════════
+# Этапы скопированы Катей 07.09.2026. Автоматика в amo своя, код — общий:
+# воронка и этапы берутся из карты OZON_PAYMENT_STAGES, а не из констант розницы.
+from waybill_config import (  # noqa: E402
+    PIPELINE_DB_WORK,
+    STATUS_DB_LINK_SENT,
+    STATUS_DB_PAYMENT_RECEIVED,
+    STATUS_DB_PAYMENT_REQUESTED,
+)
+
+_FLAG_WAS = ozon_invoice.OZON_INVOICE_DB_WORK
+
+# ── к) флаг выключен по умолчанию: код едет на прод, ничего не делая ────────
+assert _FLAG_WAS is False, "OZON_INVOICE_DB_WORK должен быть выключен по умолчанию"
+assert ozon_invoice._invoice_pipelines() == (PIPELINE_CLEVER_MAIN,)
+print("✓ картотека: флаг выключен по умолчанию, воронка одна — розница")
+
+# ── к1) флаг выключен + сделка на тех-этапе картотеки → полный скип ─────────
+_reset()
+_install_mocks(_lead(status=STATUS_DB_PAYMENT_REQUESTED, pipeline=PIPELINE_DB_WORK))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-moved", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+print("✓ картотека: при выключенном флаге счёт не создаётся, Ozon не дёргается")
+
+# ── к2) флаг включён: счёт создан, PATCH несёт ЭТАПЫ И ВОРОНКУ КАРТОТЕКИ ────
+# Главный тест задачи: ловит «зашили розничный этап в картотечный PATCH».
+ozon_invoice.OZON_INVOICE_DB_WORK = True
+_reset()
+_install_mocks(_lead(status=STATUS_DB_PAYMENT_REQUESTED, pipeline=PIPELINE_DB_WORK))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert len(_patches) == 1, _patches
+assert _patches[0]["status_id"] == STATUS_DB_LINK_SENT, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_DB_WORK, _patches[0]
+assert _patches[0]["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://qr.nspk.ru/")
+print("✓ картотека: сделка остаётся в СВОЕЙ воронке, этап — картотечная «ссылка отправлена»")
+
+# ── к3) розница при включённом флаге не сломалась ───────────────────────────
+_reset()
+_install_mocks(_lead())
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _patches[0]["status_id"] == STATUS_LINK_SENT, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_CLEVER_MAIN, _patches[0]
+print("✓ картотека включена — розница ходит прежним путём")
+
+# ── к4) перекрёстный негатив: картотека на РОЗНИЧНОМ этапе → скип ───────────
+# Ловит гейт, который сверяет только этап и не смотрит, из какой он воронки.
+_reset()
+_install_mocks(_lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_DB_WORK))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-moved", res
+assert not _ozon_calls, _ozon_calls
+print("✓ чужой этап в своей воронке — скип, этапы воронок не путаются")
+
+# ── к5) is_invoice_entry: вебхук без воронки, воронка строкой, мусор ────────
+assert ozon_invoice.is_invoice_entry(None, STATUS_DB_PAYMENT_REQUESTED) is True
+assert ozon_invoice.is_invoice_entry("11166334", str(STATUS_DB_PAYMENT_REQUESTED)) is True
+assert ozon_invoice.is_invoice_entry(PIPELINE_DB_WORK, STATUS_DB_LINK_SENT) is False
+assert ozon_invoice.is_invoice_entry("мусор", STATUS_DB_PAYMENT_REQUESTED) is False
+assert ozon_invoice.is_invoice_entry(PIPELINE_DB_WORK, None) is False
+print("✓ is_invoice_entry: строки и пустая воронка из вебхука разбираются, мусор отсекается")
+
+# ── к6) сверка ходит только по включённым воронкам ──────────────────────────
+_asked: list = []
+
+async def _fake_by_status(status_id, with_=()):
+    _asked.append(status_id)
+    return []
+
+_real_by_status = amo_service.get_leads_by_status
+amo_service.get_leads_by_status = _fake_by_status
+
+_asked.clear()
+run(ozon_invoice._reconcile_once())
+assert set(_asked) == {STATUS_LINK_SENT, STATUS_PAYMENT_REQUESTED,
+                       STATUS_DB_LINK_SENT, STATUS_DB_PAYMENT_REQUESTED}, _asked
+ozon_invoice.OZON_INVOICE_DB_WORK = False
+_asked.clear()
+run(ozon_invoice._reconcile_once())
+assert set(_asked) == {STATUS_LINK_SENT, STATUS_PAYMENT_REQUESTED}, _asked
+print("✓ сверка: с флагом четыре этапа, без флага прежние два — лишних запросов нет")
+
+# ── к7) оплата доводится до конца даже при ВЫКЛЮЧЕННОМ флаге ────────────────
+# Деньги списаны: оставить сделку на «ссылка отправлена» с одним примечанием
+# нельзя. Контракт отката, без теста развалится при первом рефакторинге.
+assert ozon_invoice.OZON_INVOICE_DB_WORK is False
+_reset()
+_install_mocks(_lead(status=STATUS_DB_LINK_SENT, pipeline=PIPELINE_DB_WORK))
+res = run(ozon_invoice._mark_paid(
+    _lead(status=STATUS_DB_LINK_SENT, pipeline=PIPELINE_DB_WORK), "1000", "extId x", "вебхук"))
+assert res == "moved", res
+assert _patches[0]["status_id"] == STATUS_DB_PAYMENT_RECEIVED, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_DB_WORK, _patches[0]
+print("✓ оплаченная сделка картотеки доезжает до «оплата получена» и с опущенным флагом")
+
+# ── к8) чужая воронка в _mark_paid → только примечание, PATCH нет ───────────
+_reset()
+_install_mocks(_lead())
+res = run(ozon_invoice._mark_paid(
+    _lead(status=142, pipeline=9421022), "1000", "extId y", "сверка"))
+assert res == "noted", res
+assert not _patches, _patches
+print("✓ чужая воронка: примечание есть, сделку не двигаем")
+
+amo_service.get_leads_by_status = _real_by_status
+ozon_invoice.OZON_INVOICE_DB_WORK = _FLAG_WAS
 
 print("\nozon_invoice: все тесты прошли")
