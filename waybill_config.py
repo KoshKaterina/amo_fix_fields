@@ -769,6 +769,28 @@ SHOWROOM_ALERT_MAX_AGE_MIN = int(os.getenv("SHOWROOM_ALERT_MAX_AGE_MIN", "60"))
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
 STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)
+
+# Те же три этапа, скопированные Катей в картотеку «Работа с базой» 07.09.2026,
+# чтобы менеджер обзвона доводил продажу на месте, не таща сделку в розницу.
+# Автоматика в amo настроена и сверена с эталоном: тех-этап пуст (его слушаем мы),
+# на «ссылка отправлена» те же боты 7173/7309, на «оплата получена» те же семь.
+STATUS_DB_PAYMENT_REQUESTED = 88412942
+STATUS_DB_LINK_SENT = 88412946
+STATUS_DB_PAYMENT_RECEIVED = 88412950
+
+# Воронка → (тех-этап входа, «ссылка отправлена», «оплата получена»).
+# Это ДАННЫЕ — что вообще бывает. Что из этого включено, решает
+# ozon_invoice._invoice_pipelines() по флагу: политику в карту не кладём, иначе
+# подмена флага в тестах и в консоли при разборе инцидента перестанет работать.
+OZON_PAYMENT_STAGES: dict[int, tuple[int, int, int]] = {
+    PIPELINE_CLEVER_MAIN: (STATUS_PAYMENT_REQUESTED, STATUS_LINK_SENT, STATUS_PAYMENT_RECEIVED),
+    PIPELINE_DB_WORK: (STATUS_DB_PAYMENT_REQUESTED, STATUS_DB_LINK_SENT, STATUS_DB_PAYMENT_RECEIVED),
+}
+
+# Счёт СБП в картотеке. Отдельный флаг от OZON_INVOICE_ENABLED: розничный контур
+# обкатан с июля, картотеку включаем своим шагом и наблюдаем отдельно.
+OZON_INVOICE_DB_WORK = os.getenv("OZON_INVOICE_DB_WORK", "").strip() == "1"
+
 FIELD_PAYMENT_LINK = 577617           # «Ссылка для оплаты»
 # «Другая сумма» (text, создано Катей 20.07.2026): если заполнено — счёт СБП
 # создаётся на ЭТУ сумму (в рублях) вместо суммы заказа МС; пусто — сумма заказа.
