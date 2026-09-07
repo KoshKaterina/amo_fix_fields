@@ -31,7 +31,7 @@ import woo_client
 from waybill_config import (
     FIELD_PAYMENT_METHOD,
     FIELD_SITE_ORDER_NUMBER,
-    PIPELINE_CLEVER,
+    PIPELINE_CLEVER_MAIN,
     PIPELINE_FULFILLMENT,
     PIPELINE_OFFICE,
     WOO_COMPLETED_STATUS,
@@ -112,7 +112,7 @@ async def resolve_target(payload: dict, lead: dict | None = None) -> dict | None
 
     pipeline_id = lead.get("pipeline_id")
     status_id = lead.get("status_id")
-    if pipeline_id not in (PIPELINE_CLEVER, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
+    if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE, PIPELINE_FULFILLMENT):
         return None
 
     payment = _cf(lead, FIELD_PAYMENT_METHOD)

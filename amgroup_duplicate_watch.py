@@ -59,7 +59,7 @@ from waybill_config import (
     AMGROUP_DUP_WATCH_LOOKBACK_H,
     AMGROUP_FALLBACK_TAG,
     FIELD_MOYSKLAD_ORDER_UUID,
-    PIPELINE_CLEVER,
+    PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
 )
 
@@ -77,7 +77,7 @@ FIELD_ORDER_NUMBER = 576697
 # amgroup_lead_builder не определил, в какую воронку кладёт сделки протез,
 # смотрим обе актуальные воронки-получателя заказов; когда определится -
 # свести сюда.
-_PIPELINES = (PIPELINE_CLEVER, PIPELINE_OFFICE)
+_PIPELINES = (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE)
 
 # Тег сделки-протеза (наша) - переиспользуем константу из waybill_config, она
 # уже общая для всего контура amgroup_fallback, заводить свою копию смысла нет.

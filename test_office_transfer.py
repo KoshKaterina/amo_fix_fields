@@ -952,10 +952,10 @@ woo_status_sync.is_enabled = _orig_woo_enabled
 assert metrika_sync._classify(metrika_sync.PIPELINE_OFFICE, STATUS_SUCCESS, False) == ("PAID", True)
 assert metrika_sync._classify(metrika_sync.PIPELINE_OFFICE, STATUS_SUCCESS, True) == ("PAID", True)
 # CLEVER-логика не тронута: предоплата PAID, наложка в CLEVER — нет
-assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER, STATUS_SUCCESS, False) == ("PAID", False)
-assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER, STATUS_SUCCESS, True) == (None, False)
+assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, False) == ("PAID", False)
+assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER_MAIN, STATUS_SUCCESS, True) == (None, False)
 # CANCELLED как был
-assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER, STATUS_CLOSED_LOST, False) == ("CANCELLED", False)
+assert metrika_sync._classify(metrika_sync.PIPELINE_CLEVER_MAIN, STATUS_CLOSED_LOST, False) == ("CANCELLED", False)
 assert metrika_sync._classify(metrika_sync.PIPELINE_OFFICE, STATUS_CLOSED_LOST, True) == ("CANCELLED", True)
 print("✓ _classify: Офис/ФФ дают PAID для любой оплаты, CLEVER/CANCELLED не тронуты")
 
@@ -977,7 +977,7 @@ assert res is moved_lead, "перенесённая сделка — сама с
 res = run(metrika_sync._resolve_clever({"id": 78, "custom_fields_values": []}))
 assert res is None
 # ...и если сиблинг в CLEVER существует (старая копия) — возвращается именно он
-clever_orig = {"id": 79, "pipeline_id": metrika_sync.PIPELINE_CLEVER,
+clever_orig = {"id": 79, "pipeline_id": metrika_sync.PIPELINE_CLEVER_MAIN,
                "custom_fields_values": [
                    {"field_id": metrika_sync.FIELD_MOYSKLAD_ORDER_UUID,
                     "values": [{"value": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}

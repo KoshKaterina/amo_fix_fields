@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import amgroup_shipment  # noqa: E402
 from waybill_config import (  # noqa: E402
     FIELD_MOYSKLAD_ORDER_UUID,
-    PIPELINE_CLEVER,
+    PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
     STATUS_OFFICE_COURIER_OWN,
     STATUS_SUCCESS,
@@ -175,7 +175,7 @@ def test_status_142_v_chuzhoy_voronke_ne_sozdaet(monkeypatch):
     Основная (не Офис) - отгрузку создавать НЕЛЬЗЯ, иначе спишем товар зря
     на закрытие сделки в чужой воронке."""
     calls = _wire(monkeypatch, template=_DEMAND_TEMPLATE, created_demand=_CREATED_DEMAND)
-    lead = _lead(PIPELINE_CLEVER, STATUS_SUCCESS)
+    lead = _lead(PIPELINE_CLEVER_MAIN, STATUS_SUCCESS)
 
     result = asyncio.run(amgroup_shipment.create_shipment_for_lead(lead))
 

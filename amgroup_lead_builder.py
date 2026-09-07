@@ -25,7 +25,7 @@
 безопасности 03.09.2026): сделка протеза создаётся сразу с заполненным полем
 «Состав заказа» (FIELD["sostav"]), а webhooks.py на изменение этого поля
 ставит резерв в МойСкладе - и воронка/этап, куда протез кладёт сделку
-(PIPELINE_CLEVER/STATUS_CLEVER_NEW_LEAD), входит в зону резервирования.
+(PIPELINE_CLEVER_MAIN/STATUS_CLEVER_NEW_LEAD), входит в зону резервирования.
 Значит включение протеза сделок ОДНОВРЕМЕННО включает простановку резервов по
 заказам, которым на момент находки может быть уже до AMGROUP_FALLBACK_LOOKBACK_HOURS
 часов и которые к этому моменту могли быть уже отгружены. Код здесь не
@@ -38,7 +38,7 @@ circuit breaker, свой HTTP-клиент здесь не заводим. Чи
 «склад не ответил», а не «данных нет» (см. докстринг amgroup_fallback.py).
 
 Константы полей/воронки ниже свести в общий конфиг на сшивке - часть уже
-живёт в waybill_config.py (PIPELINE_CLEVER, STATUS_CLEVER_NEW_LEAD,
+живёт в waybill_config.py (PIPELINE_CLEVER_MAIN, STATUS_CLEVER_NEW_LEAD,
 FIELD_MOYSKLAD_ORDER_UUID, AMGROUP_FALLBACK_TAG) и импортируется оттуда,
 остальное (карта полей сделки, ENUM выпадающих списков) - своё, локальное.
 """
@@ -57,7 +57,7 @@ from waybill_config import (
     AMGROUP_LEAD_RESPONSIBLE_USER_ID,
     FIELD_MOYSKLAD_ORDER_UUID,
     LEAD_DISTRIBUTION_ENABLED,
-    PIPELINE_CLEVER,
+    PIPELINE_CLEVER_MAIN,
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
     STATUS_CLEVER_NEW_LEAD,
 )
@@ -293,7 +293,7 @@ def _new_lead_profile() -> "lead_distribution.Profile | None":
     распределитель её не увидит никогда (проверено 03.09.2026: у сделок
     ручного переноса источник пуст, правило их пропустило)."""
     for p in lead_distribution.list_profiles():
-        if p.enabled and lead_distribution._matches_entry(p, PIPELINE_CLEVER, STATUS_CLEVER_NEW_LEAD):
+        if p.enabled and lead_distribution._matches_entry(p, PIPELINE_CLEVER_MAIN, STATUS_CLEVER_NEW_LEAD):
             return p
     return None
 
@@ -481,7 +481,7 @@ async def create_lead_for_order(order: dict) -> int | None:
     price = int((full.get("sum") or 0) / 100)
     lead_id = await api.create_lead_direct(
         name=lead_name,
-        pipeline_id=PIPELINE_CLEVER,
+        pipeline_id=PIPELINE_CLEVER_MAIN,
         status_id=STATUS_CLEVER_NEW_LEAD,
         custom_fields_values=cf,
         contact_id=contact_id,

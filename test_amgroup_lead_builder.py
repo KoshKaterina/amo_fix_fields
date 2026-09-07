@@ -226,7 +226,7 @@ def test_sozdaet_sdelku_i_stavit_otvetstvennogo(monkeypatch):
     assert calls["contacts"] == 1
     assert calls["leads"] == 1
     assert calls["last_lead_kwargs"]["contact_id"] == 555
-    assert calls["last_lead_kwargs"]["pipeline_id"] == builder.PIPELINE_CLEVER
+    assert calls["last_lead_kwargs"]["pipeline_id"] == builder.PIPELINE_CLEVER_MAIN
     assert calls["last_lead_kwargs"]["status_id"] == builder.STATUS_CLEVER_NEW_LEAD
     assert calls["last_lead_kwargs"]["tags"] == [builder.AMGROUP_FALLBACK_TAG]
     # ответственный - отдельный PATCH после создания, не часть тела создания
@@ -423,7 +423,7 @@ def test_oshibka_sozdaniya_kontakta_ne_svetit_telefon_v_loge(monkeypatch, caplog
 def _amo_lead_for_pick(lead_id=777, *, delivery="CDEK: Курьер"):
     return {
         "id": lead_id,
-        "pipeline_id": builder.PIPELINE_CLEVER,
+        "pipeline_id": builder.PIPELINE_CLEVER_MAIN,
         "status_id": builder.STATUS_CLEVER_NEW_LEAD,
         "custom_fields_values": [
             {"field_id": lead_distribution.FIELD_DELIVERY_TYPE, "values": [{"value": delivery}]},
@@ -438,7 +438,7 @@ def _wire_distribution(monkeypatch, *, lead, decision, profile_enabled=True):
     calls = {"decide": []}
     profile = lead_distribution.Profile(
         id="p1", name="Основное правило", enabled=profile_enabled,
-        entry_points=[{"pipeline_id": builder.PIPELINE_CLEVER,
+        entry_points=[{"pipeline_id": builder.PIPELINE_CLEVER_MAIN,
                        "status_ids": [builder.STATUS_CLEVER_NEW_LEAD]}],
         source_ids=[23478413], participant_ids=[9291546, 13929334],
     )

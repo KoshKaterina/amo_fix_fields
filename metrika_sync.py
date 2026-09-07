@@ -42,7 +42,7 @@ from waybill_config import (
     METRIKA_COUNTER_ID,
     METRIKA_SINCE_TS,
     METRIKA_TOKEN,
-    PIPELINE_CLEVER,
+    PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
     STATUS_CLOSED_LOST,
     STATUS_SUCCESS,
@@ -192,9 +192,9 @@ def _classify(pipeline_id, status_id, cod: bool) -> tuple[str | None, bool]:
     из оригинала в CLEVER.
     """
     if status_id == STATUS_CLOSED_LOST:
-        return "CANCELLED", pipeline_id != PIPELINE_CLEVER
+        return "CANCELLED", pipeline_id != PIPELINE_CLEVER_MAIN
 
-    if pipeline_id == PIPELINE_CLEVER:
+    if pipeline_id == PIPELINE_CLEVER_MAIN:
         if status_id == STATUS_SUCCESS and not cod:
             return "PAID", False
         if status_id not in (STATUS_SUCCESS, STATUS_CLOSED_LOST):
@@ -236,7 +236,7 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
 
     # Работаем только со сквозным потоком заказа: CLEVER → Офис/Фулфилмент.
     # Сделки из прочих воронок (опт, отдел продаж и т.п.) игнорируем.
-    if pipeline_id not in (PIPELINE_CLEVER, PIPELINE_OFFICE):
+    if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE):
         return
 
     payment = _cf(lead, FIELD_PAYMENT_METHOD)
@@ -350,7 +350,7 @@ async def _resolve_clever(dup_lead: dict) -> dict | None:
     # find_leads_by_query теперь возвращает None при сбое запроса (не только
     # пустой список) - or [] сохраняет прежнее поведение (сбой = нет сиблинга).
     for cand in await amo_service.find_leads_by_query(uuid, with_=("contacts",)) or []:
-        if cand.get("pipeline_id") == PIPELINE_CLEVER and str(
+        if cand.get("pipeline_id") == PIPELINE_CLEVER_MAIN and str(
             _cf(cand, FIELD_MOYSKLAD_ORDER_UUID) or ""
         ).strip() == uuid:
             return cand
@@ -414,7 +414,7 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
         since = since_ts if since_ts is not None else run_started - days * 86400
         leads_by_id: dict[int, dict] = {}
         fetch_failed = False
-        for pipeline in (PIPELINE_CLEVER, PIPELINE_OFFICE):
+        for pipeline in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE):
             try:
                 batch = await amo_service.get_leads_updated_since(pipeline, since, with_=("contacts",))
             except Exception:

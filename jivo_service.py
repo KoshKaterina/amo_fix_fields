@@ -24,7 +24,7 @@ import re
 import time
 
 import api
-from waybill_config import PIPELINE_CLEVER
+from waybill_config import PIPELINE_CLEVER_MAIN
 
 logger = logging.getLogger("uvicorn")
 
@@ -67,7 +67,7 @@ def _env_float(name: str, default: float) -> float:
 
 JIVO_ENABLED = _flag("JIVO_WEBHOOK_ENABLED")
 JIVO_WEBHOOK_SECRET = os.getenv("JIVO_WEBHOOK_SECRET", "").strip()
-JIVO_PIPELINE_ID = _env_int("JIVO_PIPELINE_ID", PIPELINE_CLEVER)
+JIVO_PIPELINE_ID = _env_int("JIVO_PIPELINE_ID", PIPELINE_CLEVER_MAIN)
 
 # --- Триаж ---------------------------------------------------------------
 JIVO_TRIAGE_ENABLED = _flag("JIVO_TRIAGE_ENABLED")
