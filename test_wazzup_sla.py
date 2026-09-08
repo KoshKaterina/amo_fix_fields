@@ -228,7 +228,8 @@ def test_mentions_igor_and_kirill():
 def test_mentions_artem_b2b():
     # ОПТ-сделки не должны падать в фолбэк «вся розничная смена» (MAG-жалоба
     # Тианы 31.07.2026: пропуск на сделке Артёма тегал офицера/Егора/Катю).
-    assert T.mentions_for(13822630) == "@sunscryptb2b"
+    # Хендл сменился 08.09.2026: был @sunscryptb2b, стал @temossska.
+    assert T.mentions_for(13822630) == "@temossska"
 
 
 def test_mentions_unknown_falls_back_to_shift():
