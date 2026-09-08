@@ -11,6 +11,7 @@ from starlette.status import HTTP_200_OK
 import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
+import academy_lead_alert
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -420,6 +421,12 @@ async def lead_change(request: Request):
     # сделки, и лишний запрос в amo отсюда стоил бы дорого. Проверка и отправка — в
     # собственном цикле new_lead_watch.
     new_lead_watch.note_lead(lead_id, incoming_pipeline, incoming_status)
+
+    # Новый лид в Академии (Катя 08.09.2026): сделка встала на «Входящий лид» воронки
+    # Академии → уведомление Гладкову в топик УВЕДОМЛЕНИЯ. Здесь только сравнение
+    # воронки и этапа, чтение сделки и отправка уходят в фон (academy_lead_alert).
+    # Стоит ВЫШЕ блока `updates`: этап меняют и без правки полей сделки.
+    academy_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
 
     # Протез отгрузок: пока amgroup лежит, отгрузку в МойСкладе не создаёт никто
     # и товар не списывается. Вешаемся на те же этапы воронки «Офис», на которых
