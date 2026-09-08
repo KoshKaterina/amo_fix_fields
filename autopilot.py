@@ -335,19 +335,26 @@ def answer_decision(bot: dict, answer: str) -> str:
     return "stop"
 
 
-def delivery_ok(statuses: list[dict]) -> bool | None:
-    """Дошло ли сообщение. True - дошло, False - все каналы отбили, None - ещё ждём.
+# Вердикт доставки. Ровно четыре исхода, и «провал» среди них - самый дорогой.
+VERDICT_OK = "ok"          # дошло хотя бы одним каналом
+VERDICT_WAIT = "wait"      # ещё ждём: попытки могут продолжаться
+VERDICT_FAILED = "failed"  # окно вышло, все известные попытки отбиты
+VERDICT_SILENT = "silent"  # окно вышло, а статусов не пришло ни одного
 
-    ⚠️ Бот перебирает каналы: не ушло телеграмом - пробует WhatsApp. Жалоба первого канала
-    остаётся в ленте amoCRM примечанием «SYSTEM WZ», и читать её как «клиент ничего не
-    получил» - готовый ложный вывод, на котором мы уже ошиблись 08.09.2026. Поэтому «не
-    дошло» - это когда отбили ВСЕ каналы, а не первый.
 
-    ⚠️ У Telegram статуса `delivered` не бывает вовсе: там доставкой считаем `sent`.
+def delivery_ok(statuses: list[dict]) -> bool:
+    """Дошло ли хотя бы одним каналом.
+
+    ⚠️ Бот перебирает каналы: не ушло телеграмом - пробует WhatsApp. Успех ЛЮБОГО канала
+    означает, что клиент сообщение получил, даже если соседний отбил и оставил в ленте amoCRM
+    примечание «SYSTEM WZ». Прочитать такую жалобу как «клиент ничего не получил» мы уже
+    один раз успели, 08.09.2026.
+
+    ⚠️ У Telegram статуса «доставлено» не бывает ВООБЩЕ: там путь `sent` → `read`. Ждать
+    `delivered` значит ждать вечно, поэтому на телеграм-канале успехом считаем `sent`. Это
+    слабее, чем у WhatsApp - `sent` означает «Wazzup принял», а не «человек увидел», - и
+    поэтому в журнале такая доставка подписывается отдельно, см. `delivery_note`.
     """
-    if not statuses:
-        return None
-    seen_error = False
     for st in statuses:
         status = str(st.get("status") or "").lower()
         chat_type = str(st.get("chatType") or st.get("chat_type") or "").lower()
@@ -355,9 +362,52 @@ def delivery_ok(statuses: list[dict]) -> bool | None:
             return True
         if status == "sent" and chat_type in TELEGRAM_CHAT_TYPES:
             return True
-        if status == "error":
-            seen_error = True
-    return False if seen_error else None
+    return False
+
+
+def delivery_verdict(statuses: list[dict], waited_s: float, wait_limit_s: float) -> str:
+    """Что делать прямо сейчас: ждать, идти дальше или звать человека.
+
+    ⚠️ Отказ ОДНОГО канала - это НЕ провал, пока не вышло окно ожидания. Сколько каналов
+    попробует бот, мы заранее не знаем: он решает это сам своими шагами. Поэтому единственный
+    честный признак провала - «окно вышло, а успеха так и нет», и до конца окна мы ждём даже
+    при видимых отказах. Раньше здесь стоял отказ по первой же ошибке, и это была ровно та
+    ошибка, на которой мы обожглись 08.09.2026, только записанная в код.
+
+    Отдельный исход `silent` - когда за всё окно не пришло ни одного статуса. Это другой
+    случай: сообщение не просто не дошло, а, похоже, не отправлялось вовсе (нет телефона и
+    юзернейма в карточке, канал до неё не работает). Человеку об этом надо сказать другими
+    словами, поэтому и исход отдельный.
+    """
+    if delivery_ok(statuses):
+        return VERDICT_OK
+    if waited_s < wait_limit_s:
+        return VERDICT_WAIT
+    return VERDICT_FAILED if statuses else VERDICT_SILENT
+
+
+def delivery_note(statuses: list[dict]) -> str:
+    """Человеческая подпись для журнала: что случилось по каждому каналу.
+
+    Пишем ПОКАНАЛЬНО и с оговоркой про телеграм. Без неё строка «отправлено» у телеграма
+    читается как более слабая, чем «доставлено» у ватсапа, и человек идёт искать поломку там,
+    где её нет.
+    """
+    if not statuses:
+        return "статусов от Wazzup не пришло ни одного"
+    parts = []
+    titles = {"sent": "отправлено", "delivered": "доставлено", "read": "прочитано",
+              "error": "отказ канала"}
+    for st in statuses:
+        status = str(st.get("status") or "").lower()
+        chat_type = str(st.get("chatType") or st.get("chat_type") or "").lower()
+        name = "Telegram" if chat_type in TELEGRAM_CHAT_TYPES else "WhatsApp"
+        text = titles.get(status, status or "без статуса")
+        if status == "sent" and chat_type in TELEGRAM_CHAT_TYPES:
+            text = "отправлено, подтверждения доставки телеграм не присылает"
+        parts.append(name + ": " + text)
+    return ", ".join(parts)
+
 
 
 # ── жизненный цикл ──────────────────────────────────────────────────────────────

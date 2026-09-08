@@ -129,31 +129,65 @@ def test_drop_lead_removes_all_its_stages():
 
 # ── доставка ────────────────────────────────────────────────────────────────────
 
-def test_delivery_waits_while_nothing_known():
-    assert A.delivery_ok([]) is None
-    assert A.delivery_ok([{"status": "sent", "chatType": "whatsapp"}]) is None
+WAIT = 15 * 60  # окно ожидания доставки, секунд
 
 
-def test_delivery_ok_on_any_channel():
-    """Бот перебирает каналы: телеграм отбил, ватсап доставил - клиент сообщение ПОЛУЧИЛ.
-    Считать иначе значит повторить ошибку 08.09.2026, когда жалобу первого канала прочитали
-    как «клиент ничего не получил»."""
-    assert A.delivery_ok([
+def test_one_channel_refused_is_not_a_failure_yet():
+    """Главное. Бот перебирает каналы: телеграм отбил - ватсап ещё может доставить. Пока
+    окно не вышло, отказ ОДНОГО канала это «ждём», а не «не дошло». Ровно на этом мы
+    ошиблись 08.09.2026, прочитав жалобу первого канала как приговор."""
+    statuses = [{"status": "error", "chatType": "telegram"}]
+    assert A.delivery_verdict(statuses, waited_s=60, wait_limit_s=WAIT) == A.VERDICT_WAIT
+
+
+def test_success_on_any_channel_wins_over_refusal():
+    statuses = [
         {"status": "error", "chatType": "telegram"},
         {"status": "delivered", "chatType": "whatsapp"},
-    ]) is True
+    ]
+    assert A.delivery_verdict(statuses, waited_s=1, wait_limit_s=WAIT) == A.VERDICT_OK
+    assert A.delivery_ok(statuses) is True
 
 
-def test_delivery_failed_only_when_every_channel_refused():
-    assert A.delivery_ok([
+def test_failure_only_after_the_window_closed():
+    statuses = [
         {"status": "error", "chatType": "telegram"},
         {"status": "error", "chatType": "whatsapp"},
-    ]) is False
+    ]
+    assert A.delivery_verdict(statuses, waited_s=WAIT - 1, wait_limit_s=WAIT) == A.VERDICT_WAIT
+    assert A.delivery_verdict(statuses, waited_s=WAIT, wait_limit_s=WAIT) == A.VERDICT_FAILED
+
+
+def test_no_statuses_at_all_is_a_separate_outcome():
+    """Ни одного статуса за всё окно - это не «не дошло», а «похоже, не отправлялось»:
+    в карточке нет ни телефона, ни юзернейма, и канал до неё не работает вовсе. Человеку об
+    этом надо сказать другими словами."""
+    assert A.delivery_verdict([], waited_s=1, wait_limit_s=WAIT) == A.VERDICT_WAIT
+    assert A.delivery_verdict([], waited_s=WAIT, wait_limit_s=WAIT) == A.VERDICT_SILENT
 
 
 def test_telegram_sent_counts_as_delivered():
     """У Telegram статуса «доставлено» не бывает вовсе - ждать его значит ждать вечно."""
-    assert A.delivery_ok([{"status": "sent", "chatType": "telegram"}]) is True
+    statuses = [{"status": "sent", "chatType": "telegram"}]
+    assert A.delivery_verdict(statuses, waited_s=1, wait_limit_s=WAIT) == A.VERDICT_OK
+
+
+def test_whatsapp_sent_is_not_delivery_yet():
+    """А у WhatsApp `sent` - это ещё не доставка: там `delivered` приходит, и его ждём."""
+    statuses = [{"status": "sent", "chatType": "whatsapp"}]
+    assert A.delivery_verdict(statuses, waited_s=1, wait_limit_s=WAIT) == A.VERDICT_WAIT
+
+
+def test_delivery_note_explains_telegram_separately():
+    """Иначе «отправлено» у телеграма читается как слабее «доставлено» у ватсапа, и человек
+    идёт искать поломку там, где её нет."""
+    note = A.delivery_note([
+        {"status": "sent", "chatType": "telegram"},
+        {"status": "delivered", "chatType": "whatsapp"},
+    ])
+    assert "телеграм не присылает" in note
+    assert "WhatsApp: доставлено" in note
+
 
 
 # ── ответ клиента ───────────────────────────────────────────────────────────────
