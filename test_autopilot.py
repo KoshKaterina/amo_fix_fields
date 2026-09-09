@@ -62,6 +62,7 @@ def _settings(**over):
     base = {
         "settings": {"mode": "test", "work_hours": [{"start": "10:00", "end": "19:00"}]},
         "pipeline_id": 8642414,
+        "payment_status_id": 70070986,
         "route": [],
         "test_contact_ids": [48594653],
     }
@@ -459,7 +460,8 @@ def test_cod_is_narrow_showroom_is_not_cod():
 
 
 def _fork_env(monkeypatch, *, paid, method, mode="live"):
-    _settings(settings={"mode": mode, "work_hours": [{"start": "00:00", "end": "23:59"}]})
+    _settings(settings={"mode": mode, "work_hours": [{"start": "00:00", "end": "23:59"}]},
+              payment_status_id=87280230 if mode == "live" else 70070986)
     rows = _capture(monkeypatch)
     moves: list[tuple] = []
 
@@ -511,13 +513,20 @@ def test_empty_payment_method_stops(monkeypatch):
     assert rows[-1]["outcome"] == "stop_no_payment_method"
 
 
-def test_test_mode_does_not_ask_for_money(monkeypatch):
-    """В «Тесте» цепочка честно доходит до оплаты и там останавливается: счета выставляет
-    автоматика боевой воронки, и в тестовой ей делать нечего."""
+def test_test_mode_moves_to_payment_stage_but_issues_no_invoice(monkeypatch):
+    """Правка Кати 09.09.2026: в «Тесте» неоплаченный онлайн-заказ ПЕРЕВОДИТСЯ на этап
+    оплаты - прогон должен быть виден движением сделки. Счёта при этом не будет: автоматика
+    счетов зашита на боевую воронку, и с этапа оплаты тест дальше не едет."""
     rows, moves, lead = _fork_env(monkeypatch, paid=False, method="Счет", mode="test")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
-    assert moves == []
-    assert rows[-1]["outcome"] == "done"
+    assert moves and moves[0][0] == 70070986
+
+    # А сделка, уже стоящая на этапе оплаты, дальше не едет - иначе цикл.
+    rows2, moves2, lead2 = _fork_env(monkeypatch, paid=False, method="Счет", mode="test")
+    lead2["status_id"] = 70070986
+    asyncio.run(A.payment_fork(lead2, None, "конец маршрута"))
+    assert moves2 == []
+    assert rows2[-1]["outcome"] == "done"
 
 
 def test_force_ur_never_closes_an_unpaid_online_order(monkeypatch):
@@ -776,7 +785,8 @@ def test_payment_received_still_goes_through_when_warehouse_is_silent(monkeypatc
 # ── ручные тест-сделки: без заказа МойСклада ────────────────────────────────────
 
 def _no_order_env(monkeypatch, *, method, mode):
-    _settings(settings={"mode": mode, "work_hours": [{"start": "00:00", "end": "23:59"}]})
+    _settings(settings={"mode": mode, "work_hours": [{"start": "00:00", "end": "23:59"}]},
+              payment_status_id=87280230 if mode == "live" else 70070986)
     rows = _capture(monkeypatch)
     moves: list[int] = []
 
@@ -788,14 +798,29 @@ def _no_order_env(monkeypatch, *, method, mode):
     return rows, moves, _lead(custom_fields_values=fields)
 
 
-def test_manual_test_lead_without_ms_order_finishes_quietly(monkeypatch):
-    """Правка Кати 09.09.2026: в тесте сделки заводятся руками, без заказа МойСклада, и это
-    не повод алертить - спрашивать про оплату не о чем, честно завершаем прогон."""
+def test_manual_test_lead_without_ms_order_moves_to_payment_stage(monkeypatch):
+    """Ручная тест-сделка без заказа МойСклада - не повод алертить и не повод стоять:
+    неоплаченный онлайн переводится на этап оплаты, как и всё остальное в тесте."""
     rows, moves, lead = _no_order_env(monkeypatch, method="Счет", mode="test")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
-    assert moves == []
-    assert rows[-1]["outcome"] == "done"
-    assert "без заказа" in rows[-1]["reason"]
+    assert moves == [70070986]
+
+
+def test_route_never_walks_into_payment_stage_by_card_order(monkeypatch):
+    """На этап оплаты, как и в успех, по порядку карточек не переходим - только через
+    развилку: в бою вход туда выставляет клиенту счёт, и решение о деньгах не должно
+    зависеть от расстановки карточек."""
+    _route(
+        _stage(70070982, "Первичный контакт", [_bot(1)]),
+        _stage(70070986, "Оплата", []),
+        _stage(A.STATUS_SUCCESS, "Успешно реализовано", []),
+    )
+    called = []
+    monkeypatch.setattr(A, "payment_fork", lambda *a, **k: _noop(called.append("fork")))
+    monkeypatch.setattr(A, "move_to", lambda *a, **k: _noop(called.append("move")))
+    asyncio.run(A.advance(_lead(status_id=70070982), _stage(70070982, "Первичный контакт", []),
+                          "тест"))
+    assert called == ["fork"]
 
 
 def test_manual_test_lead_with_cod_still_reaches_success(monkeypatch):

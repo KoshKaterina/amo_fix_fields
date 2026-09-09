@@ -818,7 +818,11 @@ async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None
                 reason="маршрут пройден, дальше сделку уводит перевод в офис")
         return
     nxt = next_stage(status_id)
-    if nxt is None or int(nxt.get("status_id") or 0) == STATUS_SUCCESS:
+    # На этап запроса оплаты, как и в успех, по порядку карточек не переходим - только
+    # через развилку: в бою вход в «Оплату запрошену» выставляет клиенту счёт, и решение
+    # об этом не должно зависеть от того, как расставлены карточки.
+    pay_status = settings_client.get_payment_status_id() or STATUS_PAYMENT_REQUESTED
+    if nxt is None or int(nxt.get("status_id") or 0) in (STATUS_SUCCESS, pay_status):
         await payment_fork(lead, stage, reason)
         return
     await move_to(lead, stage, int(nxt["status_id"]), str(nxt.get("status_name") or ""), reason)
@@ -891,6 +895,20 @@ async def order_is_paid(order_uuid) -> bool | None:
         return None
 
 
+def _payment_target() -> tuple[int, str]:
+    """Куда развилка отправляет неоплаченный онлайн-заказ.
+
+    Этап отдаёт панель - у неё карта соответствий воронок: в бою «Оплата запрошена»
+    (дальше счёт выставляет автоматика), в тестовой воронке «Оплата» - перевод форсится
+    и там (правка Кати 09.09.2026), чтобы прогон был виден движением сделки, а не
+    только строкой в журнале. Панель поле ещё не отдала (старый кэш) - боевая константа.
+    """
+    target = settings_client.get_payment_status_id() or STATUS_PAYMENT_REQUESTED
+    stage = settings_client.get_stage(target)
+    name = str((stage or {}).get("status_name") or "").strip()
+    return target, name or ("Оплата запрошена" if target == STATUS_PAYMENT_REQUESTED else "Оплата")
+
+
 async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
     """Конец маршрута: куда сделку вести по способу оплаты и факту оплаты."""
     lead_id = int(lead["id"])
@@ -909,12 +927,19 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
                 await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
                               "оплата при получении")
                 return
-            await asyncio.to_thread(
-                store.finish, lead_id, int(lead.get("status_id") or 0), store.PHASE_DONE,
-                "тестовый прогон дошёл до оплаты",
-            )
-            log_run(lead, stage, action="payment_fork", outcome="done",
-                    reason="тестовая сделка без заказа МойСклада, счёт не выставляю")
+            pay_status, pay_name = _payment_target()
+            if int(lead.get("status_id") or 0) == pay_status:
+                await asyncio.to_thread(
+                    store.finish, lead_id, pay_status, store.PHASE_DONE,
+                    "сделка на этапе запроса оплаты",
+                )
+                log_run(lead, stage, action="payment_fork", outcome="done",
+                        reason="сделка на этапе запроса оплаты, дальше не веду: счёт в тесте не выставляем")
+                return
+            log_run(lead, stage, action="payment_fork", outcome="advanced",
+                    reason="онлайн-оплата не поступила, перевожу на этап оплаты")
+            await move_to(lead, stage, pay_status, pay_name,
+                          "онлайн-оплата не поступила")
             return
         await stop_here(
             lead, stage, "failed", "в сделке нет заказа МойСклада",
@@ -950,26 +975,21 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
                       "оплата при получении")
         return
 
-    # Онлайн и не оплачен - дальше счёт выставляет уже работающая автоматика.
-    if settings_client.get_mode() == "test":
+    # Онлайн и не оплачен - переводим на этап запроса оплаты. В бою дальше счёт
+    # выставляет уже работающая автоматика; в тесте счёта не будет, но перевод форсится
+    # (правка Кати 09.09.2026) - прогон должен быть виден движением сделки.
+    pay_status, pay_name = _payment_target()
+    if int(lead.get("status_id") or 0) == pay_status:
         await asyncio.to_thread(
-            store.finish, lead_id, int(lead.get("status_id") or 0), store.PHASE_DONE,
-            "тестовый прогон дошёл до оплаты",
+            store.finish, lead_id, pay_status, store.PHASE_DONE, reason,
         )
         log_run(lead, stage, action="payment_fork", outcome="done",
-                reason="тестовый прогон дошёл до оплаты, счёт в тесте не выставляю")
-        return
-    if int(lead.get("status_id") or 0) == STATUS_PAYMENT_REQUESTED:
-        await asyncio.to_thread(
-            store.finish, lead_id, STATUS_PAYMENT_REQUESTED, store.PHASE_DONE, reason,
-        )
-        log_run(lead, stage, action="payment_fork", outcome="done",
-                reason="сделка уже на запросе оплаты, дальше ведёт автоматика счетов")
+                reason="сделка уже на этапе запроса оплаты, дальше не веду")
         return
     log_run(lead, stage, action="payment_fork", outcome="advanced",
-            reason="онлайн-оплата не поступила, передаю автоматике счетов")
-    await move_to(lead, stage, STATUS_PAYMENT_REQUESTED, "Оплата запрошена",
-                  "передаю автоматике счетов")
+            reason="онлайн-оплата не поступила, перевожу на этап оплаты")
+    await move_to(lead, stage, pay_status, pay_name,
+                  "онлайн-оплата не поступила")
 
 
 async def force_ur(lead: dict, stage: dict | None, note: str) -> None:

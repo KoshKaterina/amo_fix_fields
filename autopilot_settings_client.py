@@ -86,6 +86,13 @@ def get_entry_status_id() -> int | None:
     return int(value) if value else None
 
 
+def get_payment_status_id() -> int | None:
+    """Этап запроса оплаты текущей воронки. Решает панель: в бою «Оплата запрошена»,
+    в тестовой воронке его роль играет «Оплата» (правка Кати 09.09.2026)."""
+    value = get_settings().get("payment_status_id")
+    return int(value) if value else None
+
+
 def get_route() -> list[dict[str, Any]]:
     """Этапы маршрута ТЕКУЩЕЙ воронки, по порядку. Какая воронка текущая, решила панель."""
     return list(get_settings().get("route") or [])
