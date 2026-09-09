@@ -771,3 +771,72 @@ def test_payment_received_still_goes_through_when_warehouse_is_silent(monkeypatc
     asyncio.run(run())
     assert moves == [A.STATUS_SUCCESS]
     assert "промолчал" in rows[-1]["reason"]
+
+
+# ── ручные тест-сделки: без заказа МойСклада ────────────────────────────────────
+
+def _no_order_env(monkeypatch, *, method, mode):
+    _settings(settings={"mode": mode, "work_hours": [{"start": "00:00", "end": "23:59"}]})
+    rows = _capture(monkeypatch)
+    moves: list[int] = []
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    monkeypatch.setattr(A, "move_to", fake_move)
+    fields = [_cf(577373, method)] if method else []
+    return rows, moves, _lead(custom_fields_values=fields)
+
+
+def test_manual_test_lead_without_ms_order_finishes_quietly(monkeypatch):
+    """Правка Кати 09.09.2026: в тесте сделки заводятся руками, без заказа МойСклада, и это
+    не повод алертить - спрашивать про оплату не о чем, честно завершаем прогон."""
+    rows, moves, lead = _no_order_env(monkeypatch, method="Счет", mode="test")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves == []
+    assert rows[-1]["outcome"] == "done"
+    assert "без заказа" in rows[-1]["reason"]
+
+
+def test_manual_test_lead_with_cod_still_reaches_success(monkeypatch):
+    """Наложке факт оплаты не нужен вовсе - тестовая сделка с «При получении» доезжает
+    до успешной реализации даже без заказа МойСклада."""
+    rows, moves, lead = _no_order_env(monkeypatch, method="При получении", mode="test")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves == [A.STATUS_SUCCESS]
+
+
+def test_live_lead_without_ms_order_stops(monkeypatch):
+    """А в бою сделка без заказа МойСклада - аномалия: робот заведён под заказы, и
+    «спрашивать не о чем» здесь повод позвать человека, а не ехать дальше."""
+    rows, moves, lead = _no_order_env(monkeypatch, method="Счет", mode="live")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves == []
+    assert rows[-1]["outcome"] == "failed"
+    assert "нет заказа" in rows[-1]["reason"]
+
+
+def test_test_mode_alerts_go_to_tech_chat_not_managers(monkeypatch):
+    """Алерты тестового прогона не дёргают менеджеров: иначе в рабочий топик УВЕДОМЛЕНИЯ
+    полетело бы «клиент ответил...» по сделке, которой не существует."""
+    _settings(settings={"mode": "test", "work_hours": []})
+    _SENT.clear()
+
+    async def run():
+        A.alert_op("тестовое событие", responsible_id=123)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert len(_SENT) == 1
+    assert _SENT[0]["chat_id"] is None, "в тесте алерт идёт в технический чат по умолчанию"
+    assert "ТЕСТОВЫЙ прогон" in _SENT[0]["text"]
+
+    _settings(settings={"mode": "live", "work_hours": []})
+    _SENT.clear()
+
+    async def run2():
+        A.alert_op("боевое событие")
+        await asyncio.sleep(0)
+
+    asyncio.run(run2())
+    assert _SENT[0]["chat_id"] is not None, "в бою алерт идёт в чат отдела продаж"

@@ -179,6 +179,12 @@ def alert_op(text: str, responsible_id=None) -> None:
     ПРОВАЛ. Авто-режим шлёт только события: он останавливается ДО того, как что-то стало
     провалом, поэтому в чат руководства не пишет вовсе.
     """
+    # В режиме «Тест» менеджеров не дёргаем: события тестового прогона читает тот, кто
+    # тестирует, и читает он их в техническом чате. Иначе в рабочий топик УВЕДОМЛЕНИЯ
+    # полетело бы «клиент ответил...» по сделке, которой не существует.
+    if settings_client.get_mode() == "test":
+        _send_bg("🤖 Авто-режим, ТЕСТОВЫЙ прогон" + chr(10) + text)
+        return
     body = "🤖 Авто-режим" + chr(10) + text
     if responsible_id:
         try:
@@ -890,6 +896,32 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
     lead_id = int(lead["id"])
     method = amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD)
     order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+
+    # Сделка БЕЗ заказа МойСклада - это не «склад молчит», это «спрашивать не о чем».
+    # В бою такой сделки быть не должно (робот заведён под заказы) - останавливаемся и зовём.
+    # В тесте это норма: сделки заводятся руками, без заказа (правка Кати 09.09.2026) -
+    # наложку ведём в успех, ей факт оплаты не нужен, остальное честно завершаем.
+    if not order_uuid:
+        if settings_client.get_mode() == "test":
+            if is_cod_strict(method):
+                log_run(lead, stage, action="payment_fork", outcome="advanced",
+                        reason="оплата при получении, счёт не нужен")
+                await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
+                              "оплата при получении")
+                return
+            await asyncio.to_thread(
+                store.finish, lead_id, int(lead.get("status_id") or 0), store.PHASE_DONE,
+                "тестовый прогон дошёл до оплаты",
+            )
+            log_run(lead, stage, action="payment_fork", outcome="done",
+                    reason="тестовая сделка без заказа МойСклада, счёт не выставляю")
+            return
+        await stop_here(
+            lead, stage, "failed", "в сделке нет заказа МойСклада",
+            op_text="в сделке не заполнен заказ МойСклада, не могу проверить оплату, дальше не веду",
+        )
+        return
+
     paid = await order_is_paid(order_uuid)
 
     if paid is None and not is_cod_strict(method):
