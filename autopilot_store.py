@@ -240,6 +240,23 @@ def finish(lead_id: int, status_id: int, phase: str, note: str = "") -> None:
     update(lead_id, status_id, phase=phase, note=note[:500])
 
 
+def start_next_bot(lead_id: int, status_id: int, bot_id: int) -> None:
+    """Передать ход следующему боту ЭТОГО ЖЕ этапа.
+
+    Ботов на этапе бывает несколько, и они идут цепочкой: первый спросил и получил ответ,
+    второй пишет следующее. Строка состояния при этом одна на пару «сделка и этап», поэтому
+    её надо честно обнулить под нового бота - иначе он унаследует чужие отметки запуска и
+    чужую копилку статусов доставки, и окно ожидания у него истечёт ещё до отправки.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE autopilot_state SET bot_id = ?, phase = ?, launch_attempted_at = NULL, "
+            "launch_ok_at = NULL, delivery = '[]', updated_at = ? "
+            "WHERE lead_id = ? AND status_id = ?",
+            (int(bot_id), PHASE_LAUNCHING, _now(), lead_id, status_id),
+        )
+
+
 def add_delivery_status(lead_id: int, status_id: int, entry: dict) -> list[dict]:
     """Дописать статус Wazzup в копилку сделки и вернуть копилку целиком.
 

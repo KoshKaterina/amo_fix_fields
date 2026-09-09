@@ -322,22 +322,30 @@ def normalize_answer(text: Any) -> str:
 
 
 def answer_decision(bot: dict, answer: str) -> str:
-    """Что делать с ответом клиента: `advance` - дальше по маршруту, `stop` - позвать человека."""
+    """Что делать с ответом клиента: `advance` - следующий шаг, `stop` - позвать человека.
+
+    Режимы названы с экрана, заголовок там - «Когда идём дальше», и следующий шаг это не
+    обязательно следующий ЭТАП: сперва ищется следующий бот этого же этапа.
+
+      never  - «Ответ не нужен»: информационное сообщение, ответа не ждём вовсе;
+      any    - «Как только клиент ответит»: дальше ведёт ЛЮБОЙ ответ;
+      listed - «Только на эти ответы»: перечисленное ведёт дальше, прочее останавливает;
+      except - «На любой ответ, кроме этих»: перечисленное останавливает.
+
+    ⚠️ Остановка живёт в `listed` и `except`, а не в `any`. Правка Кати 09.09.2026: экран
+    обещает «идём дальше», и движок обязан обещанию соответствовать, а не читать его наоборот.
+    """
     mode = str(bot.get("stop_mode") or "any")
     listed = [
         normalize_answer(a)
         for a in (bot.get("stop_answers_norm") or bot.get("stop_answers") or [])
     ]
     got = normalize_answer(answer)
-    if mode == "never":
+    if mode in ("never", "any"):
         return "advance"
-    if mode == "any":
-        return "stop"
     if mode == "listed":
-        # «Только на эти ответы»: перечисленное ведёт дальше, всё прочее останавливает.
         return "advance" if got in listed else "stop"
     if mode == "except":
-        # «На любой ответ, кроме этих»: перечисленное останавливает.
         return "stop" if got in listed else "advance"
     return "stop"
 
@@ -572,15 +580,26 @@ async def launch_bot(lead_id: int, bot_id: int) -> bool:
 
 # ── маршрут: выбор бота и следующего этапа ──────────────────────────────────────
 
-def pick_bot(lead: dict, stage: dict) -> dict | None:
-    """Первый включённый бот этапа, чьи условия сошлись.
+def bot_index(stage: dict | None, bot_id) -> int:
+    for i, bot in enumerate((stage or {}).get("bots") or []):
+        if int(bot.get("bot_id") or 0) == int(bot_id or 0):
+            return i
+    return -1
 
-    ⚠️ Именно ПЕРВЫЙ, а не все подходящие. Ботов на этапе можно завести сколько угодно, и
-    условия у каждого свои - это список правил, а не список рассылок. Запусти мы всех
-    сошедшихся, клиент получил бы два сообщения подряд, а это худшее, что робот умеет делать.
-    Порядок задаёт человек на экране, он же и решает старшинство.
+
+def pick_bot(lead: dict, stage: dict, after_bot_id=None) -> dict | None:
+    """Следующий включённый бот этапа, чьи условия сошлись.
+
+    Боты этапа идут ЦЕПОЧКОЙ, по очереди: первый спросил, клиент ответил «да» - слово берёт
+    второй, и только когда боты кончились, сделка едет на следующий этап. Порядок задаёт
+    человек на экране.
+
+    ⚠️ Одновременно бот всегда ОДИН. Запусти движок всех сошедшихся разом, клиент получил бы
+    несколько сообщений подряд; очередь же честно ждёт ответа на предыдущее. Условия отбирают,
+    кто из них вообще участвует: несошедшийся бот не запускается, ход переходит к следующему.
     """
-    for bot in stage.get("bots") or []:
+    start = 0 if after_bot_id is None else bot_index(stage, after_bot_id) + 1
+    for bot in (stage.get("bots") or [])[start:]:
         if not bot.get("enabled", True):
             continue
         if conditions_match(lead, bot.get("conditions") or []):
@@ -659,7 +678,7 @@ async def stop_here(
 # ── ход по маршруту ─────────────────────────────────────────────────────────────
 
 async def run_stage(lead: dict, stage: dict) -> None:
-    """Этап маршрута: остаток, бот, ожидание доставки. Вызывается уже ПОСЛЕ `store.claim`."""
+    """Этап маршрута: оплата, остаток, первый бот цепочки. Вызывается уже ПОСЛЕ `store.claim`."""
     lead_id = int(lead["id"])
     status_id = int(lead["status_id"])
 
@@ -675,6 +694,28 @@ async def run_stage(lead: dict, stage: dict) -> None:
                 reason=f"вне рабочих часов, продолжу {when}")
         return
 
+    # Вход маршрута спрашиваем у панели, а не считаем по порядку карточек: человек волен
+    # собрать маршрут, начав его с середины воронки, и тогда «первая карточка» входом не
+    # является. Панель не сказала - падаем на порядок, это лучше, чем не проверить вовсе.
+    entry = settings_client.get_entry_status_id()
+    at_entry = status_id == entry if entry else stage_position(status_id) == 0
+
+    # На ВХОДЕ в маршрут сперва смотрим, не оплачен ли заказ уже (правка Кати 09.09.2026).
+    # Оплаченному заказу подтверждать нечего: спрашивать «всё верно?» у человека, который
+    # уже заплатил, - это лишний шаг и лишний повод передумать. Ведём сразу в успех.
+    #
+    # ⚠️ Молчание МойСклада здесь НЕ останавливает, в отличие от развилки в конце маршрута:
+    # там неизвестность грозит второй ссылкой на оплату, а тут - всего лишь лишним вопросом
+    # клиенту. Не знаем - идём обычным путём.
+    if at_entry:
+        order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+        if await order_is_paid(order_uuid):
+            log_run(lead, stage, action="payment_fork", outcome="advanced",
+                    reason="заказ оплачен ещё до первого сообщения, веду в успех")
+            await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
+                          "заказ уже оплачен")
+            return
+
     bot = pick_bot(lead, stage)
     if bot is None:
         log_run(lead, stage, action="route", outcome="skipped_no_bots",
@@ -684,7 +725,7 @@ async def run_stage(lead: dict, stage: dict) -> None:
 
     # Гейт остатка - на входе в маршрут, до первого слова клиенту. Дальше по маршруту заказ
     # уже подтверждён, и перепроверять остаток на каждом этапе значит гонять склад впустую.
-    if stage_position(status_id) == 0 and _flag("stock_check_enabled", True):
+    if at_entry and _flag("stock_check_enabled", True):
         enough, note = await stock_gate(lead)
         log_run(lead, stage, bot=bot, action="stock_gate",
                 outcome="advanced" if enough else "stop_no_stock", reason=note)
@@ -695,6 +736,14 @@ async def run_stage(lead: dict, stage: dict) -> None:
             )
             return
 
+    await run_bot(lead, stage, bot)
+
+
+async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
+    """Один бот цепочки: запуск и ожидание. Отдельной функцией, потому что ботов на этапе
+    бывает несколько, и второго зовёт уже не вход в этап, а ответ клиента на первого."""
+    lead_id = int(lead["id"])
+    status_id = int(lead["status_id"])
     contact = await main_contact(lead)
     chat_id = chat_id_of(contact)
     bot_id = int(bot.get("bot_id") or 0)
@@ -722,19 +771,35 @@ async def run_stage(lead: dict, stage: dict) -> None:
         # не ждём: у бота в успешной реализации отправка успешна по определению.
         log_run(lead, stage, bot=bot, action="launch_bot", outcome="advanced",
                 reason="сообщение информационное, ответа не жду")
-        await advance(lead, stage, "информационное сообщение отправлено")
+        await advance(lead, stage, "информационное сообщение отправлено", from_bot=bot)
         return
 
     log_run(lead, stage, bot=bot, action="launch_bot", outcome="waiting_delivery",
             reason="жду подтверждения доставки от Wazzup")
 
 
-async def advance(lead: dict, stage: dict, reason: str) -> None:
-    """Дальше по маршруту. Куда именно - решает порядок этапов на экране.
+async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None = None) -> None:
+    """Следующий шаг. Сперва следующий БОТ этого этапа, и только когда боты кончились - этап.
 
-    ⚠️ В успешную реализацию маршрут не «переходит», в неё пускает только развилка оплаты:
-    решение о деньгах не должно зависеть от того, в каком порядке человек перетащил карточки.
+    Боты этапа идут цепочкой: первый спросил «всё верно?», клиент ответил «да» - слово берёт
+    второй. Пока цепочка не кончилась, сделка с места не двигается.
+
+    ⚠️ В успешную реализацию карточка маршрута не ведёт: туда пускает только развилка оплаты
+    (и отдельные входы - оплаченный заказ на старте и этап «Оплата получена»). Иначе решение
+    о деньгах зависело бы от того, в каком порядке человек перетащил карточки.
     """
+    if from_bot is not None:
+        nxt_bot = pick_bot(lead, stage, after_bot_id=from_bot.get("bot_id"))
+        if nxt_bot is not None:
+            await asyncio.to_thread(
+                store.start_next_bot, int(lead["id"]), int(lead.get("status_id") or 0),
+                int(nxt_bot.get("bot_id") or 0),
+            )
+            log_run(lead, stage, bot=nxt_bot, action="route", outcome="advanced",
+                    reason="передаю ход следующему боту этапа")
+            await run_bot(lead, stage, nxt_bot)
+            return
+
     status_id = int(lead.get("status_id") or 0)
     if status_id == STATUS_SUCCESS:
         await asyncio.to_thread(
@@ -962,13 +1027,34 @@ async def on_payment_received(lead: dict) -> None:
     rows = await asyncio.to_thread(store.list_for_lead, lead_id)
     if not rows:
         return
+
+    # Сверка с МойСкладом (правка Кати 09.09.2026). На этот этап сделку переводит скрипт по
+    # вебхуку платёжной системы - источник хороший, но одинокий. Склад видит те же деньги с
+    # другой стороны, и расхождение двух источников стоит минуты менеджера.
+    #
+    # ⚠️ Молчание склада успех не блокирует: событие об оплате уже пришло, и держать сделку
+    # из-за неотвечающего отчёта значит наказывать клиента за наш склад. А вот явное «не
+    # оплачен» - останавливает: два источника разошлись, и решать это человеку.
+    order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+    paid = await order_is_paid(order_uuid)
+    if paid is False:
+        await stop_here(
+            lead, None, "failed",
+            "платёжная система сообщила об оплате, а в МойСкладе заказ не оплачен",
+            op_text="платёжная система говорит «оплачено», а в МойСкладе оплаты нет. "
+                    "В успех не веду, посмотрите заказ.",
+        )
+        return
+
+    checked = "оплата получена, сверено с МойСкладом" if paid else \
+        "оплата получена, МойСклад промолчал - веду по событию платёжной системы"
     alert_op(
         f"{lead_link(lead_id, lead.get('name'))}: оплата получена, перевожу в успешную реализацию.",
         lead.get("responsible_user_id"),
     )
     log_run(lead, None, action="payment_fork", outcome="advanced",
-            reason="оплата получена", alert_target="op")
-    await move_to(lead, None, STATUS_SUCCESS, "Успешно реализовано", "оплата получена")
+            reason=checked, alert_target="op")
+    await move_to(lead, None, STATUS_SUCCESS, "Успешно реализовано", checked)
 
 
 # ── точка входа: события Wazzup ─────────────────────────────────────────────────
@@ -1138,7 +1224,7 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
     if answer_decision(bot, text) == "advance":
         log_run(lead, stage, bot=bot, action="reply", outcome="advanced",
                 reason="ответ клиента подходит под условие успеха", client_answer=text)
-        await advance(lead, stage, "клиент ответил так, как ждали")
+        await advance(lead, stage, "клиент ответил так, как ждали", from_bot=bot)
         return
 
     listed = [normalize_answer(a) for a in (bot.get("stop_answers_norm")

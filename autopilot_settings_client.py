@@ -80,6 +80,12 @@ def get_pipeline_id() -> int | None:
     return int(value) if value else None
 
 
+def get_entry_status_id() -> int | None:
+    """Этап, на котором заказ входит в маршрут. Решает панель - у неё соответствие воронок."""
+    value = get_settings().get("entry_status_id")
+    return int(value) if value else None
+
+
 def get_route() -> list[dict[str, Any]]:
     """Этапы маршрута ТЕКУЩЕЙ воронки, по порядку. Какая воронка текущая, решила панель."""
     return list(get_settings().get("route") or [])

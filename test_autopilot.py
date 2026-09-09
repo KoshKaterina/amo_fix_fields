@@ -209,8 +209,12 @@ def test_except_mode_stops_only_on_listed_answers():
     assert A.answer_decision(bot, "всё ок") == "advance"
 
 
-def test_any_and_never_modes():
-    assert A.answer_decision({"stop_mode": "any"}, "что угодно") == "stop"
+def test_any_and_never_both_go_forward():
+    """Заголовок на экране - «Когда идём дальше», и оба режима именно ведут дальше: `any` -
+    получив любой ответ, `never` - не дожидаясь ответа вовсе. Останавливаться умеют `listed`
+    и `except`, там для этого есть список ответов. Правка Кати 09.09.2026: движок обязан
+    соответствовать обещанию экрана, а не читать его наоборот."""
+    assert A.answer_decision({"stop_mode": "any"}, "что угодно") == "advance"
     assert A.answer_decision({"stop_mode": "never"}, "что угодно") == "advance"
 
 
@@ -590,3 +594,180 @@ def test_moved_away_while_waiting_is_not_an_alert(monkeypatch):
     asyncio.run(run())
     assert rows[-1]["outcome"] == "stop_left_stage"
     assert _SENT == []
+
+
+# ── цепочка ботов на этапе ──────────────────────────────────────────────────────
+
+def test_bots_of_one_stage_run_in_turn_not_at_once():
+    """Ботов на этапе бывает несколько, и они идут ОЧЕРЕДЬЮ: первый спросил, клиент ответил -
+    слово берёт второй. Запусти движок всех разом, клиент получил бы несколько сообщений
+    подряд; поэтому одновременно бот всегда один, а `pick_bot` умеет «следующий после этого».
+    """
+    lead = _lead()
+    stage = _stage(70070982, "Первичный контакт", [_bot(1), _bot(2), _bot(3)])
+    assert A.pick_bot(lead, stage)["bot_id"] == 1
+    assert A.pick_bot(lead, stage, after_bot_id=1)["bot_id"] == 2
+    assert A.pick_bot(lead, stage, after_bot_id=2)["bot_id"] == 3
+    assert A.pick_bot(lead, stage, after_bot_id=3) is None
+
+
+def test_chain_skips_the_bot_whose_conditions_did_not_match():
+    """Условия отбирают участников очереди: несошедшийся бот не запускается, ход переходит
+    дальше по списку, а не обрывается."""
+    lead = _lead(custom_fields_values=[_cf(577373, "Счет")])
+    stage = _stage(70070982, "Первичный контакт", [
+        _bot(1),
+        _bot(2, conditions=[{"join": "and", "field": "cf:577373", "op": "eq", "value": "нал"}]),
+        _bot(3, enabled=False),
+        _bot(4),
+    ])
+    assert A.pick_bot(lead, stage, after_bot_id=1)["bot_id"] == 4
+
+
+def test_answer_passes_the_turn_to_the_next_bot_not_to_the_next_stage(monkeypatch):
+    """Пока цепочка не кончилась, сделка с места не двигается."""
+    stage = _stage(70070982, "Первичный контакт", [_bot(1), _bot(2)])
+    _route(stage, _stage(72186654, "В работе", [_bot(9)]))
+    rows = _capture(monkeypatch)
+    started: list[int] = []
+    moves: list[int] = []
+
+    async def fake_run_bot(lead, stage_, bot):
+        started.append(int(bot["bot_id"]))
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    monkeypatch.setattr(A, "run_bot", fake_run_bot)
+    monkeypatch.setattr(A, "move_to", fake_move)
+    S.claim(444, 70070982, 8642414)
+
+    asyncio.run(A.advance(_lead(id=444), stage, "клиент ответил", from_bot=_bot(1)))
+    assert started == [2] and moves == []
+
+    # А когда боты кончились - едем на следующий этап.
+    asyncio.run(A.advance(_lead(id=444), stage, "клиент ответил", from_bot=_bot(2)))
+    assert moves == [72186654]
+
+
+def test_next_bot_starts_with_a_clean_delivery_slate():
+    """Строка состояния одна на пару «сделка и этап». Не обнули мы её под нового бота, он
+    унаследовал бы чужие отметки запуска и чужую копилку статусов - и окно ожидания истекло
+    бы у него ещё до отправки."""
+    S.claim(555, 70070982, 8642414)
+    S.mark_launch_ok(555, 70070982, "79099371845")
+    S.add_delivery_status(555, 70070982, {"status": "error", "chatType": "telegram"})
+
+    S.start_next_bot(555, 70070982, 7137)
+    row = S.get(555, 70070982)
+    assert row["bot_id"] == 7137
+    assert row["delivery"] == []
+    assert row["launch_ok_at"] is None
+    assert row["phase"] == S.PHASE_LAUNCHING
+
+
+# ── оплата: два отдельных входа в успешную реализацию ───────────────────────────
+
+def test_already_paid_order_goes_to_success_without_asking_anything(monkeypatch):
+    """Правка Кати 09.09.2026. Спрашивать «всё верно?» у человека, который уже заплатил, -
+    лишний шаг и лишний повод передумать."""
+    _settings(settings={"mode": "test", "work_hours": [{"start": "00:00", "end": "23:59"}]},
+              route=[_stage(70070982, "Первичный контакт", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    moves: list[int] = []
+    launched: list[int] = []
+
+    async def fake_ms_get(path, params=None, retries=3):
+        return {"payedSum": 12000}
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    async def fake_run_bot(lead, stage_, bot):
+        launched.append(int(bot["bot_id"]))
+
+    monkeypatch.setattr(A.ms_client, "get", fake_ms_get)
+    monkeypatch.setattr(A, "move_to", fake_move)
+    monkeypatch.setattr(A, "run_bot", fake_run_bot)
+
+    lead = _lead(custom_fields_values=[_cf(576689, "uuid-1")])
+    asyncio.run(A.run_stage(lead, _stage(70070982, "Первичный контакт", [_bot(7131)])))
+    assert moves == [A.STATUS_SUCCESS]
+    assert launched == [], "оплаченному заказу шаблон не отправляем"
+
+
+def test_silent_warehouse_at_the_entrance_does_not_block_the_route(monkeypatch):
+    """На входе неизвестность стоит лишнего вопроса клиенту, а не второй ссылки на оплату -
+    поэтому здесь молчание склада пропускает дальше, в отличие от развилки в конце."""
+    _settings(settings={"mode": "test", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "stock_check_enabled": False},
+              route=[_stage(70070982, "Первичный контакт", [_bot(7131)])])
+    _capture(monkeypatch)
+    launched: list[int] = []
+
+    async def fake_ms_get(path, params=None, retries=3):
+        return None
+
+    async def fake_run_bot(lead, stage_, bot):
+        launched.append(int(bot["bot_id"]))
+
+    monkeypatch.setattr(A.ms_client, "get", fake_ms_get)
+    monkeypatch.setattr(A, "run_bot", fake_run_bot)
+
+    lead = _lead(custom_fields_values=[_cf(576689, "uuid-1")])
+    asyncio.run(A.run_stage(lead, _stage(70070982, "Первичный контакт", [_bot(7131)])))
+    assert launched == [7131]
+
+
+def test_payment_received_is_checked_against_the_warehouse(monkeypatch):
+    """На «Оплата получена» сделку переводит скрипт по вебхуку платёжной системы. Источник
+    хороший, но одинокий: склад видит те же деньги с другой стороны."""
+    _settings()
+    rows = _capture(monkeypatch)
+    S.claim(666, 70070982, 8642414)
+    moves: list[int] = []
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    monkeypatch.setattr(A, "move_to", fake_move)
+
+    async def paid_no(path, params=None, retries=3):
+        return {"payedSum": 0}
+
+    monkeypatch.setattr(A.ms_client, "get", paid_no)
+    lead = _lead(id=666, custom_fields_values=[_cf(576689, "uuid-1")])
+
+    async def run():
+        await A.on_payment_received(lead)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert moves == [], "источники разошлись - решать человеку"
+    assert rows[-1]["outcome"] == "failed"
+
+
+def test_payment_received_still_goes_through_when_warehouse_is_silent(monkeypatch):
+    """А молчание склада успех не блокирует: событие об оплате уже пришло, держать сделку
+    из-за неотвечающего отчёта значит наказывать клиента за наш склад."""
+    _settings()
+    rows = _capture(monkeypatch)
+    S.claim(777, 70070982, 8642414)
+    moves: list[int] = []
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    async def silent(path, params=None, retries=3):
+        return None
+
+    monkeypatch.setattr(A, "move_to", fake_move)
+    monkeypatch.setattr(A.ms_client, "get", silent)
+
+    async def run():
+        await A.on_payment_received(_lead(id=777, custom_fields_values=[_cf(576689, "u")]))
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert moves == [A.STATUS_SUCCESS]
+    assert "промолчал" in rows[-1]["reason"]
