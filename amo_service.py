@@ -174,7 +174,11 @@ async def _do_post(path: str, body) -> dict[str, Any]:
                 continue
             return {"ok": False, "status_code": None, "retryable": True}
 
-        if response.status_code in (200, 201, 204):
+        # 202 - «принято»: так отвечает недокументированный /api/v2/salesbot/run (тело при
+        # этом {"success": true}). Не знай мы этот код, успешный запуск бота читался бы как
+        # отказ - ровно это и случилось на первом живом прогоне авто-режима 09.09.2026:
+        # сообщение ушло, а робот решил, что нет, и позвал человека.
+        if response.status_code in (200, 201, 202, 204):
             _record_success()
             return {"ok": True, "status_code": response.status_code, "retryable": False}
 
