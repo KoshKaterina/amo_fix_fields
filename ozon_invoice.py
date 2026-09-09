@@ -52,11 +52,13 @@ from waybill_config import (
     OZON_ALERT_WINDOW_END_H,
     OZON_ALERT_WINDOW_START_H,
     OZON_STALE_ALERT_MIN,
+    OZON_INVOICE_ACADEMY,
     OZON_INVOICE_DB_WORK,
     OZON_PAYMENT_STAGES,
     OZON_STALE_ESCALATE_CHAT_ID,
     OZON_STALE_ESCALATE_DAYS,
     OZON_STALE_EVENING_H,
+    PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_DB_WORK,
     PUBLIC_BASE_URL,
@@ -89,14 +91,18 @@ def is_enabled() -> bool:
 
 def _invoice_pipelines() -> tuple[int, ...]:
     """Воронки, где выставляем счёт. Розница всегда, картотека «Работа с базой» —
-    за флагом OZON_INVOICE_DB_WORK (07.09.2026).
+    за флагом OZON_INVOICE_DB_WORK (07.09.2026), Академия — за OZON_INVOICE_ACADEMY
+    (09.09.2026, обучение продаётся по той же схеме).
 
-    Флаг читаем на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
+    Флаги читаем на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
     подменённый в тестах (и в консоли при разборе инцидента), не подействовал бы.
     Тот же приём, что в office_transfer._source_pipelines()."""
+    out = [PIPELINE_CLEVER_MAIN]
     if OZON_INVOICE_DB_WORK:
-        return (PIPELINE_CLEVER_MAIN, PIPELINE_DB_WORK)
-    return (PIPELINE_CLEVER_MAIN,)
+        out.append(PIPELINE_DB_WORK)
+    if OZON_INVOICE_ACADEMY:
+        out.append(PIPELINE_ACADEMY)
+    return tuple(out)
 
 
 def _stages(pipeline_id, *, flagged: bool = True) -> tuple[int, int, int] | None:
@@ -117,9 +123,9 @@ def _stages(pipeline_id, *, flagged: bool = True) -> tuple[int, int, int] | None
 
 def is_invoice_entry(pipeline_id, status_id) -> bool:
     """Публичный гейт для webhooks.py: сделка вошла в тех-этап воронки, где мы
-    выставляем счёт. Воронки в вебхуке может не быть — тех-этапы у розницы и
-    картотеки разные, по одному этапу решение однозначно, а process_invoice_lead
-    всё равно перечитает сделку и проверит пару целиком."""
+    выставляем счёт. Воронки в вебхуке может не быть — тех-этапы у всех воронок
+    свои, по одному этапу решение однозначно, а process_invoice_lead всё равно
+    перечитает сделку и проверит пару целиком."""
     try:
         sid = int(status_id)
     except (TypeError, ValueError):
