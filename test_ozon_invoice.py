@@ -828,4 +828,88 @@ print("✓ чужая воронка: примечание есть, сделк�
 amo_service.get_leads_by_status = _real_by_status
 ozon_invoice.OZON_INVOICE_DB_WORK = _FLAG_WAS
 
+# ══════════ воронка «Академия»: третья воронка на той же карте ══════════
+# Обучение продаётся по той же схеме (постановка Кати 09.09.2026). Проверяем,
+# что третья воронка добавляется данными, а не новой веткой логики.
+from waybill_config import (  # noqa: E402
+    PIPELINE_ACADEMY,
+    STATUS_ACADEMY_LINK_SENT,
+    STATUS_ACADEMY_PAYMENT_RECEIVED,
+    STATUS_ACADEMY_PAYMENT_REQUESTED,
+)
+
+_ACADEMY_FLAG_WAS = ozon_invoice.OZON_INVOICE_ACADEMY
+
+# ── а) флаг выключен по умолчанию ──────────────────────────────────────────
+assert _ACADEMY_FLAG_WAS is False, "OZON_INVOICE_ACADEMY должен быть выключен по умолчанию"
+assert PIPELINE_ACADEMY not in ozon_invoice._invoice_pipelines()
+print("✓ Академия: флаг выключен по умолчанию, воронки счёта её не включают")
+
+# ── б) флаг выключен + сделка на тех-этапе Академии → полный скип ──────────
+_reset()
+_install_mocks(_lead(status=STATUS_ACADEMY_PAYMENT_REQUESTED, pipeline=PIPELINE_ACADEMY))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-moved", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+print("✓ Академия: при выключенном флаге счёт не создаётся")
+
+# ── в) флаг включён: счёт создан, PATCH несёт ЭТАПЫ И ВОРОНКУ АКАДЕМИИ ─────
+ozon_invoice.OZON_INVOICE_ACADEMY = True
+_reset()
+_install_mocks(_lead(status=STATUS_ACADEMY_PAYMENT_REQUESTED, pipeline=PIPELINE_ACADEMY))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert len(_patches) == 1, _patches
+assert _patches[0]["status_id"] == STATUS_ACADEMY_LINK_SENT, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_ACADEMY, _patches[0]
+print("✓ Академия: сделка остаётся в своей воронке, этап — «ссылка отправлена» Академии")
+
+# ── г) три воронки одновременно не мешают друг другу ───────────────────────
+ozon_invoice.OZON_INVOICE_DB_WORK = True
+assert ozon_invoice._invoice_pipelines() == (PIPELINE_CLEVER_MAIN, PIPELINE_DB_WORK, PIPELINE_ACADEMY)
+_reset()
+_install_mocks(_lead())
+assert run(ozon_invoice.process_invoice_lead(LEAD_ID)) == "created"
+assert _patches[0]["pipeline_id"] == PIPELINE_CLEVER_MAIN, _patches[0]
+print("✓ обе дополнительные воронки включены — розница ходит прежним путём")
+
+# ── д) перекрёстный негатив: чужой тех-этап в Академии → скип ──────────────
+_reset()
+_install_mocks(_lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_ACADEMY))
+assert run(ozon_invoice.process_invoice_lead(LEAD_ID)) == "skipped-moved"
+assert not _ozon_calls, _ozon_calls
+print("✓ розничный этап в Академии — скип, воронки не путаются")
+
+# ── е) сверка обходит все три воронки, по два этапа на каждую ──────────────
+_asked_all: list = []
+
+async def _fake_by_status_all(status_id, with_=()):
+    _asked_all.append(status_id)
+    return []
+
+amo_service.get_leads_by_status = _fake_by_status_all
+run(ozon_invoice._reconcile_once())
+assert set(_asked_all) == {
+    STATUS_LINK_SENT, STATUS_PAYMENT_REQUESTED,
+    STATUS_DB_LINK_SENT, STATUS_DB_PAYMENT_REQUESTED,
+    STATUS_ACADEMY_LINK_SENT, STATUS_ACADEMY_PAYMENT_REQUESTED,
+}, _asked_all
+assert len(_asked_all) == 6, _asked_all
+amo_service.get_leads_by_status = _real_by_status
+print("✓ сверка: шесть этапов на три воронки, ни одного лишнего запроса")
+
+# ── ж) оплата доводится до конца и с опущенным флагом ──────────────────────
+ozon_invoice.OZON_INVOICE_ACADEMY = False
+_reset()
+_install_mocks(_lead(status=STATUS_ACADEMY_LINK_SENT, pipeline=PIPELINE_ACADEMY))
+res = run(ozon_invoice._mark_paid(
+    _lead(status=STATUS_ACADEMY_LINK_SENT, pipeline=PIPELINE_ACADEMY), "1000", "extId z", "вебхук"))
+assert res == "moved", res
+assert _patches[0]["status_id"] == STATUS_ACADEMY_PAYMENT_RECEIVED, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_ACADEMY, _patches[0]
+print("✓ оплаченная сделка Академии доезжает до «Оплата получена» и с опущенным флагом")
+
+ozon_invoice.OZON_INVOICE_DB_WORK = _FLAG_WAS
+ozon_invoice.OZON_INVOICE_ACADEMY = _ACADEMY_FLAG_WAS
+
 print("\nozon_invoice: все тесты прошли")
