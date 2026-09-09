@@ -1143,11 +1143,31 @@ def _pick_row(rows: list[dict], phase: str) -> dict | None:
     return max(fit, key=lambda r: str(r.get("updated_at") or "")) if fit else None
 
 
+def _chat_candidates(message: dict) -> list[str]:
+    """По каким ключам искать сделку этого сообщения.
+
+    ⚠️ Телефон - ключ только у WhatsApp. У Telegram `chatId` - телеграмный номер чата
+    (например 1920391385), с телефоном контакта не совпадающий никогда, и склейка по одному
+    `chatId` глушит телеграмные диалоги целиком: на первом живом прогоне 09.09.2026 бот
+    написал в Telegram, человек ответил - робот не увидел ни статусов, ни ответа. Спасает
+    то, что Wazzup кладёт в каждое сообщение ещё и `contact.phone` - ищем по обоим.
+    Контакт без телефона в карточке Wazzup так и останется невидимым - это предел способа.
+    """
+    contact = message.get("contact") if isinstance(message.get("contact"), dict) else {}
+    out: list[str] = []
+    for value in (message.get("chatId"), (contact or {}).get("phone")):
+        digits = _digits(value)
+        if digits and digits not in out:
+            out.append(digits)
+    return out
+
+
 async def _handle_message(message: dict) -> None:
-    chat_id = _digits(message.get("chatId"))
-    if not chat_id:
-        return
-    rows = await asyncio.to_thread(store.find_by_chat, chat_id)
+    rows: list[dict] = []
+    for chat in _chat_candidates(message):
+        for row in await asyncio.to_thread(store.find_by_chat, chat):
+            if row not in rows:
+                rows.append(row)
     if not rows:
         return
     chat_type = str(message.get("chatType") or "").lower()

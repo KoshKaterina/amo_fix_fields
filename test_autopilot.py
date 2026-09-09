@@ -840,3 +840,58 @@ def test_test_mode_alerts_go_to_tech_chat_not_managers(monkeypatch):
 
     asyncio.run(run2())
     assert _SENT[0]["chat_id"] is not None, "в бою алерт идёт в чат отдела продаж"
+
+
+# ── телеграм: чат живёт не под телефоном ────────────────────────────────────────
+
+def test_telegram_reply_is_matched_by_contact_phone(monkeypatch):
+    """Первый живой прогон 09.09.2026: бот написал в Telegram, человек ответил - робот не
+    увидел ответа. Телеграмный `chatId` с телефоном не совпадает никогда; склейка идёт по
+    `contact.phone` из того же вебхука."""
+    _route(_stage(70070982, "Первичный контакт", [_bot(7169)]))
+    S.claim(888, 70070982, 8642414)
+    S.update(888, 70070982, bot_id=7169, chat_id="79956109902", phase=S.PHASE_REPLY)
+    seen: list[str] = []
+
+    async def fake_answer(row, text, chat_type=""):
+        seen.append((row["lead_id"], text))
+
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "1920391385", "chatType": "telegram", "isEcho": False,
+        "text": "Всё верно", "messageId": "tg-1",
+        "contact": {"name": "Тиана Василькова", "phone": "79956109902",
+                    "username": "teanochk"},
+    }]}))
+    assert seen == [(888, "Всё верно")]
+
+
+def test_telegram_outbound_status_lands_in_the_right_piggy_bank(monkeypatch):
+    """Исходящее ботом в Telegram тоже матчится по телефону - иначе статус «прочитано» падал
+    бы мимо копилки, и окно ожидания честно истекало бы у доставленного сообщения."""
+    _route(_stage(70070982, "Первичный контакт", [_bot(7169)]))
+    S.claim(999, 70070982, 8642414)
+    S.update(999, 70070982, bot_id=7169, chat_id="79956109902", phase=S.PHASE_DELIVERY)
+    S.mark_launch_ok(999, 70070982, "79956109902")
+    delivered: list[int] = []
+
+    async def fake_on_delivered(row, items):
+        delivered.append(row["lead_id"])
+
+    monkeypatch.setattr(A, "on_delivered", fake_on_delivered)
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "1920391385", "chatType": "telegram", "isEcho": True,
+        "text": "Здравствуйте!", "messageId": "tg-2", "status": "sent",
+        "contact": {"name": "Тиана Василькова", "phone": "79956109902"},
+    }]}))
+    assert delivered == [999], "sent у телеграма - доставка, и она должна найтись"
+    row = S.get(999, 70070982)
+    assert row["delivery"] and row["delivery"][0]["chatType"] == "telegram"
+
+
+def test_contact_without_phone_stays_invisible_and_that_is_the_limit():
+    """Контакт без телефона в карточке Wazzup не сматчится - предел способа, зафиксирован."""
+    assert A._chat_candidates({
+        "chatId": "864542860", "chatType": "telegram",
+        "contact": {"name": "Без телефона", "username": "nickname"},
+    }) == ["864542860"]
