@@ -37,6 +37,7 @@ import httpx
 import amo_service
 import autopilot_settings_client as settings_client
 import autopilot_store as store
+import ms_client
 import telegram_bot
 from tg_recipients import NOTIFY_CHAT_ID, NOTIFY_THREAD_ID, mentions_for
 from waybill_config import (
@@ -44,6 +45,12 @@ from waybill_config import (
     AUTOPILOT_HOURLY_CAP,
     AUTOPILOT_STATE_TTL_DAYS,
     AUTOPILOT_TICK_INTERVAL_S,
+    FIELD_MOYSKLAD_ORDER_UUID,
+    FIELD_PAYMENT_METHOD,
+    FIELD_PHONE,
+    STATUS_PAYMENT_RECEIVED,
+    STATUS_PAYMENT_REQUESTED,
+    STATUS_SUCCESS,
     TEAM_PANEL_BASE_URL,
     TEAM_PANEL_INGEST_TOKEN,
 )
@@ -410,6 +417,784 @@ def delivery_note(statuses: list[dict]) -> str:
 
 
 
+# ── чтение сделки и контакта ────────────────────────────────────────────────────
+
+AMO_LEAD_URL = "https://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{}"
+
+
+def lead_link(lead_id: int, title: str = "") -> str:
+    """Ссылка на сделку словами. Голый номер в чате менеджеру ничего не говорит - правило
+    Кати 03.08.2026 про «я человек, я не понимаю цифры»."""
+    name = (title or "").strip() or "сделка"
+    return f'<a href="{AMO_LEAD_URL.format(lead_id)}">{name}</a>'
+
+
+async def load_lead(lead_id: int) -> dict | None:
+    """Свежая сделка из amoCRM. Перед КАЖДЫМ действием, а не по телу вебхука.
+
+    Между вебхуком и нашим ходом проходят секунды, а после ночного сна и десять часов. За это
+    время менеджер успевает увести сделку с этапа, закрыть её или переписать поля. Действовать
+    по телу вебхука значит действовать по прошлому.
+    """
+    try:
+        return await amo_service.get_lead_full(lead_id, with_=("contacts",))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("autopilot: сделка %s не прочиталась", lead_id)
+        return None
+
+
+async def main_contact(lead: dict) -> dict | None:
+    """Главный контакт, дочитанный целиком: в теле сделки у контакта только номер и признак
+    главного, ни имени, ни телефона там нет."""
+    contacts = ((lead.get("_embedded") or {}).get("contacts")) or []
+    if not contacts:
+        return None
+    main = next((c for c in contacts if c.get("is_main")), contacts[0])
+    try:
+        return await amo_service.get_contact_by_id(main.get("id"))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("autopilot: контакт %s не прочитался", main.get("id"))
+        return None
+
+
+def chat_id_of(contact: dict | None) -> str:
+    """Идентификатор чата Wazzup - телефон одними цифрами, ровно как в `wazzup_message`
+    панели. Склейка идёт по нему, поэтому формат обязан совпадать посимвольно."""
+    if not contact:
+        return ""
+    phone = amo_service.get_custom_field_value(contact, FIELD_PHONE)
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
+# ── настройки, к которым обращаемся часто ───────────────────────────────────────
+
+def _flag(key: str, default: bool = False) -> bool:
+    value = (settings_client.get_settings().get("settings") or {}).get(key)
+    return default if value is None else bool(value)
+
+
+def _num(key: str, default: float) -> float:
+    value = (settings_client.get_settings().get("settings") or {}).get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def delivery_wait_s() -> float:
+    return _num("delivery_wait_minutes", 15) * 60
+
+
+# ── режим «Тест»: белый список контактов ────────────────────────────────────────
+
+def test_gate_ok(lead: dict) -> bool:
+    """В бою пропускаем всех, в «Тесте» - только контакты из белого списка.
+
+    ⚠️ Воронка с именем «Тест» сама по себе не защищает никого: завести там сделку с живым
+    человеком ничто не мешает, и одного раза хватит. Пустой список значит «никому».
+    """
+    if settings_client.get_mode() != "test":
+        return True
+    allowed = settings_client.get_test_contact_ids()
+    contacts = ((lead.get("_embedded") or {}).get("contacts")) or []
+    return any(int(c.get("id") or 0) in allowed for c in contacts)
+
+
+# ── гейт остатка ────────────────────────────────────────────────────────────────
+
+async def stock_gate(lead: dict) -> tuple[bool, str]:
+    """Есть ли свободный остаток по всем позициям заказа. Считает панель, мы только спрашиваем.
+
+    Почему не считаем сами: остаток уже умеет считать раздел «Остатки» панели - там и список
+    складов, и тумблер вычитания резерва. Вторая копия правила разошлась бы с первой, это
+    ровно тот случай, ради которого заведён `knowledge/edinyy-kontur-pravila-i-storozh.md`.
+
+    ⚠️ Исходов ТРИ, а не два. «Панель не ответила» - это НЕ «товара нет»: молчащий склад уже
+    останавливал сторож заказов 03.09.2026. Не ответила - идём дальше и пишем себе в
+    технический чат: не отправить шаблон живому заказу дороже, чем отправить его при
+    неизвестном остатке.
+    """
+    order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+    if not order_uuid:
+        return True, "заказа МойСклада в сделке нет, остаток не проверяю"
+    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN:
+        return True, "панель не настроена, остаток не проверял"
+    base = TEAM_PANEL_BASE_URL.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                base + "/api/ingest/autopilot/stock-check",
+                params={"order_uuid": str(order_uuid)},
+                headers={"X-Ingest-Token": TEAM_PANEL_INGEST_TOKEN},
+            )
+        if resp.status_code >= 400:
+            alert_tech(
+                f"Панель не посчитала остаток, ответ {resp.status_code}. Иду дальше без проверки."
+            )
+            return True, f"панель ответила {resp.status_code}, остаток неизвестен"
+        data = resp.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("autopilot: гейт остатка не отработал")
+        alert_tech("Не смог спросить у панели остаток. Иду дальше без проверки.")
+        return True, "остаток спросить не удалось"
+    if data.get("enough"):
+        return True, "остаток есть"
+    missing = ", ".join(str(x) for x in (data.get("missing") or []))
+    return False, "не хватает: " + (missing or "позиции не названы")
+
+
+# ── запуск сейлсбота ────────────────────────────────────────────────────────────
+
+# `entity_type`: 1 контакт, 2 сделка, 3 компания. Нам нужна СДЕЛКА: маршрут идёт по сделке, а
+# запуск по контакту на закрытой сделке рождает побочную (замер Кати 08.09.2026).
+SALESBOT_ENTITY_LEAD = 2
+
+
+async def launch_bot(lead_id: int, bot_id: int) -> bool:
+    """Запуск сейлсбота. Метод недокументирован, форма выяснена замером 08.09.2026.
+
+    ⚠️ Сообщение уходит НЕ сразу: у бота приветствия первым шагом свой таймер на 15 секунд, в
+    замере от запуска до отправки прошло 35. Поэтому гейт доставки не считает первые минуты
+    молчания провалом - окно ожидания задаётся на экране и по умолчанию равно четверти часа.
+    """
+    result = await amo_service._do_post(
+        "/api/v2/salesbot/run",
+        [{"bot_id": int(bot_id), "entity_id": int(lead_id), "entity_type": SALESBOT_ENTITY_LEAD}],
+    )
+    return bool(result.get("ok"))
+
+
+# ── маршрут: выбор бота и следующего этапа ──────────────────────────────────────
+
+def pick_bot(lead: dict, stage: dict) -> dict | None:
+    """Первый включённый бот этапа, чьи условия сошлись.
+
+    ⚠️ Именно ПЕРВЫЙ, а не все подходящие. Ботов на этапе можно завести сколько угодно, и
+    условия у каждого свои - это список правил, а не список рассылок. Запусти мы всех
+    сошедшихся, клиент получил бы два сообщения подряд, а это худшее, что робот умеет делать.
+    Порядок задаёт человек на экране, он же и решает старшинство.
+    """
+    for bot in stage.get("bots") or []:
+        if not bot.get("enabled", True):
+            continue
+        if conditions_match(lead, bot.get("conditions") or []):
+            return bot
+    return None
+
+
+def stage_position(status_id: int) -> int:
+    for i, stage in enumerate(settings_client.get_route()):
+        if int(stage.get("status_id") or 0) == int(status_id):
+            return i
+    return -1
+
+
+def next_stage(status_id: int) -> dict | None:
+    """Следующий этап маршрута. Этап без ботов маршрут проходит не останавливаясь - решение
+    Кати 08.09.2026, - поэтому «следующий» здесь просто следующий по порядку."""
+    route = settings_client.get_route()
+    i = stage_position(status_id)
+    if i < 0 or i + 1 >= len(route):
+        return None
+    return route[i + 1]
+
+
+def is_last_stage(stage: dict) -> bool:
+    if stage.get("is_final"):
+        return True
+    return next_stage(int(stage.get("status_id") or 0)) is None
+
+# ── журнал одной строкой ────────────────────────────────────────────────────────
+
+def log_run(lead: dict, stage: dict | None, *, bot: dict | None = None, **extra) -> None:
+    """Строка журнала о том, что робот сделал. Пишем на КАЖДОМ шаге, включая «ничего не
+    сделал и почему»: журнал - единственный источник правды о роботе, чат может молчать
+    сутками (Телеграм у нас уже глушился одним сетевым сбоем 28-29.08.2026)."""
+    if bot:
+        extra.setdefault("bot_id", bot.get("bot_id"))
+        extra.setdefault("bot_name", bot.get("bot_name"))
+        extra.setdefault("launched_by", bot.get("launched_by"))
+    journal_bg(run_row(lead, stage, **extra))
+
+
+def bot_by_id(stage: dict | None, bot_id) -> dict:
+    """Бот этапа по номеру. Пустой словарь вместо None: настройки могли поменять, пока сделка
+    ждала ответа, и разбор ответа не должен падать из-за исчезнувшего бота - у пустого бота
+    режим по умолчанию «останавливаться на любой ответ», то есть самый осторожный."""
+    for bot in (stage or {}).get("bots") or []:
+        if int(bot.get("bot_id") or 0) == int(bot_id or 0):
+            return bot
+    return {}
+
+
+# ── остановка ───────────────────────────────────────────────────────────────────
+
+async def stop_here(
+    lead: dict, stage: dict | None, outcome: str, reason: str,
+    *, bot: dict | None = None, op_text: str = "",
+) -> None:
+    """Снять сделку с ведения и позвать человека.
+
+    Останавливаемся ОХОТНО. Робот в этой воронке пишет живым людям и двигает деньги: цена
+    лишней остановки - минута менеджера, цена лишнего хода - клиент, получивший не то.
+    """
+    lead_id = int(lead.get("id") or 0)
+    status_id = int(lead.get("status_id") or 0)
+    await asyncio.to_thread(store.finish, lead_id, status_id, store.PHASE_STOPPED, reason)
+    log_run(lead, stage, bot=bot, action="route", outcome=outcome, reason=reason,
+            alert_target="op" if op_text else "")
+    if op_text:
+        alert_op(
+            f"{lead_link(lead_id, lead.get('name'))}: {op_text}",
+            lead.get("responsible_user_id"),
+        )
+
+
+# ── ход по маршруту ─────────────────────────────────────────────────────────────
+
+async def run_stage(lead: dict, stage: dict) -> None:
+    """Этап маршрута: остаток, бот, ожидание доставки. Вызывается уже ПОСЛЕ `store.claim`."""
+    lead_id = int(lead["id"])
+    status_id = int(lead["status_id"])
+
+    if not in_work_hours():
+        wake = next_work_moment()
+        await asyncio.to_thread(
+            store.update, lead_id, status_id,
+            phase=store.PHASE_SLEEPING,
+            wake_at=wake.astimezone(_UTC).isoformat() if wake else None,
+        )
+        when = wake.strftime("%d.%m в %H:%M") if wake else "когда включат часы работы"
+        log_run(lead, stage, action="route", outcome="sleeping",
+                reason=f"вне рабочих часов, продолжу {when}")
+        return
+
+    bot = pick_bot(lead, stage)
+    if bot is None:
+        log_run(lead, stage, action="route", outcome="skipped_no_bots",
+                reason="ни один бот этапа не подошёл по условиям")
+        await advance(lead, stage, "на этапе не нашлось подходящего бота")
+        return
+
+    # Гейт остатка - на входе в маршрут, до первого слова клиенту. Дальше по маршруту заказ
+    # уже подтверждён, и перепроверять остаток на каждом этапе значит гонять склад впустую.
+    if stage_position(status_id) == 0 and _flag("stock_check_enabled", True):
+        enough, note = await stock_gate(lead)
+        log_run(lead, stage, bot=bot, action="stock_gate",
+                outcome="advanced" if enough else "stop_no_stock", reason=note)
+        if not enough:
+            await stop_here(
+                lead, stage, "stop_no_stock", note, bot=bot,
+                op_text=f"шаблон клиенту НЕ отправлял, {note}",
+            )
+            return
+
+    contact = await main_contact(lead)
+    chat_id = chat_id_of(contact)
+    bot_id = int(bot.get("bot_id") or 0)
+
+    if str(bot.get("launched_by") or "engine") == "engine":
+        if not allow_action():
+            await stop_here(lead, stage, "failed", "упёрся в потолок действий в час", bot=bot)
+            return
+        await asyncio.to_thread(store.mark_launch_attempted, lead_id, status_id, bot_id)
+        if not await launch_bot(lead_id, bot_id):
+            await stop_here(
+                lead, stage, "failed", "amoCRM не принял запуск бота", bot=bot,
+                op_text="не смог запустить бота, напишите клиенту сами",
+            )
+            return
+    else:
+        # Бот приезжает с грида Цифровой воронки - мы его не вызываем, иначе клиент получит
+        # два одинаковых сообщения. Отметка времени всё равно нужна: от неё считается окно
+        # ожидания доставки.
+        await asyncio.to_thread(store.update, lead_id, status_id, bot_id=bot_id)
+    await asyncio.to_thread(store.mark_launch_ok, lead_id, status_id, chat_id)
+
+    if str(bot.get("stop_mode") or "any") == "never":
+        # «Ответ не нужен» - информационное сообщение, а не разговор. Ни доставки, ни ответа
+        # не ждём: у бота в успешной реализации отправка успешна по определению.
+        log_run(lead, stage, bot=bot, action="launch_bot", outcome="advanced",
+                reason="сообщение информационное, ответа не жду")
+        await advance(lead, stage, "информационное сообщение отправлено")
+        return
+
+    log_run(lead, stage, bot=bot, action="launch_bot", outcome="waiting_delivery",
+            reason="жду подтверждения доставки от Wazzup")
+
+
+async def advance(lead: dict, stage: dict, reason: str) -> None:
+    """Дальше по маршруту. Куда именно - решает порядок этапов на экране.
+
+    ⚠️ В успешную реализацию маршрут не «переходит», в неё пускает только развилка оплаты:
+    решение о деньгах не должно зависеть от того, в каком порядке человек перетащил карточки.
+    """
+    status_id = int(lead.get("status_id") or 0)
+    if status_id == STATUS_SUCCESS:
+        await asyncio.to_thread(
+            store.finish, int(lead["id"]), status_id, store.PHASE_DONE, reason,
+        )
+        log_run(lead, stage, action="route", outcome="done",
+                reason="маршрут пройден, дальше сделку уводит перевод в офис")
+        return
+    nxt = next_stage(status_id)
+    if nxt is None or int(nxt.get("status_id") or 0) == STATUS_SUCCESS:
+        await payment_fork(lead, stage, reason)
+        return
+    await move_to(lead, stage, int(nxt["status_id"]), str(nxt.get("status_name") or ""), reason)
+
+
+async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: str,
+                  reason: str) -> None:
+    """Перевод сделки на этап и немедленный вход в него.
+
+    Вход делаем САМИ, не дожидаясь эха вебхука о собственной правке: эхо приходит не всегда и
+    не сразу, а ждать его значит поставить маршрут в зависимость от чужой очереди доставки.
+    Повторного хода это не создаёт - `store.claim` пропустит первого и откажет второму.
+    """
+    lead_id = int(lead["id"])
+    was = int(lead.get("status_id") or 0)
+    if not allow_action():
+        await stop_here(lead, stage, "failed", "упёрся в потолок действий в час")
+        return
+    result = await amo_service.patch_lead(
+        lead_id, status_id=status_id, pipeline_id=int(lead.get("pipeline_id") or 0) or None,
+    )
+    if not result.get("ok"):
+        await stop_here(
+            lead, stage, "failed", f"amoCRM не принял перевод на «{status_name}»",
+            op_text=f"не смог перевести сделку на этап «{status_name}», сделайте это руками",
+        )
+        return
+    await asyncio.to_thread(store.finish, lead_id, was, store.PHASE_DONE, reason)
+    log_run(lead, stage, action="route", outcome="advanced", reason=reason,
+            moved_to_status_name=status_name)
+    await handle_lead_change(lead_id)
+
+
+# ── развилка оплаты ─────────────────────────────────────────────────────────────
+
+def is_cod_strict(payment_method) -> bool:
+    """Наложка в УЗКОМ смысле: строго «При получении».
+
+    ⚠️ Соседний `waybill_config.is_cod_payment` шире - в нём есть «Эвотор» и «наличные», а это
+    шоурум, где наложки нет вовсе. Возьми мы широкое определение, шоурумные заказы уехали бы в
+    успешную реализацию мимо оплаты. Расхождение намеренное, оно описано в DESIGN.md.
+    """
+    return "при получении" in str(payment_method or "").lower()
+
+
+async def order_is_paid(order_uuid) -> bool | None:
+    """Оплачен ли заказ в МойСкладе. None - склад не ответил, и это НЕ «не оплачен».
+
+    ⚠️ Признак оплаты - `payedSum > 0`, а не сравнение с суммой заказа. Сумма первые минуты
+    пляшет: `woocommerce-sklad` раз в три минуты обнуляет цену доставки по правилу «предоплата
+    - доставка за наш счёт», и заказ мигает 387 → 0 → 387.
+
+    ⚠️ Молчание склада читать как «не оплачен» нельзя: оплаченному заказу тогда уйдёт ссылка
+    на оплату второй раз. Поэтому три исхода, и неизвестность останавливает робота.
+    """
+    if not order_uuid:
+        return None
+    try:
+        data = await ms_client.get(f"entity/customerorder/{order_uuid}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("autopilot: заказ %s не прочитался из МойСклада", order_uuid)
+        return None
+    if not data:
+        return None
+    try:
+        return float(data.get("payedSum") or 0) > 0
+    except (TypeError, ValueError):
+        return None
+
+
+async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
+    """Конец маршрута: куда сделку вести по способу оплаты и факту оплаты."""
+    lead_id = int(lead["id"])
+    method = amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD)
+    order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+    paid = await order_is_paid(order_uuid)
+
+    if paid is None and not is_cod_strict(method):
+        await stop_here(
+            lead, stage, "failed", "МойСклад не сказал, оплачен ли заказ",
+            op_text="не смог узнать в МойСкладе, оплачен ли заказ, дальше не веду",
+        )
+        return
+
+    if paid:
+        log_run(lead, stage, action="payment_fork", outcome="advanced", reason="заказ оплачен")
+        await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано", "заказ оплачен")
+        return
+
+    if not str(method or "").strip():
+        await stop_here(
+            lead, stage, "stop_no_payment_method", "способ оплаты в сделке не заполнен",
+            op_text="способ оплаты не заполнен, не понимаю, чего ждать от клиента",
+        )
+        return
+
+    if is_cod_strict(method):
+        log_run(lead, stage, action="payment_fork", outcome="advanced",
+                reason="оплата при получении, счёт не нужен")
+        await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
+                      "оплата при получении")
+        return
+
+    # Онлайн и не оплачен - дальше счёт выставляет уже работающая автоматика.
+    if settings_client.get_mode() == "test":
+        await asyncio.to_thread(
+            store.finish, lead_id, int(lead.get("status_id") or 0), store.PHASE_DONE,
+            "тестовый прогон дошёл до оплаты",
+        )
+        log_run(lead, stage, action="payment_fork", outcome="done",
+                reason="тестовый прогон дошёл до оплаты, счёт в тесте не выставляю")
+        return
+    if int(lead.get("status_id") or 0) == STATUS_PAYMENT_REQUESTED:
+        await asyncio.to_thread(
+            store.finish, lead_id, STATUS_PAYMENT_REQUESTED, store.PHASE_DONE, reason,
+        )
+        log_run(lead, stage, action="payment_fork", outcome="done",
+                reason="сделка уже на запросе оплаты, дальше ведёт автоматика счетов")
+        return
+    log_run(lead, stage, action="payment_fork", outcome="advanced",
+            reason="онлайн-оплата не поступила, передаю автоматике счетов")
+    await move_to(lead, stage, STATUS_PAYMENT_REQUESTED, "Оплата запрошена",
+                  "передаю автоматике счетов")
+
+
+async def force_ur(lead: dict, stage: dict | None, note: str) -> None:
+    """Тумблер «вести в успех, даже если шаблоны не ушли».
+
+    Включён - недоставленный шаблон перестаёт быть стопом ТАМ, где деньги уже не под вопросом:
+    заказ оплачен либо это наложка. Неоплаченный онлайн-заказ так не проводим никогда - иначе
+    робот закроет успехом сделку, за которую никто не заплатил.
+    """
+    method = amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD)
+    order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+    paid = await order_is_paid(order_uuid)
+    if paid or is_cod_strict(method):
+        why = "заказ оплачен" if paid else "оплата при получении"
+        log_run(lead, stage, action="payment_fork", outcome="advanced",
+                reason=f"шаблоны не дошли ({note}), но {why}", alert_target="op")
+        alert_op(
+            f"{lead_link(int(lead['id']), lead.get('name'))}: заказ ушёл БЕЗ подтверждения "
+            f"клиентом, {note}. Веду в успешную реализацию, потому что {why}.",
+            lead.get("responsible_user_id"),
+        )
+        await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
+                      "шаблоны не дошли, но оплата не под вопросом")
+        return
+    await stop_here(
+        lead, stage, "stop_not_delivered", f"шаблоны не дошли ({note}), заказ не оплачен",
+        op_text=f"сообщение до клиента не дошло ({note}), заказ не оплачен, дальше не веду",
+    )
+
+# ── точка входа: изменение сделки ───────────────────────────────────────────────
+
+def on_lead_change(lead_id) -> None:
+    """Врезка в вебхук `/lead_change`. Синхронная и мгновенная: amoCRM ждёт быстрый ответ,
+    а при задержке повторяет вебхук - и повтор стоил бы клиенту второго сообщения."""
+    if not is_enabled():
+        return
+    try:
+        lead_id = int(lead_id)
+    except (TypeError, ValueError):
+        return
+    task = asyncio.create_task(handle_lead_change(lead_id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def handle_lead_change(lead_id: int) -> None:
+    """Разбор изменения сделки. Сюда же входим сами после собственного перевода этапа."""
+    if not is_enabled():
+        return
+    lead = await load_lead(lead_id)
+    if not lead:
+        return
+    pipeline_id = int(lead.get("pipeline_id") or 0)
+    status_id = int(lead.get("status_id") or 0)
+
+    want = settings_client.get_pipeline_id()
+    if want and pipeline_id != want:
+        # Сделку увели в другую воронку. Снимаем с ведения МОЛЧА: это обычный ход менеджера,
+        # а не поломка, и алерт на каждый такой случай быстро научит чат нас не читать.
+        await asyncio.to_thread(store.drop_lead, lead_id)
+        return
+
+    if status_id == STATUS_PAYMENT_RECEIVED:
+        await on_payment_received(lead)
+        return
+
+    stage = settings_client.get_stage(status_id)
+    if stage is None:
+        return
+
+    if not test_gate_ok(lead):
+        logger.info("autopilot: сделка %s не в белом списке режима «Тест», не трогаю", lead_id)
+        return
+
+    # Гейт от повторного вебхука. `/lead_change` приходит на ЛЮБОЕ изменение сделки: правку
+    # поля, тег, смену ответственного. Работу берёт первый, остальные получают отказ.
+    if not await asyncio.to_thread(store.claim, lead_id, status_id, pipeline_id):
+        return
+
+    await run_stage(lead, stage)
+
+
+async def on_payment_received(lead: dict) -> None:
+    """Сделка дошла до «Оплата получена» - последний шаг маршрута.
+
+    Трогаем ТОЛЬКО те сделки, которые вели сами: до этого этапа сделку могли довести руками
+    или чужой автоматикой, и хватать чужое роботу нечего.
+    """
+    lead_id = int(lead["id"])
+    rows = await asyncio.to_thread(store.list_for_lead, lead_id)
+    if not rows:
+        return
+    alert_op(
+        f"{lead_link(lead_id, lead.get('name'))}: оплата получена, перевожу в успешную реализацию.",
+        lead.get("responsible_user_id"),
+    )
+    log_run(lead, None, action="payment_fork", outcome="advanced",
+            reason="оплата получена", alert_target="op")
+    await move_to(lead, None, STATUS_SUCCESS, "Успешно реализовано", "оплата получена")
+
+
+# ── точка входа: события Wazzup ─────────────────────────────────────────────────
+
+# messageId → пара «сделка и этап». Статусы доставки приходят отдельным событием и знают
+# только номер сообщения, а чат в них не приходит. Карта живёт в памяти процесса, и это
+# осознанно: САМИ статусы копятся на диске, поэтому рестарт теряет лишь связку свежих
+# сообщений, а не результат ожидания.
+_msg_owner: dict[str, tuple[int, int, str]] = {}
+_MSG_OWNER_MAX = 5000
+
+
+def _digits(value) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def on_wazzup(payload) -> None:
+    """Врезка в вебхук `/wazzup/{secret}` - четвёртый потребитель рядом с SLA, контролем
+    доставки и пересылкой в панель. Отвечать Wazzup надо быстро, поэтому работа уходит в фон.
+    """
+    if not is_enabled() or not isinstance(payload, dict):
+        return
+    task = asyncio.create_task(handle_wazzup(payload))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def handle_wazzup(payload: dict) -> None:
+    for message in payload.get("messages") or []:
+        if isinstance(message, dict):
+            try:
+                await _handle_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("autopilot: не разобрал сообщение Wazzup")
+    for status in payload.get("statuses") or []:
+        if isinstance(status, dict):
+            try:
+                await _handle_status(status)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("autopilot: не разобрал статус Wazzup")
+
+
+def _pick_row(rows: list[dict], phase: str) -> dict | None:
+    """Строка сделки в нужной фазе. Строк по чату может быть несколько: одна сделка проходит
+    маршрут, и на каждом этапе остаётся своя. Берём самую свежую в нужной фазе."""
+    fit = [r for r in rows if r.get("phase") == phase]
+    return max(fit, key=lambda r: str(r.get("updated_at") or "")) if fit else None
+
+
+async def _handle_message(message: dict) -> None:
+    chat_id = _digits(message.get("chatId"))
+    if not chat_id:
+        return
+    rows = await asyncio.to_thread(store.find_by_chat, chat_id)
+    if not rows:
+        return
+    chat_type = str(message.get("chatType") or "").lower()
+
+    if message.get("isEcho"):
+        row = _pick_row(rows, store.PHASE_DELIVERY)
+        if row is None:
+            return
+        message_id = str(message.get("messageId") or "").strip()
+        if message_id:
+            if len(_msg_owner) >= _MSG_OWNER_MAX:
+                _msg_owner.clear()
+            _msg_owner[message_id] = (row["lead_id"], row["status_id"], chat_type)
+        status = str(message.get("status") or "").lower()
+        if status:
+            await record_delivery(row, status, chat_type)
+        return
+
+    # Входящее. Ответ клиента - сам по себе доказательство доставки: человек не отвечает на
+    # сообщение, которого не видел. Поэтому ждущую доставки сделку он закрывает вместе с
+    # ожиданием, не дожидаясь отдельного статуса от Wazzup.
+    row = _pick_row(rows, store.PHASE_REPLY) or _pick_row(rows, store.PHASE_DELIVERY)
+    if row is None:
+        return
+    await on_client_answer(row, str(message.get("text") or ""), chat_type)
+
+
+async def _handle_status(status: dict) -> None:
+    message_id = str(status.get("messageId") or "").strip()
+    owner = _msg_owner.get(message_id)
+    if not owner:
+        return
+    lead_id, status_id, chat_type = owner
+    row = await asyncio.to_thread(store.get, lead_id, status_id)
+    if row is None:
+        return
+    await record_delivery(row, str(status.get("status") or "").lower(), chat_type)
+
+
+def waited_s(row: dict, now: datetime.datetime | None = None) -> float:
+    """Сколько секунд ждём доставку. Отсчёт от отметки запуска, а не от создания строки:
+    сделка могла проспать ночь, и та ночь к ожиданию доставки отношения не имеет."""
+    started = row.get("launch_ok_at") or row.get("created_at")
+    try:
+        moment = datetime.datetime.fromisoformat(str(started))
+    except (TypeError, ValueError):
+        return 0.0
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_UTC)
+    return max(0.0, ((now or datetime.datetime.now(_UTC)) - moment).total_seconds())
+
+
+async def record_delivery(row: dict, status: str, chat_type: str) -> None:
+    """Записать статус Wazzup и, если доставка подтвердилась, перейти к ожиданию ответа."""
+    if not status:
+        return
+    entry = {
+        "status": status,
+        "chatType": chat_type,
+        "at": datetime.datetime.now(_UTC).isoformat(),
+    }
+    items = await asyncio.to_thread(
+        store.add_delivery_status, row["lead_id"], row["status_id"], entry,
+    )
+    if row.get("phase") != store.PHASE_DELIVERY:
+        return
+    if delivery_verdict(items, waited_s(row), delivery_wait_s()) == VERDICT_OK:
+        await on_delivered(row, items)
+
+
+async def on_delivered(row: dict, items: list[dict]) -> None:
+    lead = await load_lead(row["lead_id"])
+    stage = settings_client.get_stage(row["status_id"])
+    if lead is None or stage is None:
+        return
+    bot = bot_by_id(stage, row.get("bot_id"))
+    if int(lead.get("status_id") or 0) != int(row["status_id"]):
+        # Сделку увёл человек, пока мы ждали. Это его право и не повод писать в чат.
+        await asyncio.to_thread(
+            store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+            "сделку увели с этапа, пока ждали доставки",
+        )
+        log_run(lead, stage, bot=bot, action="delivery", outcome="stop_left_stage",
+                reason="сделку увели с этапа, пока ждали доставки")
+        return
+    await asyncio.to_thread(
+        store.update, row["lead_id"], row["status_id"], phase=store.PHASE_REPLY,
+    )
+    log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
+            reason=delivery_note(items), delivery={"statuses": items})
+
+
+async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
+    """Ответ клиента. Решение принимает режим остановки бота, настроенный на экране."""
+    lead = await load_lead(row["lead_id"])
+    stage = settings_client.get_stage(row["status_id"])
+    if lead is None or stage is None:
+        return
+    bot = bot_by_id(stage, row.get("bot_id"))
+    if int(lead.get("status_id") or 0) != int(row["status_id"]):
+        await asyncio.to_thread(
+            store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+            "сделку увели с этапа, пока ждали ответа",
+        )
+        log_run(lead, stage, bot=bot, action="reply", outcome="stop_left_stage",
+                reason="сделку увели с этапа, пока ждали ответа", client_answer=text)
+        return
+
+    if answer_decision(bot, text) == "advance":
+        log_run(lead, stage, bot=bot, action="reply", outcome="advanced",
+                reason="ответ клиента подходит под условие успеха", client_answer=text)
+        await advance(lead, stage, "клиент ответил так, как ждали")
+        return
+
+    listed = [normalize_answer(a) for a in (bot.get("stop_answers_norm")
+                                            or bot.get("stop_answers") or [])]
+    known = normalize_answer(text) in listed
+    outcome = "stop_fix_requested" if known else "stop_free_text"
+    reason = ("клиент выбрал ответ, на котором робот останавливается" if known
+              else "клиент ответил не кнопкой, а своими словами")
+    await asyncio.to_thread(
+        store.update, row["lead_id"], row["status_id"], phase=store.PHASE_STOPPED, note=reason,
+    )
+    log_run(lead, stage, bot=bot, action="reply", outcome=outcome, reason=reason,
+            client_answer=text, alert_target="op")
+    answer = text.strip()
+    alert_op(
+        f"{lead_link(int(lead['id']), lead.get('name'))}: клиент ответил «{answer[:200]}». "
+        "Дальше не веду, посмотрите переписку.",
+        lead.get("responsible_user_id"),
+    )
+
+
+async def check_delivery_windows() -> None:
+    """Окно ожидания доставки истекает молча - никакого события об этом не приходит.
+
+    ⚠️ Провал объявляем ТОЛЬКО здесь, по истечении окна. Отказ отдельного канала провалом не
+    считается: бот перебирает каналы, и жалоба телеграма ничего не говорит про ватсап. Ровно
+    на этом мы обожглись 08.09.2026, читая примечание «SYSTEM WZ» в ленте amoCRM.
+    """
+    limit = delivery_wait_s()
+    for row in await asyncio.to_thread(store.list_by_phase, store.PHASE_DELIVERY):
+        waited = waited_s(row)
+        if waited < limit:
+            continue
+        items = row.get("delivery") or []
+        verdict = delivery_verdict(items, waited, limit)
+        if verdict == VERDICT_OK:
+            await on_delivered(row, items)
+            continue
+        lead = await load_lead(row["lead_id"])
+        stage = settings_client.get_stage(row["status_id"])
+        if lead is None:
+            continue
+        bot = bot_by_id(stage, row.get("bot_id"))
+        note = (delivery_note(items) if verdict == VERDICT_FAILED
+                else "ни одного статуса от Wazzup, похоже, сообщение и не отправлялось")
+        log_run(lead, stage, bot=bot, action="delivery", outcome="stop_not_delivered",
+                reason=note, delivery={"statuses": items})
+        if _flag("force_ur_when_templates_failed"):
+            await force_ur(lead, stage, note)
+            continue
+        await stop_here(
+            lead, stage, "stop_not_delivered", note, bot=bot,
+            op_text=f"сообщение до клиента не дошло: {note}. Дальше не веду.",
+        )
+
+
 # ── жизненный цикл ──────────────────────────────────────────────────────────────
 
 async def init() -> None:
@@ -449,8 +1234,8 @@ async def report_unfinished_launches() -> None:
             "рестарт в момент запуска бота",
         )
         alert_op(
-            f"Сделка {row['lead_id']}: робот перезапустился в момент запуска бота и не знает, "
-            "ушло сообщение или нет. Повторно не отправляю, посмотрите переписку."
+            f"{lead_link(row['lead_id'])}: робот перезапустился в момент запуска бота и не "
+            "знает, ушло сообщение или нет. Повторно не отправляю, посмотрите переписку."
         )
     if rows:
         logger.warning("autopilot: %s незавершённых запусков после рестарта", len(rows))
@@ -479,6 +1264,7 @@ async def tick_once() -> None:
     dropped = await asyncio.to_thread(store.purge_older_than, AUTOPILOT_STATE_TTL_DAYS)
     if dropped:
         logger.info("autopilot: снято с ведения по сроку давности: %s", dropped)
+    await check_delivery_windows()
     if not in_work_hours():
         return
     for row in await asyncio.to_thread(store.list_due):
@@ -487,3 +1273,15 @@ async def tick_once() -> None:
             store.update, row["lead_id"], row["status_id"],
             phase=store.PHASE_LAUNCHING, wake_at=None,
         )
+        lead = await load_lead(row["lead_id"])
+        stage = settings_client.get_stage(row["status_id"])
+        if lead is None or stage is None:
+            continue
+        if int(lead.get("status_id") or 0) != int(row["status_id"]):
+            # За ночь сделку увели. Продолжать с того места, где её уже нет, нельзя.
+            await asyncio.to_thread(
+                store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+                "за ночь сделку увели с этапа",
+            )
+            continue
+        await run_stage(lead, stage)

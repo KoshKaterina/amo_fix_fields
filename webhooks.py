@@ -22,6 +22,7 @@ import lead_distribution
 import lead_distribution_profiles_client
 import metrika_sync
 import migration_freeze
+import autopilot
 import new_lead_watch
 import ms_client
 import office_transfer
@@ -117,6 +118,10 @@ async def lifespan(app):
     await amgroup_fallback.init()
     await amgroup_shipment.init()
     await amgroup_duplicate_watch.init()
+    # Авто-режим ОП розница: ведёт сделку по этапам вместо менеджера. Сам первым делом
+    # смотрит флаг AUTOPILOT_ENABLED и без него не поднимает ни хранилища, ни опроса
+    # панели, ни фонового цикла.
+    await autopilot.init()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -130,6 +135,7 @@ async def lifespan(app):
     await amgroup_fallback.shutdown()
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
+    await autopilot.shutdown()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await team_panel_client.stop()
@@ -305,6 +311,13 @@ async def wazzup_webhook(secret: str, request: Request):
         wazzup_forward.enqueue(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка пересылки в панель")
+    # Авто-режим — четвёртый потребитель. Ему из этого вебхука нужны две вещи: статус
+    # доставки шаблона и текст ответа клиента. Читать переписку из amoCRM нельзя, все пути
+    # к сообщениям в API закрыты, так что другого источника у робота нет.
+    try:
+        autopilot.on_wazzup(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка авто-режима")
     return {"ok": True}
 
 
@@ -434,6 +447,11 @@ async def lead_change(request: Request):
     # делом смотрит флаг, воронку и этап и выходит без единого запроса в сеть -
     # вебхук приходит на каждое изменение любой сделки.
     amgroup_shipment.handle_lead_status_change_bg(lead_id, incoming_status, incoming_pipeline)
+
+    # Авто-режим: сделка встала на этап маршрута, настроенного в панели. Модуль сам смотрит
+    # флаг и режим и выходит без единого запроса в сеть, если выключен — вебхук приходит на
+    # ЛЮБОЕ изменение ЛЮБОЙ сделки, и лишний поход в amo отсюда стоил бы дорого.
+    autopilot.on_lead_change(lead_id)
 
 
     # Office Transfer: сделка воронки-источника зашла в УР(142)/ЗНР(143) →

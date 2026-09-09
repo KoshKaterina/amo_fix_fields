@@ -347,3 +347,246 @@ def test_test_whitelist_is_empty_means_nobody():
     assert SC.get_test_contact_ids() == set()
     _settings()
     assert SC.get_test_contact_ids() == {48594653}
+
+
+# ── маршрут: выбор бота и порядок этапов ────────────────────────────────────────
+
+def _bot(bot_id, **over):
+    bot = {
+        "bot_id": bot_id, "bot_name": f"бот {bot_id}", "launched_by": "engine",
+        "stop_mode": "any", "stop_answers": [], "stop_answers_norm": [],
+        "conditions": [], "enabled": True,
+    }
+    bot.update(over)
+    return bot
+
+
+def _cf(field_id, value):
+    return {"field_id": field_id, "values": [{"value": value}]}
+
+
+def _lead(**over):
+    lead = {
+        "id": 111, "name": "Заказ 42", "pipeline_id": 8642414, "status_id": 70070982,
+        "responsible_user_id": 0, "custom_fields_values": [], "_embedded": {"contacts": []},
+    }
+    lead.update(over)
+    return lead
+
+
+def _route(*stages):
+    _settings(route=list(stages))
+    return list(stages)
+
+
+def _stage(status_id, name, bots, **over):
+    stage = {"status_id": status_id, "status_name": name, "position": 0,
+             "is_final": False, "bots": bots}
+    stage.update(over)
+    return stage
+
+
+def _capture(monkeypatch) -> list[dict]:
+    """Журнал в список вместо панели: строки журнала - показания робота о себе, и проверять
+    надо именно их, а не то, что мы думаем про его поведение."""
+    rows: list[dict] = []
+    monkeypatch.setattr(A, "journal_bg", rows.append)
+    return rows
+
+
+def test_first_matching_bot_wins_and_disabled_is_skipped():
+    """Ботов на этапе может быть сколько угодно, но запускаем ОДНОГО.
+
+    Запусти мы всех подошедших, клиент получил бы два сообщения подряд - худшее, что робот
+    умеет делать. Старшинство задаёт порядок на экране, его и слушаемся.
+    """
+    lead = _lead(custom_fields_values=[_cf(577373, "Счет")])
+    stage = _stage(70070982, "Первичный контакт", [
+        _bot(1, enabled=False),
+        _bot(2, conditions=[{"join": "and", "field": "cf:577373", "op": "eq", "value": "нал"}]),
+        _bot(3),
+        _bot(4),
+    ])
+    assert A.pick_bot(lead, stage)["bot_id"] == 3
+
+
+def test_route_order_is_the_order_on_the_screen():
+    _route(
+        _stage(1, "Первый", [_bot(10)]),
+        _stage(2, "Второй", [_bot(11)]),
+        _stage(3, "Третий", [_bot(12)]),
+    )
+    assert A.stage_position(2) == 1
+    assert A.next_stage(1)["status_id"] == 2
+    assert A.next_stage(3) is None
+    assert A.is_last_stage({"status_id": 3, "is_final": False}) is True
+
+
+def test_success_is_entered_only_through_the_payment_fork(monkeypatch):
+    """В успешную реализацию маршрут не «переходит» по порядку карточек: туда пускает только
+    развилка оплаты. Иначе решение о деньгах зависело бы от того, как человек перетащил
+    карточки на экране."""
+    _route(
+        _stage(1, "Условия согласованы", [_bot(10)]),
+        _stage(A.STATUS_SUCCESS, "Успешно реализовано", [_bot(11)]),
+    )
+    called = []
+    monkeypatch.setattr(A, "payment_fork", lambda *a, **k: _noop(called.append("fork")))
+    monkeypatch.setattr(A, "move_to", lambda *a, **k: _noop(called.append("move")))
+    asyncio.run(A.advance(_lead(status_id=1), _stage(1, "Условия согласованы", []), "тест"))
+    assert called == ["fork"]
+
+
+async def _noop(_value=None):
+    return None
+
+
+# ── развилка оплаты ─────────────────────────────────────────────────────────────
+
+def test_cod_is_narrow_showroom_is_not_cod():
+    """Наложка - строго «При получении». Соседнее определение в `waybill_config` шире, в нём
+    есть «Эвотор» и «наличные», а это шоурум: там наложки нет, деньги берут на месте. Возьми
+    мы широкое определение, шоурумные заказы уехали бы в успех мимо оплаты."""
+    assert A.is_cod_strict("При получении") is True
+    assert A.is_cod_strict("при получении, курьеру") is True
+    assert A.is_cod_strict("Эвотор") is False
+    assert A.is_cod_strict("наличные Менеджер") is False
+    assert A.is_cod_strict("") is False
+
+
+def _fork_env(monkeypatch, *, paid, method, mode="live"):
+    _settings(settings={"mode": mode, "work_hours": [{"start": "00:00", "end": "23:59"}]})
+    rows = _capture(monkeypatch)
+    moves: list[tuple] = []
+
+    async def fake_ms_get(path, params=None, retries=3):
+        return None if paid is None else {"payedSum": 100 if paid else 0}
+
+    async def fake_move(lead, stage, status_id, status_name, reason):
+        moves.append((status_id, status_name, reason))
+
+    monkeypatch.setattr(A.ms_client, "get", fake_ms_get)
+    monkeypatch.setattr(A, "move_to", fake_move)
+    fields = [_cf(576689, "uuid-1")]
+    if method:
+        fields.append(_cf(577373, method))
+    return rows, moves, _lead(custom_fields_values=fields)
+
+
+def test_paid_order_goes_to_success(monkeypatch):
+    rows, moves, lead = _fork_env(monkeypatch, paid=True, method="Счет")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves and moves[0][0] == A.STATUS_SUCCESS
+
+
+def test_cash_on_delivery_goes_to_success_without_invoice(monkeypatch):
+    rows, moves, lead = _fork_env(monkeypatch, paid=False, method="При получении")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves and moves[0][0] == A.STATUS_SUCCESS
+
+
+def test_unpaid_online_goes_to_payment_request(monkeypatch):
+    rows, moves, lead = _fork_env(monkeypatch, paid=False, method="Счет")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves and moves[0][0] == A.STATUS_PAYMENT_REQUESTED
+
+
+def test_silent_warehouse_stops_instead_of_guessing(monkeypatch):
+    """МойСклад не ответил - это НЕ «не оплачен». Прочитай мы молчание как неоплату,
+    оплаченному заказу ушла бы ссылка на оплату второй раз."""
+    rows, moves, lead = _fork_env(monkeypatch, paid=None, method="Счет")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves == []
+    assert rows[-1]["outcome"] == "failed"
+
+
+def test_empty_payment_method_stops(monkeypatch):
+    rows, moves, lead = _fork_env(monkeypatch, paid=False, method="")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_no_payment_method"
+
+
+def test_test_mode_does_not_ask_for_money(monkeypatch):
+    """В «Тесте» цепочка честно доходит до оплаты и там останавливается: счета выставляет
+    автоматика боевой воронки, и в тестовой ей делать нечего."""
+    rows, moves, lead = _fork_env(monkeypatch, paid=False, method="Счет", mode="test")
+    asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
+    assert moves == []
+    assert rows[-1]["outcome"] == "done"
+
+
+def test_force_ur_never_closes_an_unpaid_online_order(monkeypatch):
+    """Тумблер «вести в успех, если шаблоны не ушли» снимает стоп только там, где деньги уже
+    не под вопросом. Неоплаченный онлайн-заказ так не проводим никогда."""
+    rows, moves, lead = _fork_env(monkeypatch, paid=False, method="Счет")
+    asyncio.run(A.force_ur(lead, None, "все каналы отбили"))
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_not_delivered"
+
+
+def test_force_ur_closes_a_paid_order_and_says_so(monkeypatch):
+    rows, moves, lead = _fork_env(monkeypatch, paid=True, method="Счет")
+    _SENT.clear()
+
+    async def run():
+        await A.force_ur(lead, None, "все каналы отбили")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert moves and moves[0][0] == A.STATUS_SUCCESS
+    assert any("БЕЗ подтверждения" in m["text"] for m in _SENT)
+
+
+# ── ожидание доставки и ответа ──────────────────────────────────────────────────
+
+def test_waiting_counts_from_launch_not_from_creation():
+    """Сделка могла проспать ночь. Считай мы ожидание от создания строки, утром робот
+    объявил бы шаблон недоставленным, ещё не отправив его."""
+    now = datetime.datetime(2026, 9, 9, 12, 0, tzinfo=datetime.timezone.utc)
+    row = {
+        "created_at": "2026-09-08T22:00:00+00:00",
+        "launch_ok_at": "2026-09-09T11:55:00+00:00",
+    }
+    assert A.waited_s(row, now) == 300
+
+
+def test_client_reply_is_proof_of_delivery(monkeypatch):
+    """Человек не отвечает на сообщение, которого не видел. Ответ клиента закрывает ожидание
+    доставки сам, не дожидаясь отдельного статуса от Wazzup."""
+    _route(_stage(70070982, "Первичный контакт", [_bot(7131, stop_mode="never")]))
+    S.claim(222, 70070982, 8642414)
+    S.update(222, 70070982, bot_id=7131, chat_id="79099371845", phase=S.PHASE_DELIVERY)
+    seen: list[str] = []
+
+    async def fake_answer(row, text, chat_type=""):
+        seen.append(text)
+
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "79099371845", "chatType": "whatsapp", "isEcho": False,
+        "text": "Да, всё верно", "messageId": "m-1",
+    }]}))
+    assert seen == ["Да, всё верно"]
+
+
+def test_moved_away_while_waiting_is_not_an_alert(monkeypatch):
+    """Менеджер увёл сделку с этапа, пока робот ждал. Это его право, а не поломка: пишем
+    строку в журнал и молчим в чате."""
+    _route(_stage(70070982, "Первичный контакт", [_bot(7131)]))
+    rows = _capture(monkeypatch)
+    _SENT.clear()
+    S.claim(333, 70070982, 8642414)
+
+    async def fake_load(lead_id):
+        return _lead(id=333, status_id=99999)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.on_delivered({"lead_id": 333, "status_id": 70070982, "bot_id": 7131}, [])
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_left_stage"
+    assert _SENT == []

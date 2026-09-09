@@ -23,6 +23,7 @@
 """
 
 import datetime
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -60,7 +61,7 @@ def _now() -> str:
 
 _COLS = (
     "lead_id, status_id, pipeline_id, bot_id, phase, launch_attempted_at, launch_ok_at, "
-    "chat_id, wake_at, created_at, updated_at, note"
+    "chat_id, wake_at, created_at, updated_at, note, delivery"
 )
 
 
@@ -78,7 +79,18 @@ def _row(r) -> dict:
         "created_at": r[9],
         "updated_at": r[10],
         "note": r[11],
+        "delivery": _loads(r[12]),
     }
+
+
+def _loads(raw) -> list[dict]:
+    """Копилка статусов доставки. Битую строку читаем как пустую: строка журнала не стоит
+    того, чтобы из-за неё встало ведение сделки."""
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
 
 
 def init() -> None:
@@ -99,6 +111,7 @@ def init() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 note TEXT NOT NULL DEFAULT '',
+                delivery TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (lead_id, status_id)
             )
             """
@@ -225,6 +238,53 @@ def list_due(now: datetime.datetime | None = None) -> list[dict]:
 def finish(lead_id: int, status_id: int, phase: str, note: str = "") -> None:
     """Закрыть ведение пары «сделка и этап»: этап пройден либо остановились."""
     update(lead_id, status_id, phase=phase, note=note[:500])
+
+
+def add_delivery_status(lead_id: int, status_id: int, entry: dict) -> list[dict]:
+    """Дописать статус Wazzup в копилку сделки и вернуть копилку целиком.
+
+    ⚠️ Именно на диск, а не в память процесса. Окно ожидания доставки - четверть часа, и
+    выкатка внутри него не редкость. Держи мы статусы в памяти, каждый рестарт объявлял бы
+    доставленные сообщения недоставленными и звал человека к сделкам, где всё в порядке.
+    """
+    with _connect() as conn:
+        cur = conn.execute(
+            "SELECT delivery FROM autopilot_state WHERE lead_id = ? AND status_id = ?",
+            (lead_id, status_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return []
+        items = _loads(row[0])
+        items.append(entry)
+        conn.execute(
+            "UPDATE autopilot_state SET delivery = ?, updated_at = ? "
+            "WHERE lead_id = ? AND status_id = ?",
+            (json.dumps(items, ensure_ascii=False), _now(), lead_id, status_id),
+        )
+    return items
+
+
+def list_for_lead(lead_id: int) -> list[dict]:
+    """Все строки сделки. По ним движок понимает, вёл ли он эту сделку вообще - и не лезет
+    в чужие, которые человек провёл руками."""
+    with _connect() as conn:
+        cur = conn.execute(
+            f"SELECT {_COLS} FROM autopilot_state WHERE lead_id = ?", (lead_id,)
+        )
+        rows = cur.fetchall()
+    return [_row(r) for r in rows]
+
+
+def list_by_phase(phase: str) -> list[dict]:
+    """Кто сейчас в этой фазе. Нужно фоновому тику: окно ожидания доставки истекает
+    молча, никакого события об этом не приходит."""
+    with _connect() as conn:
+        cur = conn.execute(
+            f"SELECT {_COLS} FROM autopilot_state WHERE phase = ?", (phase,)
+        )
+        rows = cur.fetchall()
+    return [_row(r) for r in rows]
 
 
 def drop_lead(lead_id: int) -> int:
