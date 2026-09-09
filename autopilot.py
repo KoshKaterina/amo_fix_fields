@@ -718,9 +718,12 @@ async def run_stage(lead: dict, stage: dict) -> None:
 
     bot = pick_bot(lead, stage)
     if bot is None:
-        log_run(lead, stage, action="route", outcome="skipped_no_bots",
-                reason="ни один бот этапа не подошёл по условиям")
-        await advance(lead, stage, "на этапе не нашлось подходящего бота")
+        # Этап без ботов - ПРОХОДНОЙ (правка Кати 09.09.2026): сделку в него перевели, чужая
+        # автоматика этапа получила своё событие, нам здесь делать нечего - идём дальше.
+        reason = ("этап проходной, ботов на нём нет" if not (stage.get("bots") or [])
+                  else "ни один бот этапа не подошёл по условиям")
+        log_run(lead, stage, action="route", outcome="skipped_no_bots", reason=reason)
+        await advance(lead, stage, reason)
         return
 
     # Гейт остатка - на входе в маршрут, до первого слова клиенту. Дальше по маршруту заказ
