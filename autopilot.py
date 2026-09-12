@@ -30,6 +30,7 @@ import asyncio
 import datetime
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -182,6 +183,17 @@ def alert_op(text: str, responsible_id=None) -> None:
     # В ограниченных режимах (тест, пилот боя) менеджеров не дёргаем: события читает
     # тот, кто тестирует, и читает он их в техническом чате. Иначе в рабочий топик
     # УВЕДОМЛЕНИЯ полетело бы «клиент ответил...» по сделке с тестовым контактом.
+    # Дубль в ленту панели - всем, кто ведёт авто-режим. Лента важнее чата: Телеграм
+    # уже глушился на сутки. В «Тесте» ленту не трогаем - тестовый шум приучил бы
+    # людей её игнорировать.
+    if settings_client.get_mode() == "live":
+        plain = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+        found = _LINK_RE.search(text)
+        panel_notify_bg(
+            kind="autopilot_alert", level="critical",
+            title="Авто-режим: нужен человек", body=plain,
+            url=found.group(1) if found else None,
+        )
     limited = limited_mode()
     if limited:
         label = "ТЕСТОВЫЙ прогон" if limited == "тест" else "ПИЛОТ прода"
@@ -196,6 +208,46 @@ def alert_op(text: str, responsible_id=None) -> None:
         if mention:
             body = body + chr(10) + mention
     _send_bg(body, chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID)
+
+
+# Ссылка в тексте алерта - html для Телеграма. Лента панели рендерит плоский текст,
+# поэтому для неё тег вынимается: текст остаётся словами, адрес уезжает в url.
+_LINK_RE = re.compile(r"<a href=\"([^\"]+)\">([^<]*)</a>")
+
+
+def panel_notify_bg(*, kind: str, title: str, body: str, url: str | None = None,
+                    level: str = "warn", dedupe_key: str | None = None) -> None:
+    """Уведомление в ленту панели - вторым каналом рядом с Телеграмом.
+
+    Лента, а не чат - основной канал: Телеграм у нас уже глушился на сутки одним
+    сетевым сбоем (28-29.08.2026). Шлём фоном и не ждём: сбой доставки уведомления
+    не должен трогать ведение сделки.
+    """
+    task = asyncio.create_task(_panel_notify(kind=kind, title=title, body=body,
+                                             url=url, level=level,
+                                             dedupe_key=dedupe_key))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _panel_notify(**payload) -> None:
+    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN:
+        return
+    body = {k: v for k, v in payload.items() if v is not None}
+    body["audience_cap"] = "manage_autopilot"
+    url = f"{TEAM_PANEL_BASE_URL.rstrip(chr(47))}/api/ingest/notification"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                url, json=body, headers={"X-Ingest-Token": TEAM_PANEL_INGEST_TOKEN},
+            )
+        if resp.status_code >= 400:
+            logger.warning("autopilot: панель не приняла уведомление, HTTP %s",
+                           resp.status_code)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("autopilot: не удалось отправить уведомление в панель")
 
 
 def journal_bg(payload: dict[str, Any]) -> None:
@@ -1074,6 +1126,25 @@ async def handle_lead_change(lead_id: int) -> None:
         await on_payment_received(lead)
         return
 
+    # Инбокс без менеджера (Катя 12.09.2026): в режиме «Прод» КАЖДАЯ заявка на входе
+    # воронки поднимает уведомление в ленте панели - любого типа, до белого списка и
+    # до условий ботов: уведомление о заявке нужно человеку даже там, где робот сам
+    # ничего делать не будет. Дедуп на панели держит один вебхук-шторм за одну заявку,
+    # локальное множество бережёт панель от лишних запросов до конца жизни процесса.
+    if (settings_client.get_mode() == "live"
+            and status_id == (settings_client.get_entry_status_id() or 0)
+            and lead_id not in _lead_notified):
+        _lead_notified.add(lead_id)
+        if len(_lead_notified) > 5000:
+            _lead_notified.clear()
+        panel_notify_bg(
+            kind="autopilot_lead", level="warn",
+            title="Новая заявка в рознице",
+            body=str(lead.get("name") or "сделка без названия"),
+            url=AMO_LEAD_URL.format(lead_id),
+            dedupe_key=f"ap-lead-{lead_id}",
+        )
+
     stage = settings_client.get_stage(status_id)
     if stage is None:
         return
@@ -1138,6 +1209,8 @@ async def on_payment_received(lead: dict) -> None:
 # осознанно: САМИ статусы копятся на диске, поэтому рестарт теряет лишь связку свежих
 # сообщений, а не результат ожидания.
 _msg_owner: dict[str, tuple[int, int, str]] = {}
+# Заявки, о которых уже уведомили, - чтобы не дёргать панель на каждый вебхук сделки.
+_lead_notified: set[int] = set()
 _MSG_OWNER_MAX = 5000
 
 

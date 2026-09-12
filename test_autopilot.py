@@ -957,3 +957,76 @@ def test_full_live_mode_has_no_whitelist():
                         "live_whitelist_enabled": False})
     assert A.limited_mode() is None
     assert A.whitelist_ok(_lead_with_contact(11111111)) is True
+
+
+# ── инбокс без менеджера: уведомления в ленту панели ────────────────────────────
+
+def test_every_new_lead_wakes_the_panel_inbox_in_live(monkeypatch):
+    """Правка Кати 12.09.2026: в «Проде» КАЖДАЯ заявка на входе воронки поднимает
+    уведомление в ленте панели - любого типа, до белого списка и условий ботов: без
+    менеджера инбокс проверяет панель."""
+    _settings(settings={"mode": "live", "work_hours": []},
+              pipeline_id=10593102, entry_status_id=83537714,
+              test_contact_ids=[], route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    A._lead_notified.clear()
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714,
+                     _embedded={"contacts": [{"id": 11111111}]})
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(424242))
+    assert len(sent) == 1
+    assert sent[0]["kind"] == "autopilot_lead"
+    assert "424242" in sent[0]["url"]
+    # Контакт НЕ из белого списка: робот сделку не повёл, а уведомление всё равно ушло.
+
+    # Повторный вебхук той же сделки панель больше не дёргает.
+    asyncio.run(A.handle_lead_change(424242))
+    assert len(sent) == 1
+
+
+def test_test_mode_does_not_touch_the_panel_inbox(monkeypatch):
+    """В «Тесте» менеджеры работают как обычно - тестовый шум в ленте приучил бы людей
+    её игнорировать."""
+    _settings(settings={"mode": "test", "work_hours": []},
+              entry_status_id=70070982,
+              route=[_stage(70070982, "Первичный контакт", [_bot(7131)])])
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    A._lead_notified.clear()
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, status_id=70070982,
+                     _embedded={"contacts": [{"id": 11111111}]})
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(424243))
+    assert sent == []
+
+
+def test_op_alert_is_mirrored_to_the_panel_feed_in_live(monkeypatch):
+    """Алерт робота дублируется в ленту панели: лента - основной канал, Телеграм уже
+    глушился на сутки одним сетевым сбоем. Html-ссылка алерта в ленту едет словами,
+    адрес - отдельным полем."""
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": False},
+              payment_status_id=87280230)
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    _SENT.clear()
+
+    async def run():
+        A.alert_op('<a href="https://amo/lead/1">сделка</a>: клиент ответил не по кнопке')
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert len(sent) == 1
+    assert sent[0]["level"] == "critical"
+    assert sent[0]["body"].startswith("сделка: клиент ответил")
+    assert sent[0]["url"] == "https://amo/lead/1"
+    assert "<a" not in sent[0]["body"]
