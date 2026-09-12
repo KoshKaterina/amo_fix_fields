@@ -856,7 +856,21 @@ def test_test_mode_alerts_go_to_tech_chat_not_managers(monkeypatch):
     assert _SENT[0]["chat_id"] is None, "в тесте алерт идёт в технический чат по умолчанию"
     assert "ТЕСТОВЫЙ прогон" in _SENT[0]["text"]
 
+    # Пилот боя (тумблер включён - а он включён по умолчанию) - тоже технический чат.
     _settings(settings={"mode": "live", "work_hours": []})
+    _SENT.clear()
+
+    async def run_pilot():
+        A.alert_op("событие пилота")
+        await asyncio.sleep(0)
+
+    asyncio.run(run_pilot())
+    assert _SENT[0]["chat_id"] is None
+    assert "ПИЛОТ" in _SENT[0]["text"]
+
+    # И только ПОЛНЫЙ бой - с выключенным тумблером - дёргает менеджеров.
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": False})
     _SENT.clear()
 
     async def run2():
@@ -864,7 +878,7 @@ def test_test_mode_alerts_go_to_tech_chat_not_managers(monkeypatch):
         await asyncio.sleep(0)
 
     asyncio.run(run2())
-    assert _SENT[0]["chat_id"] is not None, "в бою алерт идёт в чат отдела продаж"
+    assert _SENT[0]["chat_id"] is not None, "в полном бою алерт идёт в чат отдела продаж"
 
 
 # ── телеграм: чат живёт не под телефоном ────────────────────────────────────────
@@ -920,3 +934,26 @@ def test_contact_without_phone_stays_invisible_and_that_is_the_limit():
         "chatId": "864542860", "chatType": "telegram",
         "contact": {"name": "Без телефона", "username": "nickname"},
     }) == ["864542860"]
+
+
+# ── пилот боевого режима: белый список в бою ────────────────────────────────────
+
+def _lead_with_contact(contact_id: int) -> dict:
+    return _lead(_embedded={"contacts": [{"id": contact_id}]})
+
+
+def test_live_pilot_touches_only_whitelisted_contacts():
+    """Правка Кати 12.09.2026: бой обкатывается на живой воронке, но робот трогает только
+    сделки белого списка. Тумблер включён по умолчанию - первый запуск боя начинается
+    пилотом, а полный запуск это осознанное выключение, а не случайное умолчание."""
+    _settings(settings={"mode": "live", "work_hours": []})
+    assert A.limited_mode() == "пилот"
+    assert A.whitelist_ok(_lead_with_contact(48594653)) is True
+    assert A.whitelist_ok(_lead_with_contact(11111111)) is False,         "реальный клиент в пилоте невидим для робота"
+
+
+def test_full_live_mode_has_no_whitelist():
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": False})
+    assert A.limited_mode() is None
+    assert A.whitelist_ok(_lead_with_contact(11111111)) is True
