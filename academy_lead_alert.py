@@ -36,6 +36,7 @@ import time
 
 import amo_service
 import telegram_bot
+import alerts
 from api import BASE_URL
 from tg_recipients import ACADEMY_ALERT_TAG, NOTIFY_CHAT_ID, NOTIFY_THREAD_ID
 from waybill_config import (
@@ -198,10 +199,22 @@ async def _apply(lead_id) -> None:
 
         client, phone = await _client_card(lead)
         text = _build_message(lead_id, lead, client, phone)
-        ok = await telegram_bot.send_alert(
-            text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+        name = ((lead or {}).get("name") or "").strip()
+        d = alerts.decide(
+            "academy_lead", legacy_text=text, parse_mode="HTML",
+            chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID, lead=lead,
+            values={
+                "теги": ACADEMY_ALERT_TAG,
+                "телефон": phone or "",
+                "клиент": client or "",
+                "сделка": name if name and name != client else "",
+                "ссылка_на_сделку": alerts.lead_link(lead_id),
+            },
         )
+        if d is None:
+            logger.info("Академия-алерт: событие выключено в панели (сделка %s)", lead_id)
+            return
+        ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
         if ok:
             _sent_times.append(time.time())
         else:
@@ -227,12 +240,19 @@ async def _report_burst() -> None:
         "Академия-алерт: часовой лимит %s исчерпан — уведомления приглушены",
         ACADEMY_LEAD_ALERT_HOUR_LIMIT,
     )
-    await telegram_bot.send_alert(
-        f"🎓 Лидов в Академию за час пришло больше {ACADEMY_LEAD_ALERT_HOUR_LIMIT}, "
-        "дальше уведомления приглушены до конца часа. Похоже на массовый перенос сделок, "
-        "стоит заглянуть в воронку.",
-        chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+    d = alerts.decide(
+        "academy_lead_burst",
+        legacy_text=(
+            f"🎓 Лидов в Академию за час пришло больше {ACADEMY_LEAD_ALERT_HOUR_LIMIT}, "
+            "дальше уведомления приглушены до конца часа. Похоже на массовый перенос сделок, "
+            "стоит заглянуть в воронку."
+        ),
+        chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+        values={"лимит": ACADEMY_LEAD_ALERT_HOUR_LIMIT},
     )
+    if d is None:
+        return
+    await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
 async def _client_card(lead: dict) -> tuple[str | None, str | None]:

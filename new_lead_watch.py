@@ -33,6 +33,7 @@ import logging
 
 import amo_service
 import telegram_bot
+import alerts
 from api import BASE_URL
 from tg_recipients import ROP_CHAT_ID, manager_name
 from waybill_config import (
@@ -127,8 +128,7 @@ async def _still_untouched(lead_id: int) -> tuple[bool | None, dict | None]:
 def _build_message(lead_id: int, lead: dict, waited_min: float) -> str:
     """Руководству: факт и виновник. Без тегов и ID (правило Кати 03.08.2026), без
     точек посередине (правило Кати 26.08.2026)."""
-    hours = waited_min / 60
-    waited = f"{int(waited_min)} минут" if waited_min < 90 else f"{hours:.0f} часа"
+    waited = _waited_words(waited_min)
     lines = [
         f"🚨 Новый лид не взяли в работу {waited}",
         f"Ответственный: {_esc(manager_name(lead.get('responsible_user_id')))}",
@@ -139,6 +139,12 @@ def _build_message(lead_id: int, lead: dict, waited_min: float) -> str:
     lines.append("")
     lines.append(f'<a href="{BASE_URL}/leads/detail/{lead_id}">Открыть сделку</a>')
     return "\n".join(lines)
+
+
+def _waited_words(waited_min: float) -> str:
+    """«47 минут» до полутора часов, дальше «2 часа» - одно правило и для текста из кода,
+    и для переменной {{сколько_ждали}} шаблона из панели."""
+    return f"{int(waited_min)} минут" if waited_min < 90 else f"{waited_min / 60:.0f} часа"
 
 
 def _esc(s) -> str:
@@ -164,10 +170,20 @@ async def _sweep() -> None:
             _pending.pop(lead_id, None)
             if not untouched:
                 continue  # взяли, вебхук о смене этапа просто не дошёл
-            ok = await telegram_bot.send_alert(
-                _build_message(lead_id, lead or {}, waited),
-                parse_mode="HTML", chat_id=ROP_CHAT_ID,
+            d = alerts.decide(
+                "new_lead_untaken", legacy_text=_build_message(lead_id, lead or {}, waited),
+                parse_mode="HTML", chat_id=ROP_CHAT_ID, lead=lead,
+                values={
+                    "сколько_ждали": _waited_words(waited),
+                    "ответственный": manager_name((lead or {}).get("responsible_user_id")),
+                    "сделка": ((lead or {}).get("name") or "").strip(),
+                    "ссылка_на_сделку": alerts.lead_link(lead_id),
+                },
             )
+            if d is None:
+                logger.info("Новый лид: эскалация выключена в панели (сделка %s)", lead_id)
+                continue
+            ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
             logger.info(
                 "Новый лид: эскалация %s (сделка %s, %s рабочих минут на входе)",
                 "отправлена" if ok else "НЕ отправлена", lead_id, int(waited),

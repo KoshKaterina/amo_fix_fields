@@ -25,6 +25,7 @@ import os
 
 import ms_client
 import telegram_bot
+import alerts
 import woo_client
 from waybill_config import (
     MS_ATTR_ORDER_NUMBER_ID,
@@ -155,7 +156,16 @@ async def _report(lost: list[dict]) -> None:
         lines.append(f"…и ещё {len(lost) - 10}")
     lines.append("Сделки в amoCRM по таким заказам тоже нет — она создаётся уже из МойСклада.")
 
-    ok = await telegram_bot.send_alert("\n".join(lines), chat_id=TG_ALLOWED_CHAT_ID)
+    # Список заказов собирает код; панель решает только выключатель и чат (keep_text).
+    d = alerts.decide(
+        "order_watchdog_digest", legacy_text="\n".join(lines), chat_id=TG_ALLOWED_CHAT_ID,
+        values={"сколько_ещё": f"…и ещё {len(lost) - 10}" if len(lost) > 10 else ""},
+        keep_text=True,
+    )
+    if d is None:
+        logger.info("Сторож заказов: сводка выключена в панели (%s потерянных)", len(lost))
+        return
+    ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
     logger.warning(
         "Сторож заказов: %s потерянных, сообщение %s",
         len(lost), "отправлено" if ok else "НЕ отправлено",

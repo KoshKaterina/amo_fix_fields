@@ -36,6 +36,7 @@ from collections import deque
 
 import amo_service
 import telegram_bot
+import alerts
 from api import BASE_URL
 from tg_recipients import (
     NOTIFY_CHAT_ID,
@@ -111,15 +112,26 @@ async def _apply(params: dict) -> None:
         except asyncio.TimeoutError:
             logger.warning("UIS пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", call_id)
             lead_id, responsible_id = None, None
-        text = _build_message(phone, name, lead_id, missed_call_mentions(responsible_id))
-        ok = await telegram_bot.send_alert(
-            text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+        mentions = missed_call_mentions(responsible_id)
+        text = _build_message(phone, name, lead_id, mentions)
+        d = alerts.decide(
+            "missed_call", legacy_text=text, parse_mode="HTML",
+            chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+            values={
+                "теги": mentions,
+                "телефон": phone,
+                "клиент": name if name and name != phone else "",
+                "ссылка_на_сделку": alerts.lead_link(lead_id),
+            },
         )
-        logger.info(
-            "UIS пропущенный: алерт %s (тел=%s lead=%s call=%s)",
-            "отправлен" if ok else "НЕ отправлен", phone or "—", lead_id or "—", call_id or "—",
-        )
+        if d is None:
+            logger.info("UIS пропущенный: событие выключено в панели (call=%s)", call_id or "—")
+        else:
+            ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
+            logger.info(
+                "UIS пропущенный: алерт %s (тел=%s lead=%s call=%s)",
+                "отправлен" if ok else "НЕ отправлен", phone or "—", lead_id or "—", call_id or "—",
+            )
         _watch_callback(lead_id, phone, name, responsible_id)
     except Exception:
         logger.exception("UIS пропущенный: ошибка обработки (call=%s)", params.get("call_session_id"))
@@ -211,10 +223,24 @@ async def _sweep_callbacks() -> None:
             _callback_pending.pop(lead_id, None)
             if back:
                 continue
-            ok = await telegram_bot.send_alert(
-                _build_escalation(lead_id, st, int(age // 60)),
+            waited_min = int(age // 60)
+            who = (st.get("name") or "").strip()
+            d = alerts.decide(
+                "missed_call_no_callback",
+                legacy_text=_build_escalation(lead_id, st, waited_min),
                 parse_mode="HTML", chat_id=ROP_CHAT_ID,
+                values={
+                    "сколько_ждали": _waited_words(waited_min),
+                    "ответственный": manager_name(st.get("responsible_id")),
+                    "клиент": who if who and who != st.get("phone") else "",
+                    "телефон": st.get("phone") or "",
+                    "ссылка_на_сделку": alerts.lead_link(lead_id),
+                },
             )
+            if d is None:
+                logger.info("UIS перезвон: эскалация выключена в панели (сделка %s)", lead_id)
+                continue
+            ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
             logger.info(
                 "UIS перезвон: эскалация %s (сделка %s, %s мин без перезвона)",
                 "отправлена" if ok else "НЕ отправлена", lead_id, int(age // 60),
@@ -223,10 +249,15 @@ async def _sweep_callbacks() -> None:
             logger.exception("UIS перезвон: ошибка проверки сделки %s", lead_id)
 
 
+def _waited_words(waited_min: int) -> str:
+    """«47 минут» до полутора часов, дальше «2 часа» - одно правило и для текста из кода,
+    и для переменной {{сколько_ждали}} шаблона из панели."""
+    return f"{waited_min} минут" if waited_min < 90 else f"{waited_min / 60:.0f} часа"
+
+
 def _build_escalation(lead_id, st: dict, waited_min: int) -> str:
     """Текст руководству: факт и виновник, без тегов и без ID (правило Кати 03.08.2026)."""
-    hours = waited_min / 60
-    waited = f"{waited_min} минут" if waited_min < 90 else f"{hours:.0f} часа"
+    waited = _waited_words(waited_min)
     lines = [
         f"🚨 Клиенту не перезвонили {waited}",
         f"Менеджер: {_esc(manager_name(st.get('responsible_id')))}",

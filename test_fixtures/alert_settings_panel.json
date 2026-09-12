@@ -1,0 +1,160 @@
+{
+  "events": {
+    "missed_call": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "🔴 ПРОПУЩЕННЫЙ звонок — срочно связаться с клиентом\n{{теги}}\n📞 {{телефон}}\n👤 {{клиент}}\n🔗 {{ссылка_на_сделку}}",
+      "recipients_mode": "shift",
+      "recipients": []
+    },
+    "wazzup_no_reply": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "⏳ Клиент ждёт ответа {{сколько_ждали}}+ мин — ответьте\n{{теги}}\n💬 {{канал}} {{клиент}}\n📞 {{телефон}}\n{{сообщение}}\n🔗 {{ссылка_на_сделку}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "academy_lead": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "🎓 Новый лид в Академии\n{{теги}}\n📞 {{телефон}}\n👤 {{клиент}}\n📝 {{сделка}}\n🔗 {{ссылка_на_сделку}}",
+      "recipients_mode": "listed",
+      "recipients": []
+    },
+    "academy_lead_burst": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "🎓 Лидов в Академию за час пришло больше {{лимит}}, дальше уведомления приглушены до конца часа. Похоже на массовый перенос сделок, стоит заглянуть в воронку.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "showroom_pickup": {
+      "enabled": true,
+      "channel": "op_showroom",
+      "template": "🏬 Новый заказ с самовывозом\n{{теги}}\n👤 {{клиент}}\n📦 {{состав}}\n🚚 {{доставка}}\n💰 {{сумма}} ₽\n🔗 {{ссылка_на_сделку}}",
+      "recipients_mode": "listed",
+      "recipients": []
+    },
+    "ozon_invoice_failed": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "⚠️ {{причина}}\n{{сделка}}\n{{ссылка_на_сделку}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "ozon_invoice_stale": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "⏳ Счёт висит без оплаты {{сколько_ждали}} (статус Ozon: {{статус_оплаты}})\n{{сделка}}\n{{ссылка_на_сделку}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "ozon_invoice_rejected": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "❌ Оплата отклонена, счёт не оплачен {{сколько_ждали}}\n{{сделка}}\n{{ссылка_на_сделку}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "office_transfer_stuck": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "🚨 Сделка застряла в УР/ЗНР дольше {{сколько_ждали}}, автоперенос не удался — нужна ручная проверка.\n{{сделка}}\n{{ссылка_на_сделку}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "office_transfer_bad_fill": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "⚠️ {{причина}}\n{{сделка}}\n{{ссылка_на_сделку}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "lead_not_distributed": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "🚨 Сделка не распределяется дольше {{сколько_ждали}} — нужна ручная проверка.\n{{сделка}}\n{{ссылка_на_сделку}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "autopilot_event": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "🤖 Авто-режим\n{{текст_события}}\n{{теги}}",
+      "recipients_mode": "responsible",
+      "recipients": []
+    },
+    "missed_call_no_callback": {
+      "enabled": true,
+      "channel": "rop",
+      "template": "🚨 Клиенту не перезвонили {{сколько_ждали}}\nМенеджер: {{ответственный}}\nКлиент: {{клиент}}\nТелефон: {{телефон}}\n\n{{ссылка_на_сделку}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "wazzup_no_reply_escalation": {
+      "enabled": true,
+      "channel": "rop",
+      "template": "🚨 Клиенту не ответили {{сколько_ждали}} минут\nМенеджер: {{ответственный}}\nКлиент: {{клиент}}\nКанал: {{канал}}\n\n{{сообщение}}\n\n{{ссылка_на_сделку}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "new_lead_untaken": {
+      "enabled": true,
+      "channel": "rop",
+      "template": "🚨 Новый лид не взяли в работу {{сколько_ждали}}\nОтветственный: {{ответственный}}\nСделка: {{сделка}}\n\n{{ссылка_на_сделку}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "ozon_invoice_escalation": {
+      "enabled": true,
+      "channel": "ozon_escalation",
+      "template": "🚨 Счёт без оплаты {{сколько_ждали}}\n{{сделка}}\n{{ссылка_на_сделку}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "wazzup_undelivered": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "🚫 Сообщение НЕ отправлено\n💬 {{канал}}, {{клиент}}\n📞 {{телефон}}\n👤 отправил: {{отправитель}}\n⚠️ {{ошибка}}\n{{сообщение}}\n🔗 {{ссылка_на_сделку}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "order_watchdog_digest": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "⚠️ Заказы с сайта не доехали до МойСклада\n{{сколько_ещё}}\nСделки в amoCRM по таким заказам тоже нет — она создаётся уже из МойСклада.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "amgroup_duplicate": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "Похоже, задвоилась сделка по заказу, возможно, ожил amgroup поверх нашего протеза.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "autopilot_failure": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "🤖 Авто-режим\n{{текст_поломки}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    }
+  },
+  "people": [
+    {
+      "name": "Егор Константинов",
+      "handle": "@egorkonsss",
+      "tg_user_id": null,
+      "amo_user_id": 13929334,
+      "mention": "@egorkonsss"
+    },
+    {
+      "name": "Оанча Игорь",
+      "handle": "@thebarsa1",
+      "tg_user_id": null,
+      "amo_user_id": 9291546,
+      "mention": "@thebarsa1"
+    }
+  ]
+}

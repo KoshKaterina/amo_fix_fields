@@ -52,6 +52,7 @@ import os
 
 import amo_service
 import telegram_bot
+import alerts
 from waybill_config import (
     AMGROUP_DUP_WATCH_DRY_RUN,
     AMGROUP_DUP_WATCH_ENABLED,
@@ -343,7 +344,12 @@ async def _report(fresh: list[tuple[list[dict], str]]) -> bool:
         )
         return True
 
-    ok = await telegram_bot.send_alert(text)
+    # Пары дублей перечисляет код; панель решает только выключатель и чат (keep_text).
+    d = alerts.decide("amgroup_duplicate", legacy_text=text, values={}, keep_text=True)
+    if d is None:
+        logger.info("Сторож дублей amgroup: уведомление выключено в панели (%s пар)", len(fresh))
+        return True
+    ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
     logger.warning(
         "Сторож дублей amgroup: %s пар(ы), сообщение %s",
         len(fresh), "отправлено" if ok else "НЕ отправлено",

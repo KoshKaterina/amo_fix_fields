@@ -48,6 +48,7 @@ import httpx
 
 import amo_service
 import telegram_bot
+import alerts
 from api import BASE_URL
 from waybill_config import (
     TEAM_INGEST_TOKEN,
@@ -566,7 +567,15 @@ async def _alert(message_id: str, info: dict, error: dict | None) -> None:
                 )
             return
 
-        await _send(_build_message(info, error, lead_id))
+        d = alerts.decide(
+            "wazzup_undelivered", legacy_text=_build_message(info, error, lead_id),
+            parse_mode="HTML", chat_id=WAZZUP_DELIVERY_CHAT_ID, thread_id=WAZZUP_DELIVERY_THREAD_ID,
+            values=_template_values(info, error, lead_id),
+        )
+        if d is None:
+            logger.info("Wazzup доставка: алерт выключен в панели (сообщение %s)", message_id)
+            return
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
         logger.info(
             "Wazzup доставка: алерт об ошибке по сообщению %s, беседа %s",
             message_id, info.get("chat_id") or "—",
@@ -692,6 +701,28 @@ async def _resolve_lead(query: str):
 
 def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _template_values(info: dict, error: dict | None, lead_id) -> dict:
+    """Значения переменных для шаблона из панели - те же куски, что кладёт _build_message."""
+    author = info.get("author_name") or ""
+    code = str((error or {}).get("error") or "").strip()
+    desc = str((error or {}).get("description") or "").strip()
+    hint = _ERROR_HINTS.get(code, "") if error else ""
+    err = ""
+    if error:
+        err = code or "ошибка"
+        if hint or desc:
+            err += f" — {hint or desc}"
+    return {
+        "канал": info.get("chat_type") or "",
+        "клиент": info.get("contact_name") or "",
+        "телефон": info.get("chat_id") or info.get("contact_phone") or "",
+        "отправитель": ("автоматика amo" if author.lower() == "admin" else author) if author else "",
+        "ошибка": err,
+        "сообщение": f"«{info['text']}»" if info.get("text") else "",
+        "ссылка_на_сделку": alerts.lead_link(lead_id),
+    }
 
 
 def _build_message(info: dict, error: dict | None, lead_id) -> str:
