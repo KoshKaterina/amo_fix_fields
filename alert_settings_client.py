@@ -104,6 +104,19 @@ def get_people() -> list[dict[str, Any]]:
     return [p for p in people if isinstance(p, dict)] if isinstance(people, list) else []
 
 
+def person_by_amo_id(amo_user_id) -> dict[str, Any] | None:
+    """Сотрудник панели по номеру пользователя amoCRM - с ником. Нет такого или ник не
+    заполнен - None: тогда тег считает код по своей карте, как сегодня."""
+    try:
+        uid = int(amo_user_id)
+    except (TypeError, ValueError):
+        return None
+    for p in get_people():
+        if p.get("amo_user_id") == uid and p.get("handle"):
+            return p
+    return None
+
+
 def is_fresh(max_age_s: float) -> bool:
     """Отвечала ли панель за последние N секунд - чтобы честно сказать «настройки не
     забирались с 14:32», а не делать вид, что всё в порядке."""

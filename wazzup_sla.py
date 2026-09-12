@@ -378,6 +378,8 @@ async def _sweep(threshold_s: int) -> None:
             d = alerts.decide(
                 "wazzup_no_reply", legacy_text=text, parse_mode="HTML",
                 chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+                # Самовывоз ведёт шоурум: ответственного не передаём, остаётся тег Кати-офис.
+                responsible_id=None if pickup else st.get("responsible_id"),
                 values={
                     "сколько_ждали": int(wait_s // 60),
                     "теги": mentions,

@@ -472,6 +472,7 @@ async def _stale_alert(lead: dict, state: dict) -> None:
             f"{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}"
         ),
         chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        responsible_id=lead.get("responsible_user_id"),
         values={
             "сколько_ждали": f"{int(age_min)} мин",
             "сделка": lead.get("name") or "",
@@ -526,6 +527,7 @@ async def _notify_fill_problem(lead: dict, tag: str, note: str, alert: str, outc
         "office_transfer_bad_fill",
         legacy_text=f"⚠️ {alert}\n{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
         chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        responsible_id=lead.get("responsible_user_id"),
         values={
             "причина": alert,
             "сделка": lead.get("name") or "",

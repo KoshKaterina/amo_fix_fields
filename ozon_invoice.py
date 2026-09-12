@@ -329,6 +329,7 @@ async def _fail(lead: dict, reason: str, detail: str = "") -> None:
         "ozon_invoice_failed",
         legacy_text=f"⚠️ {reason}\n{name}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
         chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        responsible_id=lead.get("responsible_user_id"),
         values={
             "причина": reason,
             "сделка": lead.get("name") or "",
@@ -873,6 +874,7 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
         "ozon_invoice_rejected" if rejected else "ozon_invoice_stale",
         legacy_text=text,
         chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        responsible_id=lead.get("responsible_user_id"),
         values={
             "сколько_ждали": _human_age(age_min),
             "статус_оплаты": status or "неизвестен",
@@ -903,6 +905,7 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
                 f"{title}\n{AMO_LEAD_URL.format(lead_id)}"
             ),
             chat_id=OZON_STALE_ESCALATE_CHAT_ID or None, lead=lead,
+            responsible_id=lead.get("responsible_user_id"),
             values={
                 "сколько_ждали": _human_age(age_min),
                 "сделка": lead.get("name") or "",

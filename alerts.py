@@ -28,9 +28,11 @@
 - Номер чата панель не знает: она отдаёт ключ канала, соответствие «ключ → чат и топик»
   живёт только здесь, в `_destination`.
 
-Получатели. Панель отдаёт режим: `responsible` - как сегодня решает сендер (он передаёт
-свои теги в `values["теги"]`); `listed` - ники из панели; `shift` - вся смена;
-`nobody` - без тегов (строка с тегами выпадает из текста).
+Получатели. Панель отдаёт режим: `responsible` - ник ответственного из карточки сотрудника
+в панели (сендер передаёт `responsible_id=`), нет его там - сегодняшние теги сендера из
+`values["теги"]` со всем их фолбэком «не нашёлся → вся смена»; `listed` - ники из панели
+(ни у кого нет ника → теги сендера); `shift` - вся смена; `nobody` - без тегов (строка с
+тегами выпадает из текста). Пустым тег не остаётся никогда, кроме прямого «никого».
 
 Поля сделки `{{amo.<id>}}` подставляются, только если сендер передал `lead=` - словарь
 сделки из amo с `custom_fields_values`. Не передал - поле пустое, строка с ним выпадает.
@@ -98,21 +100,36 @@ def _destination(channel_key: str | None) -> tuple[int | str | None, int | None]
     return None
 
 
-def _tags(cfg: dict[str, Any], values: dict[str, Any]) -> str:
+def _tags(event_key: str, cfg: dict[str, Any], values: dict[str, Any], responsible_id) -> str:
+    """Строка тегов по режиму получателей из панели.
+
+    Тег не бывает пустым иначе как по прямому выбору «никого»: везде, где панель не может
+    назвать человека, подставляются сегодняшние теги сендера (`values["теги"]`) - а в них
+    уже зашит фолбэк кода «ответственный не нашёлся → вся смена».
+    """
+    legacy = str(values.get("теги") or "")
     mode = cfg.get("recipients_mode") or "responsible"
     if mode == "listed":
         handles = [str(r.get("handle")) for r in (cfg.get("recipients") or []) if r.get("handle")]
+        if not handles:
+            logger.warning("alerts: %s - в панели «названным», но ни у кого нет ника; тегаем как код", event_key)
+            return legacy
         return " ".join(handles)
     if mode == "shift":
         return tg_recipients.MANAGERS_ON_SHIFT
     if mode == "nobody":
         return ""
-    return str(values.get("теги") or "")
+    # «Ответственному за сделку»: ник берём из карточки сотрудника в панели (Катя правит его
+    # там), а карта в коде остаётся запасным путём - для тех, кого в панели нет.
+    person = settings_client.person_by_amo_id(responsible_id) if responsible_id is not None else None
+    if person:
+        return str(person["handle"])
+    return legacy
 
 
 def _from_panel(
     event_key: str, cfg: dict[str, Any], values: dict[str, Any], lead: dict | None,
-    keep_text: bool, legacy: Decision,
+    keep_text: bool, legacy: Decision, responsible_id=None,
 ) -> Decision | None:
     if cfg.get("enabled") is False:
         return None
@@ -125,7 +142,7 @@ def _from_panel(
         # только выключателем и чатом.
         return Decision(legacy.text, dest[0], dest[1], legacy.parse_mode, "panel")
     vals = dict(values)
-    vals["теги"] = _tags(cfg, values)
+    vals["теги"] = _tags(event_key, cfg, values, responsible_id)
     try:
         text = alert_templates.render(str(cfg.get("template") or ""), vals, lead=lead)
     except alert_templates.UnknownVariable as e:
@@ -143,12 +160,14 @@ def _from_panel(
 def decide(
     event_key: str, *, legacy_text: str, values: dict[str, Any],
     chat_id: int | str | None = None, thread_id: int | None = None, parse_mode: str | None = None,
-    lead: dict | None = None, keep_text: bool = False,
+    lead: dict | None = None, keep_text: bool = False, responsible_id=None,
 ) -> Decision | None:
     """Что и куда слать. None - не слать (выключено в панели или её чат не настроен).
 
     `legacy_text`, `chat_id`, `thread_id`, `parse_mode` - то, что сендер послал бы сегодня.
     `values` - значения переменных шаблона; `values["теги"]` - сегодняшние теги сендера.
+    `responsible_id` - ответственный по сделке в amoCRM: в режиме «ответственному» его ник
+    берётся из карточки сотрудника в панели, нет там - остаются теги сендера.
     `keep_text=True` - текст остаётся кодовым, панель решает только выключатель и чат.
     """
     legacy = Decision(legacy_text, chat_id, thread_id, parse_mode, "legacy")
@@ -158,7 +177,7 @@ def decide(
     cfg = settings_client.get_event(event_key)
     if cfg is None:
         return legacy
-    panel = _from_panel(event_key, cfg, values, lead, keep_text, legacy)
+    panel = _from_panel(event_key, cfg, values, lead, keep_text, legacy, responsible_id)
     if mode == "shadow":
         if panel is None:
             logger.info("alerts[shadow] %s: панель велела бы НЕ слать; шлём как раньше", event_key)
