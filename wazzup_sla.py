@@ -43,6 +43,7 @@ import httpx
 import amo_service
 import sla_filter
 import telegram_bot
+import alerts
 from api import BASE_URL
 from waybill_config import (
     DELIVERY_PICKUP_MARKERS,
@@ -374,10 +375,27 @@ async def _sweep(threshold_s: int) -> None:
             # Самовывоз ведёт шоурум — тегаем только Катю-офис, смену не будим.
             mentions = SLA_PICKUP_TAG if pickup else mentions_for(st.get("responsible_id"))
             text = _build_message(st, lead_id, mentions, int(wait_s // 60), pickup)
-            ok = await telegram_bot.send_alert(
-                text, parse_mode="HTML",
-                chat_id=NOTIFY_CHAT_ID, message_thread_id=NOTIFY_THREAD_ID,
+            d = alerts.decide(
+                "wazzup_no_reply", legacy_text=text, parse_mode="HTML",
+                chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+                values={
+                    "сколько_ждали": int(wait_s // 60),
+                    "теги": mentions,
+                    "канал": st.get("chat_type") or "",
+                    "клиент": st.get("contact_name") or "",
+                    "телефон": st.get("chat_id") or "",
+                    "сообщение": f"«{st['text']}»" if st.get("text") else "",
+                    "ссылка_на_сделку": alerts.lead_link(lead_id),
+                },
             )
+            if d is None:
+                # Выключено в панели: ожидание считаем отработанным, эскалация - своё событие.
+                st["alerted"] = True
+                logger.info("Wazzup SLA: алерт выключен в панели (беседа %s)", st["chat_id"])
+                continue
+            if pickup and d.source == "panel":
+                d = alerts.with_line_after_head(d, "🏬 самовывоз — клиент едет за заказом сам")
+            ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
             st["alerted"] = True
             logger.info(
                 "Wazzup SLA: алерт %s (беседа %s lead=%s, порог %s мин%s)",
@@ -409,11 +427,23 @@ async def _escalate(key, st: dict, age_s: float) -> None:
         return
 
     st["escalated"] = True
-    ok = await telegram_bot.send_alert(
-        _build_escalation(st, int(age_s // 60)),
-        parse_mode="HTML",
-        chat_id=ROP_CHAT_ID,
+    wait_min = int(age_s // 60)
+    d = alerts.decide(
+        "wazzup_no_reply_escalation", legacy_text=_build_escalation(st, wait_min),
+        parse_mode="HTML", chat_id=ROP_CHAT_ID,
+        values={
+            "сколько_ждали": wait_min,
+            "ответственный": manager_name(st.get("responsible_id")),
+            "клиент": st.get("contact_name") or "клиент без имени в карточке",
+            "канал": st.get("chat_type") or "",
+            "сообщение": f"«{st['text']}»" if st.get("text") else "",
+            "ссылка_на_сделку": alerts.lead_link(st.get("lead_id")),
+        },
     )
+    if d is None:
+        logger.info("Wazzup SLA: эскалация выключена в панели (беседа %s)", st.get("chat_id"))
+        return
+    ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
     logger.info(
         "Wazzup SLA: эскалация %s (беседа %s, %s мин без ответа)",
         "отправлена" if ok else "НЕ отправлена", st.get("chat_id"), int(age_s // 60),

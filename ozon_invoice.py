@@ -33,6 +33,7 @@ import time
 import httpx
 
 import amo_service
+import alerts
 import ms_client
 import telegram_bot
 import tg_recipients
@@ -324,11 +325,19 @@ async def _fail(lead: dict, reason: str, detail: str = "") -> None:
     await amo_service.add_tag(lead_id, TAG_INVOICE_ERROR)
     await amo_service.add_note(lead_id, note)
     mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
-    await telegram_bot.send_alert(
-        f"⚠️ {reason}\n{name}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+    d = alerts.decide(
+        "ozon_invoice_failed",
+        legacy_text=f"⚠️ {reason}\n{name}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
+        chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        values={
+            "причина": reason,
+            "сделка": lead.get("name") or "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "теги": mentions,
+        },
     )
+    if d is not None:
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
 async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
@@ -347,12 +356,22 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     if not lead:
         # Сделку не прочитать (amo недоступен?) — молчать нельзя: клиент ждёт
         # ссылку. Алерт на всю смену (ответственного не знаем).
-        await telegram_bot.send_alert(
-            f"⚠️ Не удалось создать СБП-счёт: сделка {lead_id} не прочиталась из amo\n"
-            f"{AMO_LEAD_URL.format(lead_id)}\n{tg_recipients.MANAGERS_ON_SHIFT}",
-            chat_id=tg_recipients.NOTIFY_CHAT_ID,
-            message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        d = alerts.decide(
+            "ozon_invoice_failed",
+            legacy_text=(
+                f"⚠️ Не удалось создать СБП-счёт: сделка {lead_id} не прочиталась из amo\n"
+                f"{AMO_LEAD_URL.format(lead_id)}\n{tg_recipients.MANAGERS_ON_SHIFT}"
+            ),
+            chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID,
+            values={
+                "причина": "Не удалось создать СБП-счёт: сделка не прочиталась из amo",
+                "сделка": "",
+                "ссылка_на_сделку": alerts.lead_link(lead_id),
+                "теги": tg_recipients.MANAGERS_ON_SHIFT,
+            },
         )
+        if d is not None:
+            await telegram_bot.send_alert(d.text, **d.send_kwargs())
         return "failed-lead-read"
 
     # Сделка могла уехать с этапа, пока задача ждала в очереди — не слать.
@@ -850,11 +869,22 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
         f"{title}\n"
         f"{AMO_LEAD_URL.format(lead_id)}\n{mentions}"
     )
-    await telegram_bot.send_alert(
-        text,
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+    d = alerts.decide(
+        "ozon_invoice_rejected" if rejected else "ozon_invoice_stale",
+        legacy_text=text,
+        chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        values={
+            "сколько_ждали": _human_age(age_min),
+            "статус_оплаты": status or "неизвестен",
+            "сделка": lead.get("name") or "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "теги": mentions,
+        },
     )
+    if d is not None:
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
+    else:
+        logger.info("ozon: напоминание по сделке %s выключено в панели", lead_id)
     _stale_alerted[lead_id] = time.time()
     try:
         await amo_service.add_note(
@@ -865,15 +895,26 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
     # Трое суток без оплаты → отдельно руководителю (решение встречи 30.07.2026).
     # Пока чат Саши не заведён, OZON_STALE_ESCALATE_CHAT_ID пуст и эскалация молчит:
     # тегать его в общем чате нельзя, это прямо оговорено.
-    if escalate and OZON_STALE_ESCALATE_CHAT_ID:
-        await telegram_bot.send_alert(
-            f"🚨 Счёт без оплаты {_human_age(age_min)}\n"
-            f"{title}\n{AMO_LEAD_URL.format(lead_id)}",
-            chat_id=OZON_STALE_ESCALATE_CHAT_ID,
+    if escalate:
+        d = alerts.decide(
+            "ozon_invoice_escalation",
+            legacy_text=(
+                f"🚨 Счёт без оплаты {_human_age(age_min)}\n"
+                f"{title}\n{AMO_LEAD_URL.format(lead_id)}"
+            ),
+            chat_id=OZON_STALE_ESCALATE_CHAT_ID or None, lead=lead,
+            values={
+                "сколько_ждали": _human_age(age_min),
+                "сделка": lead.get("name") or "",
+                "ссылка_на_сделку": alerts.lead_link(lead_id),
+            },
         )
-    elif escalate:
-        logger.info("ozon: сделка %s висит %s — эскалация не настроена "
-                    "(OZON_STALE_ESCALATE_CHAT_ID пуст)", lead_id, _human_age(age_min))
+        # Как и раньше: без своего чата эскалация молчит, а не падает в технический.
+        if d is None or (d.source == "legacy" and not OZON_STALE_ESCALATE_CHAT_ID):
+            logger.info("ozon: сделка %s висит %s — эскалация не настроена или выключена",
+                        lead_id, _human_age(age_min))
+        else:
+            await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
 async def _reconcile_once() -> str:

@@ -35,6 +35,7 @@ from collections import deque
 
 import amo_service
 import telegram_bot
+import alerts
 from api import BASE_URL
 from tg_recipients import NOTIFY_CHAT_ID, SHOWROOM_ALERT_THREAD_ID, SHOWROOM_ALERT_TAG
 from waybill_config import (
@@ -170,10 +171,22 @@ async def _apply(lead_id, delivery_type) -> None:
         price = lead.get("price")
 
         text = _build_message(lead_id, client, composition, delivery, price)
-        ok = await telegram_bot.send_alert(
-            text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, message_thread_id=SHOWROOM_ALERT_THREAD_ID,
+        d = alerts.decide(
+            "showroom_pickup", legacy_text=text, parse_mode="HTML",
+            chat_id=NOTIFY_CHAT_ID, thread_id=SHOWROOM_ALERT_THREAD_ID, lead=lead,
+            values={
+                "теги": SHOWROOM_ALERT_TAG,
+                "клиент": client or "",
+                "состав": composition or "",
+                "доставка": delivery or "",
+                "сумма": price or "",
+                "ссылка_на_сделку": alerts.lead_link(lead_id),
+            },
         )
+        if d is None:
+            logger.info("Шоурум-алерт: событие выключено в панели (сделка %s)", lead_id)
+            return
+        ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
         logger.info(
             "Шоурум-алерт: %s (сделка %s, клиент %s, доставка %s)",
             "отправлен" if ok else "НЕ отправлен", lead_id, client or "—", delivery or "—",

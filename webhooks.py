@@ -20,6 +20,7 @@ import dup_autoclose
 import jivo_service
 import lead_distribution
 import lead_distribution_profiles_client
+import alert_settings_client
 import metrika_sync
 import migration_freeze
 import autopilot
@@ -107,6 +108,8 @@ async def lifespan(app):
     lead_distribution_profiles_client.start()
     await lead_distribution.init()
     team_panel_client.start()
+    # Настройки уведомлений из панели: без ALERT_SETTINGS_FROM_PANEL ничего не опрашивает.
+    alert_settings_client.start()
     await showroom_store.init()
     await order_watchdog.init()
     await uis_missed_call.init()
@@ -138,6 +141,7 @@ async def lifespan(app):
     await autopilot.shutdown()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
+    await alert_settings_client.stop()
     await team_panel_client.stop()
     await lead_distribution_profiles_client.stop()
     await ozon_invoice.aclose()

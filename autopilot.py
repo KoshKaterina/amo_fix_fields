@@ -41,6 +41,7 @@ import autopilot_settings_client as settings_client
 import autopilot_store as store
 import ms_client
 import telegram_bot
+import alerts
 from tg_recipients import NOTIFY_CHAT_ID, NOTIFY_THREAD_ID, mentions_for
 from waybill_config import (
     AUTOPILOT_ENABLED,
@@ -157,13 +158,13 @@ def reset_hour_bucket() -> None:
 
 # ── алерты и журнал ─────────────────────────────────────────────────────────────
 
-def _send_bg(text: str, *, chat_id=None, thread_id=None) -> None:
+def _send_bg(text: str, *, chat_id=None, thread_id=None, parse_mode=None) -> None:
     """Отправка в фоне: алерт не должен задерживать разбор вебхука, а сбой Телеграма не
     должен ронять ведение сделки. Ссылку на задачу держим, иначе сборщик мусора может
     забрать её на полпути - тот же приём, что у `ozon_invoice._init_tasks`.
     """
     task = asyncio.create_task(
-        telegram_bot.send_alert(text, chat_id=chat_id, message_thread_id=thread_id)
+        telegram_bot.send_alert(text, chat_id=chat_id, message_thread_id=thread_id, parse_mode=parse_mode)
     )
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
@@ -171,7 +172,14 @@ def _send_bg(text: str, *, chat_id=None, thread_id=None) -> None:
 
 def alert_tech(text: str) -> None:
     """Наши поломки - в технический чат (адресат по умолчанию у `send_alert`)."""
-    _send_bg("🤖 Авто-режим" + chr(10) + text)
+    d = alerts.decide(
+        "autopilot_failure", legacy_text="🤖 Авто-режим" + chr(10) + text,
+        values={"текст_поломки": text},
+    )
+    if d is None:
+        logger.info("Авто-режим: уведомление о поломке выключено в панели")
+        return
+    _send_bg(d.text, chat_id=d.chat_id, thread_id=d.thread_id, parse_mode=d.parse_mode)
 
 
 def alert_op(text: str, responsible_id=None) -> None:
@@ -202,6 +210,7 @@ def alert_op(text: str, responsible_id=None) -> None:
         _send_bg("🤖 Авто-режим, " + label + chr(10) + text)
         return
     body = "🤖 Авто-режим" + chr(10) + text
+    mention = ""
     if responsible_id:
         try:
             mention = mentions_for(responsible_id)
@@ -209,7 +218,14 @@ def alert_op(text: str, responsible_id=None) -> None:
             mention = ""
         if mention:
             body = body + chr(10) + mention
-    _send_bg(body, chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID)
+    d = alerts.decide(
+        "autopilot_event", legacy_text=body, chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+        values={"текст_события": text, "теги": mention},
+    )
+    if d is None:
+        logger.info("Авто-режим: событие для менеджера выключено в панели")
+        return
+    _send_bg(d.text, chat_id=d.chat_id, thread_id=d.thread_id, parse_mode=d.parse_mode)
 
 
 # Ссылка в тексте алерта - html для Телеграма. Лента панели рендерит плоский текст,

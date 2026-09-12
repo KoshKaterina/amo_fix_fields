@@ -102,6 +102,7 @@ import logging
 import time
 
 import amo_service
+import alerts
 import migration_freeze
 import tg_recipients
 import telegram_bot
@@ -463,13 +464,23 @@ async def _stale_alert(lead: dict, state: dict) -> None:
     state["alerted"] = True
     lead_id = lead.get("id")
     mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
-    await telegram_bot.send_alert(
-        f"🚨 Сделка {lead_id} застряла в УР/ЗНР дольше {int(age_min)} мин, "
-        f"автоперенос не удался — нужна ручная проверка.\n"
-        f"{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+    d = alerts.decide(
+        "office_transfer_stuck",
+        legacy_text=(
+            f"🚨 Сделка {lead_id} застряла в УР/ЗНР дольше {int(age_min)} мин, "
+            f"автоперенос не удался — нужна ручная проверка.\n"
+            f"{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}"
+        ),
+        chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        values={
+            "сколько_ждали": f"{int(age_min)} мин",
+            "сделка": lead.get("name") or "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "теги": mentions,
+        },
     )
+    if d is not None:
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
 async def _fail(lead: dict, reason: str) -> None:
@@ -511,11 +522,19 @@ async def _notify_fill_problem(lead: dict, tag: str, note: str, alert: str, outc
     await amo_service.add_tag(lead_id, tag)
     await amo_service.add_note(lead_id, note)
     mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
-    await telegram_bot.send_alert(
-        f"⚠️ {alert}\n{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+    d = alerts.decide(
+        "office_transfer_bad_fill",
+        legacy_text=f"⚠️ {alert}\n{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
+        chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        values={
+            "причина": alert,
+            "сделка": lead.get("name") or "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "теги": mentions,
+        },
     )
+    if d is not None:
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
     return outcome
 
 

@@ -45,6 +45,7 @@ from fractions import Fraction
 from typing import Any
 
 import amo_service
+import alerts
 import lead_distribution_log_client
 import lead_distribution_profiles_client
 import team_panel_client
@@ -786,12 +787,22 @@ async def _stale_alert(lead: dict, state: dict) -> None:
     state["alerted"] = True
     lead_id = lead.get("id")
     mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
-    await telegram_bot.send_alert(
-        f"🚨 Сделка {lead_id} не распределяется дольше {int(age_min)} мин — нужна ручная проверка.\n"
-        f"{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
-        chat_id=tg_recipients.NOTIFY_CHAT_ID,
-        message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+    d = alerts.decide(
+        "lead_not_distributed",
+        legacy_text=(
+            f"🚨 Сделка {lead_id} не распределяется дольше {int(age_min)} мин — нужна ручная проверка.\n"
+            f"{lead.get('name') or ''}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}"
+        ),
+        chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        values={
+            "сколько_ждали": f"{int(age_min)} мин",
+            "сделка": lead.get("name") or "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "теги": mentions,
+        },
     )
+    if d is not None:
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
 async def _fail(lead: dict, reason: str) -> None:
