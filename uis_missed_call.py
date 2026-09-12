@@ -116,7 +116,7 @@ async def _apply(params: dict) -> None:
         text = _build_message(phone, name, lead_id, mentions)
         d = alerts.decide(
             "missed_call", legacy_text=text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+            chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID, responsible_id=responsible_id,
             values={
                 "теги": mentions,
                 "телефон": phone,

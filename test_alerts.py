@@ -194,6 +194,39 @@ def test_on_recipient_modes(mode, panel_doc):
     assert alerts.decide("academy_lead", legacy_text="", values={"теги": "@legacy"}).text == "x\ny"
 
 
+def test_on_responsible_handle_comes_from_panel_card(mode, panel_doc):
+    """«Ответственному»: ник из карточки сотрудника панели; нет его там - теги сендера
+    (с его же фолбэком на смену). Тег пустым не остаётся."""
+    mode("on")
+    tpl = "x\n{{теги}}\ny"
+    doc = _doc_with(panel_doc, "missed_call", template=tpl, recipients_mode="responsible")
+    doc["people"] = [{"name": "Екатерина Зубалий", "handle": "@kathrina_bistraya",
+                      "tg_user_id": None, "amo_user_id": 13963494, "mention": "@kathrina_bistraya"}]
+    settings_client.set_settings_for_tests(doc)
+    legacy_tags = "@offf1cer @egorkonsss @kathrina_bistraya @thebarsa1"
+    d = alerts.decide("missed_call", legacy_text="", values={"теги": legacy_tags}, responsible_id=13963494)
+    assert d.text == "x\n@kathrina_bistraya\ny"
+    d = alerts.decide("missed_call", legacy_text="", values={"теги": legacy_tags}, responsible_id="13963494")
+    assert d.text == "x\n@kathrina_bistraya\ny"
+    # Ответственный не из панели (дефолтный на новом лиде) - фолбэк сендера, как сегодня.
+    d = alerts.decide("missed_call", legacy_text="", values={"теги": legacy_tags}, responsible_id=777)
+    assert d.text == "x\n" + legacy_tags + "\ny"
+    d = alerts.decide("missed_call", legacy_text="", values={"теги": legacy_tags}, responsible_id=None)
+    assert d.text == "x\n" + legacy_tags + "\ny"
+
+
+def test_on_listed_without_any_handle_falls_back_to_sender_tags(mode, panel_doc, caplog):
+    mode("on")
+    tpl = "x\n{{теги}}\ny"
+    doc = _doc_with(panel_doc, "academy_lead", template=tpl, recipients_mode="listed",
+                    recipients=[{"name": "Без ника", "handle": None, "amo_user_id": None}])
+    settings_client.set_settings_for_tests(doc)
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        d = alerts.decide("academy_lead", legacy_text="", values={"теги": "@gladkov_369"})
+    assert d.text == "x\n@gladkov_369\ny"
+    assert any("ни у кого нет ника" in r.getMessage() for r in caplog.records)
+
+
 def test_on_channel_without_chat_is_silent(mode, panel_doc, monkeypatch):
     mode("on")
     monkeypatch.setattr(tg_recipients, "ROP_CHAT_ID", None)

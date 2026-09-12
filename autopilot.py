@@ -218,7 +218,7 @@ def alert_op(text: str, responsible_id=None) -> None:
             body = body + chr(10) + mention
     d = alerts.decide(
         "autopilot_event", legacy_text=body, chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
-        values={"текст_события": text, "теги": mention},
+        responsible_id=responsible_id, values={"текст_события": text, "теги": mention},
     )
     if d is None:
         logger.info("Авто-режим: событие для менеджера выключено в панели")
