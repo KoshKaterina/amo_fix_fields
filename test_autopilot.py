@@ -961,10 +961,11 @@ def test_full_live_mode_has_no_whitelist():
 # ── инбокс без менеджера: уведомления в ленту панели ────────────────────────────
 
 def test_every_new_lead_wakes_the_panel_inbox_in_live(monkeypatch):
-    """Правка Кати 12.09.2026: в «Проде» КАЖДАЯ заявка на входе воронки поднимает
+    """Правка Кати 12.09.2026: на ПОЛНОМ проде КАЖДАЯ заявка на входе воронки поднимает
     уведомление в ленте панели - любого типа, до белого списка и условий ботов: без
     менеджера инбокс проверяет панель."""
-    _settings(settings={"mode": "live", "work_hours": []},
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": False},
               pipeline_id=10593102, entry_status_id=83537714,
               test_contact_ids=[], route=[_stage(83537714, "Новый лид", [_bot(7131)])])
     sent: list[dict] = []
@@ -1076,3 +1077,67 @@ def test_non_order_lead_is_left_alone_but_still_notifies(monkeypatch):
     assert len(sent) == 1
     assert "Резерв" in sent[0]["body"]
     assert ran == []
+
+
+# ── пилот: лента живёт только тест-контактами ───────────────────────────────────
+
+def test_pilot_notifies_only_whitelisted_leads(monkeypatch):
+    """Правка Кати 12.09.2026 (вечер): пока включён тумблер «На проде вести только
+    тестовые контакты», заявки НЕ из белого списка ленту не будят - живой поток не должен
+    шуметь, пока робот обкатывается. Заявка тест-контакта будит как раньше."""
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": True},
+              pipeline_id=10593102, entry_status_id=83537714,
+              test_contact_ids=[48595431],
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    A._lead_notified.clear()
+
+    async def fake_load_alien(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714,
+                     _embedded={"contacts": [{"id": 11111111}]})
+
+    monkeypatch.setattr(A, "load_lead", fake_load_alien)
+    asyncio.run(A.handle_lead_change(424245))
+    assert sent == []
+
+    async def fake_load_ours(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714,
+                     _embedded={"contacts": [{"id": 48595431}]})
+
+    monkeypatch.setattr(A, "load_lead", fake_load_ours)
+    monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop())
+    asyncio.run(A.handle_lead_change(424246))
+    assert len(sent) == 1
+    assert sent[0]["kind"] == "autopilot_lead"
+
+
+def test_pilot_engine_forwards_inbound_of_led_chat_to_the_feed(monkeypatch):
+    """В пилоте панель молчит про входящие (см. панельный inbox) - сообщение ведомого
+    чата доносит движок: чат нашёлся в его состоянии, значит контакт из белого списка.
+    Чужой чат в состоянии не находится - и в ленту не попадает."""
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": True},
+              test_contact_ids=[48595431])
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(A.store, "find_by_chat",
+                        lambda chat: [{"lead_id": 1, "status_id": 2, "phase": "done"}]
+                        if chat == "79956109902" else [])
+
+    async def run(chat_id):
+        await A._handle_message({
+            "messageId": "m-77", "chatId": chat_id, "chatType": "whatsapp",
+            "isEcho": False, "text": "Да, всё верно",
+            "contact": {"name": "Тиана", "phone": chat_id},
+        })
+
+    asyncio.run(run("79000000000"))
+    assert sent == []
+    asyncio.run(run("79956109902"))
+    assert len(sent) == 1
+    assert sent[0]["kind"] == "autopilot_inbox"
+    assert sent[0]["dedupe_key"] == "ap-inbox-m-77"
+    assert sent[0]["body"].startswith("Да")

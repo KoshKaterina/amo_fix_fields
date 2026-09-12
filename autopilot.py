@@ -1124,13 +1124,15 @@ async def handle_lead_change(lead_id: int) -> None:
         await on_payment_received(lead)
         return
 
-    # Инбокс без менеджера (Катя 12.09.2026): в режиме «Прод» КАЖДАЯ заявка на входе
-    # воронки поднимает уведомление в ленте панели - любого типа, до белого списка и
-    # до условий ботов: уведомление о заявке нужно человеку даже там, где робот сам
-    # ничего делать не будет. Дедуп на панели держит один вебхук-шторм за одну заявку,
-    # локальное множество бережёт панель от лишних запросов до конца жизни процесса.
+    # Инбокс без менеджера (Катя 12.09.2026): в режиме «Прод» заявка на входе воронки
+    # поднимает уведомление в ленте панели - любого типа, до условий ботов. На полном
+    # проде - КАЖДАЯ заявка; в ПИЛОТЕ (тумблер «На проде вести только тестовые
+    # контакты») - только заявки белого списка: пока робот обкатывается, лента не должна
+    # шуметь живым потоком (правка Кати 12.09.2026, вечер). Дедуп на панели держит один
+    # вебхук-шторм за одну заявку, локальное множество бережёт панель от лишних запросов.
     if (settings_client.get_mode() == "live"
             and status_id == (settings_client.get_entry_status_id() or 0)
+            and (limited_mode() != "пилот" or whitelist_ok(lead))
             and lead_id not in _lead_notified):
         _lead_notified.add(lead_id)
         if len(_lead_notified) > 5000:
@@ -1305,6 +1307,13 @@ async def _handle_message(message: dict) -> None:
             await record_delivery(row, status, chat_type)
         return
 
+    # Пилот прода: лента живёт только тест-контактами (правка Кати 12.09.2026, вечер).
+    # Панель в пилоте входящие не уведомляет вовсе (см. inbox.notify_inbound) - сообщение
+    # ведомого чата в ленту доносит движок: чат нашёлся в состоянии, значит контакт из
+    # белого списка. Дедуп тот же, что у панели, - на полном проде дубля не будет.
+    if not message.get("isEcho") and limited_mode() == "пилот":
+        _pilot_inbox_notify(message)
+
     # Входящее. Ответ клиента - сам по себе доказательство доставки: человек не отвечает на
     # сообщение, которого не видел. Поэтому ждущую доставки сделку он закрывает вместе с
     # ожиданием, не дожидаясь отдельного статуса от Wazzup.
@@ -1312,6 +1321,35 @@ async def _handle_message(message: dict) -> None:
     if row is None:
         return
     await on_client_answer(row, str(message.get("text") or ""), chat_type)
+
+
+def _pilot_inbox_notify(message: dict) -> None:
+    """Уведомление ленты о входящем сообщении ведомого чата - только в пилоте.
+
+    Формат повторяет панельный `inbox.message_notification`: тот же вид, тот же
+    `dedupe_key` по номеру сообщения - кто бы ни доносил, уведомление одно.
+    """
+    message_id = str(message.get("messageId") or "").strip()
+    if not message_id:
+        return
+    contact = message.get("contact") if isinstance(message.get("contact"), dict) else {}
+    name = str((contact or {}).get("name") or "").strip() or str(
+        message.get("chatId") or "клиент")
+    text = str(message.get("text") or "").strip()
+    msg_type = str(message.get("type") or "").strip()
+    if text:
+        body = text[:200]
+    elif msg_type and msg_type != "text":
+        body = f"вложение ({msg_type})"
+    else:
+        body = "сообщение без текста"
+    chat = _digits(message.get("chatId")) or str(message.get("chatId") or "")
+    panel_notify_bg(
+        kind="autopilot_inbox", level="warn",
+        title=f"Сообщение от {name}", body=body,
+        url=f"/contacts?q={chat}" if chat else None,
+        dedupe_key=f"ap-inbox-{message_id}",
+    )
 
 
 async def _handle_status(status: dict) -> None:
