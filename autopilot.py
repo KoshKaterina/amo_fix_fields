@@ -184,7 +184,7 @@ def alert_op(text: str, responsible_id=None) -> None:
     # УВЕДОМЛЕНИЯ полетело бы «клиент ответил...» по сделке с тестовым контактом.
     limited = limited_mode()
     if limited:
-        label = "ТЕСТОВЫЙ прогон" if limited == "тест" else "ПИЛОТ боевого режима"
+        label = "ТЕСТОВЫЙ прогон" if limited == "тест" else "ПИЛОТ прода"
         _send_bg("🤖 Авто-режим, " + label + chr(10) + text)
         return
     body = "🤖 Авто-режим" + chr(10) + text
