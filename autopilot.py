@@ -3,10 +3,11 @@
 Устройство целиком - `features/avtorezhim-op-roznica/DESIGN.md` в рабочей папке, разбор
 рисков - `REVIEW-zamysla.md` там же. Здесь только код, решения заново не переобъясняются.
 
-Что делает: ведёт сделку по этапам маршрута, настроенного в team-panel. На этапе запускает
-ботов, ждёт доставки сообщения и ответа клиента, а когда что-то идёт не так - останавливается
-и зовёт человека. В конце маршрута решает по способу оплаты, куда сделку двинуть, и передаёт
-её уже работающим модулям (`ozon_invoice`, `office_transfer`).
+Что делает: ведёт сделку по этапам маршрута, настроенного в team-panel, - и ТОЛЬКО сделку
+с типом заявки «Заказ», остальные не трогает. На этапе запускает ботов, ждёт доставки
+сообщения и ответа клиента, а когда что-то идёт не так - останавливается и зовёт человека.
+В конце маршрута решает по способу оплаты: наложка и оплаченный онлайн едут в успех (дальше
+сделку уводит `office_transfer`), неоплаченный онлайн остаётся на месте с красным алертом.
 
 Три вещи, без которых движок опасен, и все три здесь есть:
 
@@ -46,6 +47,7 @@ from waybill_config import (
     AUTOPILOT_HOURLY_CAP,
     AUTOPILOT_STATE_TTL_DAYS,
     AUTOPILOT_TICK_INTERVAL_S,
+    FIELD_APPLICATION_TYPE,
     FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_PAYMENT_METHOD,
     FIELD_PHONE,
@@ -888,9 +890,10 @@ async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None
                 reason="маршрут пройден, дальше сделку уводит перевод в офис")
         return
     nxt = next_stage(status_id)
-    # На этап запроса оплаты, как и в успех, по порядку карточек не переходим - только
-    # через развилку: в бою вход в «Оплату запрошену» выставляет клиенту счёт, и решение
-    # об этом не должно зависеть от того, как расставлены карточки.
+    # На этап запроса оплаты, как и в успех, по порядку карточек не переходим. Сам этап
+    # робот больше не использует (правка Кати 12.09.2026) - он остался в воронке для чужой
+    # автоматики; дошли до него по порядку карточек - значит маршрут пройден, слово за
+    # развилкой оплаты.
     pay_status = settings_client.get_payment_status_id() or STATUS_PAYMENT_REQUESTED
     if nxt is None or int(nxt.get("status_id") or 0) in (STATUS_SUCCESS, pay_status):
         await payment_fork(lead, stage, reason)
@@ -945,8 +948,9 @@ async def order_is_paid(order_uuid) -> bool | None:
     пляшет: `woocommerce-sklad` раз в три минуты обнуляет цену доставки по правилу «предоплата
     - доставка за наш счёт», и заказ мигает 387 → 0 → 387.
 
-    ⚠️ Молчание склада читать как «не оплачен» нельзя: оплаченному заказу тогда уйдёт ссылка
-    на оплату второй раз. Поэтому три исхода, и неизвестность останавливает робота.
+    ⚠️ Молчание склада читать как «не оплачен» нельзя: оплаченный заказ получил бы ложный
+    алерт «не оплачен», и человек пошёл бы разбирать исправный заказ. Поэтому три исхода -
+    у неизвестности своя честная причина остановки.
     """
     if not order_uuid:
         return None
@@ -965,101 +969,62 @@ async def order_is_paid(order_uuid) -> bool | None:
         return None
 
 
-def _payment_target() -> tuple[int, str]:
-    """Куда развилка отправляет неоплаченный онлайн-заказ.
-
-    Этап отдаёт панель - у неё карта соответствий воронок: в бою «Оплата запрошена»
-    (дальше счёт выставляет автоматика), в тестовой воронке «Оплата» - перевод форсится
-    и там (правка Кати 09.09.2026), чтобы прогон был виден движением сделки, а не
-    только строкой в журнале. Панель поле ещё не отдала (старый кэш) - боевая константа.
-    """
-    target = settings_client.get_payment_status_id() or STATUS_PAYMENT_REQUESTED
-    stage = settings_client.get_stage(target)
-    name = str((stage or {}).get("status_name") or "").strip()
-    return target, name or ("Оплата запрошена" if target == STATUS_PAYMENT_REQUESTED else "Оплата")
-
-
 async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
-    """Конец маршрута: куда сделку вести по способу оплаты и факту оплаты."""
-    lead_id = int(lead["id"])
+    """Конец маршрута: решаем по способу оплаты (правка Кати 12.09.2026).
+
+    Наложка (строго «При получении») едет в успех сразу - деньги возьмут при вручении,
+    дальше сделку уводит офисная автоматика. Онлайн-заказ обязан быть УЖЕ оплачен:
+    сверяемся с МойСкладом, оплачен - успех, не оплачен или неизвестно - сделка ОСТАЁТСЯ
+    на месте, человек получает красный алерт. Выставление счёта больше не наш ход: в
+    «Оплату запрошену» робот не ведёт никого, этап живёт для чужой автоматики.
+
+    Развилка одна на оба режима: у «Теста» здесь нет поблажек, кроме прощённого пустого
+    типа заявки выше по маршруту, - неоплаченный онлайн и там стоит на месте.
+    """
     method = amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD)
-    order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
-
-    # Сделка БЕЗ заказа МойСклада - это не «склад молчит», это «спрашивать не о чем».
-    # В бою такой сделки быть не должно (робот заведён под заказы) - останавливаемся и зовём.
-    # В тесте это норма: сделки заводятся руками, без заказа (правка Кати 09.09.2026) -
-    # наложку ведём в успех, ей факт оплаты не нужен, остальное честно завершаем.
-    if not order_uuid:
-        if settings_client.get_mode() == "test":
-            if is_cod_strict(method):
-                log_run(lead, stage, action="payment_fork", outcome="advanced",
-                        reason="оплата при получении, счёт не нужен")
-                await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
-                              "оплата при получении")
-                return
-            pay_status, pay_name = _payment_target()
-            if int(lead.get("status_id") or 0) == pay_status:
-                await asyncio.to_thread(
-                    store.finish, lead_id, pay_status, store.PHASE_DONE,
-                    "сделка на этапе запроса оплаты",
-                )
-                log_run(lead, stage, action="payment_fork", outcome="done",
-                        reason="сделка на этапе запроса оплаты, дальше не веду: счёт в тесте не выставляем")
-                return
-            log_run(lead, stage, action="payment_fork", outcome="advanced",
-                    reason="онлайн-оплата не поступила, перевожу на этап оплаты")
-            await move_to(lead, stage, pay_status, pay_name,
-                          "онлайн-оплата не поступила")
-            return
-        await stop_here(
-            lead, stage, "failed", "в сделке нет заказа МойСклада",
-            op_text="в сделке не заполнен заказ МойСклада, не могу проверить оплату, дальше не веду",
-        )
-        return
-
-    paid = await order_is_paid(order_uuid)
-
-    if paid is None and not is_cod_strict(method):
-        await stop_here(
-            lead, stage, "failed", "МойСклад не сказал, оплачен ли заказ",
-            op_text="не смог узнать в МойСкладе, оплачен ли заказ, дальше не веду",
-        )
-        return
-
-    if paid:
-        log_run(lead, stage, action="payment_fork", outcome="advanced", reason="заказ оплачен")
-        await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано", "заказ оплачен")
-        return
 
     if not str(method or "").strip():
         await stop_here(
             lead, stage, "stop_no_payment_method", "способ оплаты в сделке не заполнен",
-            op_text="способ оплаты не заполнен, не понимаю, чего ждать от клиента",
+            op_text="способ оплаты не заполнен, не понимаю, ждать ли оплату",
         )
         return
 
     if is_cod_strict(method):
         log_run(lead, stage, action="payment_fork", outcome="advanced",
-                reason="оплата при получении, счёт не нужен")
+                reason="оплата при получении, деньги возьмут при вручении")
         await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
                       "оплата при получении")
         return
 
-    # Онлайн и не оплачен - переводим на этап запроса оплаты. В бою дальше счёт
-    # выставляет уже работающая автоматика; в тесте счёта не будет, но перевод форсится
-    # (правка Кати 09.09.2026) - прогон должен быть виден движением сделки.
-    pay_status, pay_name = _payment_target()
-    if int(lead.get("status_id") or 0) == pay_status:
-        await asyncio.to_thread(
-            store.finish, lead_id, pay_status, store.PHASE_DONE, reason,
+    order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+    if not order_uuid:
+        # Онлайн-оплата, а сверяться не с чем. В бою такой сделки быть не должно (заказ
+        # создаёт интеграция), в тесте это ручная сделка - исход один: без подтверждённой
+        # оплаты в успех не ведём, сделка стоит где стояла, человек смотрит.
+        await stop_here(
+            lead, stage, "stop_unpaid", "в сделке нет заказа МойСклада, оплату не проверить",
+            op_text="онлайн-оплата, а заказа МойСклада в сделке нет - оплату не проверить, "
+                    "дальше не веду",
         )
-        log_run(lead, stage, action="payment_fork", outcome="done",
-                reason="сделка уже на этапе запроса оплаты, дальше не веду")
         return
-    log_run(lead, stage, action="payment_fork", outcome="advanced",
-            reason="онлайн-оплата не поступила, перевожу на этап оплаты")
-    await move_to(lead, stage, pay_status, pay_name,
-                  "онлайн-оплата не поступила")
+
+    paid = await order_is_paid(order_uuid)
+    if paid:
+        log_run(lead, stage, action="payment_fork", outcome="advanced",
+                reason="заказ оплачен, сверено с МойСкладом")
+        await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано", "заказ оплачен")
+        return
+    if paid is None:
+        await stop_here(
+            lead, stage, "failed", "МойСклад не сказал, оплачен ли заказ",
+            op_text="не смог узнать в МойСкладе, оплачен ли заказ, дальше не веду",
+        )
+        return
+    await stop_here(
+        lead, stage, "stop_unpaid", "онлайн-заказ не оплачен",
+        op_text="онлайн-заказ не оплачен - в успех не веду, посмотрите оплату",
+    )
 
 
 async def force_ur(lead: dict, stage: dict | None, note: str) -> None:
@@ -1090,6 +1055,23 @@ async def force_ur(lead: dict, stage: dict | None, note: str) -> None:
     )
 
 # ── точка входа: изменение сделки ───────────────────────────────────────────────
+
+def is_order(lead: dict) -> bool:
+    """Робот ведёт ТОЛЬКО сделки с типом заявки «Заказ» (правка Кати 12.09.2026).
+
+    Консультации, предзаказы, резервы - работа человека: их робот не трогает совсем, о
+    них говорит только уведомление о заявке в ленте. Сравнение - строгим равенством:
+    «Предзаказ» содержит слово «заказ», и поиск подстроки брал бы его в работу.
+
+    ⚠️ Пустой тип прощается только в «Тесте»: тестовые сделки заводятся руками, и
+    требовать от них заполненное поле значило бы не протестировать ничего. В бою заказ
+    создаёт интеграция, и тип у него заполнен всегда - пустое поле там означает НЕ заказ.
+    """
+    value = str(amo_service.get_custom_field_value(lead, FIELD_APPLICATION_TYPE) or "").strip()
+    if not value:
+        return settings_client.get_mode() == "test"
+    return value.casefold() == "заказ"
+
 
 def on_lead_change(lead_id) -> None:
     """Врезка в вебхук `/lead_change`. Синхронная и мгновенная: amoCRM ждёт быстрый ответ,
@@ -1137,13 +1119,22 @@ async def handle_lead_change(lead_id: int) -> None:
         _lead_notified.add(lead_id)
         if len(_lead_notified) > 5000:
             _lead_notified.clear()
+        app_type = str(amo_service.get_custom_field_value(
+            lead, FIELD_APPLICATION_TYPE) or "").strip()
         panel_notify_bg(
             kind="autopilot_lead", level="warn",
             title="Новая заявка в рознице",
-            body=str(lead.get("name") or "сделка без названия"),
+            body=str(lead.get("name") or "сделка без названия")
+            + ", тип: " + (app_type or "не указан"),
             url=AMO_LEAD_URL.format(lead_id),
             dedupe_key=f"ap-lead-{lead_id}",
         )
+
+    if not is_order(lead):
+        # Не заказ (консультация, предзаказ, резерв) - работа человека: робот такую
+        # сделку не трогает СОВСЕМ (Катя 12.09.2026). Уведомление о заявке выше уже
+        # ушло - этим «алертим» и ограничиваемся.
+        return
 
     stage = settings_client.get_stage(status_id)
     if stage is None:

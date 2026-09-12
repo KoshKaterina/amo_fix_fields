@@ -491,15 +491,18 @@ def test_cash_on_delivery_goes_to_success_without_invoice(monkeypatch):
     assert moves and moves[0][0] == A.STATUS_SUCCESS
 
 
-def test_unpaid_online_goes_to_payment_request(monkeypatch):
+def test_unpaid_online_stays_put_with_red_alert(monkeypatch):
+    """Правка Кати 12.09.2026: счёт больше не наш ход. Неоплаченный онлайн-заказ робот
+    никуда не ведёт - сделка стоит где стояла, человек получает красный алерт."""
     rows, moves, lead = _fork_env(monkeypatch, paid=False, method="Счет")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
-    assert moves and moves[0][0] == A.STATUS_PAYMENT_REQUESTED
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_unpaid"
 
 
 def test_silent_warehouse_stops_instead_of_guessing(monkeypatch):
-    """МойСклад не ответил - это НЕ «не оплачен». Прочитай мы молчание как неоплату,
-    оплаченному заказу ушла бы ссылка на оплату второй раз."""
+    """МойСклад не ответил - это НЕ «не оплачен»: у неизвестности своя причина остановки,
+    и человек в алерте видит «не смог узнать», а не ложное «заказ не оплачен»."""
     rows, moves, lead = _fork_env(monkeypatch, paid=None, method="Счет")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
     assert moves == []
@@ -513,20 +516,14 @@ def test_empty_payment_method_stops(monkeypatch):
     assert rows[-1]["outcome"] == "stop_no_payment_method"
 
 
-def test_test_mode_moves_to_payment_stage_but_issues_no_invoice(monkeypatch):
-    """Правка Кати 09.09.2026: в «Тесте» неоплаченный онлайн-заказ ПЕРЕВОДИТСЯ на этап
-    оплаты - прогон должен быть виден движением сделки. Счёта при этом не будет: автоматика
-    счетов зашита на боевую воронку, и с этапа оплаты тест дальше не едет."""
+def test_test_mode_forks_the_same_way_as_live(monkeypatch):
+    """Развилка одна на оба режима (правка Кати 12.09.2026): неоплаченный онлайн и в
+    «Тесте» стоит на месте. Прежний форс-перевод в этап «Оплата» отменён вместе с самой
+    идеей вести сделку на этап запроса оплаты."""
     rows, moves, lead = _fork_env(monkeypatch, paid=False, method="Счет", mode="test")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
-    assert moves and moves[0][0] == 70070986
-
-    # А сделка, уже стоящая на этапе оплаты, дальше не едет - иначе цикл.
-    rows2, moves2, lead2 = _fork_env(monkeypatch, paid=False, method="Счет", mode="test")
-    lead2["status_id"] = 70070986
-    asyncio.run(A.payment_fork(lead2, None, "конец маршрута"))
-    assert moves2 == []
-    assert rows2[-1]["outcome"] == "done"
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_unpaid"
 
 
 def test_force_ur_never_closes_an_unpaid_online_order(monkeypatch):
@@ -798,12 +795,14 @@ def _no_order_env(monkeypatch, *, method, mode):
     return rows, moves, _lead(custom_fields_values=fields)
 
 
-def test_manual_test_lead_without_ms_order_moves_to_payment_stage(monkeypatch):
-    """Ручная тест-сделка без заказа МойСклада - не повод алертить и не повод стоять:
-    неоплаченный онлайн переводится на этап оплаты, как и всё остальное в тесте."""
+def test_manual_test_lead_without_ms_order_stops_with_alert(monkeypatch):
+    """Ручная тест-сделка без заказа МойСклада: онлайн-оплату подтвердить нечем, исход
+    тот же, что в бою, - стоим и зовём человека. Кейс «онлайн оплачен» в тесте требует
+    привязанного заказа МойСклада, как в бою."""
     rows, moves, lead = _no_order_env(monkeypatch, method="Счет", mode="test")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
-    assert moves == [70070986]
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_unpaid"
 
 
 def test_route_never_walks_into_payment_stage_by_card_order(monkeypatch):
@@ -837,7 +836,7 @@ def test_live_lead_without_ms_order_stops(monkeypatch):
     rows, moves, lead = _no_order_env(monkeypatch, method="Счет", mode="live")
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
     assert moves == []
-    assert rows[-1]["outcome"] == "failed"
+    assert rows[-1]["outcome"] == "stop_unpaid"
     assert "нет заказа" in rows[-1]["reason"]
 
 
@@ -1030,3 +1029,50 @@ def test_op_alert_is_mirrored_to_the_panel_feed_in_live(monkeypatch):
     assert sent[0]["body"].startswith("сделка: клиент ответил")
     assert sent[0]["url"] == "https://amo/lead/1"
     assert "<a" not in sent[0]["body"]
+
+
+# ── только заказы ───────────────────────────────────────────────────────────────
+
+def test_preorder_and_reserve_are_not_orders():
+    """Робот ведёт только тип «Заказ». Сравнение строгим равенством: «Предзаказ» содержит
+    слово «заказ», и поиск подстроки брал бы его в работу."""
+    _settings(settings={"mode": "live", "work_hours": []})
+    assert A.is_order(_lead(custom_fields_values=[_cf(577671, "Заказ")])) is True
+    assert A.is_order(_lead(custom_fields_values=[_cf(577671, "Предзаказ")])) is False
+    assert A.is_order(_lead(custom_fields_values=[_cf(577671, "Резерв")])) is False
+
+
+def test_empty_application_type_is_forgiven_only_in_test():
+    """Тестовые сделки заводятся руками и тип у них пуст - «Тест» это прощает. В бою тип
+    заполняет интеграция, и пустое поле означает НЕ заказ."""
+    _settings(settings={"mode": "test", "work_hours": []})
+    assert A.is_order(_lead()) is True
+    _settings(settings={"mode": "live", "work_hours": []})
+    assert A.is_order(_lead()) is False
+
+
+def test_non_order_lead_is_left_alone_but_still_notifies(monkeypatch):
+    """Не-заказ робот не трогает СОВСЕМ - ни ботов, ни переводов. А уведомление о заявке
+    в ленту идёт, и тип в нём назван: инбокс без менеджера работает для любого типа."""
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              test_contact_ids=[],
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    sent: list[dict] = []
+    ran: list[int] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop(ran.append(1)))
+    A._lead_notified.clear()
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714,
+                     custom_fields_values=[_cf(577671, "Резерв")],
+                     _embedded={"contacts": [{"id": 11111111}]})
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(424244))
+    assert len(sent) == 1
+    assert "Резерв" in sent[0]["body"]
+    assert ran == []
