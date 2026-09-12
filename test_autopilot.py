@@ -672,12 +672,15 @@ def test_next_bot_starts_with_a_clean_delivery_slate():
     assert row["phase"] == S.PHASE_LAUNCHING
 
 
-# ── оплата: два отдельных входа в успешную реализацию ───────────────────────────
+# ── оплата: в успех только через развилку (плюс вход «Оплата получена») ────────
 
-def test_already_paid_order_goes_to_success_without_asking_anything(monkeypatch):
-    """Правка Кати 09.09.2026. Спрашивать «всё верно?» у человека, который уже заплатил, -
-    лишний шаг и лишний повод передумать."""
-    _settings(settings={"mode": "test", "work_hours": [{"start": "00:00", "end": "23:59"}]},
+def test_paid_order_still_walks_the_route(monkeypatch):
+    """Правка Кати 12.09.2026, отменяет правку 09.09: оплаченность на входе не проверяем.
+    Независимо от статуса оплаты сделка идёт по ВСЕМ шагам маршрута, и в успех её пускает
+    только развилка после них: оплаченный заказ, телепортом уезжавший в УР без единого
+    слова клиенту («Заказ №19005»), человека только путал."""
+    _settings(settings={"mode": "test", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "stock_check_enabled": False},
               route=[_stage(70070982, "Первичный контакт", [_bot(7131)])])
     rows = _capture(monkeypatch)
     moves: list[int] = []
@@ -698,21 +701,23 @@ def test_already_paid_order_goes_to_success_without_asking_anything(monkeypatch)
 
     lead = _lead(custom_fields_values=[_cf(576689, "uuid-1")])
     asyncio.run(A.run_stage(lead, _stage(70070982, "Первичный контакт", [_bot(7131)])))
-    assert moves == [A.STATUS_SUCCESS]
-    assert launched == [], "оплаченному заказу шаблон не отправляем"
+    assert moves == []
+    assert launched == [7131], "оплаченный заказ идёт по маршруту, как все"
 
 
-def test_silent_warehouse_at_the_entrance_does_not_block_the_route(monkeypatch):
-    """На входе неизвестность стоит лишнего вопроса клиенту, а не второй ссылки на оплату -
-    поэтому здесь молчание склада пропускает дальше, в отличие от развилки в конце."""
+def test_entry_never_asks_the_warehouse_about_payment(monkeypatch):
+    """Вход маршрута в МойСклад за оплатой не ходит вовсе - вопрос оплаты живёт в одной
+    точке, развилке в конце. Меньше точек решения - меньше расхождений."""
     _settings(settings={"mode": "test", "work_hours": [{"start": "00:00", "end": "23:59"}],
                         "stock_check_enabled": False},
               route=[_stage(70070982, "Первичный контакт", [_bot(7131)])])
     _capture(monkeypatch)
+    ms_calls: list[str] = []
     launched: list[int] = []
 
     async def fake_ms_get(path, params=None, retries=3):
-        return None
+        ms_calls.append(str(path))
+        return {"payedSum": 12000}
 
     async def fake_run_bot(lead, stage_, bot):
         launched.append(int(bot["bot_id"]))
@@ -723,6 +728,7 @@ def test_silent_warehouse_at_the_entrance_does_not_block_the_route(monkeypatch):
     lead = _lead(custom_fields_values=[_cf(576689, "uuid-1")])
     asyncio.run(A.run_stage(lead, _stage(70070982, "Первичный контакт", [_bot(7131)])))
     assert launched == [7131]
+    assert ms_calls == []
 
 
 def test_payment_received_is_checked_against_the_warehouse(monkeypatch):
