@@ -795,6 +795,15 @@ STATUS_DB_PAYMENT_REQUESTED = 88412942
 STATUS_DB_LINK_SENT = 88412946
 STATUS_DB_PAYMENT_RECEIVED = 88412950
 
+# Те же этапы в воронке «Академия» (постановка Кати 09.09.2026): обучение продаётся
+# по той же схеме — менеджер двигает сделку на тех-этап, мы выставляем счёт и сами
+# переводим на «ссылка отправлена», где боты шлют клиенту шаблон.
+# ⚠️ Имена этапов в Академии писаны как есть в amo, регистр разный
+# («Оплата запрошена», но «ссылка отправлена») — на код это не влияет, сверяем по id.
+STATUS_ACADEMY_PAYMENT_REQUESTED = 88464042
+STATUS_ACADEMY_LINK_SENT = 88495938
+STATUS_ACADEMY_PAYMENT_RECEIVED = 88464046
+
 # Воронка → (тех-этап входа, «ссылка отправлена», «оплата получена»).
 # Это ДАННЫЕ — что вообще бывает. Что из этого включено, решает
 # ozon_invoice._invoice_pipelines() по флагу: политику в карту не кладём, иначе
@@ -802,11 +811,15 @@ STATUS_DB_PAYMENT_RECEIVED = 88412950
 OZON_PAYMENT_STAGES: dict[int, tuple[int, int, int]] = {
     PIPELINE_CLEVER_MAIN: (STATUS_PAYMENT_REQUESTED, STATUS_LINK_SENT, STATUS_PAYMENT_RECEIVED),
     PIPELINE_DB_WORK: (STATUS_DB_PAYMENT_REQUESTED, STATUS_DB_LINK_SENT, STATUS_DB_PAYMENT_RECEIVED),
+    PIPELINE_ACADEMY: (STATUS_ACADEMY_PAYMENT_REQUESTED, STATUS_ACADEMY_LINK_SENT,
+                       STATUS_ACADEMY_PAYMENT_RECEIVED),
 }
 
 # Счёт СБП в картотеке. Отдельный флаг от OZON_INVOICE_ENABLED: розничный контур
 # обкатан с июля, картотеку включаем своим шагом и наблюдаем отдельно.
 OZON_INVOICE_DB_WORK = os.getenv("OZON_INVOICE_DB_WORK", "").strip() == "1"
+# Счёт СБП в Академии — свой флаг по той же причине: включаем и наблюдаем отдельно.
+OZON_INVOICE_ACADEMY = os.getenv("OZON_INVOICE_ACADEMY", "").strip() == "1"
 
 FIELD_PAYMENT_LINK = 577617           # «Ссылка для оплаты»
 # «Другая сумма» (text, создано Катей 20.07.2026): если заполнено — счёт СБП
