@@ -446,6 +446,20 @@ async def _drop_bot(why: str) -> None:
     _start_reconnect_loop()
 
 
+def _record_sent(target, thread_id, sent, text: str) -> None:
+    """Ответ Telegram на отправку (message_id, чат, время) - в файл на томе: сверка «что
+    ушло» с фактом приёма, а не со строкой в логе (Катя 13.09.2026). Отправку не роняет."""
+    try:
+        import alerts
+        alerts.record_sent(
+            chat_id=target, thread_id=thread_id,
+            message_id=getattr(sent, "message_id", None),
+            sent_at=getattr(sent, "date", None), text=text,
+        )
+    except Exception:
+        logger.debug("запись ответа Telegram не удалась", exc_info=True)
+
+
 async def _send_with_retry(
     target: int,
     text: str,
@@ -466,12 +480,13 @@ async def _send_with_retry(
         if bot is None:
             return _suppress(text, "бот выключен на повторе")
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=target,
                 text=text,
                 parse_mode=parse_mode,
                 message_thread_id=thread_id,
             )
+            _record_sent(target, thread_id, sent, text)
             _state["sent"] += 1
             _state["last_ok_ts"] = time.time()
             _state["last_error"] = None

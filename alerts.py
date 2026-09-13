@@ -192,34 +192,56 @@ def decide(
                 event_key, panel.chat_id, panel.thread_id, panel.parse_mode, panel.text,
                 legacy.chat_id, legacy.thread_id,
             )
-        _shadow_record(event_key, panel, legacy)
+        _decision_record("shadow", event_key, panel, legacy)
         return legacy
+    _decision_record("on", event_key, panel, legacy)
     return panel
 
 
-# Решения тени дублируются в файл на постоянном томе: `docker logs` живёт ровно столько,
-# сколько контейнер, а его пересоздают по несколько раз в день соседние выкатки - 13.09.2026
-# так пропали пропущенные звонки и счета, которые тень видела. Файл - JSON-строки, для
-# разбора утром: `python3 -c "import json,sys; ..."` или просто grep по ключу события.
+# Решения (и тени, и боевые) дублируются в файл на постоянном томе: `docker logs` живёт ровно
+# столько, сколько контейнер, а его пересоздают по несколько раз в день соседние выкатки -
+# 13.09.2026 так пропали пропущенные звонки и счета, которые тень видела. Файл - JSON-строки:
+# `mode` (shadow | on), `event`, `panel` (что велела панель; null = не слать), `legacy` (что
+# послал бы старый код). В `on` ушло `panel`, в `shadow` - `legacy`.
 SHADOW_LOG_PATH = pathlib.Path(os.getenv("ALERT_SHADOW_LOG", "var/alert_shadow.jsonl"))
-_SHADOW_LOG_CAP = 5 * 1024 * 1024
+# Ответы Telegram на каждую отправку (пишет telegram_bot через record_sent): message_id, чат,
+# топик, время, начало текста. Сверка «решение → факт приёма Телеграмом», не строка в логе.
+SENT_LOG_PATH = pathlib.Path(os.getenv("ALERT_SENT_LOG", "var/alert_sent.jsonl"))
+_LOG_CAP = 5 * 1024 * 1024
 
 
-def _shadow_record(event_key: str, panel: Decision | None, legacy: Decision) -> None:
+def _append_jsonl(path: pathlib.Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > _LOG_CAP:
+        os.replace(path, path.with_suffix(".1.jsonl"))
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _decision_record(mode: str, event_key: str, panel: Decision | None, legacy: Decision) -> None:
     try:
-        SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if SHADOW_LOG_PATH.exists() and SHADOW_LOG_PATH.stat().st_size > _SHADOW_LOG_CAP:
-            os.replace(SHADOW_LOG_PATH, SHADOW_LOG_PATH.with_suffix(".1.jsonl"))
-        row = {
+        _append_jsonl(SHADOW_LOG_PATH, {
             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "mode": mode,
             "event": event_key,
             "panel": None if panel is None else {
                 "chat_id": panel.chat_id, "thread_id": panel.thread_id,
                 "parse_mode": panel.parse_mode, "text": panel.text,
             },
             "legacy": {"chat_id": legacy.chat_id, "thread_id": legacy.thread_id, "text": legacy.text},
-        }
-        with SHADOW_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        })
     except Exception:
-        logger.exception("alerts[shadow]: не записался файл тени %s", SHADOW_LOG_PATH)
+        logger.exception("alerts: не записался файл решений %s", SHADOW_LOG_PATH)
+
+
+def record_sent(*, chat_id, thread_id, message_id, sent_at, text: str) -> None:
+    """Зовёт telegram_bot после успешного send_message. Никогда не бросает."""
+    try:
+        _append_jsonl(SENT_LOG_PATH, {
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "chat_id": chat_id, "thread_id": thread_id, "message_id": message_id,
+            "tg_date": sent_at.isoformat(timespec="seconds") if hasattr(sent_at, "isoformat") else sent_at,
+            "text_head": (text or "")[:160],
+        })
+    except Exception:
+        logger.exception("alerts: не записался файл отправок %s", SENT_LOG_PATH)

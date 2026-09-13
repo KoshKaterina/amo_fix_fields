@@ -414,6 +414,29 @@ def test_shadow_writes_jsonl_record(mode, panel_doc, monkeypatch, tmp_path):
     alerts.decide("academy_lead", legacy_text="старый", values=ACADEMY_VALUES, chat_id=1, thread_id=2)
     rows = [_json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
     assert [r["event"] for r in rows] == ["academy_lead", "academy_lead"]
+    assert [r["mode"] for r in rows] == ["shadow", "shadow"]
     assert rows[0]["panel"]["chat_id"] == tg_recipients.NOTIFY_CHAT_ID and "Пётр" in rows[0]["panel"]["text"]
     assert rows[0]["legacy"] == {"chat_id": 1, "thread_id": 2, "text": "старый"}
     assert rows[1]["panel"] is None
+
+
+def test_on_mode_records_decision_and_sent_response(mode, panel_doc, monkeypatch, tmp_path):
+    """В `on` решение тоже пишется (mode=on), а ответ Telegram на отправку - отдельным файлом,
+    чтобы сверять «что решили» с «что принял Телеграм»."""
+    import json as _json, datetime as _dt
+    dec = tmp_path / "alert_shadow.jsonl"
+    sent = tmp_path / "alert_sent.jsonl"
+    monkeypatch.setattr(alerts, "SHADOW_LOG_PATH", dec)
+    monkeypatch.setattr(alerts, "SENT_LOG_PATH", sent)
+    mode("on")
+    settings_client.set_settings_for_tests(panel_doc)
+    d = alerts.decide("academy_lead", legacy_text="старый", values=ACADEMY_VALUES, chat_id=1, thread_id=2)
+    alerts.record_sent(chat_id=d.chat_id, thread_id=d.thread_id, message_id=4242,
+                       sent_at=_dt.datetime(2026, 9, 13, 20, 0, tzinfo=_dt.timezone.utc), text=d.text)
+    row = _json.loads(dec.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["mode"] == "on" and row["panel"]["text"] == d.text and row["legacy"]["text"] == "старый"
+    srow = _json.loads(sent.read_text(encoding="utf-8").splitlines()[-1])
+    assert srow["message_id"] == 4242 and srow["chat_id"] == tg_recipients.NOTIFY_CHAT_ID
+    assert srow["text_head"].startswith("🎓 Новый лид в Академии") and srow["tg_date"] == "2026-09-13T20:00:00+00:00"
+    # record_sent никогда не бросает - даже с мусором вместо даты.
+    alerts.record_sent(chat_id=None, thread_id=None, message_id=None, sent_at="?", text="")
