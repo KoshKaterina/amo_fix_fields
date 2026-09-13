@@ -139,6 +139,13 @@
       "template": "🤖 Авто-режим\n{{текст_поломки}}",
       "recipients_mode": "nobody",
       "recipients": []
+    },
+    "order_watchdog_restored": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "🩹 Заказ №{{номер}} нашёлся в МойСкладе с затёртым «Номером заказа на сайте» — номер возвращён.\nТой же записью могли затереться трек-номер, ПВЗ и способ оплаты — гляньте заказ глазами.",
+      "recipients_mode": "nobody",
+      "recipients": []
     }
   },
   "people": [

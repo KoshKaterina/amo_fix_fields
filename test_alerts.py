@@ -58,6 +58,7 @@ VALUES_BY_EVENT = {
     "wazzup_undelivered": {"канал", "клиент", "телефон", "отправитель", "ошибка", "сообщение", "ссылка_на_сделку"},
     # Текст этих двух собирает код (keep_text): панель решает только выключатель и чат.
     "order_watchdog_digest": {"сколько_ещё"},
+    "order_watchdog_restored": {"номер"},
     "amgroup_duplicate": set(),
 }
 
@@ -277,12 +278,14 @@ def test_fixture_default_templates_render_for_every_event(panel_doc, mode):
         "статус_оплаты": "ожидает оплаты", "текст_события": "клиент ответил «да»",
         "текст_поломки": "не смог спросить остаток", "отправитель": "автоматика amo",
         "ошибка": "24_HOURS_EXCEEDED — окно в сутки закрылось", "сколько_ещё": "…и ещё 7",
+        "номер": "19003",
     }
     for key in panel_doc["events"]:
         values = {k: sample[k] for k in VALUES_BY_EVENT[key]}
-        d = alerts.decide(key, legacy_text="старый", values=values, keep_text=key in ("order_watchdog_digest", "amgroup_duplicate"))
+        keep = key in ("order_watchdog_digest", "order_watchdog_restored", "amgroup_duplicate")
+        d = alerts.decide(key, legacy_text="старый", values=values, keep_text=keep)
         assert d is not None, key
-        if d.source == "panel" and key not in ("order_watchdog_digest", "amgroup_duplicate"):
+        if d.source == "panel" and not keep:
             assert "{{" not in d.text and d.text != "старый", (key, d.text)
 
 
