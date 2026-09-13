@@ -4,6 +4,10 @@
 он не попал. Сторож — третья линия защиты после вебхука и сверки; проверяем, что
 он ловит потерю, не шумит на нормальных заказах и не повторяется.
 
+Дополнены 13.09.2026 по ложной тревоге о заказе 19003: заказ в МС был, но мост
+amgroup затёр атрибут «Номер заказа на сайте». Теперь сторож перед криком идёт
+через сделку amo к самому заказу и возвращает затёртый номер вместо тревоги.
+
 Запуск: python3 -m pytest test_order_watchdog.py -q
 """
 
@@ -37,7 +41,11 @@ def _install_stubs():
 _install_stubs()
 
 import order_watchdog  # noqa: E402
-from waybill_config import MS_ATTR_ORDER_NUMBER_ID  # noqa: E402
+from waybill_config import (  # noqa: E402
+    FIELD_MOYSKLAD_ORDER_UUID,
+    FIELD_SITE_ORDER_NUMBER,
+    MS_ATTR_ORDER_NUMBER_ID,
+)
 
 UTC = datetime.timezone.utc
 
@@ -58,6 +66,25 @@ def _woo_order(order_id, age_min=60, total="15990", items=("Keystone 3 Pro",)):
 
 def _ms_row(site_number):
     return {"attributes": [{"id": MS_ATTR_ORDER_NUMBER_ID, "value": site_number}]}
+
+
+def _lead(lead_id, site_number=None, order_uuid=None):
+    cfs = []
+    if site_number is not None:
+        cfs.append({"field_id": FIELD_SITE_ORDER_NUMBER,
+                    "values": [{"value": str(site_number)}]})
+    if order_uuid is not None:
+        cfs.append({"field_id": FIELD_MOYSKLAD_ORDER_UUID,
+                    "values": [{"value": order_uuid}]})
+    return {"id": lead_id, "custom_fields_values": cfs}
+
+
+def _ms_order(order_uuid, site_number="", name="07481"):
+    return {
+        "id": order_uuid,
+        "name": name,
+        "attributes": [{"id": MS_ATTR_ORDER_NUMBER_ID, "value": site_number}],
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -82,26 +109,49 @@ def _clean(monkeypatch, tmp_path):
     order_watchdog._reported.clear()
 
 
-def _run(woo_orders, ms_rows, monkeypatch):
+def _run(woo_orders, ms_rows, monkeypatch, leads=(), ms_orders=None, put_log=None):
+    """Один проход сторожа на моках.
+
+    ms_rows=None — «МойСклад не ответил» (листинг вернул None).
+    leads=None — «amoCRM не ответила» (поиск сделок вернул None).
+    ms_orders — {uuid: заказ МС} для точечного чтения через сделку.
+    """
+    ms_orders = ms_orders or {}
+    if put_log is None:
+        put_log = []
+
     async def fake_woo(since):
         return woo_orders
 
-    async def fake_ms(path, params=None):
+    async def fake_ms_get(path, params=None):
+        if path.startswith("entity/customerorder/"):
+            return ms_orders.get(path.rsplit("/", 1)[-1])
+        if ms_rows is None:
+            return None
         # Отдаём одну страницу: тест не про пагинацию.
         if params and params.get("offset", 0) > 0:
             return {"rows": []}
         return {"rows": ms_rows}
 
+    async def fake_ms_put(path, body, retries=3):
+        put_log.append((path, body))
+        return {}
+
+    async def fake_find(query, with_=(), limit=50):
+        return None if leads is None else list(leads)
+
     monkeypatch.setattr(order_watchdog.woo_client, "list_orders_created_since", fake_woo)
-    monkeypatch.setattr(order_watchdog.ms_client, "get", fake_ms)
+    monkeypatch.setattr(order_watchdog.ms_client, "get", fake_ms_get)
+    monkeypatch.setattr(order_watchdog.ms_client, "put", fake_ms_put)
+    monkeypatch.setattr(order_watchdog.amo_service, "find_leads_by_query", fake_find)
     return asyncio.run(order_watchdog.check_once())
 
 
 def test_poteryanniy_zakaz_lovitsya(monkeypatch):
-    """Тот самый случай: заказ на сайте есть, в МойСкладе его нет."""
+    """Тот самый случай: заказ на сайте есть, в МойСкладе его нет, сделки тоже."""
     result = _run([_woo_order(18287)], [_ms_row("18286")], monkeypatch)
 
-    assert result == {"woo": 1, "ms": 1, "lost": 1}
+    assert result == {"woo": 1, "ms": 1, "lost": 1, "restored": 0}
     assert len(_sent) == 1
     assert "18287" in _sent[0]["text"]
     assert "не доехал" in _sent[0]["text"]
@@ -164,3 +214,98 @@ def test_zakaz_bez_daty_ne_sudim(monkeypatch):
 
     assert result["lost"] == 0
     assert _sent == []
+
+
+# --- восстановление затёртого номера (инцидент 13.09.2026, заказ 19003) ---
+
+
+def test_zatertyy_nomer_vosstanavlivaetsya(monkeypatch):
+    """Заказ в МС жив, но атрибут пуст: возвращаем номер и НЕ кричим «потерян»."""
+    put_log = []
+    result = _run(
+        [_woo_order(19003)], [], monkeypatch,
+        leads=[_lead(36554541, 19003, "u-1")],
+        ms_orders={"u-1": _ms_order("u-1", site_number="")},
+        put_log=put_log,
+    )
+
+    assert result == {"woo": 1, "ms": 0, "lost": 0, "restored": 1}
+    assert len(put_log) == 1
+    path, body = put_log[0]
+    assert path.endswith("customerorder/u-1")
+    assert body["attributes"][0]["value"] == "19003"
+    assert len(_sent) == 1
+    assert "возвращён" in _sent[0]["text"]
+    assert "не доехал" not in _sent[0]["text"]
+    # Не потерян — в дедуп не попадает: следующий раз снова проверим по-настоящему.
+    assert "19003" not in order_watchdog._reported
+
+
+def test_vosstanovlenniy_zatirayut_snova_soobshaem_snova(monkeypatch):
+    """Повторное затирание — повторное сообщение: это сигнал, что затиратель ходит."""
+    common = dict(leads=[_lead(1, 19003, "u-1")],
+                  ms_orders={"u-1": _ms_order("u-1", site_number="")})
+    _run([_woo_order(19003)], [], monkeypatch, **common)
+    _run([_woo_order(19003)], [], monkeypatch, **common)
+
+    assert len(_sent) == 2
+
+
+def test_nomer_uzhe_na_meste_molchim(monkeypatch):
+    """Окна листинга разошлись, а заказ в порядке: ни PUT, ни сообщений."""
+    put_log = []
+    result = _run(
+        [_woo_order(19003)], [], monkeypatch,
+        leads=[_lead(1, 19003, "u-1")],
+        ms_orders={"u-1": _ms_order("u-1", site_number="19003")},
+        put_log=put_log,
+    )
+
+    assert result["lost"] == 0 and result["restored"] == 0
+    assert put_log == []
+    assert _sent == []
+
+
+def test_chuzhoy_nomer_ne_trogaem(monkeypatch):
+    """В заказе стоит ДРУГОЙ номер — не перетираем, а тревожим по-старому."""
+    put_log = []
+    result = _run(
+        [_woo_order(19003)], [], monkeypatch,
+        leads=[_lead(1, 19003, "u-1")],
+        ms_orders={"u-1": _ms_order("u-1", site_number="18000")},
+        put_log=put_log,
+    )
+
+    assert result["lost"] == 1 and result["restored"] == 0
+    assert put_log == []
+    assert "не доехал" in _sent[0]["text"]
+
+
+def test_sdelka_bez_uuid_eto_poterya(monkeypatch):
+    """Сделка есть, но заказа МС из неё не выудить — честная потеря."""
+    result = _run(
+        [_woo_order(19003)], [], monkeypatch,
+        leads=[_lead(1, 19003)],
+    )
+
+    assert result["lost"] == 1
+    assert "не доехал" in _sent[0]["text"]
+
+
+def test_sboy_amo_ne_sudim(monkeypatch):
+    """amoCRM молчит — это не «сделки нет»: ни алерта, ни дедупа до след. прохода."""
+    result = _run([_woo_order(19003)], [], monkeypatch, leads=None)
+
+    assert result["lost"] == 0
+    assert _sent == []
+    assert "19003" not in order_watchdog._reported
+
+
+def test_ms_ne_otvetil_prohod_propuskaetsya(monkeypatch):
+    """МойСклад не ответил на листинг: судить некого (03.09.2026 такое молчание
+    прочиталось как «пусто», и сторож объявил потерянными 22 живых заказа)."""
+    result = _run([_woo_order(19003)], None, monkeypatch)
+
+    assert result["lost"] == 0 and result["ms"] == -1
+    assert _sent == []
+    assert "19003" not in order_watchdog._reported
