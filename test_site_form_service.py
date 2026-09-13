@@ -153,7 +153,8 @@ def test_process_full_path(monkeypatch):
     assert c["pipeline_id"] == 111
     assert c["source_uid"] == "site_form_svyazatsya"
     assert c["form_id"] == "svyazatsya"
-    assert c["lead_tags"] == ["Форма сайта"]
+    # имя источника всегда идёт первым тегом (нативный источник закрыт без виджета)
+    assert c["lead_tags"] == ["ContactForm_Связаться", "Форма сайта"]
     assert c["contact"]["custom_fields_values"][0]["values"][0]["value"] == "+79099371845"
     assert calls["accept"] == ("u-1", 222)
     note_lead, note_text = calls["note"]

@@ -232,6 +232,10 @@ async def process(payload: dict, ip: str = "") -> int | None:
         if cf:
             contact["custom_fields_values"] = cf
 
+    # Имя источника — тегом всегда: /api/v4/sources для нашей интеграции закрыт
+    # («Integration needs widget», проверено боем 13.09.2026), нативная графа
+    # «Источник» недоступна. Менеджер видит форму тегом, в названии сделки и в
+    # метаданных заявки (form_name).
     res = await api.create_unsorted_lead_ex(
         lead_name=f"{source}: {name or phone or email}",
         pipeline_id=cfg["pipeline_id"],
@@ -241,7 +245,7 @@ async def process(payload: dict, ip: str = "") -> int | None:
         created_ts=int(time.time()),
         source_name=source,
         form_id=slug,
-        lead_tags=cfg["tags"] or None,
+        lead_tags=[source] + cfg["tags"],
         ip=ip,
     )
     lead_id = res.get("lead_id")
@@ -286,8 +290,14 @@ async def ensure_sources() -> None:
                    for ext, name in wanted.items() if ext not in existing]
         if missing:
             created = await api.create_sources(missing)
-            logger.info("site_form: зарегистрировано источников: %s из %s",
-                        len(created), len(missing))
+            if created:
+                logger.info("site_form: зарегистрировано источников: %s из %s",
+                            len(created), len(missing))
+            else:
+                # amo: «Integration needs widget» — sources API только для
+                # виджетов. Не ошибка контура: форма видна тегом и именем сделки.
+                logger.info("site_form: amo не даёт регистрировать источники "
+                            "токен-интеграции (нужен виджет) — форма видна тегом")
     except Exception:
         logger.exception("site_form: регистрация источников не удалась (не критично)")
 
