@@ -392,3 +392,21 @@ def test_tech_report_helper_under_on(mode, panel_doc, monkeypatch):
     assert sent[0]["text"] == "СДЭК: нет этапов A, B — синк стоит"
     assert (sent[0]["chat_id"], sent[0]["thread"]) == (tg_recipients.NOTIFY_CHAT_ID, tg_recipients.NOTIFY_THREAD_ID)
     assert sent[1] == {"text": "без ключа - как раньше", "chat_id": None, "thread": None}
+
+
+def test_shadow_writes_jsonl_record(mode, panel_doc, monkeypatch, tmp_path):
+    """Решение тени дублируется в файл на томе: docker logs пропадает при пересоздании
+    контейнера, а файл - нет."""
+    import json as _json
+    path = tmp_path / "alert_shadow.jsonl"
+    monkeypatch.setattr(alerts, "SHADOW_LOG_PATH", path)
+    mode("shadow")
+    settings_client.set_settings_for_tests(panel_doc)
+    alerts.decide("academy_lead", legacy_text="старый", values=ACADEMY_VALUES, chat_id=1, thread_id=2)
+    settings_client.set_settings_for_tests(_doc_with(panel_doc, "academy_lead", enabled=False))
+    alerts.decide("academy_lead", legacy_text="старый", values=ACADEMY_VALUES, chat_id=1, thread_id=2)
+    rows = [_json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+    assert [r["event"] for r in rows] == ["academy_lead", "academy_lead"]
+    assert rows[0]["panel"]["chat_id"] == tg_recipients.NOTIFY_CHAT_ID and "Пётр" in rows[0]["panel"]["text"]
+    assert rows[0]["legacy"] == {"chat_id": 1, "thread_id": 2, "text": "старый"}
+    assert rows[1]["panel"] is None

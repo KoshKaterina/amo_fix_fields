@@ -39,7 +39,11 @@
 """
 from __future__ import annotations
 
+import datetime
+import json
 import logging
+import os
+import pathlib
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -188,5 +192,34 @@ def decide(
                 event_key, panel.chat_id, panel.thread_id, panel.parse_mode, panel.text,
                 legacy.chat_id, legacy.thread_id,
             )
+        _shadow_record(event_key, panel, legacy)
         return legacy
     return panel
+
+
+# Решения тени дублируются в файл на постоянном томе: `docker logs` живёт ровно столько,
+# сколько контейнер, а его пересоздают по несколько раз в день соседние выкатки - 13.09.2026
+# так пропали пропущенные звонки и счета, которые тень видела. Файл - JSON-строки, для
+# разбора утром: `python3 -c "import json,sys; ..."` или просто grep по ключу события.
+SHADOW_LOG_PATH = pathlib.Path(os.getenv("ALERT_SHADOW_LOG", "var/alert_shadow.jsonl"))
+_SHADOW_LOG_CAP = 5 * 1024 * 1024
+
+
+def _shadow_record(event_key: str, panel: Decision | None, legacy: Decision) -> None:
+    try:
+        SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if SHADOW_LOG_PATH.exists() and SHADOW_LOG_PATH.stat().st_size > _SHADOW_LOG_CAP:
+            os.replace(SHADOW_LOG_PATH, SHADOW_LOG_PATH.with_suffix(".1.jsonl"))
+        row = {
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "event": event_key,
+            "panel": None if panel is None else {
+                "chat_id": panel.chat_id, "thread_id": panel.thread_id,
+                "parse_mode": panel.parse_mode, "text": panel.text,
+            },
+            "legacy": {"chat_id": legacy.chat_id, "thread_id": legacy.thread_id, "text": legacy.text},
+        }
+        with SHADOW_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("alerts[shadow]: не записался файл тени %s", SHADOW_LOG_PATH)
