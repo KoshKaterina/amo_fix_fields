@@ -55,7 +55,7 @@ VALUES_BY_EVENT = {
     "new_lead_untaken": {"сколько_ждали", "ответственный", "сделка", "ссылка_на_сделку"},
     "autopilot_event": {"текст_события", "теги"},
     "autopilot_failure": {"текст_поломки"},
-    "wazzup_undelivered": {"канал", "клиент", "телефон", "отправитель", "ошибка", "сообщение", "ссылка_на_сделку"},
+    "wazzup_undelivered": {"канал", "клиент", "телефон", "отправитель", "тип_сообщения", "ошибка", "сообщение", "ссылка_на_сделку"},
     # Текст этих двух собирает код (keep_text): панель решает только выключатель и чат.
     "order_watchdog_digest": {"сколько_ещё"},
     "order_watchdog_restored": {"номер"},
@@ -76,6 +76,12 @@ VALUES_BY_EVENT = {
     "office_transfer_no_since": set(),
     "lead_distribution_no_since": set(),
     "wazzup_undelivered_burst": {"лимит", "окно"},
+    # Накладные СДЭК (waybill_service), 13.09.2026.
+    "waybill_amo_not_updated": {"номер_сделки", "трек", "ошибка"},
+    "waybill_track_cleared_unknown": {"номер_сделки", "трек", "сколько_ждали"},
+    "waybill_track_restored": {"номер_сделки", "трек", "сколько_ждали"},
+    "waybill_track_not_restored": {"номер_сделки", "трек", "ошибка"},
+    "waybill_create_failed": {"номер_сделки", "причина"},
 }
 
 
@@ -297,6 +303,7 @@ def test_fixture_default_templates_render_for_every_event(panel_doc, mode):
         "номер": "19003", "этапы": "Оплата запрошена, Счёт выставлен", "сколько": 3,
         "номер_сделки": "36554593", "дорожка": "amo", "глубина": 120, "порог": 100,
         "подробности": "Все дорожки: amo=120, api_queue=3.", "задача": "waybill", "окно": 10,
+        "тип_сообщения": "WABA-шаблон", "трек": "10320455561",
     }
     for key in panel_doc["events"]:
         values = {k: sample[k] for k in VALUES_BY_EVENT[key]}

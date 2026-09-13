@@ -49,7 +49,7 @@ def _stub(lead, events, patch_ok=True):
         _patched.append((lead_id, kw))
         return {"ok": patch_ok}
 
-    async def _fake_alert(text):
+    async def _fake_alert(text, *args, **kwargs):  # ключ события и значения панели - мимо
         _alerted.append(text)
 
     waybill_service.amo_service.get_lead_full = _fake_get_lead_full

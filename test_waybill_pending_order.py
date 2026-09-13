@@ -61,7 +61,7 @@ def _stub(get_order_responses, commit_ok=True, patch_ok=True):
         _patched.append((lead_id, kw))
         return {"ok": patch_ok}
 
-    async def _fake_alert(text):
+    async def _fake_alert(text, *args, **kwargs):  # ключ события и значения панели - мимо
         _alerted.append(text)
 
     waybill_service.cdek_client.get_order = _fake_get_order

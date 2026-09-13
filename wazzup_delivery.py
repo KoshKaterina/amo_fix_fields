@@ -726,6 +726,8 @@ def _template_values(info: dict, error: dict | None, lead_id) -> dict:
         "клиент": info.get("contact_name") or "",
         "телефон": info.get("chat_id") or info.get("contact_phone") or "",
         "отправитель": ("автоматика amo" if author.lower() == "admin" else author) if author else "",
+        # «WABA-шаблон» - только у шаблонных сообщений; пусто - строка шаблона выпадет.
+        "тип_сообщения": "WABA-шаблон" if info.get("msg_type") == "wapi_template" else "",
         "ошибка": err,
         "сообщение": f"«{info['text']}»" if info.get("text") else "",
         "ссылка_на_сделку": alerts.lead_link(lead_id),

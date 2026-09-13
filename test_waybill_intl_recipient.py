@@ -79,7 +79,7 @@ def _stub(find_city_result, create_order_uuid="test-uuid", cdek_number="10306104
     async def _fake_commit_waybill(lead_id, cdek_value, current_tags, **kw):
         return {"ok": True}
 
-    async def _fake_alert(text):
+    async def _fake_alert(text, *args, **kwargs):  # ключ события и значения панели - мимо
         pass
 
     waybill_service.cdek_client.find_city = _fake_find_city

@@ -80,7 +80,11 @@ def set_alert_callback(fn: Callable[[str], Awaitable[None]]) -> None:
     _alert_callback = fn
 
 
-async def _alert(text: str) -> None:
+async def _alert(text: str, event: str | None = None, values: dict | None = None) -> None:
+    """Уведомление о накладной в Телеграм через колбэк (telegram_bot.send_alert).
+    `event` - ключ события в каталоге панели: панель может выключить его, перенаправить и
+    поправить текст; без ключа - как раньше, готовой строкой в технический чат. Кулдаун
+    по тексту остаётся и для выключенного - иначе выключенное долбило бы лог."""
     if _alert_callback is None:
         logger.warning("alert callback not set, suppressing: %s", text)
         return
@@ -93,7 +97,16 @@ async def _alert(text: str) -> None:
     # доставке откатываем — иначе сбой TG-шлюза заглушил бы алерт на весь кулдаун.
     _alert_last_sent[text] = now
     try:
-        ok = await _alert_callback(text)
+        body, kw = text, {}
+        if event:
+            import alerts  # по требованию: alerts тянет клиента панели, waybill_service - нет
+            d = alerts.decide(event, legacy_text=text, values=values or {})
+            if d is None:
+                logger.info("%s: уведомление выключено в панели", event)
+                return
+            body = d.text
+            kw = {k: v for k, v in d.send_kwargs().items() if v is not None}
+        ok = await (_alert_callback(body, **kw) if kw else _alert_callback(body))
     except Exception:
         logger.exception("alert callback failed")
         ok = False
@@ -449,7 +462,10 @@ async def _commit_success(
             f"но AMO не обновлён (status={result.get('status_code')}). Внеси номер вручную."
         )
         logger.error(critical)
-        await _alert(critical)
+        await _alert(critical, "waybill_amo_not_updated", {
+            "номер_сделки": lead_id, "трек": cdek_value,
+            "ошибка": f"status={result.get('status_code')}",
+        })
         return False
 
     asyncio.create_task(_verify_trek_after_delay(lead_id, cdek_value))
@@ -578,7 +594,9 @@ async def _verify_trek_after_delay(lead_id, cdek_value: str) -> None:
         await _alert(
             f"⚠️ Сделка {lead_id}: трек-номер СДЭК {cdek_value} пропал из поля 571657 через "
             f"{TREK_VERIFY_DELAY_S:.0f}с после записи, но не удалось определить, кто его очистил — "
-            f"НЕ восстанавливаю автоматически, проверь вручную."
+            f"НЕ восстанавливаю автоматически, проверь вручную.",
+            "waybill_track_cleared_unknown",
+            {"номер_сделки": lead_id, "трек": cdek_value, "сколько_ждали": f"{TREK_VERIFY_DELAY_S:.0f}с"},
         )
         return
     if actor != 0:
@@ -597,12 +615,16 @@ async def _verify_trek_after_delay(lead_id, cdek_value: str) -> None:
         await _alert(
             f"⚠️ Сделка {lead_id}: трек-номер СДЭК {cdek_value} пропал из amo через "
             f"{TREK_VERIFY_DELAY_S:.0f}с после создания накладной (стёрто ботом/интеграцией) — "
-            f"восстановлен автоматически."
+            f"восстановлен автоматически.",
+            "waybill_track_restored",
+            {"номер_сделки": lead_id, "трек": cdek_value, "сколько_ждали": f"{TREK_VERIFY_DELAY_S:.0f}с"},
         )
     else:
         await _alert(
             f"КРИТИЧНО: сделка {lead_id}, трек {cdek_value} пропал из amo и НЕ восстановился "
-            f"автоматически ({res}). Внеси номер вручную."
+            f"автоматически ({res}). Внеси номер вручную.",
+            "waybill_track_not_restored",
+            {"номер_сделки": lead_id, "трек": cdek_value, "ошибка": str(res)},
         )
 
 
@@ -622,7 +644,8 @@ async def _fail(lead_id, reason: str, source: str, current_tags: list[dict]) -> 
     if not note_res.get("ok"):
         logger.warning("Lead %s: не удалось добавить примечание с причиной ошибки: %s", lead_id, note_res)
     if source != "retry":
-        await _alert(f"Сделка {lead_id}: {reason}")
+        await _alert(f"Сделка {lead_id}: {reason}", "waybill_create_failed",
+                     {"номер_сделки": lead_id, "причина": reason})
     return {"ok": False, "lead_id": lead_id, "reason": reason, "cdek_number": None, "skipped": False}
 
 

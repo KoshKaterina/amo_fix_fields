@@ -115,7 +115,7 @@
     "wazzup_undelivered": {
       "enabled": true,
       "channel": "tech",
-      "template": "🚫 Сообщение НЕ отправлено\n💬 {{канал}}, {{клиент}}\n📞 {{телефон}}\n👤 отправил: {{отправитель}}\n⚠️ {{ошибка}}\n{{сообщение}}\n🔗 {{ссылка_на_сделку}}",
+      "template": "🚫 Сообщение НЕ отправлено\n💬 {{канал}}, {{клиент}}\n📞 {{телефон}}\n👤 отправил: {{отправитель}}\n📄 {{тип_сообщения}}\n⚠️ {{ошибка}}\n{{сообщение}}\n🔗 {{ссылка_на_сделку}}",
       "recipients_mode": "nobody",
       "recipients": []
     },
@@ -249,6 +249,41 @@
       "enabled": true,
       "channel": "tech",
       "template": "🚫 Wazzup: недоставленных больше {{лимит}} за {{окно}} мин — похоже на массовый сбой. Дальше в этом окне молчу, чтобы не залить чат: подробности в панели и логе.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "waybill_amo_not_updated": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "КРИТИЧНО: сделка {{номер_сделки}}, СДЭК #{{трек}} создан, но AMO не обновлён ({{ошибка}}). Внеси номер вручную.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "waybill_track_cleared_unknown": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "⚠️ Сделка {{номер_сделки}}: трек-номер СДЭК {{трек}} пропал из поля через {{сколько_ждали}} после записи, но не удалось определить, кто его очистил — НЕ восстанавливаю автоматически, проверь вручную.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "waybill_track_restored": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "⚠️ Сделка {{номер_сделки}}: трек-номер СДЭК {{трек}} пропал из amo через {{сколько_ждали}} после создания накладной (стёрто ботом/интеграцией) — восстановлен автоматически.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "waybill_track_not_restored": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "КРИТИЧНО: сделка {{номер_сделки}}, трек {{трек}} пропал из amo и НЕ восстановился автоматически ({{ошибка}}). Внеси номер вручную.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "waybill_create_failed": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "Сделка {{номер_сделки}}: {{причина}}",
       "recipients_mode": "nobody",
       "recipients": []
     }
