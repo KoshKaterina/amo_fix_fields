@@ -86,6 +86,29 @@ def test_normalize_phone():
     assert sf._normalize_phone("нет цифр") == ""
 
 
+def test_fallback_phone_and_email_nonstandard_keys(monkeypatch):
+    calls = _mock_api(monkeypatch)
+    payload = {"form": "svyazatsya", "fields": {
+        "imya-klienta-905": "Пётр",
+        "tel-905": "8 (909) 937-18-45",
+    }}
+    assert asyncio.run(sf.process(payload)) == 201
+    assert calls["create"]["contact"]["custom_fields_values"][0]["values"][0]["value"] == "+79099371845"
+
+    sf._seen.clear()
+    calls2 = _mock_api(monkeypatch)
+    payload = {"form": "svyazatsya", "fields": {"pochta-123": "x@y.ru", "msg": "вопрос"}}
+    assert asyncio.run(sf.process(payload)) == 201
+    assert calls2["create"]["contact"]["custom_fields_values"][0]["field_code"] == "EMAIL"
+
+
+def test_fallback_ignores_short_numbers(monkeypatch):
+    calls = _mock_api(monkeypatch)
+    payload = {"form": "svyazatsya", "fields": {"kolichestvo": "3", "msg": "хочу 25 штук"}}
+    assert asyncio.run(sf.process(payload)) is None
+    assert "create" not in calls
+
+
 # --- process --------------------------------------------------------------
 
 def _mock_api(monkeypatch, contact_id=None, lead_id=101, uid="u-1", accepted=201):

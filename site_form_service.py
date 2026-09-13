@@ -157,6 +157,24 @@ def _normalize_phone(raw: str) -> str:
     return f"+{digits}" if digits else ""
 
 
+def _fallback_phone(fields: dict) -> str:
+    """Поле телефона названо нестандартно (CF7 позволяет что угодно) — ищем по
+    значению: первое поле, где после чистки остаётся 10-15 цифр."""
+    for v in fields.values():
+        p = _normalize_phone(str(v or ""))
+        if 11 <= len(p) <= 16:  # "+" и 10-15 цифр
+            return p
+    return ""
+
+
+def _fallback_email(fields: dict) -> str:
+    for v in fields.values():
+        v = str(v or "").strip()
+        if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", v):
+            return v
+    return ""
+
+
 def external_id(slug: str) -> str:
     return f"site_form_{slug}"
 
@@ -185,8 +203,8 @@ async def process(payload: dict, ip: str = "") -> int | None:
         return None
 
     name = _pick(fields, NAME_KEYS)[:MAX_NAME_LEN]
-    phone = _normalize_phone(_pick(fields, PHONE_KEYS))
-    email = _pick(fields, EMAIL_KEYS)
+    phone = _normalize_phone(_pick(fields, PHONE_KEYS)) or _fallback_phone(fields)
+    email = _pick(fields, EMAIL_KEYS) or _fallback_email(fields)
     if not phone and not email:
         logger.warning("site_form[%s]: ни телефона, ни почты — пропуск (спам-отсев)", slug)
         return None
