@@ -34,6 +34,7 @@ import reserve_service
 import showroom_alert
 import showroom_store
 import showroom_tag
+import site_form_service
 import team_panel_client
 import telegram_bot
 import uis_missed_call
@@ -114,6 +115,8 @@ async def lifespan(app):
     await order_watchdog.init()
     await uis_missed_call.init()
     await new_lead_watch.init()
+    # Формы сайта: без SITE_FORM_ENABLED роут отвечает 404 и ничего не делает.
+    await site_form_service.init()
     # Протез amgroup (03.09.2026): их интеграция МойСклад -> amoCRM встала 02.09.
     # Сборку сделки подключаем точкой расширения, чтобы протез искал заказы, а
     # создавал их отдельный модуль - оба выключены флагами по умолчанию.
@@ -322,6 +325,36 @@ async def wazzup_webhook(secret: str, request: Request):
         autopilot.on_wazzup(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка авто-режима")
+    return {"ok": True}
+
+
+@app.post("/site_form")
+async def site_form(request: Request):
+    """Контактные формы сайта (CF7 → WP-сниппет) → сделка в amo с источником
+    формы («ContactForm_Академия» и т.п., карта SITE_FORM_MAP). Авторизация —
+    заголовок X-Api-Key: секрет не попадает ни в URL, ни в access-логи nginx;
+    браузер посетителя сюда не ходит вовсе (постит сервер WP со своей стороны).
+    Отвечаем 200 сразу — ошибку обработки посетитель сайта видеть не должен,
+    работа фоном."""
+    if not site_form_service.is_enabled():
+        return Response("disabled", status_code=404)
+    if not site_form_service.secret_ok(request.headers.get("X-Api-Key", "")):
+        logger.warning("site_form: неверный X-Api-Key")
+        return Response("forbidden", status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("site_form: невалидный JSON")
+        return {"ok": False}
+    if not isinstance(payload, dict):
+        logger.warning("site_form: тело не объект")
+        return {"ok": False}
+    fwd = request.headers.get("X-Forwarded-For", "")
+    ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")
+    if not site_form_service.allow_ip(ip):
+        logger.warning("site_form: rate limit для %s — заявка отброшена", ip)
+        return {"ok": True}
+    site_form_service.handle_bg(payload, ip)
     return {"ok": True}
 
 

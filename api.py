@@ -661,11 +661,40 @@ async def create_unsorted_lead(
     created_ts: int,
     source_name: str = "Jivo онлайн-чат",
 ) -> tuple[int | None, int | None]:
+    """Создаёт заявку в «Неразобранное» воронки. Обёртка над
+    create_unsorted_lead_ex с прежней сигнатурой (Jivo-мост)."""
+    res = await create_unsorted_lead_ex(
+        lead_name=lead_name,
+        pipeline_id=pipeline_id,
+        contact=contact,
+        source_uid=source_uid,
+        page_url=page_url,
+        created_ts=created_ts,
+        source_name=source_name,
+    )
+    return res.get("lead_id"), res.get("contact_id")
+
+
+async def create_unsorted_lead_ex(
+    lead_name: Any,
+    pipeline_id: int,
+    contact: dict,
+    source_uid: str,
+    page_url: str,
+    created_ts: int,
+    source_name: str = "Jivo онлайн-чат",
+    form_id: str = "jivo_chat",
+    lead_tags: list | None = None,
+    ip: str = "0.0.0.0",
+) -> dict:
     """Создаёт заявку в «Неразобранное» воронки (system-статус type=1, куда
     обычный POST /leads нельзя). Контакт передаётся встроенно: либо {"id": ...}
     для найденного дубля, либо новый dict с PHONE/EMAIL. Возвращает
-    (lead_id, contact_id)."""
+    {"lead_id", "contact_id", "uid"} — uid нужен для accept_unsorted."""
     referer = page_url or f"{BASE_URL}"
+    lead_entry: dict[str, Any] = {"name": str(lead_name)}
+    if lead_tags:
+        lead_entry["_embedded"] = {"tags": [{"name": str(t)} for t in lead_tags if str(t).strip()]}
     form = {
         "source_name": source_name,
         "source_uid": str(source_uid),
@@ -674,31 +703,65 @@ async def create_unsorted_lead(
         # metadata — на ВЕРХНЕМ уровне запроса (внутри _embedded amo даёт 400
         # FieldMissing), это обязательный блок формы.
         "metadata": {
-            "form_id": "jivo_chat",
+            "form_id": str(form_id),
             "form_name": source_name,
             "form_page": referer,
             "form_sent_at": int(created_ts),
             "referer": referer,
-            "ip": "0.0.0.0",
+            "ip": ip or "0.0.0.0",
         },
         "_embedded": {
-            "leads": [{"name": str(lead_name)}],
+            "leads": [lead_entry],
             "contacts": [contact],
         },
     }
     url = f"{BASE_URL}/api/v4/leads/unsorted/forms"
     data = await _request_json("POST", url, body=[form], what="create_unsorted")
     if not isinstance(data, dict):
-        return None, None
+        return {}
     unsorted = (data.get("_embedded") or {}).get("unsorted") or []
     if not unsorted:
-        return None, None
+        return {}
     emb = (unsorted[0].get("_embedded") or {})
     leads = emb.get("leads") or []
     contacts = emb.get("contacts") or []
-    lead_id = leads[0].get("id") if leads else None
-    contact_id = contacts[0].get("id") if contacts else None
-    return lead_id, contact_id
+    return {
+        "lead_id": leads[0].get("id") if leads else None,
+        "contact_id": contacts[0].get("id") if contacts else None,
+        "uid": unsorted[0].get("uid"),
+    }
+
+
+async def accept_unsorted(uid: str, status_id: int, user_id: int | None = None) -> int | None:
+    """Принимает заявку из «Неразобранного» в обычный этап (источник сделки при
+    этом сохраняется — ради него и ходим через unsorted). Возвращает id сделки."""
+    body: dict[str, Any] = {"status_id": int(status_id)}
+    if user_id:
+        body["user_id"] = int(user_id)
+    url = f"{BASE_URL}/api/v4/leads/unsorted/{uid}/accept"
+    data = await _request_json("POST", url, body=body, what=f"accept_unsorted[{uid}]")
+    if not isinstance(data, dict):
+        return None
+    leads = (data.get("_embedded") or {}).get("leads") or []
+    return leads[0].get("id") if leads else None
+
+
+async def list_sources() -> list:
+    """Источники сделок, зарегистрированные НАШЕЙ интеграцией (чужие не видны)."""
+    url = f"{BASE_URL}/api/v4/sources"
+    data = await _request_json("GET", url, what="list_sources")
+    if not isinstance(data, dict):
+        return []
+    return (data.get("_embedded") or {}).get("sources") or []
+
+
+async def create_sources(items: list) -> list:
+    """Регистрирует источники интеграции: [{"name": ..., "external_id": ...}]."""
+    url = f"{BASE_URL}/api/v4/sources"
+    data = await _request_json("POST", url, body=items, what="create_sources")
+    if not isinstance(data, dict):
+        return []
+    return (data.get("_embedded") or {}).get("sources") or []
 
 
 if __name__ == "__main__":
