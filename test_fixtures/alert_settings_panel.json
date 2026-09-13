@@ -146,6 +146,111 @@
       "template": "🩹 Заказ №{{номер}} нашёлся в МойСкладе с затёртым «Номером заказа на сайте» — номер возвращён.\nТой же записью могли затереться трек-номер, ПВЗ и способ оплаты — гляньте заказ глазами.",
       "recipients_mode": "nobody",
       "recipients": []
+    },
+    "cdek_sync_no_pipeline": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "CDEK sync: не определена воронка «офис» (pipeline cache пуст?) — синхронизация ВЫКЛЮЧЕНА",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "cdek_sync_stages_missing": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "CDEK sync: в воронке «офис» не найдены этапы: {{этапы}} — синхронизация ВЫКЛЮЧЕНА",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "cdek_sync_webhook_failed": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "CDEK sync: не удалось оформить подписку на вебхуки СДЭК: {{ошибка}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "metrika_sync_counters_failed": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "Metrika sync: не удалось получить список счётчиков: {{ошибка}} — ВЫКЛЮЧЕНА",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "metrika_sync_counter_ambiguous": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "Metrika sync: в аккаунте {{сколько}} счётчиков — задай METRIKA_COUNTER_ID. ВЫКЛЮЧЕНА",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "metrika_order_load_failed": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "Metrika: ошибка загрузки заказа {{номер}}: {{ошибка}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "woo_status_sync_error": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "Woo: ошибка по заказу сайта {{номер}} (сделка {{номер_сделки}}): {{ошибка}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "queue_lane_depth": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "⚠️ amo_fix_fields: очередь «{{дорожка}}» = {{глубина}} задач (порог {{порог}}). {{подробности}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "queue_api_depth": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "⚠️ amo_fix_fields: очередь API-пайплайна amo = {{глубина}} запросов (порог {{порог}}). {{подробности}}",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "queue_task_waited": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "⚠️ amo_fix_fields: задача {{задача}} (сделка {{номер_сделки}}) ждала в очереди «{{дорожка}}» {{сколько_ждали}} (порог {{порог}}).",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "ozon_invoice_stages_missing": {
+      "enabled": true,
+      "channel": "op_notify",
+      "template": "⚠️ ozon_invoice: не найдены в прогретом кэше воронок этапы оплаты: {{этапы}} — проверьте ID в waybill_config.py (переименовали/пересоздали этап?)",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "office_transfer_targets_missing": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "office_transfer: не найдены в прогретом кэше воронок целевые этапы: {{этапы}} — проверьте ID в waybill_config.py (переименовали/удалили этап?)",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "office_transfer_no_since": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "office_transfer: OFFICE_TRANSFER_ENABLED=1, но OFFICE_TRANSFER_SINCE_TS не задан — reconciliation НЕ запущена (иначе задело бы сделки, висевшие в УР/ЗНР до включения). Вебхук-путь при этом работает.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "lead_distribution_no_since": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "lead_distribution: LEAD_DISTRIBUTION_ENABLED=1, но LEAD_DISTRIBUTION_SINCE_TS не задан — reconciliation НЕ запущена (иначе задело бы сделки, висевшие в точках входа до включения). Вебхук-путь при этом работает.",
+      "recipients_mode": "nobody",
+      "recipients": []
+    },
+    "wazzup_undelivered_burst": {
+      "enabled": true,
+      "channel": "tech",
+      "template": "🚫 Wazzup: недоставленных больше {{лимит}} за {{окно}} мин — похоже на массовый сбой. Дальше в этом окне молчу, чтобы не залить чат: подробности в панели и логе.",
+      "recipients_mode": "nobody",
+      "recipients": []
     }
   },
   "people": [

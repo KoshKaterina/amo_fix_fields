@@ -24,6 +24,7 @@ CLEVER по UUID МойСклад).
 
 import logging
 
+import alerts
 import amo_service
 import migration_freeze
 import metrika_sync
@@ -85,13 +86,20 @@ async def shutdown() -> None:
     logger.info("Woo status sync stopped")
 
 
-async def _alert(text: str) -> None:
+async def _alert(text: str, event: str | None = None, values: dict | None = None) -> None:
     logger.error(text)
     try:
         from telegram_bot import send_alert
-        await send_alert(text)
+        body, kw = text, {}
+        if event:
+            d = alerts.decide(event, legacy_text=text, values=values or {})
+            if d is None:
+                logger.info("%s: уведомление выключено в панели", event)
+                return
+            body, kw = d.text, d.send_kwargs()
+        await send_alert(body, **kw)
     except Exception:
-        logger.exception("Woo alert failed: %s", text)
+        logger.exception("%s", "Woo alert failed: " + text)
 
 
 def _cf(entity: dict, field_id: int):
@@ -174,7 +182,10 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     try:
         result = await woo_client.complete_order(site)
     except woo_client.WooError as exc:
-        await _alert(f"Woo: ошибка по заказу сайта {site} (сделка {canonical_id}): {exc}")
+        await _alert(
+            f"Woo: ошибка по заказу сайта {site} (сделка {canonical_id}): {exc}",
+            "woo_status_sync_error", {"номер": site, "номер_сделки": canonical_id, "ошибка": str(exc)},
+        )
         return
 
     if result in ("completed", "already"):

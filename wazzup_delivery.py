@@ -560,11 +560,18 @@ async def _alert(message_id: str, info: dict, error: dict | None) -> None:
 
         if not allowed:
             if first_suppressed:
-                await _send(
-                    f"🚫 Wazzup: недоставленных больше {WAZZUP_DELIVERY_BURST_MAX} за "
-                    f"{WAZZUP_DELIVERY_BURST_WINDOW_S // 60} мин — похоже на массовый сбой. "
-                    f"Дальше в этом окне молчу, чтобы не залить чат: подробности в панели и логе."
+                d = alerts.decide(
+                    "wazzup_undelivered_burst",
+                    legacy_text=(
+                        f"🚫 Wazzup: недоставленных больше {WAZZUP_DELIVERY_BURST_MAX} за "
+                        f"{WAZZUP_DELIVERY_BURST_WINDOW_S // 60} мин — похоже на массовый сбой. "
+                        f"Дальше в этом окне молчу, чтобы не залить чат: подробности в панели и логе."
+                    ),
+                    parse_mode="HTML", chat_id=WAZZUP_DELIVERY_CHAT_ID, thread_id=WAZZUP_DELIVERY_THREAD_ID,
+                    values={"лимит": WAZZUP_DELIVERY_BURST_MAX, "окно": WAZZUP_DELIVERY_BURST_WINDOW_S // 60},
                 )
+                if d is not None:
+                    await telegram_bot.send_alert(d.text, **d.send_kwargs())
             return
 
         d = alerts.decide(

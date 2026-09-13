@@ -159,11 +159,13 @@ async def _validate_stages() -> None:
             "(переименовали/пересоздали этап?)"
         )
         logger.error(msg)
-        await telegram_bot.send_alert(
-            f"⚠️ {msg}",
-            chat_id=tg_recipients.NOTIFY_CHAT_ID,
-            message_thread_id=tg_recipients.NOTIFY_THREAD_ID,
+        d = alerts.decide(
+            "ozon_invoice_stages_missing", legacy_text=f"⚠️ {msg}",
+            chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID,
+            values={"этапы": ", ".join(missing)},
         )
+        if d is not None:
+            await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
 def init() -> None:

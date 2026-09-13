@@ -60,6 +60,22 @@ VALUES_BY_EVENT = {
     "order_watchdog_digest": {"сколько_ещё"},
     "order_watchdog_restored": {"номер"},
     "amgroup_duplicate": set(),
+    # Технические рапорты интеграции (13.09.2026), по событию на сообщение.
+    "cdek_sync_no_pipeline": set(),
+    "cdek_sync_stages_missing": {"этапы"},
+    "cdek_sync_webhook_failed": {"ошибка"},
+    "metrika_sync_counters_failed": {"ошибка"},
+    "metrika_sync_counter_ambiguous": {"сколько"},
+    "metrika_order_load_failed": {"номер", "ошибка"},
+    "woo_status_sync_error": {"номер", "номер_сделки", "ошибка"},
+    "queue_lane_depth": {"дорожка", "глубина", "порог", "подробности"},
+    "queue_api_depth": {"глубина", "порог", "подробности"},
+    "queue_task_waited": {"задача", "номер_сделки", "дорожка", "сколько_ждали", "порог"},
+    "ozon_invoice_stages_missing": {"этапы"},
+    "office_transfer_targets_missing": {"этапы"},
+    "office_transfer_no_since": set(),
+    "lead_distribution_no_since": set(),
+    "wazzup_undelivered_burst": {"лимит", "окно"},
 }
 
 
@@ -278,7 +294,9 @@ def test_fixture_default_templates_render_for_every_event(panel_doc, mode):
         "статус_оплаты": "ожидает оплаты", "текст_события": "клиент ответил «да»",
         "текст_поломки": "не смог спросить остаток", "отправитель": "автоматика amo",
         "ошибка": "24_HOURS_EXCEEDED — окно в сутки закрылось", "сколько_ещё": "…и ещё 7",
-        "номер": "19003",
+        "номер": "19003", "этапы": "Оплата запрошена, Счёт выставлен", "сколько": 3,
+        "номер_сделки": "36554593", "дорожка": "amo", "глубина": 120, "порог": 100,
+        "подробности": "Все дорожки: amo=120, api_queue=3.", "задача": "waybill", "окно": 10,
     }
     for key in panel_doc["events"]:
         values = {k: sample[k] for k in VALUES_BY_EVENT[key]}
@@ -345,3 +363,32 @@ def test_academy_sender_end_to_end_with_panel_settings(mode, panel_doc, monkeypa
     assert sent[0]["text"] == "🎓 Лид: Пётр Иванов, Самовывоз\n@gladkov_369\n" + LINK
     assert sent[0]["parse_mode"] == "HTML"
     assert (sent[0]["chat_id"], sent[0]["thread"]) == (tg_recipients.NOTIFY_CHAT_ID, tg_recipients.NOTIFY_THREAD_ID)
+
+
+def test_tech_report_helper_under_on(mode, panel_doc, monkeypatch):
+    """`_alert(text, event, values)` синка СДЭК: под `on` текст по шаблону панели и чат из
+    панели; без ключа события - как раньше, в технический чат."""
+    import types, asyncio
+    sent = []
+    tg = types.ModuleType("telegram_bot")
+
+    async def send_alert(text, parse_mode=None, chat_id=None, message_thread_id=None):
+        sent.append({"text": text, "chat_id": chat_id, "thread": message_thread_id})
+        return True
+    tg.send_alert = send_alert
+    monkeypatch.setitem(sys.modules, "telegram_bot", tg)
+    for name in ("amo_service", "cdek_client"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    import importlib
+    import cdek_status_sync
+    importlib.reload(cdek_status_sync)
+
+    mode("on")
+    settings_client.set_settings_for_tests(_doc_with(
+        panel_doc, "cdek_sync_stages_missing",
+        template="СДЭК: нет этапов {{этапы}} — синк стоит", channel="op_notify"))
+    asyncio.run(cdek_status_sync._alert("старый текст", "cdek_sync_stages_missing", {"этапы": "A, B"}))
+    asyncio.run(cdek_status_sync._alert("без ключа - как раньше"))
+    assert sent[0]["text"] == "СДЭК: нет этапов A, B — синк стоит"
+    assert (sent[0]["chat_id"], sent[0]["thread"]) == (tg_recipients.NOTIFY_CHAT_ID, tg_recipients.NOTIFY_THREAD_ID)
+    assert sent[1] == {"text": "без ключа - как раньше", "chat_id": None, "thread": None}

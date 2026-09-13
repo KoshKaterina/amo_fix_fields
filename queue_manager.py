@@ -172,7 +172,7 @@ def queue_stats() -> dict:
     }
 
 
-def _alert_bg(key: str, text: str) -> None:
+def _alert_bg(key: str, text: str, event: str | None = None, values: dict | None = None) -> None:
     """TG-алерт с кулдауном по ключу (не чаще раза в QUEUE_ALERT_COOLDOWN_SECONDS),
     отправка в фоне — не блокирует воркер/монитор.
 
@@ -191,7 +191,18 @@ def _alert_bg(key: str, text: str) -> None:
         ok = False
         try:
             from telegram_bot import send_alert
-            ok = await send_alert(text)
+            body, kw = text, {}
+            if event:
+                # Ключ события в каталоге панели: панель может выключить рапорт или
+                # перенаправить; кулдаун при этом остаётся, чтобы выключенное не долбило лог.
+                import alerts
+                d = alerts.decide(event, legacy_text=text, values=values or {})
+                if d is None:
+                    logger.info("QUEUE ALERT [%s]: выключен в панели", key)
+                    ok = True
+                    return
+                body, kw = d.text, d.send_kwargs()
+            ok = await send_alert(body, **kw)
         except Exception:
             logger.exception("Queue alert send failed: %s", text)
         if not ok and _alert_last_sent.get(key) == now:
@@ -220,12 +231,17 @@ async def _monitor() -> None:
                         f"depth-{lane}",
                         f"⚠️ amo_fix_fields: очередь «{lane}» = {depth} задач "
                         f"(порог {QUEUE_ALERT_DEPTH}). Все дорожки: {lanes}, api_queue={api_q}.",
+                        "queue_lane_depth",
+                        {"дорожка": lane, "глубина": depth, "порог": QUEUE_ALERT_DEPTH,
+                         "подробности": f"Все дорожки: {lanes}, api_queue={api_q}."},
                     )
             if api_q >= QUEUE_ALERT_DEPTH:
                 _alert_bg(
                     "depth-api",
                     f"⚠️ amo_fix_fields: очередь API-пайплайна amo = {api_q} запросов "
                     f"(порог {QUEUE_ALERT_DEPTH}). Дорожки: {lanes}.",
+                    "queue_api_depth",
+                    {"глубина": api_q, "порог": QUEUE_ALERT_DEPTH, "подробности": f"Дорожки: {lanes}."},
                 )
         except asyncio.CancelledError:
             raise
@@ -471,6 +487,9 @@ async def _worker(lane: str) -> None:
                 f"wait-{lane}",
                 f"⚠️ amo_fix_fields: задача {kind} (сделка {lead_id or '—'}) ждала в очереди "
                 f"«{lane}» {waited:.0f}с (порог {QUEUE_ALERT_WAIT_SECONDS:.0f}с).",
+                "queue_task_waited",
+                {"задача": kind, "номер_сделки": lead_id or "", "дорожка": lane,
+                 "сколько_ждали": f"{waited:.0f}с", "порог": f"{QUEUE_ALERT_WAIT_SECONDS:.0f}с"},
             )
         try:
             if is_circuit_open(category):

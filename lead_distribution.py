@@ -1082,9 +1082,18 @@ async def _reconcile_loop() -> None:
 
 # ════════════════ жизненный цикл ════════════════
 
-async def _alert(text: str) -> None:
+async def _alert(text: str, event: str | None = None, values: dict | None = None) -> None:
+    """Технический рапорт. `event` - ключ события в каталоге панели: панель может выключить
+    его или перенаправить; без ключа - как раньше, прямо в технический чат."""
     try:
-        await telegram_bot.send_alert(text)
+        body, kw = text, {}
+        if event:
+            d = alerts.decide(event, legacy_text=text, values=values or {})
+            if d is None:
+                logger.info("%s: уведомление выключено в панели", event)
+                return
+            body, kw = d.text, d.send_kwargs()
+        await telegram_bot.send_alert(body, **kw)
     except Exception:
         logger.exception("lead_distribution alert failed: %s", text)
 
@@ -1104,7 +1113,7 @@ async def init() -> None:
             "Вебхук-путь при этом работает."
         )
         logger.error(msg)
-        await _alert(msg)
+        await _alert(msg, "lead_distribution_no_since")
         return
 
     _last_reconcile_ts = LEAD_DISTRIBUTION_SINCE_TS

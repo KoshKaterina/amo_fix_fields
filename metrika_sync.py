@@ -30,6 +30,7 @@ import logging
 import os
 import time
 
+import alerts
 import amo_service
 import migration_freeze
 import metrika_client
@@ -126,7 +127,10 @@ async def init() -> None:
         try:
             counters = await metrika_client.get_counters()
         except Exception as exc:
-            await _alert(f"Metrika sync: не удалось получить список счётчиков: {exc} — ВЫКЛЮЧЕНА")
+            await _alert(
+                f"Metrika sync: не удалось получить список счётчиков: {exc} — ВЫКЛЮЧЕНА",
+                "metrika_sync_counters_failed", {"ошибка": str(exc)},
+            )
             await metrika_client.aclose()
             return
         if len(counters) == 1:
@@ -134,7 +138,8 @@ async def init() -> None:
             logger.info("Metrika sync: счётчик определён автоматически: %s", counter)
         else:
             await _alert(
-                f"Metrika sync: в аккаунте {len(counters)} счётчиков — задай METRIKA_COUNTER_ID. ВЫКЛЮЧЕНА"
+                f"Metrika sync: в аккаунте {len(counters)} счётчиков — задай METRIKA_COUNTER_ID. ВЫКЛЮЧЕНА",
+                "metrika_sync_counter_ambiguous", {"сколько": len(counters)},
             )
             await metrika_client.aclose()
             return
@@ -173,13 +178,20 @@ async def shutdown() -> None:
     logger.info("Metrika sync stopped")
 
 
-async def _alert(text: str) -> None:
+async def _alert(text: str, event: str | None = None, values: dict | None = None) -> None:
     logger.error(text)
     try:
         from telegram_bot import send_alert
-        await send_alert(text)
+        body, kw = text, {}
+        if event:
+            d = alerts.decide(event, legacy_text=text, values=values or {})
+            if d is None:
+                logger.info("%s: уведомление выключено в панели", event)
+                return
+            body, kw = d.text, d.send_kwargs()
+        await send_alert(body, **kw)
     except Exception:
-        logger.exception("Metrika alert failed: %s", text)
+        logger.exception("%s", "Metrika alert failed: " + text)
 
 
 def _cf(entity: dict, field_id: int):
@@ -346,7 +358,10 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
             metrika_order_id, order_status, cod, lead_id,
         )
     except metrika_client.MetrikaError as exc:
-        await _alert(f"Metrika: ошибка загрузки заказа {metrika_order_id}: {exc}")
+        await _alert(
+            f"Metrika: ошибка загрузки заказа {metrika_order_id}: {exc}",
+            "metrika_order_load_failed", {"номер": metrika_order_id, "ошибка": str(exc)},
+        )
 
 
 async def _resolve_clever(dup_lead: dict) -> dict | None:

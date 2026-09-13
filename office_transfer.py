@@ -838,9 +838,18 @@ _RULE_TARGETS = (
 )
 
 
-async def _alert(text: str) -> None:
+async def _alert(text: str, event: str | None = None, values: dict | None = None) -> None:
+    """Технический рапорт. `event` - ключ события в каталоге панели: панель может выключить
+    его или перенаправить; без ключа - как раньше, прямо в технический чат."""
     try:
-        await telegram_bot.send_alert(text)
+        body, kw = text, {}
+        if event:
+            d = alerts.decide(event, legacy_text=text, values=values or {})
+            if d is None:
+                logger.info("%s: уведомление выключено в панели", event)
+                return
+            body, kw = d.text, d.send_kwargs()
+        await telegram_bot.send_alert(body, **kw)
     except Exception:
         logger.exception("office_transfer alert failed: %s", text)
 
@@ -856,7 +865,7 @@ async def _validate_enabled_targets() -> None:
             f"{', '.join(missing)} — проверьте ID в waybill_config.py (переименовали/удалили этап?)"
         )
         logger.error(msg)
-        await _alert(msg)
+        await _alert(msg, "office_transfer_targets_missing", {"этапы": ", ".join(missing)})
 
 
 async def init() -> None:
@@ -876,7 +885,7 @@ async def init() -> None:
             "Вебхук-путь при этом работает."
         )
         logger.error(msg)
-        await _alert(msg)
+        await _alert(msg, "office_transfer_no_since")
         return
 
     _last_reconcile_ts = OFFICE_TRANSFER_SINCE_TS

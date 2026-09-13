@@ -16,6 +16,7 @@
 import asyncio
 import logging
 
+import alerts
 import amo_service
 import cdek_client
 from queue_manager import enqueue_cdek_sync
@@ -55,7 +56,7 @@ async def init() -> None:
     if _office_pipeline_id is None:
         msg = "CDEK sync: не определена воронка «офис» (pipeline cache пуст?) — синхронизация ВЫКЛЮЧЕНА"
         logger.error(msg)
-        await _alert(msg)
+        await _alert(msg, "cdek_sync_no_pipeline")
         return
 
     # Системные финальные статусы amoCRM — одинаковые id во всех воронках
@@ -80,7 +81,7 @@ async def init() -> None:
             f"{', '.join(missing)} — синхронизация ВЫКЛЮЧЕНА"
         )
         logger.error(msg)
-        await _alert(msg)
+        await _alert(msg, "cdek_sync_stages_missing", {"этапы": ", ".join(missing)})
         return
 
     _enabled = True
@@ -108,12 +109,21 @@ async def shutdown() -> None:
     logger.info("CDEK sync stopped")
 
 
-async def _alert(text: str) -> None:
+async def _alert(text: str, event: str | None = None, values: dict | None = None) -> None:
+    """Технический рапорт в Телеграм. `event` - ключ события в каталоге панели: панель может
+    выключить его или перенаправить; без ключа - как раньше, прямо в технический чат."""
     try:
         from telegram_bot import send_alert
-        await send_alert(text)
+        body, kw = text, {}
+        if event:
+            d = alerts.decide(event, legacy_text=text, values=values or {})
+            if d is None:
+                logger.info("%s: уведомление выключено в панели", event)
+                return
+            body, kw = d.text, d.send_kwargs()
+        await send_alert(body, **kw)
     except Exception:
-        logger.exception("CDEK sync alert failed: %s", text)
+        logger.exception("%s", "CDEK sync alert failed: " + text)
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +145,7 @@ async def _ensure_webhook_subscription() -> None:
     except cdek_client.CdekError as exc:
         msg = f"CDEK sync: не удалось оформить подписку на вебхуки СДЭК: {exc}"
         logger.error(msg)
-        await _alert(msg)
+        await _alert(msg, "cdek_sync_webhook_failed", {"ошибка": str(exc)})
     except Exception:
         logger.exception("CDEK sync: неожиданная ошибка подписки на вебхуки")
 
