@@ -130,10 +130,15 @@ def _mock_api(monkeypatch, contact_id=None, lead_id=101, uid="u-1", accepted=201
         calls["note"] = (lid, text)
         return True
 
+    async def set_lead_tags(lid, tags):
+        calls["tags"] = (lid, tags)
+        return True
+
     monkeypatch.setattr(api, "find_contact_id", find_contact_id)
     monkeypatch.setattr(api, "create_unsorted_lead_ex", create_unsorted_lead_ex)
     monkeypatch.setattr(api, "accept_unsorted", accept_unsorted)
     monkeypatch.setattr(api, "add_note_to_lead", add_note_to_lead)
+    monkeypatch.setattr(api, "set_lead_tags", set_lead_tags)
     return calls
 
 
@@ -157,6 +162,8 @@ def test_process_full_path(monkeypatch):
     assert c["lead_tags"] == ["ContactForm_Связаться", "Форма сайта"]
     assert c["contact"]["custom_fields_values"][0]["values"][0]["value"] == "+79099371845"
     assert calls["accept"] == ("u-1", 222)
+    # теги дожимаются PATCH-ем на ПРИНЯТУЮ сделку: источник первым, потом из карты
+    assert calls["tags"] == (201, ["ContactForm_Связаться", "Форма сайта"])
     note_lead, note_text = calls["note"]
     assert note_lead == 201
     assert "Иван" in note_text and "svyazatsya" in note_text

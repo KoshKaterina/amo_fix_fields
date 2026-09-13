@@ -261,6 +261,9 @@ async def process(payload: dict, ip: str = "") -> int | None:
             logger.error("site_form[%s]: accept в этап %s не прошёл, заявка %s осталась в Неразобранном",
                          slug, cfg["status_id"], lead_id)
 
+    # Дожим тегов обычным PATCH: unsorted/forms существующие теги по имени не
+    # линкует (создаёт только новые), поэтому «Тест» через него не встаёт.
+    await api.set_lead_tags(lead_id, [source] + cfg["tags"])
     await api.add_note_to_lead(lead_id, _note_text(slug, fields, page_url))
     logger.info("site_form[%s]: сделка %s, источник %s", slug, lead_id, source)
     return lead_id

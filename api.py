@@ -523,6 +523,16 @@ async def add_note_to_lead(lead_id: Any, text: str) -> bool:
     return data is not None
 
 
+async def set_lead_tags(lead_id: Any, tags: list) -> bool:
+    """Ставит сделке теги по именам (ЗАМЕНЯЕТ весь набор). Нужен потому, что
+    unsorted/forms существующий тег по имени не линкует — создаёт и цепляет
+    только новые (боем 13.09.2026: «Тест» не лёг, новый тег формы лёг)."""
+    url = f"{BASE_URL}/api/v4/leads/{lead_id}"
+    body = {"_embedded": {"tags": [{"name": str(t)} for t in tags if str(t).strip()]}}
+    data = await _request_json("PATCH", url, body=body, what=f"set_lead_tags[{lead_id}]")
+    return data is not None
+
+
 async def create_contact(name: Any, phone: Any, email: Any) -> int | None:
     """Создаёт контакт с телефоном/email. Возвращает id или None."""
     custom_fields = []
