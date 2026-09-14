@@ -3,16 +3,19 @@
 замокан."""
 
 import asyncio
+import time
 
 import pytest
 
 import api
 import site_form_service as sf
+import site_form_store as store
 
 
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
     sf._rate.clear()
+    sf._client_rate.clear()
     sf._seen.clear()
     monkeypatch.setattr(sf, "FORM_MAP", {
         "svyazatsya": {
@@ -264,3 +267,272 @@ def test_api_accept_unsorted(monkeypatch):
 
     monkeypatch.setattr(api, "_request_json", fake_request_json)
     assert asyncio.run(api.accept_unsorted("U1", 42)) == 99
+
+
+def test_api_set_lead_utm(monkeypatch):
+    captured = {}
+
+    async def fake_request_json(method, url, body=None, what=""):
+        captured.update(method=method, url=url, body=body)
+        return {"id": 1}
+
+    monkeypatch.setattr(api, "_request_json", fake_request_json)
+    assert asyncio.run(api.set_lead_utm(1, {"utm_source": "ya", "utm_term": ""}))
+    assert captured["method"] == "PATCH"
+    assert captured["url"].endswith("/api/v4/leads/1")
+    assert captured["body"] == {"custom_fields_values": [{"field_code": "UTM_SOURCE", "values": [{"value": "ya"}]}]}
+
+
+# --- схема 2: новые формы (плагин sun-contact-forms) -----------------------
+
+SID = "3f2b8c1e-5d4a-4b6f-9a7e-1c2d3e4f5a6b"
+
+V2_MAP = {
+    "test-callback": {"source": "Форма: обратный звонок", "pipeline_id": 8642414,
+                      "status_id": 70070982, "tags": ["тест"]},
+    "test-consultation": {"source": "Форма: консультация", "pipeline_id": 8642414,
+                          "status_id": 70070982, "tags": ["тест"]},
+}
+
+
+@pytest.fixture
+def v2(monkeypatch, tmp_path):
+    monkeypatch.setattr(sf, "FORM_MAP", {**sf.FORM_MAP, **V2_MAP})
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "site_form.sqlite3"))
+    monkeypatch.setattr(sf, "_wake", None)
+    store.init_db()
+    return store
+
+
+def _v2_payload(form_type="callback", **over):
+    payload = {
+        "schema": 2,
+        "form": f"test-{form_type}",
+        "form_type": form_type,
+        "submission_id": SID,
+        "client_ip": "203.0.113.7",
+        "contact": {"name": "Иван", "phone": "+79099371845", "telegram": "@ivan_test"},
+        "comment": "Какой кошелёк выбрать?",
+        "context": {
+            "title": "Остались вопросы?",
+            "entry": "test-page-callback",
+            "page_url": "https://test.sunscrypt.ru/product/hardware-wallets/apparatnyj-koshelek-keystone-3-pro/?utm_source=ya",
+            "page_title": "Keystone 3 Pro",
+            "referrer": "https://yandex.ru/",
+            "utm": {"utm_source": "ya", "utm_medium": "cpc", "evil": "x"},
+            "product": {"id": 4899, "name": "Keystone 3 Pro", "sku": "HW-26",
+                        "url": "https://test.sunscrypt.ru/product/hardware-wallets/apparatnyj-koshelek-keystone-3-pro/"},
+            "service": None,
+            "format": None,
+        },
+    }
+    if form_type == "consultation":
+        payload["context"]["service"] = {"id": None, "name": "Консультация по безопасности", "url": "", "verified": False}
+        payload["context"]["format"] = {"code": "showroom", "label": "В шоуруме в Москве"}
+    payload.update(over)
+    return payload
+
+
+def _mock_api_v2(monkeypatch, lead_id=301, uid="U-301", accepted=301):
+    calls = _mock_api(monkeypatch, lead_id=lead_id, uid=uid, accepted=accepted)
+
+    async def set_lead_utm(lid, utm):
+        calls["utm"] = (lid, utm)
+        return True
+
+    monkeypatch.setattr(api, "set_lead_utm", set_lead_utm)
+    return calls
+
+
+def test_normalize_phone_v2():
+    assert sf.normalize_phone_v2("8 (909) 937-18-45") == "+79099371845"
+    assert sf.normalize_phone_v2("+7 909 937-18-45") == "+79099371845"
+    assert sf.normalize_phone_v2("9099371845") == "+79099371845"
+    assert sf.normalize_phone_v2("+375 29 123-45-67") == "+375291234567"
+    # без «+» страну не угадываем - человек проверяет номер сам
+    assert sf.normalize_phone_v2("375291234567") == ""
+    assert sf.normalize_phone_v2("+7 909 937") == ""
+    assert sf.normalize_phone_v2("+8 909 937-18-45") == ""
+    assert sf.normalize_phone_v2("звоните вечером") == ""
+
+
+def test_clean_v2_callback(v2):
+    clean = sf.clean_v2(_v2_payload())
+    assert clean["contact"]["phone"] == "+79099371845"
+    assert clean["context"]["utm"] == {"utm_source": "ya", "utm_medium": "cpc"}
+    assert clean["context"]["product"]["sku"] == "HW-26"
+    assert clean["context"]["service"] is None
+    assert clean["context"]["format"] is None
+
+
+@pytest.mark.parametrize("mutate, error", [
+    (lambda p: p.update(form="left-form"), "unknown-form"),
+    (lambda p: p.update(submission_id="<script>"), "bad-submission-id"),
+    (lambda p: p.update(form_type="preorder"), "bad-form-type"),
+    (lambda p: p["contact"].update(name="  "), "no-name"),
+    (lambda p: p["contact"].update(phone="12345"), "bad-phone"),
+])
+def test_clean_v2_rejects(v2, mutate, error):
+    payload = _v2_payload()
+    mutate(payload)
+    with pytest.raises(sf.PayloadError, match=error):
+        sf.clean_v2(payload)
+
+
+def test_clean_v2_consultation_requires_format(v2):
+    payload = _v2_payload("consultation")
+    payload["context"]["format"] = None
+    with pytest.raises(sf.PayloadError, match="no-format"):
+        sf.clean_v2(payload)
+    payload["context"]["format"] = {"code": "moon"}
+    with pytest.raises(sf.PayloadError, match="no-format"):
+        sf.clean_v2(payload)
+
+
+def test_clean_v2_drops_bad_urls(v2):
+    payload = _v2_payload()
+    payload["context"]["page_url"] = "javascript:alert(1)"
+    payload["context"]["referrer"] = "ftp://example.com/"
+    payload.pop("page_url", None)
+    clean = sf.clean_v2(payload)
+    assert clean["context"]["page_url"] == ""
+    assert clean["context"]["referrer"] == ""
+
+
+def test_accept_v2_accepted_then_duplicate(v2):
+    assert asyncio.run(sf.accept_v2(_v2_payload())) == (200, {"ok": True, "status": "accepted"})
+    assert asyncio.run(sf.accept_v2(_v2_payload())) == (200, {"ok": True, "status": "duplicate"})
+    row = store.get(SID)
+    assert row["status"] == "pending"
+    assert "+79099371845" in row["payload"]
+
+
+def test_accept_v2_invalid_and_rate_limit(v2, monkeypatch):
+    broken = _v2_payload()
+    broken["contact"]["phone"] = ""
+    assert asyncio.run(sf.accept_v2(broken)) == (422, {"ok": False, "error": "bad-phone"})
+    monkeypatch.setattr(sf, "SITE_FORM_CLIENT_RATE_PER_MINUTE", 1)
+    assert asyncio.run(sf.accept_v2(_v2_payload()))[0] == 200
+    second = _v2_payload(submission_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    assert asyncio.run(sf.accept_v2(second)) == (429, {"ok": False, "error": "rate-limit"})
+
+
+def test_accept_v2_store_down(v2, monkeypatch):
+    def boom(*args, **kwargs):
+        raise OSError("disk")
+
+    monkeypatch.setattr(store, "insert_pending", boom)
+    assert asyncio.run(sf.accept_v2(_v2_payload())) == (503, {"ok": False, "error": "store"})
+
+
+def test_run_due_creates_lead_and_wipes_payload(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    asyncio.run(sf.accept_v2(_v2_payload()))
+    assert asyncio.run(sf.run_due()) == 1
+
+    created = calls["create"]
+    assert created["pipeline_id"] == 8642414
+    assert created["lead_name"] == "Форма: обратный звонок: Иван"
+    assert created["lead_tags"] == ["Форма: обратный звонок", "тест"]
+    assert created["ip"] == "203.0.113.7"
+    assert created["page_url"].startswith("https://test.sunscrypt.ru/product/")
+    assert created["contact"]["custom_fields_values"][0]["values"][0]["value"] == "+79099371845"
+    assert calls["find"] == ["+79099371845"]
+    assert calls["accept"] == ("U-301", 70070982)
+    assert calls["tags"] == (301, ["Форма: обратный звонок", "тест"])
+    assert calls["utm"] == (301, {"utm_source": "ya", "utm_medium": "cpc"})
+
+    note = calls["note"][1]
+    for piece in (
+        "Заявка с сайта: Обратный звонок или вопрос",
+        "Заголовок окна: Остались вопросы?",
+        "Имя: Иван",
+        "Телефон: +79099371845",
+        "Telegram: @ivan_test",
+        "Вопрос: Какой кошелёк выбрать?",
+        "Товар: Keystone 3 Pro, артикул HW-26 - https://test.sunscrypt.ru/product/",
+        "Страница: Keystone 3 Pro - https://test.sunscrypt.ru/product/",
+        "Кнопка на сайте: test-page-callback",
+        "UTM: utm_source=ya, utm_medium=cpc",
+        "Пришёл с: https://yandex.ru/",
+        "Номер заявки: 3f2b8c1e",
+    ):
+        assert piece in note
+    assert "·" not in note
+
+    row = store.get(SID)
+    assert row["status"] == "done"
+    assert row["lead_id"] == 301
+    assert row["payload"] is None  # персональные данные после создания сделки не храним
+
+    # повтор той же попытки после создания сделки - второй сделки нет
+    calls.pop("create")
+    assert asyncio.run(sf.accept_v2(_v2_payload()))[1]["status"] == "duplicate"
+    assert asyncio.run(sf.run_due()) == 0
+    assert "create" not in calls
+
+
+def test_consultation_note_has_service_and_format(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    asyncio.run(sf.accept_v2(_v2_payload("consultation")))
+    asyncio.run(sf.run_due())
+    note = calls["note"][1]
+    assert "Заявка с сайта: Запись на консультацию" in note
+    assert "Запрос: Какой кошелёк выбрать?" in note
+    assert "Консультация: Консультация по безопасности (название пришло со страницы" in note
+    assert "Формат: В шоуруме в Москве" in note
+
+
+def test_v2_existing_contact_linked_by_phone(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+
+    async def find_contact_id(query):
+        calls.setdefault("find", []).append(query)
+        return 777
+
+    monkeypatch.setattr(api, "find_contact_id", find_contact_id)
+    asyncio.run(sf.accept_v2(_v2_payload()))
+    asyncio.run(sf.run_due())
+    assert calls["create"]["contact"] == {"id": 777}
+
+
+def test_v2_amo_down_retries_then_alerts(v2, monkeypatch):
+    _mock_api_v2(monkeypatch, lead_id=None)
+    sent = []
+
+    async def fake_alert(row, error, attempts):
+        sent.append((row["submission_id"][:8], error, attempts))
+
+    monkeypatch.setattr(sf, "_alert_failed", fake_alert)
+    asyncio.run(sf.accept_v2(_v2_payload()))
+    asyncio.run(sf.run_due())
+    row = store.get(SID)
+    assert row["status"] == "pending"
+    assert row["attempts"] == 1
+    assert row["last_error"] == "amo-create-failed"
+    assert row["next_try_at"] > time.time() + 20
+
+    for _ in range(len(sf.RETRY_DELAYS_S)):
+        asyncio.run(sf.run_due(now=time.time() + 10 ** 6))
+    row = store.get(SID)
+    assert row["status"] == "failed"
+    assert row["payload"] is not None  # для ручного разбора, до очистки
+    assert sent == [("3f2b8c1e", "amo-create-failed", len(sf.RETRY_DELAYS_S) + 1)]
+
+
+def test_v2_created_row_is_finished_without_second_lead(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    asyncio.run(sf.accept_v2(_v2_payload()))
+    store.mark_created(SID, 555, "U-555")
+    asyncio.run(sf.run_due())
+    assert "create" not in calls
+    assert calls["accept"] == ("U-555", 70070982)
+    assert store.get(SID)["status"] == "done"
+
+
+def test_store_purge_keeps_fresh_rows(v2):
+    store.insert_pending("aaaaaaaa-0000-4000-8000-000000000001", "test-callback", "{}", now=1000.0)
+    store.mark_done("aaaaaaaa-0000-4000-8000-000000000001", 1, now=1000.0)
+    store.insert_pending(SID, "test-callback", "{}")
+    assert store.purge(7, now=1000.0 + 8 * 86400) == 1
+    assert store.get(SID) is not None

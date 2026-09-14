@@ -533,6 +533,22 @@ async def set_lead_tags(lead_id: Any, tags: list) -> bool:
     return data is not None
 
 
+async def set_lead_utm(lead_id: Any, utm: dict) -> bool:
+    """Пишет UTM-метки в стандартные поля отслеживания сделки (utm_source → field_code
+    UTM_SOURCE и т.д.). Пустые значения пропускаются. False - amo не приняла: формы сайта
+    держат те же метки в примечании, так что это не повод терять сделку."""
+    fields = [
+        {"field_code": str(key).upper(), "values": [{"value": str(value)}]}
+        for key, value in (utm or {}).items()
+        if str(value or "").strip()
+    ]
+    if not fields:
+        return True
+    url = f"{BASE_URL}/api/v4/leads/{lead_id}"
+    data = await _request_json("PATCH", url, body={"custom_fields_values": fields}, what=f"set_lead_utm[{lead_id}]")
+    return data is not None
+
+
 async def create_contact(name: Any, phone: Any, email: Any) -> int | None:
     """Создаёт контакт с телефоном/email. Возвращает id или None."""
     custom_fields = []

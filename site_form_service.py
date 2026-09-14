@@ -1,31 +1,44 @@
-"""Приём контактных форм сайта → сделки в amoCRM с источником на каждую форму.
+"""Приём контактных форм сайта → сделки в amoCRM.
 
-Контур: Contact Form 7 на sunscrypt.ru → WP-сниппет (хук wpcf7_mail_sent, сервер
-WP сам постит сюда JSON) → POST /site_form → заявка в «Неразобранное» воронки →
-(опционально) сразу принимается в этап. Через «Неразобранное» ходим намеренно:
-только этот путь amo даёт проставить сделке «источник создания» — обычному
-POST /leads источник не передаётся.
+Один роут POST /site_form (заголовок X-Api-Key), два контракта.
 
-Источники вида «ContactForm_Академия» регистрируются на нашей интеграции через
-/api/v4/sources при старте (ensure_sources); связь заявки с источником — по
-source_uid = external_id ("site_form_<slug>").
-
-Контракт запроса от WP-сниппета:
-    POST /site_form
-    X-Api-Key: <SITE_FORM_SECRET>
+Схема 1 (13.09.2026). WPCode-сниппет на sunscrypt.ru, тестовые копии старых форм CF7:
     {"form": "<slug>", "page_url": "https://...", "fields": {"your-name": "...", ...}}
+    Обработка фоном сразу, ответ 200 всегда. Живёт, пока сниппет не снят.
+
+Схема 2 (14.09.2026). Плагин sun-contact-forms, формы по ТЗ «Новые контактные формы»
+(обратный звонок или вопрос, запись на консультацию):
+    {"schema": 2, "form": "test-callback", "form_type": "callback" | "consultation",
+     "submission_id": "<uuid одной попытки человека>", "client_ip": "...",
+     "contact": {"name": "...", "phone": "+7...", "telegram": "@..."}, "comment": "...",
+     "context": {"title", "entry", "page_url", "page_title", "referrer", "utm": {...},
+                 "product": {id, name, sku, url} | null,
+                 "service": {id, name, url, verified} | null,
+                 "format": {"code": "online" | "showroom", "label"} | null}}
+    Проверка → запись в очередь site_form_store → ответ 200 {"ok": true, "status":
+    "accepted" | "duplicate"}. Сделку создаёт фоновый обработчик с повторами: amo недоступна -
+    заявка ждёт в очереди, а не теряется. Ответ не 200 (422 проверка, 429 частота, 503 очередь) -
+    сайт показывает человеку «Не получилось отправить заявку» и сохраняет введённое.
+    Повтор той же попытки (тот же submission_id) вторую сделку не создаёт.
+
+Сделка идёт через «Неразобранное» воронки и сразу принимается в этап карты: только этот путь
+amo даёт заполнить метаданные формы. Нативная графа «Источник» токен-интеграции закрыта
+(«Integration needs widget», боем 13.09.2026) - имя формы едет тегом и в названии сделки.
 
 Env:
-    SITE_FORM_ENABLED=1     — включатель, по умолчанию ВЫКЛЮЧЕНО (деплой безопасен)
-    SITE_FORM_SECRET=...    — сверяется с заголовком X-Api-Key
-    SITE_FORM_MAP='{"svyazatsya": {"source": "ContactForm_Связаться",
-                    "pipeline_id": 123, "status_id": 456, "tags": ["Форма сайта"]},
-                    "test-svyazatsya": {"source": "ContactForm_Тест",
-                    "pipeline_id": <воронка Тест>, "status_id": <её этап>,
-                    "tags": ["Тест"]}}'
-        slug формы → куда класть. status_id не задан → заявка остаётся
-        в «Неразобранном» воронки pipeline_id. Формы не из карты игнорируются.
-    SITE_FORM_RATE_PER_MINUTE=30 — предел заявок с одного IP в минуту
+    SITE_FORM_ENABLED=1     - включатель, по умолчанию ВЫКЛЮЧЕНО (деплой безопасен)
+    SITE_FORM_SECRET=...    - сверяется с заголовком X-Api-Key
+    SITE_FORM_MAP='{"test-callback": {"source": "Форма: обратный звонок",
+                    "pipeline_id": 8642414, "status_id": 70070982, "tags": ["тест"]}}'
+        slug формы → куда класть. status_id не задан → заявка остаётся в «Неразобранном»
+        воронки pipeline_id. Формы не из карты: схема 1 - пропуск, схема 2 - ответ 422.
+    SITE_FORM_RATE_PER_MINUTE=30        - схема 1: заявок с одного адреса в минуту
+    SITE_FORM_CLIENT_RATE_PER_MINUTE=5  - схема 2: заявок от одного посетителя в минуту
+    SITE_FORM_DB_PATH=/app/var/site_form.sqlite3 - очередь схемы 2
+    SITE_FORM_KEEP_DAYS=7               - сколько хранить законченные и проваленные строки
+    SITE_FORM_WORKER_INTERVAL_S=15      - как часто фоновый обработчик смотрит очередь
+    SITE_FORM_TELEGRAM_FIELD_ID=0       - поле контакта «Telegram» для новых контактов
+                                          (0 - ник только в примечании сделки)
 """
 
 import asyncio
@@ -37,6 +50,7 @@ import re
 import time
 
 import api
+import site_form_store as store
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -56,17 +70,37 @@ def _env_int(name: str, default: int) -> int:
 
 
 SITE_FORM_RATE_PER_MINUTE = _env_int("SITE_FORM_RATE_PER_MINUTE", 30)
+SITE_FORM_CLIENT_RATE_PER_MINUTE = _env_int("SITE_FORM_CLIENT_RATE_PER_MINUTE", 5)
+SITE_FORM_KEEP_DAYS = _env_int("SITE_FORM_KEEP_DAYS", 7)
+SITE_FORM_WORKER_INTERVAL_S = _env_int("SITE_FORM_WORKER_INTERVAL_S", 15)
+SITE_FORM_TELEGRAM_FIELD_ID = _env_int("SITE_FORM_TELEGRAM_FIELD_ID", 0)
+
+# Паузы между попытками создать сделку; после последней заявка «failed» и алерт в технический чат.
+# В сумме около двух часов - дольше amo у нас не лежала.
+RETRY_DELAYS_S = (30, 60, 120, 300, 600, 1800, 3600)
 
 # Обрезка недоверенного ввода перед отправкой в amo (иначе 400).
 MAX_NAME_LEN = 200
 MAX_NOTE_LEN = 5000
-# Антидубль повторной отправки той же заявки (даблклик, ретрай WP).
+# Схема 1: антидубль повторной отправки той же заявки (даблклик, ретрай WP).
 SEEN_TTL_SECONDS = _env_int("SITE_FORM_SEEN_TTL_SECONDS", 120)
 
-# Ключи полей CF7, из которых достаём контакт (первый непустой).
+# Схема 1: ключи полей CF7, из которых достаём контакт (первый непустой).
 NAME_KEYS = ("your-name", "name", "fio", "imya")
 PHONE_KEYS = ("your-tel", "your-phone", "tel", "phone", "telefon")
 EMAIL_KEYS = ("your-email", "email")
+
+# Схема 2: справочники формы. Тексты - как их видит человек на сайте.
+FORM_TYPES = {
+    "callback": "Обратный звонок или вопрос",
+    "consultation": "Запись на консультацию",
+}
+FORMATS = {
+    "online": "Онлайн",
+    "showroom": "В шоуруме в Москве",
+}
+UTM_KEYS = ("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content")
+_SUBMISSION_RE = re.compile(r"^[a-f0-9-]{16,64}$")
 
 
 def _load_map() -> dict:
@@ -107,7 +141,11 @@ def _load_map() -> dict:
 FORM_MAP = _load_map()
 
 _rate: dict[str, list] = {}
+_client_rate: dict[str, list] = {}
 _seen: dict[str, float] = {}
+
+_wake: asyncio.Event | None = None
+_worker_task: asyncio.Task | None = None
 
 
 def is_enabled() -> bool:
@@ -120,15 +158,25 @@ def secret_ok(key: str) -> bool:
     return hmac.compare_digest(SITE_FORM_SECRET, key)
 
 
-def allow_ip(ip: str) -> bool:
-    """Скользящее окно на минуту. IP пустой (нет X-Forwarded-For) — общая корзина."""
+def _allow(buckets: dict, key: str, limit: int) -> bool:
+    """Скользящее окно на минуту. Пустой ключ - общая корзина."""
     now = time.monotonic()
-    bucket = _rate.setdefault(ip or "-", [])
+    bucket = buckets.setdefault(key or "-", [])
     bucket[:] = [t for t in bucket if now - t < 60]
-    if len(bucket) >= SITE_FORM_RATE_PER_MINUTE:
+    if len(bucket) >= limit:
         return False
     bucket.append(now)
     return True
+
+
+def allow_ip(ip: str) -> bool:
+    """Схема 1: предел по адресу запроса (это адрес сервера WP, а не посетителя)."""
+    return _allow(_rate, ip, SITE_FORM_RATE_PER_MINUTE)
+
+
+def allow_client(client_ip: str) -> bool:
+    """Схема 2: предел по адресу посетителя, который сайт передаёт в заявке."""
+    return _allow(_client_rate, client_ip, SITE_FORM_CLIENT_RATE_PER_MINUTE)
 
 
 def _seen_recently(key: str) -> bool:
@@ -155,6 +203,30 @@ def _normalize_phone(raw: str) -> str:
     if len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
     return f"+{digits}" if digits else ""
+
+
+def normalize_phone_v2(raw: str) -> str:
+    """Те же правила, что у плагина на сайте. '' - номер неоднозначный, не угадываем.
+    Без «+» принимаем только российские записи: 8/7 и 10 цифр или 10 цифр с 9 в начале."""
+    raw = (raw or "").strip()
+    if not raw or re.search(r"[^0-9+()\s.\-]", raw):
+        return ""
+    plus = raw.startswith("+")
+    digits = re.sub(r"\D", "", raw)
+    n = len(digits)
+    if not plus:
+        if n == 11 and digits[0] in "78":
+            return "+7" + digits[1:]
+        if n == 10 and digits[0] == "9":
+            return "+7" + digits
+        return ""
+    if n < 10 or n > 15 or digits[0] == "0":
+        return ""
+    if digits[0] == "7" and n != 11:
+        return ""
+    if digits.startswith("89"):  # «+8 9…» - перепутали код страны
+        return ""
+    return "+" + digits
 
 
 def _fallback_phone(fields: dict) -> str:
@@ -190,8 +262,12 @@ def _note_text(slug: str, fields: dict, page_url: str) -> str:
     return "\n".join(lines)[:MAX_NOTE_LEN]
 
 
+# ---------------------------------------------------------------------------
+# Схема 1
+# ---------------------------------------------------------------------------
+
 async def process(payload: dict, ip: str = "") -> int | None:
-    """Одна заявка → сделка. Возвращает id сделки или None (не создана/пропуск)."""
+    """Схема 1: одна заявка → сделка. Возвращает id сделки или None (не создана/пропуск)."""
     slug = str(payload.get("form") or "").strip()
     cfg = FORM_MAP.get(slug)
     if not cfg:
@@ -277,8 +353,341 @@ async def _safe_process(payload: dict, ip: str) -> None:
 
 
 def handle_bg(payload: dict, ip: str = "") -> None:
-    """Обработка фоном: вебхук отвечает 200 сразу, WP не ждёт amo."""
+    """Схема 1: обработка фоном, вебхук отвечает 200 сразу, WP не ждёт amo."""
     asyncio.get_running_loop().create_task(_safe_process(payload, ip))
+
+
+# ---------------------------------------------------------------------------
+# Схема 2: проверка и очередь
+# ---------------------------------------------------------------------------
+
+class PayloadError(ValueError):
+    """Заявка схемы 2 не прошла проверку. Текст - короткий код без персональных данных."""
+
+
+def _s(value, limit: int) -> str:
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return ""
+    return str(value).strip()[:limit]
+
+
+def _url(value, limit: int = 1000) -> str:
+    url = _s(value, limit + 1)
+    if len(url) > limit or not re.match(r"^https?://[^\s]+$", url):
+        return ""
+    return url
+
+
+def _int_or_none(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _clean_ref(value, with_sku: bool = False, with_verified: bool = False) -> dict | None:
+    """Товар или консультация из контекста страницы. Пустышка → None."""
+    if not isinstance(value, dict):
+        return None
+    ref = {
+        "id": _int_or_none(value.get("id")),
+        "name": _s(value.get("name"), 200),
+        "url": _url(value.get("url")),
+    }
+    if with_sku:
+        ref["sku"] = _s(value.get("sku"), 64)
+    if with_verified:
+        ref["verified"] = bool(value.get("verified"))
+    if not ref["name"] and ref["id"] is None:
+        return None
+    return ref
+
+
+def clean_v2(payload: dict) -> dict:
+    """Проверка и нормализация заявки схемы 2. Сайт уже проверил поля, но на слово ему не верим."""
+    slug = _s(payload.get("form"), 64)
+    if slug not in FORM_MAP:
+        raise PayloadError("unknown-form")
+    submission_id = _s(payload.get("submission_id"), 64).lower()
+    if not _SUBMISSION_RE.match(submission_id):
+        raise PayloadError("bad-submission-id")
+    form_type = _s(payload.get("form_type"), 32)
+    if form_type not in FORM_TYPES:
+        raise PayloadError("bad-form-type")
+
+    contact_in = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
+    name = _s(contact_in.get("name"), 80)
+    if not name:
+        raise PayloadError("no-name")
+    phone = normalize_phone_v2(_s(contact_in.get("phone"), 32))
+    if not phone:
+        raise PayloadError("bad-phone")
+
+    ctx_in = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    fmt_in = ctx_in.get("format") if isinstance(ctx_in.get("format"), dict) else {}
+    fmt_code = _s(fmt_in.get("code"), 16)
+    if form_type == "consultation" and fmt_code not in FORMATS:
+        raise PayloadError("no-format")
+
+    utm_in = ctx_in.get("utm") if isinstance(ctx_in.get("utm"), dict) else {}
+    utm = {}
+    for key in UTM_KEYS:
+        value = _s(utm_in.get(key), 200)
+        if value:
+            utm[key] = value
+
+    page_url = _url(ctx_in.get("page_url")) or _url(payload.get("page_url"))
+    return {
+        "schema": 2,
+        "form": slug,
+        "form_type": form_type,
+        "submission_id": submission_id,
+        "client_ip": _s(payload.get("client_ip"), 64),
+        "contact": {
+            "name": name,
+            "phone": phone,
+            "telegram": _s(contact_in.get("telegram"), 64),
+        },
+        "comment": _s(payload.get("comment"), 2000),
+        "context": {
+            "title": _s(ctx_in.get("title"), 200),
+            "entry": _s(ctx_in.get("entry"), 64),
+            "page_url": page_url,
+            "page_title": _s(ctx_in.get("page_title"), 300),
+            "referrer": _url(ctx_in.get("referrer")),
+            "utm": utm,
+            "product": _clean_ref(ctx_in.get("product"), with_sku=True),
+            "service": _clean_ref(ctx_in.get("service"), with_verified=True) if form_type == "consultation" else None,
+            "format": {"code": fmt_code, "label": FORMATS[fmt_code]} if fmt_code in FORMATS else None,
+        },
+    }
+
+
+async def accept_v2(payload: dict) -> tuple[int, dict]:
+    """Схема 2: проверка и постановка в очередь. Возвращает (HTTP-код, тело ответа)."""
+    try:
+        clean = clean_v2(payload)
+    except PayloadError as exc:
+        logger.warning("site_form[v2]: заявка отклонена: %s (форма %r)", exc, _s(payload.get("form"), 64))
+        return 422, {"ok": False, "error": str(exc)}
+    if not allow_client(clean["client_ip"]):
+        logger.warning("site_form[%s]: превышена частота заявок от одного посетителя", clean["form"])
+        return 429, {"ok": False, "error": "rate-limit"}
+    short_id = clean["submission_id"][:8]
+    try:
+        inserted, row = await asyncio.to_thread(
+            store.insert_pending, clean["submission_id"], clean["form"], json.dumps(clean, ensure_ascii=False),
+        )
+    except Exception:
+        logger.exception("site_form[%s]: очередь недоступна, заявка %s не принята", clean["form"], short_id)
+        return 503, {"ok": False, "error": "store"}
+    if not inserted:
+        logger.info("site_form[%s]: повтор попытки %s (статус %s) — вторую сделку не создаём",
+                    clean["form"], short_id, row.get("status"))
+        return 200, {"ok": True, "status": "duplicate"}
+    logger.info("site_form[%s]: заявка %s принята в очередь", clean["form"], short_id)
+    _kick()
+    return 200, {"ok": True, "status": "accepted"}
+
+
+# ---------------------------------------------------------------------------
+# Схема 2: сделка
+# ---------------------------------------------------------------------------
+
+def note_text_v2(p: dict, source: str) -> str:
+    """Примечание к сделке: всё, что человек ввёл, и откуда он пришёл. Словами, без кодов."""
+    ctx = p["context"]
+    contact = p["contact"]
+    consultation = p["form_type"] == "consultation"
+    lines = [f"Заявка с сайта: {FORM_TYPES[p['form_type']]} ({source})"]
+    if ctx["title"]:
+        lines.append(f"Заголовок окна: {ctx['title']}")
+    lines.append(f"Имя: {contact['name']}")
+    lines.append(f"Телефон: {contact['phone']}")
+    if contact["telegram"]:
+        lines.append(f"Telegram: {contact['telegram']}")
+    if p["comment"]:
+        lines.append(f"{'Запрос' if consultation else 'Вопрос'}: {p['comment']}")
+    service = ctx["service"]
+    if consultation:
+        if service:
+            line = f"Консультация: {service['name'] or 'без названия'}"
+            if service["url"]:
+                line += f" - {service['url']}"
+            if not service.get("verified"):
+                line += " (название пришло со страницы, по каталогу не сверено)"
+            lines.append(line)
+        if ctx["format"]:
+            lines.append(f"Формат: {ctx['format']['label']}")
+    product = ctx["product"]
+    if product and not (service and service.get("id") and service.get("id") == product.get("id")):
+        line = f"Товар: {product['name'] or 'без названия'}"
+        if product.get("sku"):
+            line += f", артикул {product['sku']}"
+        if product["url"]:
+            line += f" - {product['url']}"
+        lines.append(line)
+    if ctx["page_url"]:
+        lines.append(f"Страница: {ctx['page_title'] + ' - ' if ctx['page_title'] else ''}{ctx['page_url']}")
+    if ctx["entry"]:
+        lines.append(f"Кнопка на сайте: {ctx['entry']}")
+    if ctx["utm"]:
+        lines.append("UTM: " + ", ".join(f"{k}={v}" for k, v in ctx["utm"].items()))
+    if ctx["referrer"]:
+        lines.append(f"Пришёл с: {ctx['referrer']}")
+    lines.append(f"Номер заявки: {p['submission_id'][:8]}")
+    return "\n".join(lines)[:MAX_NOTE_LEN]
+
+
+async def _create_lead_v2(p: dict, cfg: dict) -> tuple[int | None, str | None]:
+    """Заявка в «Неразобранное». Контакт ищем по телефону по действующему правилу (как Jivo
+    и схема 1); новый контакт - имя и телефон, Telegram - если задано поле."""
+    contact_in = p["contact"]
+    source = cfg["source"]
+    contact_id = await api.find_contact_id(contact_in["phone"])
+    if contact_id:
+        contact = {"id": int(contact_id)}
+    else:
+        fields = [{"field_code": "PHONE", "values": [{"value": contact_in["phone"], "enum_code": "WORK"}]}]
+        if contact_in["telegram"] and SITE_FORM_TELEGRAM_FIELD_ID:
+            fields.append({"field_id": SITE_FORM_TELEGRAM_FIELD_ID, "values": [{"value": contact_in["telegram"]}]})
+        contact = {"name": contact_in["name"], "custom_fields_values": fields}
+    res = await api.create_unsorted_lead_ex(
+        lead_name=f"{source}: {contact_in['name']}",
+        pipeline_id=cfg["pipeline_id"],
+        contact=contact,
+        source_uid=external_id(p["form"]),
+        page_url=p["context"]["page_url"],
+        created_ts=int(time.time()),
+        source_name=source,
+        form_id=p["form"],
+        lead_tags=[source] + cfg["tags"],
+        ip=p["client_ip"] or "0.0.0.0",
+    )
+    return res.get("lead_id"), res.get("uid")
+
+
+async def _finish_lead_v2(p: dict, cfg: dict, row: dict) -> int:
+    """Доводка созданной сделки: этап, теги, UTM, примечание. Каждый шаг - по возможности:
+    сделка уже есть, и провал доводки не повод создавать её заново."""
+    lead_id = int(row["lead_id"])
+    source = cfg["source"]
+    if cfg["status_id"] and row.get("unsorted_uid"):
+        accepted = await api.accept_unsorted(row["unsorted_uid"], cfg["status_id"])
+        if accepted:
+            lead_id = int(accepted)
+        else:
+            logger.error("site_form[%s]: accept в этап %s не прошёл, сделка %s осталась в Неразобранном",
+                         p["form"], cfg["status_id"], lead_id)
+    await api.set_lead_tags(lead_id, [source] + cfg["tags"])
+    if p["context"]["utm"]:
+        if not await api.set_lead_utm(lead_id, p["context"]["utm"]):
+            logger.warning("site_form[%s]: UTM в поля сделки %s не записались, остались в примечании",
+                           p["form"], lead_id)
+    await api.add_note_to_lead(lead_id, note_text_v2(p, source))
+    return lead_id
+
+
+async def _retry_or_fail(row: dict, error: str) -> None:
+    attempts = int(row.get("attempts") or 0) + 1
+    short_id = row["submission_id"][:8]
+    if attempts > len(RETRY_DELAYS_S):
+        await asyncio.to_thread(store.mark_failed, row["submission_id"], attempts, error)
+        logger.error("site_form[%s]: заявка %s не доставлена за %s попыток (%s) — нужен ручной разбор",
+                     row["form"], short_id, attempts, error)
+        await _alert_failed(row, error, attempts)
+        return
+    delay = RETRY_DELAYS_S[attempts - 1]
+    await asyncio.to_thread(store.mark_retry, row["submission_id"], attempts, time.time() + delay, error)
+    logger.warning("site_form[%s]: заявка %s не доставлена (%s), попытка %s, следующая через %s с",
+                   row["form"], short_id, error, attempts, delay)
+
+
+async def _alert_failed(row: dict, error: str, attempts: int) -> None:
+    """Технический чат: без имени и телефона - они лежат в очереди на сервере."""
+    import alerts
+    import telegram_bot
+
+    source = (FORM_MAP.get(row["form"]) or {}).get("source") or row["form"]
+    text = (
+        "Заявка с сайта не создалась в amoCRM\n"
+        f"Форма: {source}\n"
+        f"Попыток: {attempts}, последняя ошибка: {error}\n"
+        f"Номер заявки: {row['submission_id'][:8]}\n"
+        f"Данные заявки хранятся на сервере в очереди форм {SITE_FORM_KEEP_DAYS} дн."
+    )
+    try:
+        decision = alerts.decide("site_form_failed", legacy_text=text, values={})
+        if decision is not None:
+            await telegram_bot.send_alert(decision.text, **decision.send_kwargs())
+    except Exception:
+        logger.exception("site_form: алерт о недоставленной заявке не отправлен")
+
+
+async def deliver(row: dict) -> None:
+    """Одна строка очереди → сделка. Ошибка не роняет обработчик: строка уходит на повтор."""
+    submission_id = row["submission_id"]
+    try:
+        payload = json.loads(row.get("payload") or "")
+    except ValueError:
+        await asyncio.to_thread(store.mark_failed, submission_id, int(row.get("attempts") or 0), "broken-payload")
+        logger.error("site_form[%s]: заявка %s испорчена в очереди", row["form"], submission_id[:8])
+        return
+    cfg = FORM_MAP.get(row["form"])
+    if not cfg:
+        # Карту поменяли после приёма: ждём, пока форму вернут, заявку не теряем.
+        await _retry_or_fail(row, "form-not-in-map")
+        return
+    try:
+        if row["status"] == "pending":
+            lead_id, uid = await _create_lead_v2(payload, cfg)
+            if not lead_id:
+                await _retry_or_fail(row, "amo-create-failed")
+                return
+            await asyncio.to_thread(store.mark_created, submission_id, lead_id, uid)
+            row = {**row, "status": "created", "lead_id": lead_id, "unsorted_uid": uid}
+        lead_id = await _finish_lead_v2(payload, cfg, row)
+        await asyncio.to_thread(store.mark_done, submission_id, lead_id)
+        logger.info("site_form[%s]: заявка %s → сделка %s", row["form"], submission_id[:8], lead_id)
+    except Exception as exc:
+        logger.exception("site_form[%s]: заявка %s — сбой доставки", row["form"], submission_id[:8])
+        await _retry_or_fail(row, type(exc).__name__)
+
+
+async def run_due(now: float | None = None) -> int:
+    rows = await asyncio.to_thread(store.due, now)
+    for row in rows:
+        await deliver(row)
+    return len(rows)
+
+
+def _kick() -> None:
+    if _wake is not None:
+        _wake.set()
+
+
+async def _worker() -> None:
+    last_purge = 0.0
+    while True:
+        _wake.clear()
+        try:
+            await run_due()
+            if time.time() - last_purge > 3600:
+                removed = await asyncio.to_thread(store.purge, SITE_FORM_KEEP_DAYS)
+                if removed:
+                    logger.info("site_form: из очереди удалено старых строк: %s", removed)
+                last_purge = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("site_form: сбой фонового обработчика")
+        try:
+            await asyncio.wait_for(_wake.wait(), timeout=SITE_FORM_WORKER_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def ensure_sources() -> None:
@@ -306,6 +715,7 @@ async def ensure_sources() -> None:
 
 
 async def init() -> None:
+    global _wake, _worker_task
     if not SITE_FORM_ENABLED:
         logger.info("site_form: выключено (SITE_FORM_ENABLED не задан)")
         return
@@ -315,5 +725,24 @@ async def init() -> None:
     if not FORM_MAP:
         logger.error("site_form: SITE_FORM_ENABLED=1, но карта SITE_FORM_MAP пуста — приём не работает")
         return
+    try:
+        await asyncio.to_thread(store.init_db)
+    except Exception:
+        # Схема 1 работает и без очереди; схема 2 будет отвечать 503, сайт покажет ошибку.
+        logger.exception("site_form: очередь %s не открылась — схема 2 не принимает заявки", store.DB_PATH)
     await ensure_sources()
+    _wake = asyncio.Event()
+    _worker_task = asyncio.get_running_loop().create_task(_worker())
     logger.info("site_form: включено, форм в карте: %s", len(FORM_MAP))
+
+
+async def shutdown() -> None:
+    global _worker_task
+    if _worker_task is None:
+        return
+    _worker_task.cancel()
+    try:
+        await _worker_task
+    except asyncio.CancelledError:
+        pass
+    _worker_task = None

@@ -5,7 +5,7 @@ import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from starlette.status import HTTP_200_OK
 
 import amgroup_duplicate_watch
@@ -138,6 +138,7 @@ async def lifespan(app):
     await order_watchdog.shutdown()
     await uis_missed_call.shutdown()
     await new_lead_watch.shutdown()
+    await site_form_service.shutdown()
     await amgroup_fallback.shutdown()
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
@@ -330,12 +331,14 @@ async def wazzup_webhook(secret: str, request: Request):
 
 @app.post("/site_form")
 async def site_form(request: Request):
-    """Контактные формы сайта (CF7 → WP-сниппет) → сделка в amo с источником
-    формы («ContactForm_Академия» и т.п., карта SITE_FORM_MAP). Авторизация —
+    """Контактные формы сайта → сделка в amo (карта SITE_FORM_MAP). Авторизация —
     заголовок X-Api-Key: секрет не попадает ни в URL, ни в access-логи nginx;
     браузер посетителя сюда не ходит вовсе (постит сервер WP со своей стороны).
-    Отвечаем 200 сразу — ошибку обработки посетитель сайта видеть не должен,
-    работа фоном."""
+
+    Схема 1 (WPCode-сниппет, копии старых форм): 200 сразу, работа фоном.
+    Схема 2 (плагин sun-contact-forms): 200 только когда заявка легла в очередь;
+    422/429/503 — сайт покажет человеку «Не получилось отправить» и сохранит
+    введённое. Сделка создаётся фоном с повторами (site_form_service)."""
     if not site_form_service.is_enabled():
         return Response("disabled", status_code=404)
     if not site_form_service.secret_ok(request.headers.get("X-Api-Key", "")):
@@ -349,6 +352,9 @@ async def site_form(request: Request):
     if not isinstance(payload, dict):
         logger.warning("site_form: тело не объект")
         return {"ok": False}
+    if payload.get("schema") == 2:
+        status_code, body = await site_form_service.accept_v2(payload)
+        return JSONResponse(body, status_code=status_code)
     fwd = request.headers.get("X-Forwarded-For", "")
     ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")
     if not site_form_service.allow_ip(ip):
