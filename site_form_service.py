@@ -497,49 +497,70 @@ async def accept_v2(payload: dict) -> tuple[int, dict]:
 # Схема 2: сделка
 # ---------------------------------------------------------------------------
 
+def _page_title(title: str) -> str:
+    """Название страницы без хвоста сайта: «Keystone 3 Pro - Sunscrypt» → «Keystone 3 Pro»."""
+    return re.sub(r"\s+[-–—|]\s+Sunscrypt\s*$", "", title or "").strip()
+
+
 def note_text_v2(p: dict, source: str) -> str:
-    """Примечание к сделке: всё, что человек ввёл, и откуда он пришёл. Словами, без кодов."""
+    """Примечание к сделке - три блока через пустую строку.
+
+    1. Что за заявка: тип, страница, окно, консультация с форматом или товар, вопрос. Менеджер с
+       первого взгляда видит, с какой страницы, в какую форму и с чем пришёл человек.
+    2. Контакт: имя, телефон, Telegram.
+    3. Техническое: источник в amo, адреса страницы и товара, кнопка, UTM, откуда пришёл, номер заявки.
+
+    Жирного в примечаниях amo нет: текст идёт без разметки, HTML amo экранирует («&» в API отдаётся
+    как «&amp;»). Поэтому заголовки блоков - капсом и с эмодзи. Пустые необязательные поля не выводятся.
+    """
     ctx = p["context"]
     contact = p["contact"]
     consultation = p["form_type"] == "consultation"
-    lines = [f"Заявка с сайта: {FORM_TYPES[p['form_type']]} ({source})"]
-    if ctx["title"]:
-        lines.append(f"Заголовок окна: {ctx['title']}")
-    lines.append(f"Имя: {contact['name']}")
-    lines.append(f"Телефон: {contact['phone']}")
-    if contact["telegram"]:
-        lines.append(f"Telegram: {contact['telegram']}")
-    if p["comment"]:
-        lines.append(f"{'Запрос' if consultation else 'Вопрос'}: {p['comment']}")
     service = ctx["service"]
-    if consultation:
-        if service:
-            line = f"Консультация: {service['name'] or 'без названия'}"
-            if service["url"]:
-                line += f" - {service['url']}"
-            if not service.get("verified"):
-                line += " (название пришло со страницы, по каталогу не сверено)"
-            lines.append(line)
-        if ctx["format"]:
-            lines.append(f"Формат: {ctx['format']['label']}")
     product = ctx["product"]
-    if product and not (service and service.get("id") and service.get("id") == product.get("id")):
+    same_item = bool(service and product and service.get("id") and service.get("id") == product.get("id"))
+
+    head = [f"📩 ЗАЯВКА С САЙТА: {FORM_TYPES[p['form_type']].upper()}"]
+    page_title = _page_title(ctx["page_title"])
+    if page_title:
+        head.append(f"Страница: {page_title}")
+    if ctx["title"]:
+        head.append(f"Форма: {ctx['title']}")
+    if consultation and service:
+        head.append(f"Консультация: {service['name'] or 'без названия'}")
+    if consultation and ctx["format"]:
+        head.append(f"Формат: {ctx['format']['label']}")
+    if product and not same_item:
         line = f"Товар: {product['name'] or 'без названия'}"
         if product.get("sku"):
             line += f", артикул {product['sku']}"
-        if product["url"]:
-            line += f" - {product['url']}"
-        lines.append(line)
+        head.append(line)
+    if p["comment"]:
+        head.append(f"{'Запрос' if consultation else 'Вопрос'}: {p['comment']}")
+
+    person = ["👤 КОНТАКТ", f"Имя: {contact['name']}", f"Телефон: {contact['phone']}"]
+    if contact["telegram"]:
+        person.append(f"Telegram: {contact['telegram']}")
+
+    tech = ["⚙️ ТЕХНИЧЕСКОЕ", f"Источник: {source}"]
     if ctx["page_url"]:
-        lines.append(f"Страница: {ctx['page_title'] + ' - ' if ctx['page_title'] else ''}{ctx['page_url']}")
+        tech.append(f"Адрес страницы: {ctx['page_url']}")
+    if consultation and service and service["url"]:
+        tech.append(f"Ссылка на консультацию: {service['url']}")
+    if consultation and service and not service.get("verified"):
+        # Кнопка передала только название (не номер страницы) - сайт его не сверил.
+        tech.append("Консультация не сверена с сайтом: кнопка передала только название")
+    if product and not same_item and product["url"]:
+        tech.append(f"Ссылка на товар: {product['url']}")
     if ctx["entry"]:
-        lines.append(f"Кнопка на сайте: {ctx['entry']}")
+        tech.append(f"Кнопка на сайте: {ctx['entry']}")
     if ctx["utm"]:
-        lines.append("UTM: " + ", ".join(f"{k}={v}" for k, v in ctx["utm"].items()))
+        tech.append("UTM: " + ", ".join(f"{k}={v}" for k, v in ctx["utm"].items()))
     if ctx["referrer"]:
-        lines.append(f"Пришёл с: {ctx['referrer']}")
-    lines.append(f"Номер заявки: {p['submission_id'][:8]}")
-    return "\n".join(lines)[:MAX_NOTE_LEN]
+        tech.append(f"Пришёл с: {ctx['referrer']}")
+    tech.append(f"Номер заявки: {p['submission_id'][:8]}")
+
+    return "\n\n".join("\n".join(block) for block in (head, person, tech))[:MAX_NOTE_LEN]
 
 
 async def _create_lead_v2(p: dict, cfg: dict) -> tuple[int | None, str | None]:

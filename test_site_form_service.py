@@ -443,21 +443,25 @@ def test_run_due_creates_lead_and_wipes_payload(v2, monkeypatch):
     assert calls["utm"] == (301, {"utm_source": "ya", "utm_medium": "cpc"})
 
     note = calls["note"][1]
-    for piece in (
-        "Заявка с сайта: Обратный звонок или вопрос",
-        "Заголовок окна: Остались вопросы?",
-        "Имя: Иван",
-        "Телефон: +79099371845",
-        "Telegram: @ivan_test",
+    head, person, tech = note.split("\n\n")
+    assert head.splitlines() == [
+        "📩 ЗАЯВКА С САЙТА: ОБРАТНЫЙ ЗВОНОК ИЛИ ВОПРОС",
+        "Страница: Keystone 3 Pro",
+        "Форма: Остались вопросы?",
+        "Товар: Keystone 3 Pro, артикул HW-26",
         "Вопрос: Какой кошелёк выбрать?",
-        "Товар: Keystone 3 Pro, артикул HW-26 - https://test.sunscrypt.ru/product/",
-        "Страница: Keystone 3 Pro - https://test.sunscrypt.ru/product/",
+    ]
+    assert person.splitlines() == ["👤 КОНТАКТ", "Имя: Иван", "Телефон: +79099371845", "Telegram: @ivan_test"]
+    assert tech.splitlines() == [
+        "⚙️ ТЕХНИЧЕСКОЕ",
+        "Источник: Форма: обратный звонок",
+        "Адрес страницы: https://test.sunscrypt.ru/product/hardware-wallets/apparatnyj-koshelek-keystone-3-pro/?utm_source=ya",
+        "Ссылка на товар: https://test.sunscrypt.ru/product/hardware-wallets/apparatnyj-koshelek-keystone-3-pro/",
         "Кнопка на сайте: test-page-callback",
         "UTM: utm_source=ya, utm_medium=cpc",
         "Пришёл с: https://yandex.ru/",
         "Номер заявки: 3f2b8c1e",
-    ):
-        assert piece in note
+    ]
     assert "·" not in note
 
     row = store.get(SID)
@@ -477,10 +481,36 @@ def test_consultation_note_has_service_and_format(v2, monkeypatch):
     asyncio.run(sf.accept_v2(_v2_payload("consultation")))
     asyncio.run(sf.run_due())
     note = calls["note"][1]
-    assert "Заявка с сайта: Запись на консультацию" in note
-    assert "Запрос: Какой кошелёк выбрать?" in note
-    assert "Консультация: Консультация по безопасности (название пришло со страницы" in note
-    assert "Формат: В шоуруме в Москве" in note
+    head, _person, tech = (block.splitlines() for block in note.split("\n\n"))
+    assert head[0] == "📩 ЗАЯВКА С САЙТА: ЗАПИСЬ НА КОНСУЛЬТАЦИЮ"
+    assert "Консультация: Консультация по безопасности" in head
+    assert "Формат: В шоуруме в Москве" in head
+    assert head[-1] == "Запрос: Какой кошелёк выбрать?"
+    # пометка о несверенной консультации - только в технической части
+    assert "Консультация не сверена с сайтом: кнопка передала только название" in tech
+    assert not any("не сверена" in line for line in head)
+
+
+def test_consultation_verified_service_has_no_mark(v2):
+    clean = sf.clean_v2(_v2_payload("consultation"))
+    clean["context"]["service"] = {"id": 555, "name": "Консультация по Tangem",
+                                   "url": "https://test.sunscrypt.ru/konsultaciya-tangem/", "verified": True}
+    head, _person, tech = (b.splitlines() for b in sf.note_text_v2(clean, "Форма: консультация").split("\n\n"))
+    assert "Консультация: Консультация по Tangem" in head
+    assert "Ссылка на консультацию: https://test.sunscrypt.ru/konsultaciya-tangem/" in tech
+    assert not any("не сверена" in line for line in tech)
+
+
+def test_note_skips_empty_fields_and_site_suffix(v2):
+    clean = sf.clean_v2(_v2_payload())
+    clean["context"]["page_title"] = "Тест контактных форм (служебная) - Sunscrypt"
+    clean["comment"] = ""
+    clean["contact"]["telegram"] = ""
+    head, person, tech = sf.note_text_v2(clean, "Форма: обратный звонок").split("\n\n")
+    assert "Страница: Тест контактных форм (служебная)" in head.splitlines()
+    assert not any(line.startswith("Вопрос:") for line in head.splitlines())
+    assert not any(line.startswith("Telegram:") for line in person.splitlines())
+    assert tech.splitlines()[-1] == "Номер заявки: 3f2b8c1e"
 
 
 def test_v2_existing_contact_linked_by_phone(v2, monkeypatch):
