@@ -1,0 +1,22 @@
+# Обход фильтра МойСклада на время атаки на него (заведено 03.09.2026).
+# Исходящее к api.moysklad.ru идёт релеем через xray на шлюзе 82.97.249.88:18080.
+# Выход - российский адрес самого шлюза (catch-all direct), НЕ Вена: МойСклад
+# российский, он режет конкретно наш адрес, а не страну. Правки в конфиге xray
+# НЕ требуется - там уже есть общее правило "всё остальное напрямую".
+# NO_PROXY держит внутри всё, кроме склада: петлю, соседние контейнеры, панель,
+# амо, СДЭК и прочие внешние API. Убирать оттуда петлю и соседей нельзя никогда.
+# Откат: mv этот файл в .disabled и docker compose up -d
+services:
+  # 15.09.2026: amo-fix-fields ходит в МойСклад (api и online) напрямую, мимо шлюза.
+  # Телеграм по-прежнему через шлюз - своей переменной TG_PROXY_URL в .env сервиса.
+  amo-fix-fields:
+    environment:
+      HTTPS_PROXY: ${MS_PROXY_URL:-}
+      NO_PROXY: ${MS_NO_PROXY:-},api.moysklad.ru,online.moysklad.ru
+  # 15.09.2026: woo-sklad ходит в api.moysklad.ru напрямую, мимо шлюза. Шлюз за утро лёг дважды,
+  # заказы сайта не доезжали до МойСклада. amo-fix-fields с того же дня тоже напрямую.
+  # Разбор: knowledge/zakaz-sayta-poteryan-pri-sboe-svyazi.md в dev-workspace-and-journal.
+  woo-sklad:
+    environment:
+      HTTPS_PROXY: ${MS_PROXY_URL:-}
+      NO_PROXY: ${MS_NO_PROXY:-},api.moysklad.ru

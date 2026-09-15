@@ -1,0 +1,29 @@
+# Интеграции на сервере №2 (рефералка-prod-v2, 85.193.91.169).
+# ПАССИВНАЯ подготовка: образы собираются, но сервисы НЕ поднимаются автоматически.
+# Порты выбраны так, чтобы НЕ пересекаться с рефералкой (она на 127.0.0.1:8000, postgres:5432).
+#   amo_fix_fields → host 127.0.0.1:8010 → container 8000
+#   woo-sklad      → host 127.0.0.1:8011 → container 8000
+# Запуск (вечер Х, вручную): docker compose up -d
+# restart: unless-stopped — намеренно, чтобы reboot сервера не поднял их сам до готовности вебхуков.
+services:
+  amo-fix-fields:
+    build: ./amo_fix_fields
+    container_name: amo-fix-fields
+    env_file: ./amo_fix_fields/.env
+    ports:
+      - "127.0.0.1:8010:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./amo_fix_fields/var:/app/var
+    restart: unless-stopped
+
+  woo-sklad:
+    build: ./woocommerce-sklad
+    container_name: woo-sklad
+    env_file: ./woocommerce-sklad/.env
+    ports:
+      - "127.0.0.1:8011:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
