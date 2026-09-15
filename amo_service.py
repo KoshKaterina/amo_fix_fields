@@ -706,10 +706,13 @@ async def remove_tag(lead_id: int | str, tag_name: str, *, lead: dict | None = N
     return await patch_lead(lead_id, tags=new_tags)
 
 
-async def patch_contact(contact_id: int | str, *, tags: list[dict] | None = None) -> dict[str, Any]:
+async def patch_contact(contact_id: int | str, *, tags: list[dict] | None = None,
+                        custom_fields: dict[int, Any] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {}
     if tags is not None:
         body.setdefault("_embedded", {})["tags"] = _tags_payload(tags)
+    if custom_fields:
+        body["custom_fields_values"] = [_make_custom_field(fid, value) for fid, value in custom_fields.items()]
     if not body:
         return {"ok": True, "status_code": 204, "retryable": False}
     return await _do_patch(f"/api/v4/contacts/{contact_id}", body)

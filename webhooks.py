@@ -37,6 +37,7 @@ import showroom_tag
 import site_form_service
 import team_panel_client
 import telegram_bot
+import telegram_contact
 import uis_missed_call
 import unmiss_tag
 import urgency_tag
@@ -457,6 +458,8 @@ async def lead_change(request: Request):
     # ORDER_NOTE_ENABLED по умолчанию.
     if await get_nested(nested, ["leads", "add", "0", "id"]) is not None:
         order_note.post_bg(lead_id)
+        # Ник Телеграма из контрагента МС в контакт («TelegramUsername_WZ», только в пустое)
+        telegram_contact.post_bg(lead_id)
 
     status_update = await get_nested(nested, ["leads", "update", "0", "status_id"])
     status_add = await get_nested(nested, ["leads", "add", "0", "status_id"])

@@ -419,6 +419,21 @@ ORDER_NOTE_ENABLED = os.getenv("ORDER_NOTE_ENABLED", "0") == "1"
 ORDER_NOTE_RETRY_DELAYS_S = [
     float(x) for x in os.getenv("ORDER_NOTE_RETRY_DELAYS_S", "5,20,60").split(",") if x.strip()
 ]
+
+# Ник Телеграма покупателя из МойСклада в контакт amo (telegram_contact) - 15.09.2026.
+# Покупатель оставляет ник на оформлении заказа, woocommerce-sklad кладёт его в доп.поле
+# контрагента «Телеграм». amgroup доп.поля контрагента в amo не несёт, поэтому на создании
+# сделки дочитываем заказ МС и пишем ник в поле контакта «TelegramUsername_WZ» - из него
+# Wazzup берёт ник, чтобы написать первым в Телеграм. Только в пустое поле. Включён по
+# умолчанию: пока в заказе нет ника (на сайте поля ещё нет), модуль ничего не пишет.
+TELEGRAM_CONTACT_ENABLED = os.getenv("TELEGRAM_CONTACT_ENABLED", "1") == "1"
+TELEGRAM_CONTACT_FIELD_ID = 577785   # контакт «TelegramUsername_WZ» (поле Wazzup)
+MS_ATTR_COUNTERPARTY_TELEGRAM_ID = os.getenv(
+    "MS_ATTR_COUNTERPARTY_TELEGRAM_ID", "79e2dacf-b10e-11f1-0a80-1075003b0415")
+# UUID заказа (576689) amgroup заполняет через секунды после создания сделки - дочитываем с повторами.
+TELEGRAM_CONTACT_RETRY_DELAYS_S = [
+    float(x) for x in os.getenv("TELEGRAM_CONTACT_RETRY_DELAYS_S", "5,20,60").split(",") if x.strip()
+]
 FIELD_FF_TREK = 571657
 
 # Протез amgroup (amgroup_fallback): сторонняя интеграция МойСклад -> amoCRM
