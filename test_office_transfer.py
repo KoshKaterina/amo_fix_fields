@@ -624,7 +624,7 @@ assert res == "moved", res
 print("✓ cutover-гейт: SINCE_TS=0 (не задан) — гейт выключен")
 
 
-# ── 6в) гейт «уже переносилась»: 578151 заполнен → повторный вход в УР не трогаем ──
+# ── 6в) 578151 заполнен руками → перенос всё равно идёт (гейт снят 15.09.2026, сделка 36556353) ──
 
 _reset()
 lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
@@ -632,9 +632,9 @@ lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCR
 lead["custom_fields_values"].append(_cf(FIELD_FORMER_RESPONSIBLE, value="Оанча Игорь"))
 _install_dispatcher_mocks(lead)
 res = run(office_transfer.process_office_transfer(42))
-assert res == "skipped-already-transferred", res
-assert not _patches and not _tags and not _alerts
-print("✓ гейт повторного переноса: 578151 заполнен → сделка стоит в УР, не трогаем")
+assert res == "moved", res
+assert _patches and _patches[0]["pipeline_id"] == PIPELINE_OFFICE, _patches
+print("✓ 578151 заполнен руками → сделка всё равно уезжает в Офис")
 
 
 # ── 7) правило «Почта России» → Офис/«Сделать накладную» (Катя 31.07.2026) ──
@@ -831,16 +831,16 @@ assert not _patches, "наугад не переносим"
 assert (42, TAG_BAD_FILL) in _tags, _tags
 print("✓ ОПТ: доставка вне пяти правил → алерт, наугад не переносим")
 
-# гейт «уже переносилась» действует и для опта
+# и для опта заполненный 578151 перенос не останавливает
 _reset()
 lead = _lead(pipeline_id=PIPELINE_OPT, application_type=APPLICATION_TYPE_ORDER,
              warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ")
 lead["custom_fields_values"].append(_cf(FIELD_FORMER_RESPONSIBLE, value="Иван Иванов"))
 _install_dispatcher_mocks(lead)
 res = run(office_transfer.process_office_transfer(42))
-assert res == "skipped-already-transferred", res
-assert not _patches
-print("✓ ОПТ: гейт «578151 заполнен → уже переносилась» работает и здесь")
+assert res == "moved", res
+assert _patches and _patches[0]["status_id"] == STATUS_CREATE_WAYBILL, _patches
+print("✓ ОПТ: 578151 заполнен → сделка всё равно уезжает в Офис")
 
 # reconciliation обходит ОБЕ воронки: 4 запроса (2 воронки × 2 статуса)
 _opt_reconcile_requests: list = []
