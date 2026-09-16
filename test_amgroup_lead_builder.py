@@ -41,6 +41,8 @@ _install_stubs()
 import amgroup_lead_builder as builder  # noqa: E402
 import lead_distribution  # noqa: E402
 
+PREORDER_ATTRIBUTE_UUID = "aef73872-b202-11f1-0a80-00c30002599a"
+
 
 def _ms_order(uuid, number, *, site="12345", phone="+79991234567", agent_name="Иван Иванов"):
     """Полная карточка заказа МойСклад, как её отдаёт _fetch_full_order
@@ -84,6 +86,8 @@ def _clean(monkeypatch):
     иначе один тест видит контакт, созданный в другом."""
     builder._contact_cache.clear()
     monkeypatch.setattr(builder, "AMGROUP_LEAD_RESPONSIBLE_USER_ID", 999, raising=False)
+    monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", False)
+    monkeypatch.setattr(builder, "MS_ATTR_PREORDER_SUMMARY_ID", "")
     yield
     builder._contact_cache.clear()
 
@@ -234,6 +238,115 @@ def test_sozdaet_sdelku_i_stavit_otvetstvennogo(monkeypatch):
     # бюджет - тоже отдельный PATCH (у create_lead_direct нет параметра суммы,
     # api.py не трогаем), уходит ПЕРЕД проставлением ответственного
     assert calls["patch"] == [(777, {"price": 13990}), (777, {"responsible_user_id": 999})]
+
+
+def _preorder_attribute(value, *, uuid=PREORDER_ATTRIBUTE_UUID):
+    return {"id": uuid, "name": "Предзаказ: ожидаемые позиции", "value": value}
+
+
+def test_disabled_gate_keeps_legacy_order_type_even_with_summary(monkeypatch):
+    order = _ms_order("uuid-legacy", "08000", site="")
+    order["attributes"].append(_preorder_attribute(
+        "Тип: Предзаказ\nОжидаемые позиции:\n- Tangem 2.0 White [SKU: T-1] × 1"
+    ))
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch)
+
+    assert asyncio.run(builder.create_lead_for_order({"id": order["id"]})) == 777
+    fields = {field["field_id"]: field["values"][0]
+              for field in calls["last_lead_kwargs"]["custom_fields_values"]}
+    assert fields[builder.FIELD["type"]] == {"enum_id": builder.ENUM["type"]["Заказ"]}
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_type", "mixed"),
+    [
+        ("Тип: Заказ\nОжидаемые позиции: нет", "Заказ", False),
+        ("Тип: Предзаказ\nОжидаемые позиции:\n- Tangem 2.0 White [SKU: T-1] × 1", "Предзаказ", False),
+        ("Тип: Предзаказ\nОжидаемые позиции:\n- Tangem 2.0 White [SKU: T-1] × 1", "Предзаказ", True),
+    ],
+)
+def test_preorder_type_is_in_initial_create_payload(monkeypatch, summary, expected_type, mixed):
+    """Новый признак меняет только enum при первоначальном POST, не связку/состав."""
+    order = _ms_order("uuid-preorder", "08001", site="")
+    order["attributes"].append(_preorder_attribute(summary))
+    if mixed:
+        order["positions"]["rows"].append({
+            "quantity": 2, "price": 50000,
+            "assortment": {"name": "Обычный товар", "meta": {"type": "product"}},
+        })
+    monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", True)
+    monkeypatch.setattr(builder, "MS_ATTR_PREORDER_SUMMARY_ID", PREORDER_ATTRIBUTE_UUID)
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch)
+
+    assert asyncio.run(builder.create_lead_for_order({"id": order["id"]})) == 777
+
+    lead = calls["last_lead_kwargs"]
+    fields = {field["field_id"]: field["values"][0] for field in lead["custom_fields_values"]}
+    assert fields[builder.FIELD["type"]] == {"enum_id": builder.ENUM["type"][expected_type]}
+    assert fields[builder.FIELD["order_uuid"]] == {"value": order["id"]}
+    assert fields[builder.FIELD["order_num"]] == {"value": order["name"]}
+    assert order["id"] in fields[builder.FIELD["order_url"]]["value"]
+    assert "Tangem 2.0 White" in fields[builder.FIELD["sostav"]]["value"]
+    assert ("Обычный товар" in fields[builder.FIELD["sostav"]]["value"]) == mixed
+    assert lead["name"] == "Заказ МС 08001"  # тестовый заказ без номера сайта
+    assert builder.FIELD["site"] not in fields
+    assert all("custom_fields_values" not in patch for _, patch in calls["patch"])
+
+
+@pytest.mark.parametrize(
+    ("attribute", "expected_reason"),
+    [
+        (None, "attribute_not_found"),
+        (_preorder_attribute("Тип: Заказ"), "invalid_summary"),
+        (_preorder_attribute("Тип: Заказ\nОжидаемые позиции: нет", uuid="11111111-1111-1111-1111-111111111111"), "attribute_not_found"),
+    ],
+)
+def test_enabled_unknown_type_holds_new_lead_before_any_write(monkeypatch, caplog, attribute, expected_reason):
+    order = _ms_order("uuid-unknown", "08002", site="")
+    if attribute:
+        order["attributes"].append(attribute)
+    monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", True)
+    monkeypatch.setattr(builder, "MS_ATTR_PREORDER_SUMMARY_ID", PREORDER_ATTRIBUTE_UUID)
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        assert asyncio.run(builder.create_lead_for_order({"id": order["id"]})) is None
+
+    assert calls == {"contacts": 0, "leads": 0, "patch": []}
+    assert any(expected_reason in record.message for record in caplog.records)
+    assert all("Tangem" not in record.message for record in caplog.records)
+
+
+def test_enabled_without_configured_uuid_holds_new_lead(monkeypatch, caplog):
+    order = _ms_order("uuid-no-config", "08003", site="")
+    order["attributes"].append(_preorder_attribute("Тип: Заказ\nОжидаемые позиции: нет"))
+    monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", True)
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        assert asyncio.run(builder.create_lead_for_order({"id": order["id"]})) is None
+    assert calls["contacts"] == calls["leads"] == 0
+    assert any("invalid_expected_uuid" in record.message for record in caplog.records)
+
+
+def test_existing_lead_not_reclassified_even_if_summary_is_unknown(monkeypatch):
+    order = _ms_order("uuid-existing", "08004", site="")
+    monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", True)
+    monkeypatch.setattr(builder, "MS_ATTR_PREORDER_SUMMARY_ID", PREORDER_ATTRIBUTE_UUID)
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch, leads=[{"id": 771, "name": "Заказ МС 08004"}])
+    calls = _stub_create(monkeypatch)
+
+    assert asyncio.run(builder.create_lead_for_order({"id": order["id"]})) == 771
+    assert calls == {"contacts": 0, "leads": 0, "patch": []}
 
 
 def test_povtornyy_vyzov_na_tom_zhe_zakaze_ne_sozdaet_sdelku(monkeypatch):
@@ -519,4 +632,3 @@ def test_bez_konstanty_no_s_raspredelitelem_sdelka_sozdaetsya(monkeypatch):
 
     assert result == 780
     assert calls["patch"][-1] == (780, {"responsible_user_id": 13929334})
-
