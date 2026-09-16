@@ -75,6 +75,27 @@ def test_same_id_and_href_is_one_attribute_not_duplicate():
     assert result == ParsedOrderType("order", "ok")
 
 
+@pytest.mark.parametrize("authority", [
+    "example.invalid", "api.moysklad.ru.example.invalid",
+    "api.moysklad.ru@example.invalid", "user@api.moysklad.ru",
+    "api.moysklad.ru:8443", "api.moysklad.ru.",
+])
+@pytest.mark.parametrize("include_id", [False, True])
+def test_foreign_or_noncanonical_authority_cannot_identify_attribute(authority, include_id):
+    attribute = {"meta": {"href": HREF.replace("api.moysklad.ru", authority)},
+                 "value": ORDINARY}
+    if include_id:
+        attribute["id"] = ATTR
+    reason = "attribute_identity_conflict" if include_id else "attribute_not_found"
+    assert parse_ms_preorder_type(_order(attribute), ATTR) == ParsedOrderType("unknown", reason)
+
+
+def test_dns_case_is_not_an_identity_difference():
+    attribute = {"meta": {"href": HREF.replace("api.moysklad.ru", "API.MOYSKLAD.RU")},
+                 "value": ORDINARY}
+    assert parse_ms_preorder_type(_order(attribute), ATTR) == ParsedOrderType("order", "ok")
+
+
 @pytest.mark.parametrize("customerorder,expected,reason", [
     (None, ATTR, "invalid_order"),
     ({}, "", "invalid_expected_uuid"),
