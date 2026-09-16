@@ -1,8 +1,12 @@
 """Isolated contract tests: no application startup, dotenv, socket or database."""
 
+import os
+from pathlib import Path
 import socket
+import subprocess
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
 
@@ -11,16 +15,25 @@ def _forbidden(*_args, **_kwargs):
     raise AssertionError("network/dotenv access is forbidden in parser tests")
 
 
-# Install fail-closed guards before importing the unit under test.
-socket.socket = _forbidden
-socket.create_connection = _forbidden
-socket.getaddrinfo = _forbidden
 dotenv_stub = types.ModuleType("dotenv")
 dotenv_stub.load_dotenv = _forbidden
 dotenv_stub.find_dotenv = _forbidden
-sys.modules["dotenv"] = dotenv_stub
 
-from ms_preorder_type import ParsedOrderType, parse_ms_preorder_type  # noqa: E402
+# Block before importing the unit under test, then restore collection state.
+with (patch.object(socket, "socket", _forbidden),
+      patch.object(socket, "create_connection", _forbidden),
+      patch.object(socket, "getaddrinfo", _forbidden),
+      patch.dict(sys.modules, {"dotenv": dotenv_stub})):
+    from ms_preorder_type import ParsedOrderType, parse_ms_preorder_type  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _guard_each_test(monkeypatch):
+    """Keep guards active only for this test; pytest restores every patch."""
+    monkeypatch.setattr(socket, "socket", _forbidden)
+    monkeypatch.setattr(socket, "create_connection", _forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", _forbidden)
+    monkeypatch.setitem(sys.modules, "dotenv", dotenv_stub)
 
 
 ATTR = "123e4567-e89b-42d3-a456-426614174000"
@@ -132,3 +145,51 @@ def test_reason_is_diagnostic_code_without_customer_content():
     result = parse_ms_preorder_type(customerorder, ATTR)
     assert result == ParsedOrderType("unknown", "invalid_summary")
     assert "Иван" not in repr(result)
+
+
+@pytest.mark.parametrize("dotenv_present", [False, True])
+def test_import_guard_restores_other_tests_in_safe_subprocess(dotenv_present):
+    """Collection must not leave socket or dotenv changed for unrelated tests."""
+    script = r'''
+import socket
+import sys
+import types
+
+class OuterSocket(socket.socket):
+    def __new__(cls, *args, **kwargs):
+        raise AssertionError("no real sockets")
+
+def outer_connection(*args, **kwargs):
+    raise AssertionError("no real connections")
+
+def outer_dns(*args, **kwargs):
+    raise AssertionError("no real DNS")
+
+socket.socket = OuterSocket
+socket.create_connection = outer_connection
+socket.getaddrinfo = outer_dns
+if sys.argv[1] == "present":
+    old_dotenv = types.ModuleType("dotenv")
+    old_dotenv.load_dotenv = lambda: "existing sentinel"
+    sys.modules["dotenv"] = old_dotenv
+else:
+    sys.modules.pop("dotenv", None)
+    old_dotenv = None
+
+import test_ms_preorder_type
+assert socket.socket is OuterSocket
+assert socket.create_connection is outer_connection
+assert socket.getaddrinfo is outer_dns
+assert sys.modules.get("dotenv") is old_dotenv
+'''
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script, "present" if dotenv_present else "absent"],
+        cwd=Path(__file__).resolve().parent,
+        env={"PATH": os.pathsep.join((str(Path(sys.executable).parent), "/usr/bin", "/bin")),
+             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONNOUSERSITE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
