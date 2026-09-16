@@ -52,11 +52,14 @@ import api
 import lead_distribution
 import ms_client
 from api_helpers import sanitize_custom_field_value
+from ms_preorder_type import parse_ms_preorder_type
 from waybill_config import (
     AMGROUP_FALLBACK_TAG,
     AMGROUP_LEAD_RESPONSIBLE_USER_ID,
+    AMGROUP_PREORDER_TYPE_ENABLED,
     FIELD_MOYSKLAD_ORDER_UUID,
     LEAD_DISTRIBUTION_ENABLED,
+    MS_ATTR_PREORDER_SUMMARY_ID,
     PIPELINE_CLEVER_MAIN,
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
     STATUS_CLEVER_NEW_LEAD,
@@ -361,7 +364,7 @@ async def assign_responsible(lead_id: int, responsible_user_id: int | None = Non
     return ok
 
 
-def _custom_fields(order: dict, b: dict, site: str) -> list[dict]:
+def _custom_fields(order: dict, b: dict, site: str, *, order_type: str = "Заказ") -> list[dict]:
     """Собирает custom_fields_values для POST /leads. t() - текстовые поля,
     e() - select/enum. Пустые значения не добавляются (как в прототипе).
     t() режет значение через sanitize_custom_field_value (потолок 256
@@ -392,7 +395,7 @@ def _custom_fields(order: dict, b: dict, site: str) -> list[dict]:
     e("currency", "руб")
     e("paystatus", b["paystatus"])
     e("created_by", "Из МойСклад")
-    e("type", "Заказ")
+    e("type", order_type)
     t("order_uuid", order.get("id"))
     t("order_num", order.get("name"))
     t("agent_uuid", ag.get("id"))
@@ -464,8 +467,23 @@ async def create_lead_for_order(order: dict) -> int | None:
         )
         return None
 
+    # Классифицируем только новую сделку, после дедупа, но до каких-либо
+    # записей в amoCRM. Неизвестный/испорченный снимок удерживаем для разбора:
+    # отсутствие поля у старого заказа не доказывает обычный заказ.
+    order_type = "Заказ"
+    if AMGROUP_PREORDER_TYPE_ENABLED:
+        parsed = parse_ms_preorder_type(full, MS_ATTR_PREORDER_SUMMARY_ID)
+        if parsed.kind == "unknown":
+            logger.warning(
+                "amgroup_lead_builder: тип заказа МС %s неизвестен (%s); "
+                "новую сделку не создаю до разбора",
+                order_number, parsed.reason,
+            )
+            return None
+        order_type = "Предзаказ" if parsed.kind == "preorder" else "Заказ"
+
     b = _build_fields(full)
-    cf = _custom_fields(full, b, site)
+    cf = _custom_fields(full, b, site, order_type=order_type)
 
     ag = full.get("agent") or {}
     try:
