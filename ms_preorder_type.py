@@ -113,8 +113,8 @@ def parse_ms_preorder_type(
         if identity_id == expected or identity_href == expected:
             if "meta" in attribute and meta is not None and not isinstance(meta, Mapping):
                 return ParsedOrderType("unknown", "attribute_identity_conflict")
-            if (raw_id is not None and identity_id != expected) or (
-                raw_href is not None and identity_href != expected
+            if ("id" in attribute and identity_id != expected) or (
+                isinstance(meta, Mapping) and "href" in meta and identity_href != expected
             ):
                 return ParsedOrderType("unknown", "attribute_identity_conflict")
             if isinstance(meta, Mapping) and meta.get("type") not in (None, "attributemetadata"):
