@@ -337,6 +337,24 @@ def test_enabled_without_configured_uuid_holds_new_lead(monkeypatch, caplog):
     assert any("invalid_expected_uuid" in record.message for record in caplog.records)
 
 
+@pytest.mark.parametrize("attributes", [[None], {"bad": "shape"}])
+def test_malformed_attributes_reach_fail_closed_parser(monkeypatch, caplog, attributes):
+    """Ранний lookup номера сайта не должен скрывать unknown исключением."""
+    order = _ms_order("uuid-malformed", "08005", site="")
+    order["attributes"] = attributes
+    monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", True)
+    monkeypatch.setattr(builder, "MS_ATTR_PREORDER_SUMMARY_ID", PREORDER_ATTRIBUTE_UUID)
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="uvicorn"):
+        assert asyncio.run(builder.create_lead_for_order({"id": order["id"]})) is None
+
+    assert calls == {"contacts": 0, "leads": 0, "patch": []}
+    assert any("invalid_attributes" in record.message for record in caplog.records)
+
+
 def test_existing_lead_not_reclassified_even_if_summary_is_unknown(monkeypatch):
     order = _ms_order("uuid-existing", "08004", site="")
     monkeypatch.setattr(builder, "AMGROUP_PREORDER_TYPE_ENABLED", True)
