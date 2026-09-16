@@ -54,7 +54,10 @@ def _uuid_from_href(value: object) -> str | None:
         parts = urlsplit(value)
     except ValueError:
         return None
-    if parts.scheme != "https" or not parts.netloc or parts.query or parts.fragment:
+    # Recognize the exact authority emitted by task 6, not a matching path on
+    # another host, userinfo URL, or alternate port. This performs no request.
+    if (parts.scheme != "https" or parts.netloc.lower() != "api.moysklad.ru"
+            or parts.query or parts.fragment):
         return None
     prefix, separator, suffix = parts.path.rpartition(_ATTRIBUTE_PATH)
     if not separator or prefix != "/api/remap/1.2" or "/" in suffix:
