@@ -45,6 +45,7 @@ FIELD_MOYSKLAD_ORDER_UUID, AMGROUP_FALLBACK_TAG) и импортируется �
 
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any
 
 import amo_service
@@ -143,8 +144,11 @@ def _attr(order: dict, name: str) -> Any:
     """Значение доп. поля заказа МойСклад по человекочитаемому имени.
     Доп. поля приходят в ответе всегда, expand для них не нужен (в отличие
     от positions/agent/store — это ссылочные поля)."""
-    for a in order.get("attributes") or []:
-        if a.get("name") == name:
+    attributes = order.get("attributes")
+    if not isinstance(attributes, list):
+        return None
+    for a in attributes:
+        if isinstance(a, Mapping) and a.get("name") == name:
             return a.get("value")
     return None
 
