@@ -445,13 +445,13 @@ def test_run_due_creates_lead_and_wipes_payload(v2, monkeypatch):
     note = calls["note"][1]
     head, person, tech = note.split("\n\n")
     assert head.splitlines() == [
-        "📩 ЗАЯВКА С САЙТА: ОБРАТНЫЙ ЗВОНОК ИЛИ ВОПРОС",
+        "✉️ ЗАЯВКА С САЙТА: ОБРАТНЫЙ ЗВОНОК ИЛИ ВОПРОС",
         "Страница: Keystone 3 Pro",
         "Форма: Остались вопросы?",
         "Товар: Keystone 3 Pro, артикул HW-26",
         "Вопрос: Какой кошелёк выбрать?",
     ]
-    assert person.splitlines() == ["👤 КОНТАКТ", "Имя: Иван", "Телефон: +79099371845", "Telegram: @ivan_test"]
+    assert person.splitlines() == ["☎️ КОНТАКТ", "Имя: Иван", "Телефон: +79099371845", "Telegram: @ivan_test"]
     assert tech.splitlines() == [
         "⚙️ ТЕХНИЧЕСКОЕ",
         "Источник: Форма: обратный звонок",
@@ -463,6 +463,8 @@ def test_run_due_creates_lead_and_wipes_payload(v2, monkeypatch):
         "Номер заявки: 3f2b8c1e",
     ]
     assert "·" not in note
+    # amo молча вырезает символы вне базовой плоскости Unicode (📩, 👤) - в примечании их быть не должно
+    assert all(ord(ch) < 0x10000 for ch in note)
 
     row = store.get(SID)
     assert row["status"] == "done"
@@ -482,7 +484,8 @@ def test_consultation_note_has_service_and_format(v2, monkeypatch):
     asyncio.run(sf.run_due())
     note = calls["note"][1]
     head, _person, tech = (block.splitlines() for block in note.split("\n\n"))
-    assert head[0] == "📩 ЗАЯВКА С САЙТА: ЗАПИСЬ НА КОНСУЛЬТАЦИЮ"
+    assert head[0] == "✉️ ЗАЯВКА С САЙТА: ЗАПИСЬ НА КОНСУЛЬТАЦИЮ"
+    assert all(ord(ch) < 0x10000 for ch in note)
     assert "Консультация: Консультация по безопасности" in head
     assert "Формат: В шоуруме в Москве" in head
     assert head[-1] == "Запрос: Какой кошелёк выбрать?"
