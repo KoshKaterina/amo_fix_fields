@@ -1057,8 +1057,9 @@ def test_v2_existing_contact_linked_by_phone(v2, monkeypatch):
 
 
 def test_v2_no_lead_id_is_uncertain_not_retried(v2, monkeypatch):
+    monkeypatch.setattr(sf, "SITE_FORM_UNAVAILABLE_ENABLED", True)
     _mock_api_v2(monkeypatch, lead_id=None)
-    asyncio.run(sf.accept_v2(_v2_payload()))
+    asyncio.run(sf.accept_v2(_v2_payload("unavailable")))
     asyncio.run(sf.run_due())
     row = store.get(SID)
     assert row["status"] == "uncertain"
@@ -1067,8 +1068,192 @@ def test_v2_no_lead_id_is_uncertain_not_retried(v2, monkeypatch):
     assert store.due(now=time.time() + 10 ** 6) == []
 
 
-@pytest.mark.parametrize("form_type", ["unavailable", "callback", "consultation"])
-def test_remote_committed_then_timeout_never_recreates(v2, monkeypatch, form_type):
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+@pytest.mark.parametrize("failure", ["timeout", "503"])
+def test_existing_forms_gate_off_keep_create_api_retries(v2, monkeypatch, form_type, failure):
+    real_create = api.create_unsorted_lead_ex
+    _mock_api_v2(monkeypatch)
+    monkeypatch.setattr(api, "create_unsorted_lead_ex", real_create)
+    monkeypatch.setattr(api, "MAX_PATCH_RETRIES", 2)
+    monkeypatch.setattr(api, "compute_retry_delay", lambda *_args: 0)
+    posts = []
+
+    async def transient_then_success(method, url, _headers, json_body=None):
+        posts.append((method, url, json_body))
+        request = api.httpx.Request(method, url)
+        if len(posts) == 1:
+            if failure == "timeout":
+                raise api.httpx.ReadTimeout("temporary", request=request)
+            return api.httpx.Response(503, request=request, text="temporary")
+        return api.httpx.Response(200, request=request, json={"_embedded": {"unsorted": [
+            {"uid": "U-301", "_embedded": {"leads": [{"id": 301}], "contacts": [{"id": 302}]}}
+        ]}})
+
+    monkeypatch.setattr(api, "submit_request", transient_then_success)
+    assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.run_due()) == 1
+    assert len(posts) == 2
+    assert all(method == "POST" and url.endswith("/api/v4/leads/unsorted/forms")
+               for method, url, _body in posts)
+    assert store.get(SID)["status"] == "done"
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+def test_existing_forms_gate_off_failed_create_returns_to_due(v2, monkeypatch, form_type):
+    calls = _mock_api_v2(monkeypatch, lead_id=None)
+    assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.run_due()) == 1
+    row = store.get(SID)
+    assert row["status"] == "pending"
+    assert row["attempts"] == 1
+    assert row["last_error"] == "amo-create-failed"
+    assert row["next_try_at"] > time.time()
+    assert store.due(now=row["next_try_at"] + 1)[0]["submission_id"] == SID
+    assert calls["create"]["lead_name"] == f"{V2_MAP[f'test-{form_type}']['source']}: Иван"
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+@pytest.mark.parametrize("failure", ["timeout", "503"])
+def test_existing_forms_gate_off_keep_note_api_retries(v2, monkeypatch, form_type, failure):
+    real_note = api.add_note_to_lead
+    _mock_api_v2(monkeypatch)
+    monkeypatch.setattr(api, "add_note_to_lead", real_note)
+    monkeypatch.setattr(api, "MAX_PATCH_RETRIES", 2)
+    monkeypatch.setattr(api, "compute_retry_delay", lambda *_args: 0)
+    posts = []
+
+    async def transient_then_success(method, url, _headers, json_body=None):
+        posts.append((method, url, json_body))
+        request = api.httpx.Request(method, url)
+        if len(posts) == 1:
+            if failure == "timeout":
+                raise api.httpx.ReadTimeout("temporary", request=request)
+            return api.httpx.Response(503, request=request, text="temporary")
+        return api.httpx.Response(200, request=request, json=[])
+
+    monkeypatch.setattr(api, "submit_request", transient_then_success)
+    assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.run_due()) == 1
+    assert len(posts) == 2
+    assert all(method == "POST" and url.endswith("/api/v4/leads/301/notes")
+               for method, url, _body in posts)
+    assert store.get(SID)["status"] == "done"
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+def test_existing_forms_gate_off_keep_nonfatal_note_failure(v2, monkeypatch, form_type):
+    _mock_api_v2(monkeypatch)
+    notes = []
+
+    async def failed_note(lead_id, note):
+        notes.append((lead_id, note))
+        return False
+
+    monkeypatch.setattr(api, "add_note_to_lead", failed_note)
+    assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.run_due()) == 1
+    assert len(notes) == 1
+    assert store.get(SID)["status"] == "done"
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+@pytest.mark.parametrize("phase, expected_status", [("create", "pending"), ("note", "created")])
+def test_existing_forms_gate_off_exception_uses_retry_queue(v2, monkeypatch, form_type, phase, expected_status):
+    _mock_api_v2(monkeypatch)
+
+    async def failed_create(**_kwargs):
+        raise TimeoutError("temporary create failure")
+
+    async def failed_note(_lead_id, _note):
+        raise TimeoutError("temporary note failure")
+
+    if phase == "create":
+        monkeypatch.setattr(api, "create_unsorted_lead_ex", failed_create)
+    else:
+        monkeypatch.setattr(api, "add_note_to_lead", failed_note)
+    assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.run_due()) == 1
+    row = store.get(SID)
+    assert row["status"] == expected_status
+    assert row["attempts"] == 1
+    assert row["last_error"] == "TimeoutError"
+    assert store.due(now=row["next_try_at"] + 1)[0]["submission_id"] == SID
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+def test_existing_forms_gate_off_processing_claim_excludes_second_worker(v2, monkeypatch, form_type):
+    _mock_api_v2(monkeypatch)
+    creates = []
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_create(**kwargs):
+            creates.append(kwargs)
+            started.set()
+            await release.wait()
+            return {"lead_id": 301, "uid": "U-301"}
+
+        monkeypatch.setattr(api, "create_unsorted_lead_ex", slow_create)
+        assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+        assert (await sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+        first = asyncio.create_task(sf.run_due())
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert store.get(SID)["status"] == "processing"
+        assert await asyncio.wait_for(sf.run_due(), timeout=5) == 0
+        release.set()
+        assert await asyncio.wait_for(first, timeout=5) == 1
+
+    asyncio.run(scenario())
+    assert len(creates) == 1
+    assert store.get(SID)["status"] == "done"
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+@pytest.mark.parametrize("phase, expected_status", [("create", "pending"), ("note", "created")])
+def test_existing_forms_gate_off_cancellation_releases_claim(v2, monkeypatch, form_type, phase, expected_status):
+    _mock_api_v2(monkeypatch)
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def blocked_create(**_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def blocked_note(_lead_id, _note):
+            started.set()
+            await asyncio.Event().wait()
+
+        if phase == "create":
+            monkeypatch.setattr(api, "create_unsorted_lead_ex", blocked_create)
+        else:
+            monkeypatch.setattr(api, "add_note_to_lead", blocked_note)
+        assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+        assert (await sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+        if phase == "note":
+            store.mark_created(SID, 301, "U-301")
+        worker = asyncio.create_task(sf.run_due())
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert store.get(SID)["status"] == ("processing" if phase == "create" else "finishing")
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    asyncio.run(scenario())
+    row = store.get(SID)
+    assert row["status"] == expected_status
+    assert row["attempts"] == 0
+    assert store.due()[0]["submission_id"] == SID
+
+
+def test_remote_committed_then_timeout_never_recreates(v2, monkeypatch):
     monkeypatch.setattr(sf, "SITE_FORM_UNAVAILABLE_ENABLED", True)
     _mock_api_v2(monkeypatch)
     creates = []
@@ -1078,7 +1263,7 @@ def test_remote_committed_then_timeout_never_recreates(v2, monkeypatch, form_typ
         raise TimeoutError("response lost after remote commit")
 
     monkeypatch.setattr(api, "create_unsorted_lead_ex", committed_then_timeout)
-    payload = _v2_payload(form_type)
+    payload = _v2_payload("unavailable")
     assert asyncio.run(sf.accept_v2(payload))[1]["status"] == "accepted"
     assert asyncio.run(sf.run_due()) == 1
     row = store.get(SID)
@@ -1090,8 +1275,7 @@ def test_remote_committed_then_timeout_never_recreates(v2, monkeypatch, form_typ
     assert len(creates) == 1
 
 
-@pytest.mark.parametrize("form_type", ["unavailable", "callback", "consultation"])
-def test_mark_created_write_error_never_recreates(v2, monkeypatch, form_type):
+def test_mark_created_write_error_never_recreates(v2, monkeypatch):
     monkeypatch.setattr(sf, "SITE_FORM_UNAVAILABLE_ENABLED", True)
     _mock_api_v2(monkeypatch)
     creates = []
@@ -1105,7 +1289,7 @@ def test_mark_created_write_error_never_recreates(v2, monkeypatch, form_type):
 
     monkeypatch.setattr(api, "create_unsorted_lead_ex", created_remotely)
     monkeypatch.setattr(store, "mark_created", failed_write)
-    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.accept_v2(_v2_payload("unavailable")))[1]["status"] == "accepted"
     assert asyncio.run(sf.run_due()) == 1
     row = store.get(SID)
     assert row["status"] == "uncertain"
