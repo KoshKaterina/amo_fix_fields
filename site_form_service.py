@@ -624,6 +624,7 @@ async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None
         contact = {"name": contact_in["name"], "custom_fields_values": fields}
     # С этого момента timeout/отмена не доказывают, что amo не создала сделку.
     attempt["remote_create_started"] = True
+    create_options = {"max_attempts": 1} if p["form_type"] == "unavailable" else {}
     res = await api.create_unsorted_lead_ex(
         lead_name=lead_name,
         pipeline_id=cfg["pipeline_id"],
@@ -635,14 +636,13 @@ async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None
         form_id=p["form"],
         lead_tags=[source] + cfg["tags"],
         ip=p["client_ip"] or "0.0.0.0",
-        max_attempts=1,
+        **create_options,
     )
     return res.get("lead_id"), res.get("uid")
 
 
 async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
-    """Доводка созданной сделки: этап, теги и UTM по возможности; исход note
-    должен быть известен, иначе ручная сверка без нового create."""
+    """Доводка сделки; строгий one-shot note только для unavailable."""
     lead_id = int(row["lead_id"])
     source = cfg["source"]
     if cfg["status_id"] and row.get("unsorted_uid"):
@@ -657,10 +657,16 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
         if not await api.set_lead_utm(lead_id, p["context"]["utm"]):
             logger.warning("site_form[%s]: UTM в поля сделки %s не записались, остались в примечании",
                            p["form"], lead_id)
-    # Если ответ на добавление примечания потерян, повтор может его удвоить.
-    attempt["note_started"] = True
-    if not await api.add_note_to_lead(lead_id, note_text_v2(p, source), max_attempts=1):
-        raise RuntimeError("amo-note-outcome-unknown")
+    note = note_text_v2(p, source)
+    if p["form_type"] == "unavailable":
+        # Если ответ на добавление примечания потерян, повтор может его удвоить.
+        attempt["note_started"] = True
+        if not await api.add_note_to_lead(lead_id, note, max_attempts=1):
+            raise RuntimeError("amo-note-outcome-unknown")
+    else:
+        # Прежняя политика callback/consultation: API сам повторяет POST,
+        # отрицательный ответ note не препятствует завершению заявки.
+        await api.add_note_to_lead(lead_id, note)
     return lead_id
 
 
@@ -712,7 +718,7 @@ async def _alert_failed(row: dict, error: str, attempts: int) -> None:
 
 
 async def deliver(row: dict, attempt: dict) -> bool | None:
-    """Одна строка очереди → сделка; неопределённый create не уходит на повтор."""
+    """Одна строка очереди → сделка; fail-closed create только для unavailable."""
     submission_id = row["submission_id"]
     try:
         payload = json.loads(row.get("payload") or "")
@@ -720,7 +726,9 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         await asyncio.to_thread(store.mark_failed, submission_id, int(row.get("attempts") or 0), "broken-payload")
         logger.error("site_form[%s]: заявка %s испорчена в очереди", row["form"], submission_id[:8])
         return
-    if payload.get("form_type") == "unavailable" and not SITE_FORM_UNAVAILABLE_ENABLED:
+    is_unavailable = payload.get("form_type") == "unavailable"
+    attempt["is_unavailable"] = is_unavailable
+    if is_unavailable and not SITE_FORM_UNAVAILABLE_ENABLED:
         # Убираем из due, сохраняя строку/попытки до восстановления gate.
         await asyncio.to_thread(store.mark_held, submission_id, "unavailable-disabled")
         logger.info("site_form[%s]: заявка %s удержана (тип выключен)", row["form"], submission_id[:8])
@@ -750,7 +758,10 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         if row["status"] == "pending":
             lead_id, uid = await _create_lead_v2(payload, cfg, attempt)
             if not lead_id:
-                await _hold_unknown_external_write(row, "amo-create-outcome-unknown")
+                if is_unavailable:
+                    await _hold_unknown_external_write(row, "amo-create-outcome-unknown")
+                else:
+                    await _retry_or_fail(row, "amo-create-failed")
                 return
             # Сохраняем lead_id и владение доводкой одним UPDATE: другой worker
             # не увидит промежуточную created до примечания.
@@ -763,9 +774,9 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         logger.info("site_form[%s]: заявка %s → сделка %s", row["form"], submission_id[:8], lead_id)
     except Exception as exc:
         logger.exception("site_form[%s]: заявка %s — сбой доставки", row["form"], submission_id[:8])
-        if row["status"] == "pending" and attempt["remote_create_started"]:
+        if is_unavailable and row["status"] == "pending" and attempt["remote_create_started"]:
             await _hold_unknown_external_write(row, f"amo-create-outcome-unknown:{type(exc).__name__}")
-        elif row["status"] == "created" and attempt["note_started"]:
+        elif is_unavailable and row["status"] == "created" and attempt["note_started"]:
             await _hold_unknown_external_write(row, f"amo-note-outcome-unknown:{type(exc).__name__}")
         else:
             await _retry_or_fail(row, type(exc).__name__)
@@ -798,18 +809,23 @@ async def run_due(now: float | None = None) -> int:
                 if not store.claim_created(row["submission_id"], now):
                     continue
             handled += 1
-            attempt = {"remote_create_started": False, "note_started": False}
+            attempt = {"remote_create_started": False, "note_started": False, "is_unavailable": False}
             try:
                 result = await deliver(row, attempt)
             except asyncio.CancelledError:
+                is_unavailable = attempt["is_unavailable"]
                 if row["status"] == "pending":
                     try:
-                        if attempt["remote_create_started"]:
+                        if is_unavailable and attempt["remote_create_started"]:
                             store.mark_uncertain(row["submission_id"], "cancelled-after-create-start")
                             logger.error("site_form[%s]: create заявки %s прерван — нужна сверка вручную",
                                          row["form"], row["submission_id"][:8])
                         else:
                             store.release_claim(row["submission_id"])
+                            # mark_created мог уже сохранить lead_id и перейти в
+                            # finishing, пока ожидающий to_thread был отменён.
+                            if not is_unavailable:
+                                store.release_created_claim(row["submission_id"])
                     except Exception:
                         # processing не находится в due; безопаснее ручная
                         # сверка, чем второй create после ошибки БД.
@@ -817,7 +833,7 @@ async def run_due(now: float | None = None) -> int:
                                          row["form"], row["submission_id"][:8])
                 elif row["status"] == "created":
                     try:
-                        if attempt["note_started"]:
+                        if is_unavailable and attempt["note_started"]:
                             store.mark_uncertain(row["submission_id"], "cancelled-after-note-start")
                             logger.error("site_form[%s]: примечание заявки %s прервано — нужна сверка вручную",
                                          row["form"], row["submission_id"][:8])
