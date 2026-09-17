@@ -55,8 +55,11 @@ def normalize(raw) -> str | None:
 
 
 async def _lead_with_order(lead_id):
-    """Сделка с контактами и UUID заказа МС. amgroup заполняет поле через секунды после
-    создания сделки - дочитываем с повторами. (None, "") - сделка не из заказа."""
+    """Сделка с контактами и UUID заказа МС. amgroup сперва создаёт сделку, через секунды
+    заполняет поле заказа и только потом привязывает контакт - поэтому ждём повторами и то,
+    и другое. Поймано на заказе 19102: UUID был сразу, контакт появился позже, и ник было
+    некуда писать. (None, "") - сделка не из заказа."""
+    found = (None, "")
     for delay in [0.0] + list(TELEGRAM_CONTACT_RETRY_DELAYS_S):
         if delay:
             await asyncio.sleep(delay)
@@ -64,9 +67,12 @@ async def _lead_with_order(lead_id):
         if not lead:
             continue
         uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
-        if uuid:
+        if not uuid:
+            continue
+        if _main_contact_id(lead):
             return lead, uuid
-    return None, ""
+        found = (lead, uuid)
+    return found
 
 
 async def _counterparty_telegram(order_uuid: str) -> str | None:

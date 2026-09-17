@@ -68,9 +68,11 @@ def _ms_order(nick="@good_ghost"):
 def _run(monkeypatch, *, lead=None, ms_order=None, contact=None, search=(), patch_ok=True):
     calls = {"patch": [], "ms": [], "lead_reads": 0}
 
+    leads = list(lead) if isinstance(lead, list) else [lead]
+
     async def fake_lead(lead_id, with_=()):
         calls["lead_reads"] += 1
-        return lead
+        return leads[min(calls["lead_reads"] - 1, len(leads) - 1)]
 
     async def fake_ms_get(path, params=None):
         calls["ms"].append((path, params))
@@ -188,3 +190,24 @@ def test_disabled_flag_does_nothing(monkeypatch):
     monkeypatch.setattr(T, "TELEGRAM_CONTACT_ENABLED", False)
     T.post_bg(LEAD)  # без event loop и без исключений - просто выход
     assert not T._bg_tasks
+
+
+def test_contact_attached_later_still_written(monkeypatch):
+    """amgroup привязал контакт уже после создания сделки - дожидаемся и пишем (заказ 19102)."""
+    outcome, calls = _run(
+        monkeypatch,
+        lead=[_lead(contacts=()), _lead()],
+        ms_order=_ms_order(),
+        contact=_contact(),
+    )
+    assert outcome == "written"
+    assert calls["lead_reads"] == 2
+    assert calls["patch"] == [(CONTACT, {TELEGRAM_CONTACT_FIELD_ID: "@good_ghost"})]
+
+
+def test_no_contact_after_all_retries(monkeypatch):
+    """Контакта у сделки так и нет - не пишем никуда и не падаем."""
+    outcome, calls = _run(monkeypatch, lead=_lead(contacts=()), ms_order=_ms_order(), contact=_contact())
+    assert outcome == "no_contact"
+    assert calls["patch"] == []
+    assert calls["lead_reads"] == 3
