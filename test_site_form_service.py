@@ -1299,6 +1299,45 @@ def test_mark_created_write_error_never_recreates(v2, monkeypatch):
     assert len(creates) == 1
 
 
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+@pytest.mark.parametrize("db_recovers", [True, False])
+def test_known_legacy_lead_mark_created_error_never_recreates(v2, monkeypatch, form_type, db_recovers):
+    _mock_api_v2(monkeypatch)
+    original_create = api.create_unsorted_lead_ex
+    original_mark = store.mark_created
+    creates = []
+    mark_calls = []
+
+    async def counted_create(**kwargs):
+        creates.append(kwargs)
+        return await original_create(**kwargs)
+
+    def failed_first_mark(*args, **kwargs):
+        mark_calls.append((args, kwargs))
+        if not db_recovers or len(mark_calls) == 1:
+            raise OSError("SQLite write failed after amo confirmed lead")
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(api, "create_unsorted_lead_ex", counted_create)
+    monkeypatch.setattr(store, "mark_created", failed_first_mark)
+    assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+    assert asyncio.run(sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+    assert asyncio.run(sf.run_due()) == 1
+    row = store.get(SID)
+    assert row["status"] == ("created" if db_recovers else "processing")
+    assert row["attempts"] == 0
+    assert len(creates) == 1
+    if db_recovers:
+        assert row["lead_id"] == 301
+        assert asyncio.run(sf.run_due()) == 1
+        assert store.get(SID)["status"] == "done"
+    else:
+        assert store.due(now=time.time() + 10 ** 6) == []
+        assert asyncio.run(sf.run_due(now=time.time() + 10 ** 6)) == 0
+    assert len(creates) == 1
+    assert len(mark_calls) == 2
+
+
 @pytest.mark.parametrize("phase, status", [("create", "processing"), ("note", "finishing")])
 def test_uncertain_store_write_error_remains_outside_due(v2, monkeypatch, phase, status):
     monkeypatch.setattr(sf, "SITE_FORM_UNAVAILABLE_ENABLED", True)
@@ -1425,6 +1464,57 @@ def test_late_mark_created_after_cancel_cannot_override_uncertain(v2, monkeypatc
         asyncio.run(scenario())
     finally:
         release.set()
+
+
+@pytest.mark.parametrize("form_type", ["callback", "consultation"])
+def test_late_mark_created_after_cancel_keeps_confirmed_legacy_lead(v2, monkeypatch, form_type):
+    _mock_api_v2(monkeypatch)
+    original_create = api.create_unsorted_lead_ex
+    original_mark = store.mark_created
+    entered, release, finished = Event(), Event(), Event()
+    creates = []
+
+    async def counted_create(**kwargs):
+        creates.append(kwargs)
+        return await original_create(**kwargs)
+
+    def delayed_mark(*args, **kwargs):
+        # Первый вызов работает в to_thread; отмена запускает второй вызов
+        # синхронно и сохраняет подтверждённый lead_id до освобождения claim.
+        if not entered.is_set():
+            entered.set()
+            try:
+                assert release.wait(5)
+                return original_mark(*args, **kwargs)
+            finally:
+                finished.set()
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(api, "create_unsorted_lead_ex", counted_create)
+    monkeypatch.setattr(store, "mark_created", delayed_mark)
+
+    async def scenario():
+        assert sf.SITE_FORM_UNAVAILABLE_ENABLED is False
+        assert (await sf.accept_v2(_v2_payload(form_type)))[1]["status"] == "accepted"
+        worker = asyncio.create_task(sf.run_due())
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert store.get(SID)["status"] == "processing"
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        assert store.get(SID)["status"] == "created"
+        assert store.get(SID)["lead_id"] == 301
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        assert store.get(SID)["status"] == "created"
+        assert await sf.run_due() == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert len(creates) == 1
+    assert store.get(SID)["status"] == "done"
 
 
 def test_late_mark_done_after_cancel_cannot_override_uncertain(v2, monkeypatch):

@@ -694,6 +694,16 @@ async def _hold_unknown_external_write(row: dict, reason: str) -> None:
                          row["form"], row["submission_id"][:8])
 
 
+def _park_confirmed_lead(submission_id: str, lead_id: int, uid: str | None) -> None:
+    """Не даём уже подтверждённому create вернуться в pending после локального сбоя.
+
+    Оба UPDATE синхронны и условны: запоздалый mark_created из to_thread
+    проиграет CAS, а при ошибке SQLite processing/finishing остаются вне due.
+    """
+    store.mark_created(submission_id, lead_id, uid, claim_finish=True)
+    store.release_created_claim(submission_id)
+
+
 async def _alert_failed(row: dict, error: str, attempts: int) -> None:
     """Технический чат: без имени и телефона - они лежат в очереди на сервере."""
     import alerts
@@ -761,6 +771,9 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
                 else:
                     await _retry_or_fail(row, "amo-create-failed")
                 return
+            # Ответ amo уже содержит id: при отмене ожидающего to_thread нельзя
+            # возвращать processing в pending и снова выполнять create.
+            attempt["confirmed_lead"] = (lead_id, uid)
             # Сохраняем lead_id и владение доводкой одним UPDATE: другой worker
             # не увидит промежуточную created до примечания.
             if not await asyncio.to_thread(store.mark_created, submission_id, lead_id, uid, claim_finish=True):
@@ -776,6 +789,16 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
             await _hold_unknown_external_write(row, f"amo-create-outcome-unknown:{type(exc).__name__}")
         elif is_unavailable and row["status"] == "created" and attempt["note_started"]:
             await _hold_unknown_external_write(row, f"amo-note-outcome-unknown:{type(exc).__name__}")
+        elif row["status"] == "pending" and attempt.get("confirmed_lead"):
+            # Remote create уже подтвердил id. Ошибка локального mark_created
+            # не разрешает повтор create; при повторном сбое БД claim остаётся
+            # processing/finishing вне due для ручного восстановления.
+            lead_id, uid = attempt["confirmed_lead"]
+            try:
+                _park_confirmed_lead(submission_id, lead_id, uid)
+            except Exception:
+                logger.exception("site_form[%s]: известная сделка %s не сохранена в очереди — нужна сверка БД",
+                                 row["form"], lead_id)
         else:
             await _retry_or_fail(row, type(exc).__name__)
 
@@ -818,12 +841,14 @@ async def run_due(now: float | None = None) -> int:
                             store.mark_uncertain(row["submission_id"], "cancelled-after-create-start")
                             logger.error("site_form[%s]: create заявки %s прерван — нужна сверка вручную",
                                          row["form"], row["submission_id"][:8])
+                        elif attempt.get("confirmed_lead"):
+                            # create подтверждён. Если фоновый mark_created ещё
+                            # ждёт, этот условный UPDATE выиграет claim; поздний
+                            # UPDATE уже не сможет вернуть строку в finishing.
+                            lead_id, uid = attempt["confirmed_lead"]
+                            _park_confirmed_lead(row["submission_id"], lead_id, uid)
                         else:
                             store.release_claim(row["submission_id"])
-                            # mark_created мог уже сохранить lead_id и перейти в
-                            # finishing, пока ожидающий to_thread был отменён.
-                            if not is_unavailable:
-                                store.release_created_claim(row["submission_id"])
                     except Exception:
                         # processing не находится в due; безопаснее ручная
                         # сверка, чем второй create после ошибки БД.
