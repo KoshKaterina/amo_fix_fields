@@ -7,8 +7,9 @@
     Обработка фоном сразу, ответ 200 всегда. Живёт, пока сниппет не снят.
 
 Схема 2 (14.09.2026). Плагин sun-contact-forms, формы по ТЗ «Новые контактные формы»
-(обратный звонок или вопрос, запись на консультацию):
-    {"schema": 2, "form": "test-callback", "form_type": "callback" | "consultation",
+(обратный звонок или вопрос, запись на консультацию). Отдельный тип «Нет в наличии»
+принимается только при дополнительном включателе и явной карте формы:
+    {"schema": 2, "form": "test-callback", "form_type": "callback" | "consultation" | "unavailable",
      "submission_id": "<uuid одной попытки человека>", "client_ip": "...",
      "contact": {"name": "...", "phone": "+7...", "telegram": "@..."}, "comment": "...",
      "context": {"title", "entry", "page_url", "page_title", "referrer", "utm": {...},
@@ -20,6 +21,11 @@
     заявка ждёт в очереди, а не теряется. Ответ не 200 (422 проверка, 429 частота, 503 очередь) -
     сайт показывает человеку «Не получилось отправить заявку» и сохраняет введённое.
     Повтор той же попытки (тот же submission_id) вторую сделку не создаёт.
+    Перед create pending-строка атомарно захватывается worker. Это исключает
+    одновременный create двумя worker. При неопределённом исходе внешнего create
+    строка становится uncertain (или остаётся processing при сбое БД) и не
+    повторяется автоматически: нужна ручная сверка по submission_id. После
+    внезапной смерти процесса processing также требует сверки; crash-gap не закрыт.
 
 Сделка идёт через «Неразобранное» воронки и сразу принимается в этап карты: только этот путь
 amo даёт заполнить метаданные формы. Нативная графа «Источник» токен-интеграции закрыта
@@ -32,6 +38,9 @@ Env:
                     "pipeline_id": 8642414, "status_id": 70070982, "tags": ["тест"]}}'
         slug формы → куда класть. status_id не задан → заявка остаётся в «Неразобранном»
         воронки pipeline_id. Формы не из карты: схема 1 - пропуск, схема 2 - ответ 422.
+        Для «Нет в наличии» запись обязана иметь "form_type": "unavailable" и свой
+        slug/source. Без неё новый тип не принимается; схему 1 для этого slug не используем.
+    SITE_FORM_UNAVAILABLE_ENABLED=1 - отдельный включатель «Нет в наличии», по умолчанию ВЫКЛЮЧЕН
     SITE_FORM_RATE_PER_MINUTE=30        - схема 1: заявок с одного адреса в минуту
     SITE_FORM_CLIENT_RATE_PER_MINUTE=5  - схема 2: заявок от одного посетителя в минуту
     SITE_FORM_DB_PATH=/app/var/site_form.sqlite3 - очередь схемы 2
@@ -55,6 +64,7 @@ import site_form_store as store
 logger = logging.getLogger("uvicorn.error")
 
 SITE_FORM_ENABLED = os.getenv("SITE_FORM_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+SITE_FORM_UNAVAILABLE_ENABLED = os.getenv("SITE_FORM_UNAVAILABLE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 SITE_FORM_SECRET = os.getenv("SITE_FORM_SECRET", "").strip()
 
 
@@ -94,6 +104,7 @@ EMAIL_KEYS = ("your-email", "email")
 FORM_TYPES = {
     "callback": "Обратный звонок или вопрос",
     "consultation": "Запись на консультацию",
+    "unavailable": "Нет в наличии",
 }
 FORMATS = {
     "online": "Онлайн",
@@ -128,11 +139,16 @@ def _load_map() -> dict:
             logger.error("SITE_FORM_MAP[%s]: нужны source и pipeline_id (int) — пропуск", slug)
             continue
         status_id = cfg.get("status_id")
+        form_type = cfg.get("form_type")
+        if form_type is not None and (not isinstance(form_type, str) or form_type not in FORM_TYPES):
+            logger.error("SITE_FORM_MAP[%s]: неизвестный form_type — пропуск", slug)
+            continue
         entry = {
             "source": source,
             "pipeline_id": pipeline_id,
             "status_id": status_id if isinstance(status_id, int) else None,
             "tags": [str(t) for t in (cfg.get("tags") or []) if str(t).strip()],
+            "form_type": form_type,
         }
         out[str(slug)] = entry
     return out
@@ -272,6 +288,11 @@ async def process(payload: dict, ip: str = "") -> int | None:
     cfg = FORM_MAP.get(slug)
     if not cfg:
         logger.warning("site_form: форма %r не в карте — пропуск", slug)
+        return None
+    if cfg.get("form_type") == "unavailable" or payload.get("form_type") == "unavailable":
+        # Схема 1 не имеет обязательных товара и submission_id: не даём ей
+        # превратить новый тип заявки в обычную форму без очереди и антидубля.
+        logger.warning("site_form[%s]: форма «Нет в наличии» требует схему 2", slug)
         return None
     fields = payload.get("fields")
     if not isinstance(fields, dict):
@@ -417,6 +438,11 @@ def clean_v2(payload: dict) -> dict:
     form_type = _s(payload.get("form_type"), 32)
     if form_type not in FORM_TYPES:
         raise PayloadError("bad-form-type")
+    declared_type = FORM_MAP[slug].get("form_type")
+    if form_type == "unavailable" and not SITE_FORM_UNAVAILABLE_ENABLED:
+        raise PayloadError("unavailable-disabled")
+    if (form_type == "unavailable" and declared_type != "unavailable") or (declared_type and declared_type != form_type):
+        raise PayloadError("form-type-mismatch")
 
     contact_in = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
     name = _s(contact_in.get("name"), 80)
@@ -440,6 +466,14 @@ def clean_v2(payload: dict) -> dict:
             utm[key] = value
 
     page_url = _url(ctx_in.get("page_url")) or _url(payload.get("page_url"))
+    product = _clean_ref(ctx_in.get("product"), with_sku=True)
+    if form_type == "unavailable":
+        # Не подменяем конкретный товар общим вопросом: идентификатор, название
+        # и карточка товара нужны менеджеру и для проверки источника обращения.
+        if not product or not product["id"] or product["id"] <= 0 or not product["name"] or not product["url"]:
+            raise PayloadError("no-product")
+        if not _s(ctx_in.get("entry"), 64):
+            raise PayloadError("no-entry")
     return {
         "schema": 2,
         "form": slug,
@@ -459,9 +493,9 @@ def clean_v2(payload: dict) -> dict:
             "page_title": _s(ctx_in.get("page_title"), 300),
             "referrer": _url(ctx_in.get("referrer")),
             "utm": utm,
-            "product": _clean_ref(ctx_in.get("product"), with_sku=True),
+            "product": product,
             "service": _clean_ref(ctx_in.get("service"), with_verified=True) if form_type == "consultation" else None,
-            "format": {"code": fmt_code, "label": FORMATS[fmt_code]} if fmt_code in FORMATS else None,
+            "format": {"code": fmt_code, "label": FORMATS[fmt_code]} if form_type != "unavailable" and fmt_code in FORMATS else None,
         },
     }
 
@@ -521,6 +555,10 @@ def note_text_v2(p: dict, source: str) -> str:
     same_item = bool(service and product and service.get("id") and service.get("id") == product.get("id"))
 
     head = [f"📩 ЗАЯВКА С САЙТА: {FORM_TYPES[p['form_type']].upper()}"]
+    if p["form_type"] == "unavailable":
+        # Даже если длинное примечание обрежется до MAX_NOTE_LEN, полный ключ
+        # остаётся в начале для сопоставления с локальной очередью.
+        head.append(f"ID заявки: {p['submission_id']}")
     page_title = _page_title(ctx["page_title"])
     if page_title:
         head.append(f"Страница: {page_title}")
@@ -536,7 +574,7 @@ def note_text_v2(p: dict, source: str) -> str:
             line += f", артикул {product['sku']}"
         head.append(line)
     if p["comment"]:
-        head.append(f"{'Запрос' if consultation else 'Вопрос'}: {p['comment']}")
+        head.append(f"{'Запрос' if consultation or p['form_type'] == 'unavailable' else 'Вопрос'}: {p['comment']}")
 
     person = ["👤 КОНТАКТ", f"Имя: {contact['name']}", f"Телефон: {contact['phone']}"]
     if contact["telegram"]:
@@ -563,11 +601,17 @@ def note_text_v2(p: dict, source: str) -> str:
     return "\n\n".join("\n".join(block) for block in (head, person, tech))[:MAX_NOTE_LEN]
 
 
-async def _create_lead_v2(p: dict, cfg: dict) -> tuple[int | None, str | None]:
+async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None, str | None]:
     """Заявка в «Неразобранное». Контакт ищем по телефону по действующему правилу (как Jivo
     и схема 1); новый контакт - имя и телефон, Telegram - если задано поле."""
     contact_in = p["contact"]
     source = cfg["source"]
+    lead_name = f"{source}: {contact_in['name']}"
+    if p["form_type"] == "unavailable":
+        # Уникальный ключ должен попасть именно в первичный POST: после timeout
+        # примечание может не существовать, а source_uid/form_id остаются slug.
+        suffix = f" [ID заявки: {p['submission_id']}]"
+        lead_name = f"{lead_name[:MAX_NAME_LEN - len(suffix)]}{suffix}"
     contact_id = await api.find_contact_id(contact_in["phone"])
     if contact_id:
         contact = {"id": int(contact_id)}
@@ -576,8 +620,10 @@ async def _create_lead_v2(p: dict, cfg: dict) -> tuple[int | None, str | None]:
         if contact_in["telegram"] and SITE_FORM_TELEGRAM_FIELD_ID:
             fields.append({"field_id": SITE_FORM_TELEGRAM_FIELD_ID, "values": [{"value": contact_in["telegram"]}]})
         contact = {"name": contact_in["name"], "custom_fields_values": fields}
+    # С этого момента timeout/отмена не доказывают, что amo не создала сделку.
+    attempt["remote_create_started"] = True
     res = await api.create_unsorted_lead_ex(
-        lead_name=f"{source}: {contact_in['name']}",
+        lead_name=lead_name,
         pipeline_id=cfg["pipeline_id"],
         contact=contact,
         source_uid=external_id(p["form"]),
@@ -587,13 +633,14 @@ async def _create_lead_v2(p: dict, cfg: dict) -> tuple[int | None, str | None]:
         form_id=p["form"],
         lead_tags=[source] + cfg["tags"],
         ip=p["client_ip"] or "0.0.0.0",
+        max_attempts=1,
     )
     return res.get("lead_id"), res.get("uid")
 
 
-async def _finish_lead_v2(p: dict, cfg: dict, row: dict) -> int:
-    """Доводка созданной сделки: этап, теги, UTM, примечание. Каждый шаг - по возможности:
-    сделка уже есть, и провал доводки не повод создавать её заново."""
+async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
+    """Доводка созданной сделки: этап, теги и UTM по возможности; исход note
+    должен быть известен, иначе ручная сверка без нового create."""
     lead_id = int(row["lead_id"])
     source = cfg["source"]
     if cfg["status_id"] and row.get("unsorted_uid"):
@@ -608,7 +655,10 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict) -> int:
         if not await api.set_lead_utm(lead_id, p["context"]["utm"]):
             logger.warning("site_form[%s]: UTM в поля сделки %s не записались, остались в примечании",
                            p["form"], lead_id)
-    await api.add_note_to_lead(lead_id, note_text_v2(p, source))
+    # Если ответ на добавление примечания потерян, повтор может его удвоить.
+    attempt["note_started"] = True
+    if not await api.add_note_to_lead(lead_id, note_text_v2(p, source), max_attempts=1):
+        raise RuntimeError("amo-note-outcome-unknown")
     return lead_id
 
 
@@ -625,6 +675,17 @@ async def _retry_or_fail(row: dict, error: str) -> None:
     await asyncio.to_thread(store.mark_retry, row["submission_id"], attempts, time.time() + delay, error)
     logger.warning("site_form[%s]: заявка %s не доставлена (%s), попытка %s, следующая через %s с",
                    row["form"], short_id, error, attempts, delay)
+
+
+async def _hold_unknown_external_write(row: dict, reason: str) -> None:
+    """Не повторяем внешнюю запись при неизвестном ответе; claim остаётся вне due."""
+    try:
+        if await asyncio.to_thread(store.mark_uncertain, row["submission_id"], reason):
+            logger.error("site_form[%s]: исход внешней записи заявки %s неизвестен — нужна сверка вручную (%s)",
+                         row["form"], row["submission_id"][:8], reason)
+    except Exception:
+        logger.exception("site_form[%s]: не удалось записать uncertain для заявки %s",
+                         row["form"], row["submission_id"][:8])
 
 
 async def _alert_failed(row: dict, error: str, attempts: int) -> None:
@@ -648,8 +709,8 @@ async def _alert_failed(row: dict, error: str, attempts: int) -> None:
         logger.exception("site_form: алерт о недоставленной заявке не отправлен")
 
 
-async def deliver(row: dict) -> None:
-    """Одна строка очереди → сделка. Ошибка не роняет обработчик: строка уходит на повтор."""
+async def deliver(row: dict, attempt: dict) -> bool | None:
+    """Одна строка очереди → сделка; неопределённый create не уходит на повтор."""
     submission_id = row["submission_id"]
     try:
         payload = json.loads(row.get("payload") or "")
@@ -657,32 +718,122 @@ async def deliver(row: dict) -> None:
         await asyncio.to_thread(store.mark_failed, submission_id, int(row.get("attempts") or 0), "broken-payload")
         logger.error("site_form[%s]: заявка %s испорчена в очереди", row["form"], submission_id[:8])
         return
+    if payload.get("form_type") == "unavailable" and not SITE_FORM_UNAVAILABLE_ENABLED:
+        # Убираем из due, сохраняя строку/попытки до восстановления gate.
+        await asyncio.to_thread(store.mark_held, submission_id, "unavailable-disabled")
+        logger.info("site_form[%s]: заявка %s удержана (тип выключен)", row["form"], submission_id[:8])
+        return False
     cfg = FORM_MAP.get(row["form"])
     if not cfg:
-        # Карту поменяли после приёма: ждём, пока форму вернут, заявку не теряем.
+        if payload.get("form_type") == "unavailable":
+            await asyncio.to_thread(store.mark_held, submission_id, "form-not-in-map")
+            logger.error("site_form[%s]: заявка %s удержана (форма отсутствует в карте)",
+                         row["form"], submission_id[:8])
+            return False
+        # Существующие формы сохраняют прежний порядок повторов.
         await _retry_or_fail(row, "form-not-in-map")
+        return
+    declared_type = cfg.get("form_type")
+    if (payload.get("form_type") == "unavailable" and declared_type != "unavailable") or (
+        declared_type and declared_type != payload.get("form_type")
+    ):
+        if payload.get("form_type") == "unavailable":
+            await asyncio.to_thread(store.mark_held, submission_id, "form-type-mismatch")
+            logger.error("site_form[%s]: заявка %s удержана (тип формы изменился в карте)",
+                         row["form"], submission_id[:8])
+            return False
+        await _retry_or_fail(row, "form-type-mismatch")
         return
     try:
         if row["status"] == "pending":
-            lead_id, uid = await _create_lead_v2(payload, cfg)
+            lead_id, uid = await _create_lead_v2(payload, cfg, attempt)
             if not lead_id:
-                await _retry_or_fail(row, "amo-create-failed")
+                await _hold_unknown_external_write(row, "amo-create-outcome-unknown")
                 return
-            await asyncio.to_thread(store.mark_created, submission_id, lead_id, uid)
+            # Сохраняем lead_id и владение доводкой одним UPDATE: другой worker
+            # не увидит промежуточную created до примечания.
+            if not await asyncio.to_thread(store.mark_created, submission_id, lead_id, uid, claim_finish=True):
+                raise RuntimeError("mark-created-claim-lost")
             row = {**row, "status": "created", "lead_id": lead_id, "unsorted_uid": uid}
-        lead_id = await _finish_lead_v2(payload, cfg, row)
-        await asyncio.to_thread(store.mark_done, submission_id, lead_id)
+        lead_id = await _finish_lead_v2(payload, cfg, row, attempt)
+        if not await asyncio.to_thread(store.mark_done, submission_id, lead_id, require_finishing=True):
+            raise RuntimeError("mark-done-claim-lost")
         logger.info("site_form[%s]: заявка %s → сделка %s", row["form"], submission_id[:8], lead_id)
     except Exception as exc:
         logger.exception("site_form[%s]: заявка %s — сбой доставки", row["form"], submission_id[:8])
-        await _retry_or_fail(row, type(exc).__name__)
+        if row["status"] == "pending" and attempt["remote_create_started"]:
+            await _hold_unknown_external_write(row, f"amo-create-outcome-unknown:{type(exc).__name__}")
+        elif row["status"] == "created" and attempt["note_started"]:
+            await _hold_unknown_external_write(row, f"amo-note-outcome-unknown:{type(exc).__name__}")
+        else:
+            await _retry_or_fail(row, type(exc).__name__)
 
 
 async def run_due(now: float | None = None) -> int:
-    rows = await asyncio.to_thread(store.due, now)
-    for row in rows:
-        await deliver(row)
-    return len(rows)
+    if SITE_FORM_UNAVAILABLE_ENABLED:
+        available_forms = [slug for slug, cfg in FORM_MAP.items()
+                           if cfg.get("form_type") == "unavailable"]
+        released = await asyncio.to_thread(store.release_held, available_forms, now)
+        if released:
+            logger.info("site_form: удержанных заявок возвращено в очередь: %s", released)
+    processed = 0
+    while True:
+        rows = await asyncio.to_thread(store.due, now)
+        if not rows:
+            return processed
+        held = 0
+        handled = 0
+        for row in rows:
+            if row["status"] == "pending":
+                # due() только читает: другой worker мог выбрать ту же строку.
+                # Условный UPDATE в SQLite оставит право на create лишь одному.
+                # Синхронный короткий claim не может продолжить работу в thread
+                # после отмены ожидающей корутины.
+                claimed = store.claim_pending(row["submission_id"], now)
+                if not claimed:
+                    continue
+            elif row["status"] == "created":
+                if not store.claim_created(row["submission_id"], now):
+                    continue
+            handled += 1
+            attempt = {"remote_create_started": False, "note_started": False}
+            try:
+                result = await deliver(row, attempt)
+            except asyncio.CancelledError:
+                if row["status"] == "pending":
+                    try:
+                        if attempt["remote_create_started"]:
+                            store.mark_uncertain(row["submission_id"], "cancelled-after-create-start")
+                            logger.error("site_form[%s]: create заявки %s прерван — нужна сверка вручную",
+                                         row["form"], row["submission_id"][:8])
+                        else:
+                            store.release_claim(row["submission_id"])
+                    except Exception:
+                        # processing не находится в due; безопаснее ручная
+                        # сверка, чем второй create после ошибки БД.
+                        logger.exception("site_form[%s]: не удалось завершить claim при отмене заявки %s",
+                                         row["form"], row["submission_id"][:8])
+                elif row["status"] == "created":
+                    try:
+                        if attempt["note_started"]:
+                            store.mark_uncertain(row["submission_id"], "cancelled-after-note-start")
+                            logger.error("site_form[%s]: примечание заявки %s прервано — нужна сверка вручную",
+                                         row["form"], row["submission_id"][:8])
+                        else:
+                            store.release_created_claim(row["submission_id"])
+                    except Exception:
+                        logger.exception("site_form[%s]: не удалось завершить доводку при отмене заявки %s",
+                                         row["form"], row["submission_id"][:8])
+                raise
+            if result is False:
+                held += 1
+        processed += handled
+        if handled == 0:
+            return processed
+        # Если всю страницу заняли удержанные строки, сразу берём следующую:
+        # callback/consultation не ждут очередного тика worker.
+        if held != handled:
+            return processed
 
 
 def _kick() -> None:
@@ -714,7 +865,8 @@ async def _worker() -> None:
 async def ensure_sources() -> None:
     """Регистрирует недостающие источники карты на нашей интеграции. Ошибка не
     роняет старт: без источника amo подставит источник интеграции по умолчанию."""
-    wanted = {external_id(slug): cfg["source"] for slug, cfg in FORM_MAP.items()}
+    wanted = {external_id(slug): cfg["source"] for slug, cfg in FORM_MAP.items()
+              if cfg.get("form_type") != "unavailable" or SITE_FORM_UNAVAILABLE_ENABLED}
     if not wanted:
         return
     try:
