@@ -545,7 +545,9 @@ def note_text_v2(p: dict, source: str) -> str:
     3. Техническое: источник в amo, адреса страницы и товара, кнопка, UTM, откуда пришёл, номер заявки.
 
     Жирного в примечаниях amo нет: текст идёт без разметки, HTML amo экранирует («&» в API отдаётся
-    как «&amp;»). Поэтому заголовки блоков - капсом и с эмодзи. Пустые необязательные поля не выводятся.
+    как «&amp;»). Поэтому заголовки блоков - капсом и со значком. Значки только из базовой плоскости
+    Unicode (✉️ ☎️ ⚙️): четырёхбайтовые эмодзи вроде 📩 и 👤 amo молча вырезает (сделка 36555685,
+    14.09.2026). Пустые необязательные поля не выводятся.
     """
     ctx = p["context"]
     contact = p["contact"]
@@ -554,7 +556,7 @@ def note_text_v2(p: dict, source: str) -> str:
     product = ctx["product"]
     same_item = bool(service and product and service.get("id") and service.get("id") == product.get("id"))
 
-    head = [f"📩 ЗАЯВКА С САЙТА: {FORM_TYPES[p['form_type']].upper()}"]
+    head = [f"✉️ ЗАЯВКА С САЙТА: {FORM_TYPES[p['form_type']].upper()}"]
     if p["form_type"] == "unavailable":
         # Даже если длинное примечание обрежется до MAX_NOTE_LEN, полный ключ
         # остаётся в начале для сопоставления с локальной очередью.
@@ -576,7 +578,7 @@ def note_text_v2(p: dict, source: str) -> str:
     if p["comment"]:
         head.append(f"{'Запрос' if consultation or p['form_type'] == 'unavailable' else 'Вопрос'}: {p['comment']}")
 
-    person = ["👤 КОНТАКТ", f"Имя: {contact['name']}", f"Телефон: {contact['phone']}"]
+    person = ["☎️ КОНТАКТ", f"Имя: {contact['name']}", f"Телефон: {contact['phone']}"]
     if contact["telegram"]:
         person.append(f"Telegram: {contact['telegram']}")
 
