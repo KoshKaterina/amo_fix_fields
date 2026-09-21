@@ -445,6 +445,12 @@ FIELD_FF_TREK = 571657
 # смотрим лог, что модуль бы сделал, и только потом разрешаем запись.
 AMGROUP_FALLBACK_ENABLED = os.getenv("AMGROUP_FALLBACK_ENABLED", "0") == "1"
 AMGROUP_FALLBACK_DRY_RUN = os.getenv("AMGROUP_FALLBACK_DRY_RUN", "1") == "1"
+# Классификация только локального резервного создателя по снимку задачи 6.
+# Оба условия обязательны: gate выключен до согласованного переключения,
+# UUID не выводим из имени поля или текущего остатка. Основной внешний amGroup
+# настраивается и проверяется отдельно.
+AMGROUP_PREORDER_TYPE_ENABLED = os.getenv("AMGROUP_PREORDER_TYPE_ENABLED", "0") == "1"
+MS_ATTR_PREORDER_SUMMARY_ID = os.getenv("MS_ATTR_PREORDER_SUMMARY_ID", "").strip()
 AMGROUP_FALLBACK_INTERVAL_SEC = int(os.getenv("AMGROUP_FALLBACK_INTERVAL_SEC", "180"))
 # Насколько назад смотрим заказы МойСклада на каждом проходе.
 AMGROUP_FALLBACK_LOOKBACK_HOURS = int(os.getenv("AMGROUP_FALLBACK_LOOKBACK_HOURS", "48"))
