@@ -614,6 +614,7 @@ def _tags_payload(tags: list[dict]) -> list[dict]:
 async def patch_lead(
     lead_id: int | str,
     *,
+    name: str | None = None,
     custom_fields: dict[int, Any] | None = None,
     status_id: int | None = None,
     pipeline_id: int | None = None,
@@ -622,6 +623,8 @@ async def patch_lead(
     price: int | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
+    if name is not None:
+        body["name"] = name
     if custom_fields:
         body["custom_fields_values"] = [
             _make_custom_field(fid, val) for fid, val in custom_fields.items()

@@ -955,6 +955,21 @@ OFFICE_TRANSFER_RECONCILE_INTERVAL_S = int(os.getenv("OFFICE_TRANSFER_RECONCILE_
 # успехе). 0 = алерт выключен.
 OFFICE_TRANSFER_STALE_ALERT_MIN = int(os.getenv("OFFICE_TRANSFER_STALE_ALERT_MIN", "30"))
 
+# ── Имя сделки для заявок с формы предзаказа (Катя 21.09.2026) ──
+# Форма предзаказа называет сделку именем клиента, номера у неё своего нет.
+# Берём автонумерацию amo - id сделки - и делаем «Заказ №<id>». Разбор -
+# preorder_lead_name.py и knowledge/forma-predzakaza-kak-ustroena.md.
+PREORDER_LEAD_NAME_ENABLED = os.getenv("PREORDER_LEAD_NAME_ENABLED", "0") == "1"
+
+# Повторы чтения сделки: вебхук о создании может обогнать запись полей.
+PREORDER_LEAD_NAME_RETRY_DELAYS_S = [
+    float(x) for x in os.getenv("PREORDER_LEAD_NAME_RETRY_DELAYS_S", "5,20,60").split(",") if x.strip()
+]
+
+# Источник сделок форм сайта - «Новый сайт (ContactForm)». Общий для всех форм,
+# поэтому предзаказ отличаем ещё и по полю «Тип заявки».
+LEAD_SOURCE_SITE_CONTACT_FORM = int(os.getenv("LEAD_SOURCE_SITE_CONTACT_FORM", "23478357"))
+
 # Поля сделки
 FIELD_DELIVERY_TYPE = 577315       # Тип доставки (text) — используется и в showroom_tag.py как литерал
 FIELD_APPLICATION_TYPE = 577671    # Тип заявки (select)

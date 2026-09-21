@@ -28,6 +28,7 @@ import new_lead_watch
 import ms_client
 import office_transfer
 import order_note
+import preorder_lead_name
 import order_watchdog
 import ozon_invoice
 import reserve_service
@@ -460,6 +461,9 @@ async def lead_change(request: Request):
         order_note.post_bg(lead_id)
         # Ник Телеграма из контрагента МС в контакт («TelegramUsername_WZ», только в пустое)
         telegram_contact.post_bg(lead_id)
+        # Заявка с формы предзаказа: имя сделки «Заказ №<id>» вместо имени клиента
+        # (Катя 21.09.2026). Модуль сам проверяет флаг, источник и тип заявки.
+        preorder_lead_name.rename_bg(lead_id)
 
     status_update = await get_nested(nested, ["leads", "update", "0", "status_id"])
     status_add = await get_nested(nested, ["leads", "add", "0", "status_id"])
