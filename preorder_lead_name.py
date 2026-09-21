@@ -51,12 +51,20 @@ def build_name(lead_id) -> str:
 
 
 def _source_id(lead: dict) -> int | None:
-    """Источник сделки из `_embedded.source` (тот же приём, что в lead_distribution)."""
-    src = (lead.get("_embedded") or {}).get("source")
-    if not src or src.get("id") is None:
+    """Источник сделки.
+
+    ⚠️ При `with=source_id` amo кладёт его полем ВЕРХНЕГО уровня (`source_id`), а не
+    в `_embedded.source` - проверено на боевых сделках 21.09.2026. В `_embedded.source`
+    он приезжает в ответах других ручек, поэтому читаем оба места: сперва поле,
+    потом вложенное."""
+    raw = lead.get("source_id")
+    if raw is None:
+        src = (lead.get("_embedded") or {}).get("source") or {}
+        raw = src.get("id")
+    if raw is None:
         return None
     try:
-        return int(src["id"])
+        return int(raw)
     except (TypeError, ValueError):
         return None
 

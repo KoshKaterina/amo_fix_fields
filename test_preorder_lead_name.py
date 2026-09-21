@@ -19,10 +19,15 @@ from waybill_config import (
 
 
 def _lead(*, source_id=LEAD_SOURCE_SITE_CONTACT_FORM, type_enum=APPLICATION_TYPE_PREORDER,
-          name="Эльдар") -> dict:
+          name="Эльдар", source_place="top") -> dict:
+    """source_place: где лежит источник. `top` - полем `source_id` (так отвечает amo
+    на `with=source_id`, проверено на боевых сделках), `embedded` - вложенным."""
     lead = {"id": 36559797, "name": name, "_embedded": {}}
     if source_id is not None:
-        lead["_embedded"]["source"] = {"id": source_id}
+        if source_place == "top":
+            lead["source_id"] = source_id
+        else:
+            lead["_embedded"]["source"] = {"id": source_id}
     if type_enum is not None:
         lead["custom_fields_values"] = [
             {"field_id": FIELD_APPLICATION_TYPE, "values": [{"enum_id": type_enum}]}
@@ -40,6 +45,11 @@ assert pln.is_preorder_form_lead(_lead(source_id=None)) is False
 assert pln.is_preorder_form_lead(_lead(type_enum=APPLICATION_TYPE_ORDER)) is False
 # тип заявки ещё не проставлен — ждём повтора, а не переименовываем вслепую
 assert pln.is_preorder_form_lead(_lead(type_enum=None)) is False
+
+# ⚠️ Источник приезжает полем верхнего уровня - на этом модуль один раз уже
+# спотыкался (21.09.2026). Оба формата ответа должны узнаваться.
+assert pln.is_preorder_form_lead(_lead(source_place="embedded")) is True
+assert pln.is_preorder_form_lead(_lead(source_id=23478413, source_place="embedded")) is False
 
 # ── идемпотентность ──
 assert pln.needs_rename(_lead(name="Эльдар")) is True
