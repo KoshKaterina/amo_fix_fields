@@ -398,7 +398,8 @@ def run_deadlines(collect=False):
         if not dl:
             continue
         d = datetime.fromtimestamp(dl / 1000, MSK).date()
-        label = f"{t.get('idTaskProject') or t.get('idTaskCommon') or ''} {t.get('title','')}".strip()
+        # код задачи не пишем: Катя читает названия, а не MAG-283 (правило 03.08.2026)
+        label = (t.get("title") or "").strip() or "задача без названия"
         if d < today:
             overdue.append((d, label))
         elif d == today:
@@ -417,11 +418,15 @@ def run_deadlines(collect=False):
 
     parts = []
     if overdue:
-        parts.append(f"\nПросрочено ({len(overdue)}):")
-        for d, label in sorted(overdue)[:10]:
+        # ⚠️ Раньше сюда падали десять самых СТАРЫХ - мёртвый груз, который не меняется
+        # неделями, и сводка превращалась в обои. Показываем три свежепросроченных:
+        # по ним ещё можно успеть. Остальные живут в YouGile, счётчиком.
+        fresh_overdue = sorted(overdue, reverse=True)[:3]
+        parts.append(f"\nПросрочено: {len(overdue)}. Протухли последними:")
+        for d, label in fresh_overdue:
             parts.append(f"• {label} - срок был {d.strftime('%d.%m')}")
-        if len(overdue) > 10:
-            parts.append(f"• …и ещё {len(overdue) - 10}")
+        if len(overdue) > 3:
+            parts.append(f"Остальные {len(overdue) - 3} - в YouGile.")
     if due_today:
         parts.append(f"\nСегодня ({len(due_today)}):")
         parts += [f"• {label}" for _, label in due_today[:10]]
@@ -434,7 +439,7 @@ def run_deadlines(collect=False):
             who = {"864665f1-3697-4993-87bd-f588285bc820": "Андрей",
                    "3480b624-16d8-4f94-80ef-33b2f07d06e8": "Влад",
                    "ce3fe8fc-2a04-4e1c-a510-5c283c690efc": "Гладков"}.get(t.get("createdBy"), "кто-то")
-            label = f"{t.get('idTaskProject') or ''} {t.get('title','')}".strip()
+            label = (t.get("title") or "").strip() or "задача без названия"
             parts.append(f"• {label} (от {who})")
 
     log(f"  просрочено {len(overdue)}, сегодня {len(due_today)}, "
