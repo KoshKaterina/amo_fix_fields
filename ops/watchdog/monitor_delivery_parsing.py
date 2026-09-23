@@ -6,7 +6,8 @@
   2. МойСклад доехал - у сделки есть «ID Заказа» (576689);
   3. распределение отработало - ответственный проставлен, самовывоз не ушёл в пул.
 
-Запуск: python monitor_delivery.py [часов] [--since-ts UNIX]
+Запуск: python ops/watchdog/monitor_delivery_parsing.py [часов] [--since-ts UNIX]
+Токен берётся из .env корня проекта (переопределяется AMO_FIX_FIELDS_ROOT).
 """
 import os
 import re
@@ -16,7 +17,8 @@ import collections
 
 import httpx
 
-ROOT = r"C:\Users\crtvg\Desktop\tiana-workspace\tiana-workspace\repositories\amo_fix_fields"
+ROOT = os.environ.get("AMO_FIX_FIELDS_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BASE = "https://new5a2e8ea7b16b4.amocrm.ru"
 LEAD_URL = BASE + "/leads/detail/"
 
