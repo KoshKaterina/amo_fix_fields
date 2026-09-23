@@ -118,6 +118,19 @@ assert office_transfer._match_ur_delivery(lead3) is None, "предзаказ �
 lead4 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_ERMS_MAIN,
               delivery_text="Доставка курьером по Москве")
 assert office_transfer._match_ur_delivery(lead4) is None, "чужой склад — не матчит"
+# новое имя своей курьерки (переименование 23.09.2026)
+lead5 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+              delivery_text="Курьерская доставка")
+assert office_transfer._match_ur_delivery(lead5) == (PIPELINE_OFFICE, STATUS_OFFICE_DELIVERY)
+# ⚠️ мина: у курьерки СДЭК та же подстрока «курьерская доставка», но ехать ей на
+# «Сделать накладную», а не на «Оформить доставку»
+lead6 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+              delivery_text="СДЭК: Курьерская доставка")
+assert office_transfer._match_ur_delivery(lead6) is None, "курьерка СДЭК — не наша доставка"
+assert office_transfer._match_ur_waybill(lead6) == (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL),     "курьерка СДЭК должна ехать на «Сделать накладную»"
+lead7 = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+              delivery_text="СДЭК: Доставка в постамат")
+assert office_transfer._match_ur_delivery(lead7) is None, "постамат СДЭК — не наша доставка"
 print("✓ УР-1 Достависта: матчинг верный")
 
 # УР-2 Самовывоз (дискриминатор «из офиса» против «CDEK: Самовывоз»)

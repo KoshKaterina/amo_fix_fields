@@ -20,7 +20,8 @@ select-поля сверяются по enum_id, не по тексту, что�
 менеджер видит подпись значения):
 
   УР (142), источник [CLEVER] Основная:
-    1. Тип доставки содержит «курьером по москве» + Тип заявки=Заказ +
+    1. Тип доставки содержит «курьером по москве» ИЛИ «курьерская доставка»
+       (новое имя с 23.09.2026, перевозчик при этом НЕ упомянут) + Тип заявки=Заказ +
        Склад∈{Основной,Вскрытые} → Офис/«Оформить доставку»
     2. Тип доставки содержит «самовывоз из офиса» + Тип заявки=Заказ +
        Склад∈{Основной,Вскрытые} → Офис/УР(142). Исключение (10.08.2026,
@@ -111,7 +112,7 @@ from waybill_config import (
     APPLICATION_TYPE_PREORDER,
     APPLICATION_TYPE_RESERVE,
     DELIVERY_CDEK_MARKERS,
-    DELIVERY_COURIER_MOSCOW_MARKER,
+    DELIVERY_COURIER_OWN_MARKERS,
     DELIVERY_RUSSIAN_POST_MARKER,
     DELIVERY_PICKUP_MARKERS,
     DELIVERY_SHOWROOM_PICKUP_MARKER,
@@ -215,7 +216,14 @@ def _match_ur_delivery(lead: dict, *, ignore_flags: bool = False) -> tuple[int, 
         return None
     if _warehouse(lead) not in OFFICE_TRANSFER_WAREHOUSES:
         return None
-    if DELIVERY_COURIER_MOSCOW_MARKER not in _delivery_text(lead):
+    text = _delivery_text(lead)
+    # ⚠️ Перевозчика отбрасываем ПЕРВЫМ: «СДЭК: Курьерская доставка» содержит ту же
+    # подстроку «курьерская доставка», что и наша курьерка, а ехать ей надо на
+    # «Сделать накладную» (_match_ur_waybill), не на «Оформить доставку». Этот матчер
+    # в _UR_RULES стоит раньше, поэтому без отсева он перехватил бы СДЭК-заказы.
+    if any(marker in text for marker in DELIVERY_CDEK_MARKERS):
+        return None
+    if not any(marker in text for marker in DELIVERY_COURIER_OWN_MARKERS):
         return None
     return (PIPELINE_OFFICE, STATUS_OFFICE_DELIVERY)
 

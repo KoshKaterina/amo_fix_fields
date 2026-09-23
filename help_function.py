@@ -1,13 +1,25 @@
 import re
 from typing import Any, Iterable
 
+# ⚠️ Имена способов доставки МЕНЯЮТСЯ (переименование на сайте 23.09.2026: «CDEK:»
+# стало кириллическим «СДЭК:», «Доставка курьером по Москве» - «Курьерской доставкой»).
+# Старые имена при этом никуда не делись: в живых сделках на 23.09 разом встречаются
+# и «Самовывоз из офиса Sunscrypt», и «Самовывоз из шоурума Sunscrypt». Поэтому список
+# ДОБАВЛЯЕТСЯ, а не заменяется, префиксы держим короткими (по слову-признаку), и матч
+# идёт регистронезависимо - раньше строка с маленькой буквы прошла бы мимо.
+# Не опознали строку → она молча уедет в «Состав заказа» как товар, а «Тип доставки»
+# останется пустым (api.add_info_from_ms пропускает пустое значение). Карта всех мест,
+# где зашиты имена, - knowledge/imena-dostavki-gde-zashity.md в папке Кати.
 DELIVERY_PREFIXES = (
     "CDEK",
-    "Доставка курьером",
+    "СДЭК",
+    "Доставка",
+    "Курьер",
     "Самовывоз",
     "Наценка за наложенный платеж",
     "Почта России"
 )
+_DELIVERY_PREFIXES_CF = tuple(p.casefold() for p in DELIVERY_PREFIXES)
 
 # Строка доставки из МС всегда имеет вид «<описание>, <количество>[ <ед.
 # изм.>], <сумма> <валюта>» — количество это ВСЕГДА предпоследний сегмент
@@ -37,7 +49,7 @@ async def parse_the_cart_field(data: str):
         line = item.strip()
 
         # 2. Classify based on the delivery prefixes
-        if line.startswith(DELIVERY_PREFIXES):
+        if line.casefold().startswith(_DELIVERY_PREFIXES_CF):
             deliveries.append(_strip_quantity_segment(line))
         else:
             products.append(line)
