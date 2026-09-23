@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import collections
+import statistics
 
 import httpx
 
@@ -41,6 +42,10 @@ ZUBALIY = 13963494
 # 36562137 (23.09) путь занял 76 секунд. Сделки моложе этого порога показываем
 # отдельной строкой «ещё в обработке», а не как поломку.
 GRACE_S = 300
+# Порог «слишком поздно»: триггер воронки читает «Тип доставки» сразу после смены
+# этапа. Замер 23.09.2026 по ленте amo: медиана 8 секунд, но при шквале вебхуков
+# доходит до трёх минут - и тогда шаблон уходит пустым.
+SLOW_S = 60
 
 
 def env_token():
@@ -77,6 +82,31 @@ def fetch(since_ts, token):
                 break
             time.sleep(1)
     return rows
+
+
+def first_events(client, headers, field_id, ts_from, ts_to):
+    """Первое событие изменения поля по каждой сделке в окне.
+    Тип события у amo включает id поля: custom_field_<id>_value_changed."""
+    first = {}
+    for page in range(1, 21):
+        r = client.get(BASE + "/api/v4/events", headers=headers, params={
+            "filter[type]": "custom_field_%s_value_changed" % field_id,
+            "filter[created_at][from]": ts_from,
+            "filter[created_at][to]": ts_to,
+            "limit": 100, "page": page,
+        })
+        if r.status_code == 204:
+            break
+        r.raise_for_status()
+        evs = (r.json().get("_embedded") or {}).get("events") or []
+        for e in evs:
+            lid, t = e.get("entity_id"), e.get("created_at")
+            if lid is not None and (lid not in first or t < first[lid]):
+                first[lid] = t
+        if len(evs) < 100:
+            break
+        time.sleep(0.3)
+    return first
 
 
 def main():
@@ -172,7 +202,39 @@ def main():
     else:
         print("наш самовывоз в окне: 0")
 
-    bad = len(unparsed) + len(no_tariff) + len(no_responsible)
+    # ── задержка обработки: «Корзина» записана → «Тип доставки» записан ──
+    # Катя 23.09.2026: «поля заполнились слишком поздно и из-за этого шаблоны ушли
+    # пустыми». Триггеры воронки читают поле сразу после смены этапа, а оно едет
+    # через очередь - вот сколько именно оно едет.
+    slow = []
+    delays = []
+    try:
+        with httpx.Client(timeout=40) as c:
+            h = {"Authorization": "Bearer " + env_token()}
+            cart_ev = first_events(c, h, FIELD_CART, since, int(time.time()))
+            dlv_ev = first_events(c, h, FIELD_DELIVERY, since, int(time.time()) + 600)
+        for lid, t_cart in cart_ev.items():
+            t_dlv = dlv_ev.get(lid)
+            if t_dlv is None:
+                continue
+            d = t_dlv - t_cart
+            delays.append(d)
+            if d > SLOW_S:
+                slow.append((lid, d))
+    except Exception as exc:  # лента недоступна - не роняем отчёт
+        print()
+        print("задержку замерить не удалось: %s" % exc)
+
+    if delays:
+        delays.sort()
+        print()
+        print("задержка «Корзина» → «Тип доставки»: медиана %ds, максимум %ds (%d сделок)"
+              % (int(statistics.median(delays)), max(delays), len(delays)))
+        slow.sort(key=lambda x: -x[1])
+        block("дольше %d с — триггеры и шаблоны могли прочитать пустое поле" % SLOW_S, slow,
+              lambda x: "%s%s  — %d с" % (LEAD_URL, x[0], x[1]))
+
+    bad = len(unparsed) + len(no_tariff) + len(no_responsible) + len(slow)
     print()
     print("ИТОГ: " + ("всё чисто" if bad == 0 else "ЕСТЬ ЧТО СМОТРЕТЬ (%d)" % bad))
 
