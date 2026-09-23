@@ -973,7 +973,7 @@ def test_in_flight_covers_patch_not_just_decide_and_record():
     assert len(_patch_calls) == 1
 
 
-# ════════════════ доставка «офис» — не распределяем (решение Тианы 19.08.2026) ════════════════
+# ══════ наш самовывоз (офис/шоурум) — не распределяем (Тиана 19.08.2026, шоурум — Катя 23.09.2026) ══════
 
 def test_office_pickup_delivery_is_not_distributed():
     """Реальное значение поля 577315 на живом аккаунте: 'Самовывоз из офиса
@@ -985,7 +985,7 @@ def test_office_pickup_delivery_is_not_distributed():
     _lead_by_id[310] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
     outcome = run(ld.process_lead_distribution(310))
-    assert outcome == "skipped-office-delivery"
+    assert outcome == "skipped-pickup-delivery"
     assert not _patch_calls, "сделка с самовывозом из офиса не должна получать ответственного"
 
 
@@ -995,7 +995,43 @@ def test_office_pickup_delivery_case_insensitive():
     lead = _lead(lead_id=311, source_id=1, delivery_type="САМОВЫВОЗ ИЗ ОФИСА")
     _lead_by_id[311] = lead
     outcome = run(ld.process_lead_distribution(311))
-    assert outcome == "skipped-office-delivery"
+    assert outcome == "skipped-pickup-delivery"
+
+
+def test_showroom_pickup_delivery_is_not_distributed():
+    """Живое значение поля 577315 для шоурума: «Самовывоз из шоурума Sunscrypt,
+    0.00 рублей» (у шоурума с 06.08.2026 свой склад). Слова «офис» в строке нет
+    вовсе — до 23.09.2026 такая сделка уходила в общий пул распределения."""
+    _reset_fakes()
+    _seed_profile(name="ShowroomGuard", source_ids=[1])
+    lead = _lead(lead_id=314, source_id=1, delivery_type="Самовывоз из шоурума Sunscrypt, 0.00 рублей")
+    _lead_by_id[314] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(314))
+    assert outcome == "skipped-pickup-delivery"
+    assert not _patch_calls, "сделка с самовывозом из шоурума не должна получать ответственного"
+
+
+def test_showroom_pickup_delivery_case_insensitive():
+    _reset_fakes()
+    _seed_profile(name="ShowroomGuardCase", source_ids=[1])
+    lead = _lead(lead_id=315, source_id=1, delivery_type="САМОВЫВОЗ ИЗ ШОУРУМА")
+    _lead_by_id[315] = lead
+    outcome = run(ld.process_lead_distribution(315))
+    assert outcome == "skipped-pickup-delivery"
+
+
+def test_cdek_pvz_pickup_is_distributed_normally():
+    """Контрольный: ПВЗ перевозчика — НЕ наш самовывоз, его ведёт МОП как обычно.
+    Ни «офис», ни «шоурум» в строке нет, под правило попасть не должен."""
+    _reset_fakes()
+    _seed_profile(name="CdekPvzGuard", source_ids=[1])
+    lead = _lead(lead_id=316, source_id=1, delivery_type="CDEK: Самовывоз, 1 шт, 350.00 рублей")
+    _lead_by_id[316] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(316))
+    assert outcome == "routed"
+    assert _patch_calls and _patch_calls[0]["lead_id"] == 316
 
 
 def test_non_office_delivery_is_distributed_normally():

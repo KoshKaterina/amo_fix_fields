@@ -223,14 +223,20 @@ def _lead_source_id(lead: dict) -> int | None:
     return int(src["id"])
 
 
-def _is_office_delivery(lead: dict) -> bool:
-    """Тип доставки (FIELD_DELIVERY_TYPE, 577315, text) содержит «офис» -
-    самовывоз из офиса Sunscrypt (та же подстрока, что DELIVERY_SHOWROOM_MARKER
-    в office_transfer.py, регистронезависимо - .casefold(), тот же приём).
-    Решение Тианы 19.08.2026: такие сделки не распределяются вообще, ими
-    занимается офис-менеджер напрямую, не пул участников профиля."""
+def _is_pickup_delivery(lead: dict) -> bool:
+    """Тип доставки (FIELD_DELIVERY_TYPE, 577315, text) - НАШ самовывоз: из
+    офиса («офис») или из шоурума («шоурум», у шоурума с 06.08.2026 свой склад).
+    Обе подстроки - регистронезависимо (.casefold(), тот же приём, что у
+    DELIVERY_SHOWROOM_MARKER в office_transfer.py). Матч именно по подстроке:
+    живое значение поля идёт с количеством и ценой в той же строке -
+    «Самовывоз из шоурума Sunscrypt, 0.00 рублей».
+    Решение Тианы 19.08.2026 (офис) и Кати 23.09.2026 (шоурум): такие сделки
+    не распределяются вообще, ими занимается офис-менеджер напрямую, не пул
+    участников профиля.
+    ⚠️ «CDEK: Самовывоз» и «Самовывоз СДЭК» - это ПВЗ перевозчика, а не наш
+    самовывоз: ни «офис», ни «шоурум» в строке нет, под правило они не идут."""
     text = str(amo_service.get_custom_field_value(lead, FIELD_DELIVERY_TYPE) or "").casefold()
-    return "офис" in text
+    return "офис" in text or "шоурум" in text
 
 
 def _matches_entry(profile: Profile, pipeline_id: int, status_id: int) -> bool:
@@ -848,11 +854,12 @@ async def process_lead_distribution(lead_id, source: str = "webhook") -> str:
     if profile is None:
         return "no-profile"
 
-    if _is_office_delivery(lead):
-        # Самовывоз из офиса — ведёт офис-менеджер напрямую, не пул профиля
-        # (решение Тианы 19.08.2026). Без тега и без записи в лог распределений:
-        # сделка вообще не считается вошедшей в диспетчер.
-        return "skipped-office-delivery"
+    if _is_pickup_delivery(lead):
+        # Самовывоз из офиса или из шоурума — ведёт офис-менеджер напрямую, не
+        # пул профиля (решение Тианы 19.08.2026, шоурум добавлен Катей
+        # 23.09.2026). Без тега и без записи в лог распределений: сделка вообще
+        # не считается вошедшей в диспетчер.
+        return "skipped-pickup-delivery"
 
     if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
         # Идемпотентно: решение уже зафиксировано - тег (старые сделки, им

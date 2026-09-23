@@ -302,8 +302,9 @@ async def pick_responsible(lead_id: int) -> tuple[int | None, str]:
     """Кого ставить ответственным на сделку протеза (03.09.2026, после того как
     amgroup ожил и стало видно, откуда у живых сделок берётся ответственный).
     Порядок:
-      1. самовывоз из офиса - офис-менеджер (правило Кати 03.09: Екатерине
-         самовывоз, остальное дежурному);
+      1. самовывоз из офиса ИЛИ из шоурума - офис-менеджер (правило Кати
+         03.09: Екатерине самовывоз, остальное дежурному; шоурум добавлен
+         23.09.2026 той же правкой, что и в распределителе);
       2. иначе - распределитель лидов, тот же, что раздаёт сделки amgroup: по
          смене из ростера панели, после конца дня - тому, кто на смене завтра;
       3. распределитель выключен, профиля нет или он никого не выбрал -
@@ -314,8 +315,8 @@ async def pick_responsible(lead_id: int) -> tuple[int | None, str]:
     lead = await amo_service.get_lead_full(lead_id, with_=("contacts", "tags"))
     if not lead:
         return AMGROUP_LEAD_RESPONSIBLE_USER_ID, "константа (сделка не прочиталась)"
-    if lead_distribution._is_office_delivery(lead):
-        return RESPONSIBLE_OFFICE_MANAGER_USER_ID, "самовывоз из офиса - офис-менеджер"
+    if lead_distribution._is_pickup_delivery(lead):
+        return RESPONSIBLE_OFFICE_MANAGER_USER_ID, "самовывоз (офис/шоурум) - офис-менеджер"
     profile = _new_lead_profile()
     if profile is None:
         return AMGROUP_LEAD_RESPONSIBLE_USER_ID, "константа (нет включённого профиля на «Новый лид»)"

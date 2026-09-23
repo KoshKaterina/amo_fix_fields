@@ -492,6 +492,25 @@ def test_samovyvoz_iz_ofisa_uhodit_ofis_menedzheru_bez_raspredelitelya(monkeypat
     assert calls["patch"][-1] == (778, {"responsible_user_id": builder.RESPONSIBLE_OFFICE_MANAGER_USER_ID})
 
 
+def test_samovyvoz_iz_shouruma_uhodit_ofis_menedzheru_bez_raspredelitelya(monkeypatch):
+    """Самовывоз из шоурума — тот же офис-менеджер (правило Кати 23.09.2026):
+    у шоурума свой склад, но забирает клиент так же на месте."""
+    order = _ms_order("uuid-r2s", "07402s")
+    _stub_ms_ok(monkeypatch, order)
+    _stub_amo_empty(monkeypatch)
+    calls = _stub_create(monkeypatch, contact_id=555, lead_id=788)
+    dist = _wire_distribution(
+        monkeypatch,
+        lead=_amo_lead_for_pick(788, delivery="Самовывоз из шоурума Sunscrypt, 0.00 рублей"),
+        decision=9291546,
+    )
+
+    asyncio.run(builder.create_lead_for_order({"id": "uuid-r2s", "name": "07402s"}))
+
+    assert dist["decide"] == []
+    assert calls["patch"][-1] == (788, {"responsible_user_id": builder.RESPONSIBLE_OFFICE_MANAGER_USER_ID})
+
+
 def test_raspredelitel_nikogo_ne_vybral_beryom_konstantu(monkeypatch):
     """Пул пуст, дежурного нет - запасной ход: константа из настроек."""
     order = _ms_order("uuid-r3", "07403")
