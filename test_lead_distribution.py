@@ -973,20 +973,62 @@ def test_in_flight_covers_patch_not_just_decide_and_record():
     assert len(_patch_calls) == 1
 
 
-# ════════════════ доставка «офис» — не распределяем (решение Тианы 19.08.2026) ════════════════
+# ══════ наш самовывоз → офис-менеджер (Тиана 19.08.2026, назначение — Катя 23.09.2026) ══════
 
-def test_office_pickup_delivery_is_not_distributed():
+def test_office_pickup_delivery_goes_to_office_manager():
     """Реальное значение поля 577315 на живом аккаунте: 'Самовывоз из офиса
     Sunscrypt, 1 шт, 0.00 рублей' — с ценой/количеством в той же строке,
-    не голое 'офис'. Матч обязан быть по подстроке, не по точному значению."""
+    не голое 'офис'. Матч обязан быть по подстроке, не по точному значению.
+    С 23.09.2026 такая сделка не просто минует пул, а уходит офис-менеджеру."""
     _reset_fakes()
     _seed_profile(name="OfficeGuard", source_ids=[1])
     lead = _lead(lead_id=310, source_id=1, delivery_type="Самовывоз из офиса Sunscrypt, 1 шт, 0.00 рублей")
     _lead_by_id[310] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
     outcome = run(ld.process_lead_distribution(310))
-    assert outcome == "skipped-office-delivery"
-    assert not _patch_calls, "сделка с самовывозом из офиса не должна получать ответственного"
+    assert outcome == "pickup-assigned-office"
+    assert _patch_calls and _patch_calls[0]["responsible_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+
+
+def test_showroom_pickup_delivery_goes_to_office_manager():
+    """Ради чего всё затевалось (Катя 23.09.2026): триггер воронки ждёт подстроку
+    «шоурума» в поле, а поле приезжает через очередь и к моменту триггера обычно
+    пустое — сделка оставалась на дефолтном ответственном."""
+    _reset_fakes()
+    _seed_profile(name="ShowroomAssign", source_ids=[1])
+    lead = _lead(lead_id=317, source_id=1,
+                 delivery_type="Самовывоз из шоурума Sunscrypt, 0.00 рублей")
+    _lead_by_id[317] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(317))
+    assert outcome == "pickup-assigned-office"
+    assert _patch_calls[0]["responsible_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+
+
+def test_pickup_already_on_office_manager_is_not_patched_again():
+    """Ответственный уже офис-менеджер — PATCH не шлём вовсе, но сделку
+    помечаем обработанной, чтобы шквал вебхуков не гонял её по кругу."""
+    _reset_fakes()
+    _seed_profile(name="PickupIdempotent", source_ids=[1])
+    lead = _lead(lead_id=318, source_id=1, delivery_type="Самовывоз из шоурума Sunscrypt")
+    lead["responsible_user_id"] = ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+    _lead_by_id[318] = lead
+    outcome = run(ld.process_lead_distribution(318))
+    assert outcome == "pickup-assigned-office"
+    assert not _patch_calls, "ответственный тот же — переназначать нечего"
+
+
+def test_pickup_second_webhook_does_not_reassign():
+    """Второй вебхук по той же сделке ничего не трогает: иначе ручная правка
+    менеджера затиралась бы обратно на офис-менеджера."""
+    _reset_fakes()
+    _seed_profile(name="PickupRepeat", source_ids=[1])
+    lead = _lead(lead_id=319, source_id=1, delivery_type="Самовывоз из шоурума Sunscrypt")
+    _lead_by_id[319] = lead
+    assert run(ld.process_lead_distribution(319)) == "pickup-assigned-office"
+    _patch_calls.clear()
+    assert run(ld.process_lead_distribution(319)) == "skipped-already-routed"
+    assert not _patch_calls
 
 
 def test_office_pickup_delivery_case_insensitive():
@@ -995,7 +1037,7 @@ def test_office_pickup_delivery_case_insensitive():
     lead = _lead(lead_id=311, source_id=1, delivery_type="САМОВЫВОЗ ИЗ ОФИСА")
     _lead_by_id[311] = lead
     outcome = run(ld.process_lead_distribution(311))
-    assert outcome == "skipped-office-delivery"
+    assert outcome == "pickup-assigned-office"
 
 
 def test_non_office_delivery_is_distributed_normally():
@@ -1299,8 +1341,9 @@ def test_log_send_detail_carries_load_counters_and_reason():
 # ════════════════ журнал: НЕсостоявшиеся распределения (30.08.2026) ════════════════
 
 def test_log_outcome_office_delivery():
-    """Самовывоз из офиса ответственного не получает - но в журнал попадает,
-    иначе на вопрос «почему её никому не раздали» ответить нечем."""
+    """Самовывоз уходит офис-менеджеру, и это видно в журнале панели: код исхода
+    прежний (панель валидирует его белым списком), но assigned_user_id теперь
+    заполнен - по нему разбор и понимает, что ответственный появился."""
     _reset_fakes()
     _seed_profile(name="OfficeLog", source_ids=[1])
     lead = _lead(lead_id=710, source_id=1, delivery_type="Самовывоз из офиса Sunscrypt")
@@ -1309,11 +1352,12 @@ def test_log_outcome_office_delivery():
 
     result = run(_call_and_drain(ld.process_lead_distribution(710)))
 
-    assert result == "skipped-office-delivery"
-    assert not _patch_calls
+    assert result == "pickup-assigned-office"
+    assert _patch_calls[0]["responsible_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
     call = _log_calls[0]
     assert call["outcome"] == "office_delivery"
-    assert call["assigned_user_id"] is None
+    assert call["assigned_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+    assert call["rule"] == "pickup_office"
     # Имя/телефон подтягиваются отдельным GET - иначе строку нельзя было бы
     # найти поиском по клиенту наравне с остальными.
     assert call["contact_name"] == "Клиент Офисный"

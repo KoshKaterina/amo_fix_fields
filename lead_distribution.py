@@ -67,6 +67,7 @@ from waybill_config import (
     LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S,
     LEAD_DISTRIBUTION_SINCE_TS,
     LEAD_DISTRIBUTION_STALE_ALERT_MIN,
+    RESPONSIBLE_OFFICE_MANAGER_USER_ID,
     LEAD_DISTRIBUTION_UIS_TAG_POLL_S,
     LEAD_DISTRIBUTION_UIS_TAG_WAIT_S,
     TAG_LEAD_DISTRIBUTION_ERROR,
@@ -855,6 +856,10 @@ OUTCOME_OFFICE_DELIVERY = "office_delivery"
 OUTCOME_UIS_CONNECTED = "uis_connected"
 OUTCOME_PATCH_FAILED = "patch_failed"
 OUTCOME_CONTACT_MISSING = "contact_missing"
+# Правило, по которому назначен ответственный. У обычного распределения это
+# режим профиля (load/always/random), у самовывоза - своё имя: пул не
+# участвует, человек известен заранее.
+RULE_PICKUP_OFFICE = "pickup_office"
 
 
 async def _outcome_already_logged(lead_id: int, outcome: str) -> bool:
@@ -1065,6 +1070,72 @@ async def _fail(lead: dict, reason: str) -> None:
     await _stale_alert(lead, state)
 
 
+async def _assign_office_manager(
+    lead: dict, profile: Profile, lid: int, prev_responsible_user_id: int | None,
+) -> str:
+    """Наш самовывоз (офис или шоурум) ведёт офис-менеджер — назначаем ЕГО, а не
+    пропускаем сделку мимо распределения.
+
+    До 23.09.2026 здесь был чистый скип: сделка выпадала из пула, а
+    ответственного ставил триггер воронки по подстроке «шоурума» в «Типе
+    доставки». Триггер промахивался, и вот почему: поле заполняется НЕ при
+    создании сделки и не при переходе на этап, а на вебхук об изменении
+    «Корзины» (576703), через очередь. Замер по ленте amo 23.09.2026: медиана
+    8 секунд, при шквале вебхуков до 201 секунды. Триггер читает поле сразу
+    после смены этапа — то есть обычно ПУСТОЕ. Живой случай: сделка 36562141
+    с самовывозом из шоурума осталась на дефолтном ответственном (Перфилов),
+    хотя тег «Запись в шоурум» на ней встал.
+
+    Мы же в этот момент значение держим в руках, поэтому решение Кати
+    23.09.2026: назначать офис-менеджера здесь. Правило шире просьбы («там, где
+    шоурум») намеренно: самовывоз из офиса — тот же класс и тот же человек,
+    отдельная ветка для него означала бы две копии одного правила.
+
+    Идемпотентность — та же, что у обычного распределения: тег/`routed_ids`
+    против повторного захода, `_in_flight` против пересекающихся по времени.
+    Без них шквал вебхуков переназначал бы ответственного по кругу и затирал
+    ручную правку менеджера.
+    """
+    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
+        return "skipped-already-routed"
+    if lid in _in_flight:
+        return "skipped-in-flight"
+
+    _in_flight.add(lid)
+    try:
+        current = int(lead.get("responsible_user_id") or 0)
+        if current != RESPONSIBLE_OFFICE_MANAGER_USER_ID:
+            result = await amo_service.patch_lead(
+                lid, responsible_user_id=RESPONSIBLE_OFFICE_MANAGER_USER_ID)
+            if not result.get("ok"):
+                await _fail(lead, f"PATCH не прошёл (status_code={result.get('status_code')})")
+                _spawn(_log_decision(
+                    lead, profile, outcome=OUTCOME_PATCH_FAILED, rule=RULE_PICKUP_OFFICE,
+                    prev_responsible_user_id=prev_responsible_user_id,
+                    extra_detail={"intended_user_id": RESPONSIBLE_OFFICE_MANAGER_USER_ID,
+                                  "patch_status_code": result.get("status_code")}))
+                return "failed-patch"
+        await _mark_locally_routed(lid)
+    finally:
+        _in_flight.discard(lid)
+
+    _clear_fail(lid)
+    logger.info(
+        "lead_distribution %s: самовывоз — ответственным ставим офис-менеджера %s (было %s)",
+        lid, RESPONSIBLE_OFFICE_MANAGER_USER_ID, prev_responsible_user_id,
+    )
+    # Исход остаётся OUTCOME_OFFICE_DELIVERY: панель валидирует код белым
+    # списком (routers/ingest.py), новое значение она отвергнет. Отличие
+    # сегодняшней строки от прежних — заполненный assigned_user_id, по нему
+    # разбор в панели и понимает, что ответственный появился.
+    _spawn(_log_decision(
+        lead, profile, outcome=OUTCOME_OFFICE_DELIVERY,
+        assigned_user_id=RESPONSIBLE_OFFICE_MANAGER_USER_ID,
+        rule=RULE_PICKUP_OFFICE,
+        prev_responsible_user_id=prev_responsible_user_id))
+    return "pickup-assigned-office"
+
+
 async def process_lead_distribution(
     lead_id, source: str = "webhook", *, uis_tag_wait_expired: bool = False,
 ) -> str:
@@ -1100,17 +1171,7 @@ async def process_lead_distribution(
         return "no-profile"
 
     if _is_pickup_delivery(lead):
-        # Самовывоз из офиса или из шоурума — ведёт офис-менеджер напрямую, не
-        # пул профиля (решение Тианы 19.08.2026, шоурум добавлен Катей
-        # 23.09.2026). Тег по-прежнему не ставим, но строку в журнал с
-        # 30.08.2026 пишем: раньше такая сделка просто исчезала из виду, и на
-        # вопрос «почему её никому не раздали» ответить было нечем.
-        # ⚠️ Имя исхода OUTCOME_OFFICE_DELIVERY НЕ переименовываем: панель
-        # валидирует его белым списком (routers/ingest.py), новый код она
-        # отвергнет. Подпись на экране панели поправлена отдельно.
-        _spawn(_log_decision(lead, profile, outcome=OUTCOME_OFFICE_DELIVERY,
-                             prev_responsible_user_id=prev_responsible_user_id))
-        return "skipped-pickup-delivery"
+        return await _assign_office_manager(lead, profile, lid, prev_responsible_user_id)
 
     if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
         # Идемпотентно: решение уже зафиксировано - тег (старые сделки, им
