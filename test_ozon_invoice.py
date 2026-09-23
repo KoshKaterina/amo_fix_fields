@@ -362,6 +362,16 @@ assert run(ozon_invoice._retry_missing_link(old)) == 0
 assert not _ozon_calls, "давно стоящая сделка — это работа менеджера, не наш сбой"
 print("✓ сторож молчит о сделках, которые просто долго стоят на этапе оплаты")
 
+# Константы Академии импортируются ниже по файлу — здесь берём их из модуля.
+_reset()
+_install_mocks(_lead())
+academy = _lead(status=ozon_invoice.OZON_PAYMENT_STAGES[ozon_invoice.PIPELINE_ACADEMY][0],
+                pipeline=ozon_invoice.PIPELINE_ACADEMY, uuid="")
+academy["updated_at"] = int(time.time() - 10 * 60)
+assert run(ozon_invoice._retry_missing_link(academy)) == 0
+assert not _ozon_calls and not _notes and not _tags, "Академию сторож не трогает вовсе"
+print("✓ сторож не лезет в Академию: там счёт выставляют иначе")
+
 # ═══ Этап 2: вебхук факта оплаты ════════════════════════════════════════════
 
 def _notif(ext="amo-777001-123", status="Completed", amount="759000", sign=True):

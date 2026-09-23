@@ -963,6 +963,13 @@ async def _retry_missing_link(lead: dict) -> int:
     """
     if OZON_NO_LINK_RETRY_MIN <= 0:
         return 0
+    # Академия под сторож не идёт (решение Кати 23.09.2026): счёт там выставляют
+    # иначе, заказа МС у таких сделок нет и не будет, и сделка месяцами стоит на
+    # «Оплата запрошена», пока клиент решается. Повтор заведомо холостой, а тег
+    # «ошибка счёта» и алерт менеджеру - ложные. Сверку оплат по Академии это не
+    # трогает: она ходит по выставленным счетам и работает как раньше.
+    if int(lead.get("pipeline_id") or 0) == PIPELINE_ACADEMY:
+        return 0
     lead_id = lead.get("id")
     updated_at = int(lead.get("updated_at") or 0)
     quiet_min = (time.time() - float(updated_at)) / 60
