@@ -52,6 +52,8 @@ from waybill_config import (
     OZON_RECONCILE_INTERVAL_S,
     OZON_ALERT_WINDOW_END_H,
     OZON_ALERT_WINDOW_START_H,
+    OZON_NO_LINK_ALERT_MIN,
+    OZON_NO_LINK_RETRY_MIN,
     OZON_STALE_ALERT_MIN,
     OZON_INVOICE_ACADEMY,
     OZON_INVOICE_DB_WORK,
@@ -353,7 +355,12 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     if key in _recent:
         logger.info("Lead %s: счёт уже создавался в последние %.0fс — скип (дедуп)", lead_id, RECENT_TTL_S)
         return "skipped-recent"
-    _recent[key] = now
+    # ⚠️ Ключ дедупа НЕ ставим здесь (23.09.2026, разбор сделки 36553383).
+    # Раньше окно занимал любой заход, включая отказной: «поле уже заполнено»,
+    # «уехала с этапа», «сделку не прочитать». Выходило хуже всего для того, кто
+    # старается: менеджер дёргал этап раз в полминуты, каждый заход занимал окно
+    # заново, и ссылка не создавалась восемь минут подряд. Теперь окно занимает
+    # только настоящая попытка создания - см. _recent[key] перед _create_payment.
 
     lead = await amo_service.get_lead_full(lead_id, with_=())
     if not lead:
@@ -434,6 +441,10 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     by_card = _is_checked(amo_service.get_custom_field_value(lead, FIELD_INVOICE_BY_CARD))
 
     ext_id = f"amo-{lead_id}-{int(time.time())}"
+    # Вот она, «настоящая попытка»: дальше идём в Ozon за платежом. Окно дедупа
+    # занимаем ЗДЕСЬ, до сетевого вызова - иначе повторный вебхук, пришедший
+    # пока мы ждём ответ, создал бы второй платёж на ту же сделку.
+    _recent[key] = time.monotonic()
     pay_link, payment_id, err = await _create_payment(
         ext_id, kopecks, by_card=by_card, ms_order_name=str(order.get("name") or "").strip(),
     )
@@ -922,10 +933,67 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
             await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
+# Сделки, по которым уже звали человека из-за отсутствующей ссылки: второй раз
+# в тот же день не зовём. Живёт в процессе - после пересборки контейнера
+# напоминание может повториться, и это дешевле, чем тащить ради него примечание.
+_no_link_alerted: dict[int, float] = {}
+_NO_LINK_ALERT_GAP_S = 6 * 3600
+
+
+async def _retry_missing_link(lead: dict) -> int:
+    """Сделка стоит на «Оплата запрошена», ссылки нет — пробуем создать заново.
+
+    Зачем это вообще нужно (23.09.2026, разбор сделки 36553383). Счёт создаётся
+    ТОЛЬКО по вебхуку об изменении сделки. Значит достаточно один раз промахнуться
+    - потерялся вебхук, попытка попала в дедуп-окно, менеджер очистил поле и
+    больше сделку не трогал, - и сделка стоит без ссылки, пока кто-нибудь её не
+    тронет руками. Клиент в этот момент ждёт оплату и ничего не получает.
+
+    Ждём OZON_NO_LINK_RETRY_MIN минут покоя, чтобы не наступать на пятки живой
+    работе менеджера: сделку могли только что перевести, и вебхук ещё в очереди.
+    Отсчёт - от updated_at: пока сделку крутят, счётчик сбрасывается сам.
+
+    Возвращает 1, если ссылка создалась, иначе 0.
+    """
+    if OZON_NO_LINK_RETRY_MIN <= 0:
+        return 0
+    lead_id = lead.get("id")
+    quiet_min = (time.time() - float(lead.get("updated_at") or 0)) / 60
+    if quiet_min < OZON_NO_LINK_RETRY_MIN:
+        return 0
+
+    outcome = await process_invoice_lead(lead_id, source="reconcile")
+    if outcome == "created":
+        logger.info("Ozon сверка: сделка %s висела без ссылки %.0f мин — счёт создан заново",
+                    lead_id, quiet_min)
+        _no_link_alerted.pop(lead_id, None)
+        return 1
+
+    logger.info("Ozon сверка: сделка %s без ссылки %.0f мин, повтор дал «%s»",
+                lead_id, quiet_min, outcome)
+
+    # Повтор не помог и сделка висит давно — зовём человека. Порог отдельный от
+    # OZON_STALE_ALERT_MIN: там «клиент не платит по выставленному счёту», а
+    # здесь счёта нет вовсе, и это чинить нам, а не клиенту.
+    if OZON_NO_LINK_ALERT_MIN <= 0 or quiet_min < OZON_NO_LINK_ALERT_MIN:
+        return 0
+    if time.time() - _no_link_alerted.get(lead_id, 0.0) < _NO_LINK_ALERT_GAP_S:
+        return 0
+    if not _in_alert_window():
+        return 0
+    _no_link_alerted[lead_id] = time.time()
+    await _fail(
+        lead,
+        f"Сделка {int(quiet_min)} мин на «Оплата запрошена», а ссылки нет - выставьте счёт вручную",
+        detail=f"автоповтор вернул «{outcome}»",
+    )
+    return 0
+
+
 async def _reconcile_once() -> str:
     """Один проход: сделки с выставленным счётом на этапах оплаты → спросить
     Ozon → Completed двигаем, зависшие подсвечиваем алертом."""
-    checked = moved = 0
+    checked = moved = retried = 0
     # Пары «воронка + этап»: сверка ходит только по включённым воронкам, иначе
     # выключенный флаг всё равно стоил бы двух лишних запросов на проход.
     for pipeline_id in _invoice_pipelines():
@@ -941,7 +1009,13 @@ async def _reconcile_once() -> str:
                     continue
                 link = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_LINK) or "").strip()
                 if not link:
-                    continue  # счёта нет — сверять нечего (менеджер ещё не запросил оплату)
+                    # Ссылки нет. На «Ссылка отправлена» это и правда нечего
+                    # сверять, а вот на тех-этапе «Оплата запрошена» — застрявшая
+                    # сделка: счёт не создался, и сам он уже не создастся, потому
+                    # что повторных попыток по расписанию у модуля не было.
+                    if status_id == stages[0]:
+                        retried += await _retry_missing_link(lead)
+                    continue
 
                 lead_id = lead.get("id")
                 payment_id, ext_id, order_ext_id, created_at, last_alert_at = await _payment_ref(lead_id)
@@ -969,8 +1043,9 @@ async def _reconcile_once() -> str:
                     moved += 1
                     _stale_alerted.pop(lead_id, None)
 
-    logger.info("Ozon сверка: проверено счетов %s, переведено сделок %s", checked, moved)
-    return f"checked={checked} moved={moved}"
+    logger.info("Ozon сверка: проверено счетов %s, переведено сделок %s, пересозданных ссылок %s",
+                checked, moved, retried)
+    return f"checked={checked} moved={moved} retried={retried}"
 
 
 async def _reconcile_loop() -> None:

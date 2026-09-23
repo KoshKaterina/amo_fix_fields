@@ -294,6 +294,48 @@ assert res == "skipped-link-present", res
 assert not _ozon_calls and not _patches and not _alerts and not _tags
 print("✓ ссылка уже в поле: второй платёж не создаём, ручную ссылку уважаем")
 
+# ── отказной заход НЕ занимает дедуп-окно (23.09.2026, сделка 36553383) ─────
+# Раньше окно занимал любой проход, включая отказной. Менеджер очищал поле,
+# чтобы получить новую ссылку, дёргал этап — и попадал в окно, занятое
+# предыдущим отказом. Чем настойчивее дёргал, тем дольше не создавалось.
+_reset()
+_install_mocks(_lead(link="https://qr.nspk.ru/OLD"))
+res1 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res1 == "skipped-link-present", res1
+assert not _ozon_calls, "при заполненном поле в Ozon не ходим"
+_install_mocks(_lead())          # менеджер очистил поле и дёрнул сделку снова
+res2 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res2 == "created", res2
+assert len(_ozon_calls) == 1, _ozon_calls
+print("✓ отказ «ссылка уже есть» не блокирует следующую попытку")
+
+_reset()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+res1 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res1 == "skipped-moved", res1
+_install_mocks(_lead())
+res2 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res2 == "created", res2
+print("✓ отказ «уехала с этапа» тоже не блокирует следующую попытку")
+
+# ── сторож: сделка висит на «Оплата запрошена» без ссылки ───────────────────
+_reset()
+_install_mocks(_lead())
+fresh = _lead()
+fresh["updated_at"] = int(time.time())            # только что трогали
+assert run(ozon_invoice._retry_missing_link(fresh)) == 0
+assert not _ozon_calls, "свежую сделку не трогаем — её вебхук ещё в очереди"
+print("✓ сторож не наступает на пятки: свежую сделку не пересоздаёт")
+
+_reset()
+_install_mocks(_lead())
+stale = _lead()
+stale["updated_at"] = int(time.time() - 10 * 60)  # тишина десять минут
+assert run(ozon_invoice._retry_missing_link(stale)) == 1
+assert len(_ozon_calls) == 1, _ozon_calls
+assert _patches and _patches[0]["status_id"] == STATUS_LINK_SENT
+print("✓ сторож: зависшая без ссылки сделка получает счёт повторной попыткой")
+
 # ═══ Этап 2: вебхук факта оплаты ════════════════════════════════════════════
 
 def _notif(ext="amo-777001-123", status="Completed", amount="759000", sign=True):
