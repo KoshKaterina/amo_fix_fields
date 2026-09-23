@@ -336,6 +336,32 @@ assert len(_ozon_calls) == 1, _ozon_calls
 assert _patches and _patches[0]["status_id"] == STATUS_LINK_SENT
 print("✓ сторож: зависшая без ссылки сделка получает счёт повторной попыткой")
 
+# ── сторож не долбит одну и ту же сделку (Катя 23.09.2026: «плохо для сервера») ──
+# Проход сверки идёт каждые три минуты. Без этой защиты сторож ходил в amo и
+# МойСклад по одним и тем же сделкам бесконечно: за сорок минут 18 заходов по
+# двум сделкам, у которых счёт в принципе не мог создаться (нет заказа МС).
+_reset()
+_install_mocks(_lead(uuid=""))                    # заказа МС нет — счёт невозможен
+broken = _lead(uuid="")
+broken["updated_at"] = int(time.time() - 10 * 60)
+assert run(ozon_invoice._retry_missing_link(broken)) == 0
+first_calls = len(_notes)
+assert run(ozon_invoice._retry_missing_link(broken)) == 0
+assert len(_notes) == first_calls, "вторая попытка на той же версии сделки не нужна"
+# сделку тронули — версия сменилась, пробуем снова
+broken["updated_at"] = int(time.time() - 9 * 60)
+assert run(ozon_invoice._retry_missing_link(broken)) == 0
+assert len(_notes) > first_calls, "после изменения сделки попытка обязана повториться"
+print("✓ сторож: одна попытка на версию сделки, повтор только после изменения")
+
+_reset()
+_install_mocks(_lead())
+old = _lead()
+old["updated_at"] = int(time.time() - 8 * 3600)    # висит восемь часов
+assert run(ozon_invoice._retry_missing_link(old)) == 0
+assert not _ozon_calls, "давно стоящая сделка — это работа менеджера, не наш сбой"
+print("✓ сторож молчит о сделках, которые просто долго стоят на этапе оплаты")
+
 # ═══ Этап 2: вебхук факта оплаты ════════════════════════════════════════════
 
 def _notif(ext="amo-777001-123", status="Completed", amount="759000", sign=True):

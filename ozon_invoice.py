@@ -53,6 +53,7 @@ from waybill_config import (
     OZON_ALERT_WINDOW_END_H,
     OZON_ALERT_WINDOW_START_H,
     OZON_NO_LINK_ALERT_MIN,
+    OZON_NO_LINK_MAX_QUIET_MIN,
     OZON_NO_LINK_RETRY_MIN,
     OZON_STALE_ALERT_MIN,
     OZON_INVOICE_ACADEMY,
@@ -938,6 +939,11 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
 # напоминание может повториться, и это дешевле, чем тащить ради него примечание.
 _no_link_alerted: dict[int, float] = {}
 _NO_LINK_ALERT_GAP_S = 6 * 3600
+# На каком updated_at сделки мы уже пробовали создать счёт. Пока сделка не
+# изменилась, повторять бессмысленно: входные данные те же, ответ будет тот же.
+# Без этого сторож ходил в amo и МойСклад по одним и тем же сделкам каждые
+# три минуты (Катя 23.09.2026: «это плохо для сервера»).
+_no_link_tried_at: dict[int, int] = {}
 
 
 async def _retry_missing_link(lead: dict) -> int:
@@ -958,15 +964,26 @@ async def _retry_missing_link(lead: dict) -> int:
     if OZON_NO_LINK_RETRY_MIN <= 0:
         return 0
     lead_id = lead.get("id")
-    quiet_min = (time.time() - float(lead.get("updated_at") or 0)) / 60
+    updated_at = int(lead.get("updated_at") or 0)
+    quiet_min = (time.time() - float(updated_at)) / 60
     if quiet_min < OZON_NO_LINK_RETRY_MIN:
         return 0
+    # Слишком давно не трогали — это не застрявший счёт, а живая работа: клиент
+    # думает, менеджер переписывается, сделка стоит на этапе оплаты неделями.
+    if 0 < OZON_NO_LINK_MAX_QUIET_MIN < quiet_min:
+        return 0
+    # Уже пробовали на этой же версии сделки — входные данные не изменились,
+    # ответ будет тот же. Ждём, пока сделку тронут: тогда updated_at сдвинется.
+    if _no_link_tried_at.get(lead_id) == updated_at:
+        return 0
+    _no_link_tried_at[lead_id] = updated_at
 
     outcome = await process_invoice_lead(lead_id, source="reconcile")
     if outcome == "created":
         logger.info("Ozon сверка: сделка %s висела без ссылки %.0f мин — счёт создан заново",
                     lead_id, quiet_min)
         _no_link_alerted.pop(lead_id, None)
+        _no_link_tried_at.pop(lead_id, None)
         return 1
 
     logger.info("Ozon сверка: сделка %s без ссылки %.0f мин, повтор дал «%s»",

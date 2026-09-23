@@ -895,6 +895,11 @@ OZON_STALE_ALERT_MIN = int(os.getenv("OZON_STALE_ALERT_MIN", "60"))
 OZON_NO_LINK_RETRY_MIN = int(os.getenv("OZON_NO_LINK_RETRY_MIN", "5"))
 # ...и зовёт человека, если и после повторов ссылки нет столько минут (0 = молча):
 OZON_NO_LINK_ALERT_MIN = int(os.getenv("OZON_NO_LINK_ALERT_MIN", "15"))
+# ⚠️ Верхняя граница (Катя 23.09.2026: «сторож спамит нерелевантные сделки»).
+# Сделка, которую не трогали дольше этого, - не «счёт не создался минуту назад»,
+# а рабочая ситуация: клиент думает, менеджер ведёт переписку, сделка месяцами
+# стоит на этапе оплаты. Такие сторож не трогает вовсе: ни попыток, ни алертов.
+OZON_NO_LINK_MAX_QUIET_MIN = int(os.getenv("OZON_NO_LINK_MAX_QUIET_MIN", "120"))
 # Рабочее окно напоминаний, МСК. Без него они уходили ночью: инцидент
 # 31.07.2026, сообщения в 00:11 и 00:14. Совпадает с окном Wazzup SLA.
 OZON_ALERT_WINDOW_START_H = int(os.getenv("OZON_ALERT_WINDOW_START_H", "12"))
