@@ -12,6 +12,7 @@ import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
 import academy_lead_alert
+import academy_invite_link
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -403,6 +404,25 @@ async def talk_probe(request: Request):
     return {"ok": True}
 
 
+@app.post("/contact_change")
+async def contact_change(request: Request):
+    """Изменение контакта amoCRM — триггер одноразовой ссылки Академии.
+
+    Отвечаем сразу; чтение контакта/сделок и Telegram API работают в фоне.
+    Остальные интеграции контакта этот маршрут не затрагивает.
+    """
+    form = await request.form()
+    nested = {}
+    for raw_key, value in form.items():
+        keys = re.findall(r"([^\[\]]+)", raw_key)
+        insert_nested(nested, keys, value)
+    contact_id = await get_nested(nested, ["contacts", "update", "0", "id"])
+    if contact_id is None:
+        contact_id = await get_nested(nested, ["contacts", "add", "0", "id"])
+    academy_invite_link.on_contact_change(contact_id)
+    return {"status": "ok"}
+
+
 @app.post("/lead_change")
 async def lead_change(request: Request):
     form = await request.form()
@@ -490,6 +510,9 @@ async def lead_change(request: Request):
     # воронки и этапа, чтение сделки и отправка уходят в фон (academy_lead_alert).
     # Стоит ВЫШЕ блока `updates`: этап меняют и без правки полей сделки.
     academy_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
+    # Одноразовая ссылка на чат мероприятия. Модуль выключен по умолчанию и
+    # внутри ещё раз проверяет воронку, контакт, событие и пустое поле ссылки.
+    academy_invite_link.on_lead_change(lead_id)
 
     # Протез отгрузок: пока amgroup лежит, отгрузку в МойСкладе не создаёт никто
     # и товар не списывается. Вешаемся на те же этапы воронки «Офис», на которых

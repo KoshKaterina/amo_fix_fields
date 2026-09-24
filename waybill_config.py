@@ -815,6 +815,20 @@ ACADEMY_LEAD_ALERT_DEDUP_H = int(os.getenv("ACADEMY_LEAD_ALERT_DEDUP_H", "24"))
 # Перебор = похоже на массовый перенос сделок: одно предупреждение и тишина до конца часа.
 ACADEMY_LEAD_ALERT_HOUR_LIMIT = int(os.getenv("ACADEMY_LEAD_ALERT_HOUR_LIMIT", "20"))
 
+# Одноразовые ссылки в закрытые чаты мероприятий Академии. Мастер-флаг OFF:
+# включать только после проверки токена и chat_id. Бот не пишет в чат — только
+# вызывает createChatInviteLink(member_limit=1), а ссылку кладёт в сделку amo.
+ACADEMY_INVITE_LINK_ENABLED = os.getenv("ACADEMY_INVITE_LINK_ENABLED", "0") == "1"
+ACADEMY_INVITE_BOT_TOKEN = os.getenv("ACADEMY_INVITE_BOT_TOKEN", "").strip()
+ACADEMY_PRACTICUM_CHAT_ID = os.getenv("ACADEMY_PRACTICUM_CHAT_ID", "").strip()
+ACADEMY_CONFERENCE_CHAT_ID = os.getenv("ACADEMY_CONFERENCE_CHAT_ID", "").strip()
+ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
+
+# Поле-триггер находится в контакте, результат — в сделке.
+FIELD_ACADEMY_EVENT_REGISTRATION = 578259
+FIELD_ACADEMY_PRACTICUM_LINK = 578271
+FIELD_ACADEMY_CONFERENCE_LINK = 578273
+
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
 STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)
