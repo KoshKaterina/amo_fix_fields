@@ -73,10 +73,12 @@ async def process(contact_id, changed_field_ids: set[int], *, now=None) -> str:
     patch = {}
     for consent_field_id in sorted(set(changed_field_ids or set()).intersection(_TARGETS)):
         value = str(amo_service.get_custom_field_value(contact, consent_field_id) or "").strip().lower()
-        if value == "да":
-            patch[_TARGETS[consent_field_id]] = date_text
+        date_field_id = _TARGETS[consent_field_id]
+        current_date = str(amo_service.get_custom_field_value(contact, date_field_id) or "").strip()
+        if value == "да" and current_date != date_text:
+            patch[date_field_id] = date_text
     if not patch:
-        return "consent_not_yes"
+        return "already_stamped_or_consent_not_yes"
     result = await amo_service.patch_contact(contact_id, custom_fields=patch)
     if result.get("ok"):
         logger.info("Академия-согласия: контакт %s, дата %s, полей %s", contact_id, date_text, len(patch))

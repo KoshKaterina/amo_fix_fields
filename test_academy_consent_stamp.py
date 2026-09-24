@@ -53,6 +53,29 @@ class AcademyConsentStampTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "no_new_academy_lead")
         write.assert_not_awaited()
 
+    async def test_skips_when_date_is_already_current(self):
+        contact = {
+            "custom_fields_values": [
+                {"field_id": mod.FIELD_ACADEMY_PD_CONSENT, "values": [{"value": "да"}]},
+                {"field_id": mod.FIELD_ACADEMY_PD_DATE_TEXT, "values": [{"value": "24/09/2026"}]},
+            ],
+            "_embedded": {"leads": [{"id": 10}]},
+        }
+        lead = {
+            "id": 10,
+            "pipeline_id": mod.PIPELINE_ACADEMY,
+            "created_at": mod.ACADEMY_CUTOVER_TS,
+        }
+        now = datetime.datetime(2026, 9, 24, 18, 47, tzinfo=datetime.timezone(datetime.timedelta(hours=3)))
+        with (
+            patch.object(mod.amo_service, "get_contact_by_id", AsyncMock(return_value=contact)),
+            patch.object(mod.amo_service, "get_lead_full", AsyncMock(return_value=lead)),
+            patch.object(mod.amo_service, "patch_contact", AsyncMock()) as write,
+        ):
+            result = await mod.process(5, {mod.FIELD_ACADEMY_PD_CONSENT}, now=now)
+        self.assertEqual(result, "already_stamped_or_consent_not_yes")
+        write.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()
