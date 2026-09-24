@@ -13,6 +13,7 @@ import amgroup_fallback
 import amgroup_lead_builder
 import academy_lead_alert
 import academy_invite_link
+import academy_intent_alert
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -186,6 +187,21 @@ def insert_nested(data, keys, value):
             cur[key] = {}
         cur = cur[key]
     cur[keys[-1]] = value
+
+
+def contact_changed_field_ids(nested: dict) -> set[int]:
+    """field_id из payload contacts.add/update amoCRM (индексы приходят строками)."""
+    out: set[int] = set()
+    contacts = nested.get("contacts") or {}
+    for event in ("add", "update"):
+        for contact in (contacts.get(event) or {}).values():
+            fields = (contact or {}).get("custom_fields") or {}
+            for field in fields.values():
+                try:
+                    out.add(int((field or {}).get("id")))
+                except (TypeError, ValueError):
+                    continue
+    return out
 
 
 @app.get("/barcode/{ident}")
@@ -419,7 +435,9 @@ async def contact_change(request: Request):
     contact_id = await get_nested(nested, ["contacts", "update", "0", "id"])
     if contact_id is None:
         contact_id = await get_nested(nested, ["contacts", "add", "0", "id"])
-    academy_invite_link.on_contact_change(contact_id)
+    changed_field_ids = contact_changed_field_ids(nested)
+    academy_invite_link.on_contact_change(contact_id, changed_field_ids)
+    academy_intent_alert.on_contact_change(contact_id, changed_field_ids)
     return {"status": "ok"}
 
 

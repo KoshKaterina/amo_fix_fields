@@ -826,8 +826,14 @@ ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
 
 # Поле-триггер находится в контакте, результат — в сделке.
 FIELD_ACADEMY_EVENT_REGISTRATION = 578259
+FIELD_ACADEMY_MANAGER_ACTION = 578269
 FIELD_ACADEMY_PRACTICUM_LINK = 578271
 FIELD_ACADEMY_CONFERENCE_LINK = 578273
+
+# Уведомления в топик УВЕДОМЛЕНИЯ отдела продаж по двум полям контакта Академии.
+# OFF до общего переключения сценария; обработчик реагирует только когда amo
+# прямо прислала изменившийся field_id, поэтому старые заполненные карточки не разошлёт.
+ACADEMY_INTENT_ALERT_ENABLED = os.getenv("ACADEMY_INTENT_ALERT_ENABLED", "0") == "1"
 
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)

@@ -77,8 +77,12 @@ def on_lead_change(lead_id) -> None:
         _spawn(process_lead(lead_id, delay=ACADEMY_INVITE_DELAY_S))
 
 
-def on_contact_change(contact_id) -> None:
-    if configured() and contact_id is not None:
+def on_contact_change(contact_id, changed_field_ids: set[int] | None = None) -> None:
+    if (
+        configured()
+        and contact_id is not None
+        and (changed_field_ids is None or FIELD_ACADEMY_EVENT_REGISTRATION in changed_field_ids)
+    ):
         _spawn(process_contact(contact_id, delay=ACADEMY_INVITE_DELAY_S))
 
 
