@@ -41,7 +41,8 @@ STATUS_INBOUND = 87654850
 STATUS_BOT_STARTED = 88838378
 STATUS_QUESTIONNAIRE = 88838382
 STATUS_QUESTIONNAIRE_DONE = 88838386
-_BOT_STATUSES = {STATUS_INBOUND, STATUS_BOT_STARTED, STATUS_QUESTIONNAIRE}
+STATUS_RECORDED_PRACTICUM = 88835666
+_BOT_STATUSES = {STATUS_INBOUND, STATUS_BOT_STARTED, STATUS_QUESTIONNAIRE, STATUS_QUESTIONNAIRE_DONE}
 
 _CUSTOM_MAP = {
     "pd_consent": FIELD_PD_CONSENT,
@@ -178,6 +179,10 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
 def _target_status(payload: dict, current_status: int | None) -> int | None:
     if current_status is not None and current_status not in _BOT_STATUSES:
         return None
+    event = _text(payload.get("Регистрация на мероприятие")).lower()
+    manager_action = _text(payload.get("действие менеджера")).lower()
+    if "практикум" in event or "практикум" in manager_action:
+        return STATUS_RECORDED_PRACTICUM
     answers = [_text(payload.get(k)) for k in ("опыт_в_инвестициях", "размер_капитала", "зачем_капитал")]
     if all(answers):
         return STATUS_QUESTIONNAIRE_DONE

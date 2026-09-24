@@ -20,8 +20,10 @@ def payload(**overrides):
 
 
 def test_target_status_progression_and_guard():
-    assert mod._target_status(payload(размер_капитала="", зачем_капитал=""), mod.STATUS_BOT_STARTED) == mod.STATUS_QUESTIONNAIRE
-    assert mod._target_status(payload(), mod.STATUS_QUESTIONNAIRE) == mod.STATUS_QUESTIONNAIRE_DONE
+    no_event = {"Регистрация на мероприятие": "", "действие менеджера": ""}
+    assert mod._target_status(payload(размер_капитала="", зачем_капитал="", **no_event), mod.STATUS_BOT_STARTED) == mod.STATUS_QUESTIONNAIRE
+    assert mod._target_status(payload(**no_event), mod.STATUS_QUESTIONNAIRE) == mod.STATUS_QUESTIONNAIRE_DONE
+    assert mod._target_status(payload(), mod.STATUS_QUESTIONNAIRE_DONE) == mod.STATUS_RECORDED_PRACTICUM
     assert mod._target_status(payload(), 88835666) is None
 
 
@@ -57,4 +59,4 @@ def test_process_updates_existing_contact_and_lead(monkeypatch):
     result = run(mod.process(payload()))
     assert result["ok"] is True
     assert patched_contacts[0][0:2] == (10, "Тест Кат")
-    assert patched_leads == [(20, {"status_id": mod.STATUS_QUESTIONNAIRE_DONE, "pipeline_id": mod.PIPELINE_ACADEMY, "responsible_user_id": mod.ACADEMY_RESPONSIBLE_USER_ID})]
+    assert patched_leads == [(20, {"status_id": mod.STATUS_RECORDED_PRACTICUM, "pipeline_id": mod.PIPELINE_ACADEMY, "responsible_user_id": mod.ACADEMY_RESPONSIBLE_USER_ID})]
