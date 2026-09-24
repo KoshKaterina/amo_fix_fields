@@ -825,6 +825,13 @@ ACADEMY_BOTHELP_WEBHOOK_SECRET = os.getenv("ACADEMY_BOTHELP_WEBHOOK_SECRET", "")
 ACADEMY_PRACTICUM_CHAT_ID = os.getenv("ACADEMY_PRACTICUM_CHAT_ID", "").strip()
 ACADEMY_CONFERENCE_CHAT_ID = os.getenv("ACADEMY_CONFERENCE_CHAT_ID", "").strip()
 ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
+ACADEMY_BOTHELP_CLIENT_ID = os.getenv("ACADEMY_BOTHELP_CLIENT_ID", "").strip()
+ACADEMY_BOTHELP_CLIENT_SECRET = os.getenv("ACADEMY_BOTHELP_CLIENT_SECRET", "").strip()
+ACADEMY_INVITE_MESSAGE_DELAY_S = float(os.getenv("ACADEMY_INVITE_MESSAGE_DELAY_S", "60"))
+ACADEMY_MANAGER_FIRST_NAME = os.getenv("ACADEMY_MANAGER_FIRST_NAME", "Артем").strip() or "Артем"
+ACADEMY_INVITE_SENT_PATH = os.getenv(
+    "ACADEMY_INVITE_SENT_PATH", "/app/var/academy_invite_sent.json",
+).strip()
 # Обязательный cutover-гард для всех новых автоматик Академии. При 0 они не
 # обрабатывают ни одну сделку, даже если мастер-флаг случайно включили.
 ACADEMY_CUTOVER_TS = int(os.getenv("ACADEMY_CUTOVER_TS", "0") or "0")

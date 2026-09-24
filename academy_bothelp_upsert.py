@@ -15,6 +15,7 @@ from typing import Any
 
 import amo_service
 import api
+import academy_invite_delivery
 from waybill_config import (
     ACADEMY_BOTHELP_UPSERT_ENABLED,
     ACADEMY_BOTHELP_WEBHOOK_SECRET,
@@ -244,4 +245,5 @@ async def process(payload: dict) -> dict[str, Any]:
         "ACADEMY_BOTHELP_UPSERT ok cuid=%s contact=%s lead=%s resolution=%s",
         _text(payload.get("cuid")), contact["id"], lead["id"], resolution,
     )
+    academy_invite_delivery.schedule(payload, int(lead["id"]))
     return {"ok": True, "contact_id": contact["id"], "lead_id": lead["id"], "resolution": resolution}
