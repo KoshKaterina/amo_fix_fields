@@ -835,6 +835,11 @@ FIELD_ACADEMY_CONFERENCE_LINK = 578273
 # прямо прислала изменившийся field_id, поэтому старые заполненные карточки не разошлёт.
 ACADEMY_INTENT_ALERT_ENABLED = os.getenv("ACADEMY_INTENT_ALERT_ENABLED", "0") == "1"
 
+# Временное правило распределения Академии (Катя 24.09.2026): все новые лиды
+# назначаются Артёму Коннову. OFF до общего переключения BotHelp-копии.
+ACADEMY_ASSIGNMENT_ENABLED = os.getenv("ACADEMY_ASSIGNMENT_ENABLED", "0") == "1"
+ACADEMY_RESPONSIBLE_USER_ID = int(os.getenv("ACADEMY_RESPONSIBLE_USER_ID", "13822630"))
+
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
 STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)

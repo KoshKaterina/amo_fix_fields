@@ -14,6 +14,7 @@ import amgroup_lead_builder
 import academy_lead_alert
 import academy_invite_link
 import academy_intent_alert
+import academy_assignment
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -528,6 +529,7 @@ async def lead_change(request: Request):
     # воронки и этапа, чтение сделки и отправка уходят в фон (academy_lead_alert).
     # Стоит ВЫШЕ блока `updates`: этап меняют и без правки полей сделки.
     academy_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
+    academy_assignment.assign_bg(lead_id, incoming_pipeline, incoming_status)
     # Одноразовая ссылка на чат мероприятия. Модуль выключен по умолчанию и
     # внутри ещё раз проверяет воронку, контакт, событие и пустое поле ссылки.
     academy_invite_link.on_lead_change(lead_id)
