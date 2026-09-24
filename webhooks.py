@@ -15,6 +15,7 @@ import academy_lead_alert
 import academy_invite_link
 import academy_intent_alert
 import academy_assignment
+import academy_consent_stamp
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -439,6 +440,7 @@ async def contact_change(request: Request):
     changed_field_ids = contact_changed_field_ids(nested)
     academy_invite_link.on_contact_change(contact_id, changed_field_ids)
     academy_intent_alert.on_contact_change(contact_id, changed_field_ids)
+    academy_consent_stamp.on_contact_change(contact_id, changed_field_ids)
     return {"status": "ok"}
 
 
