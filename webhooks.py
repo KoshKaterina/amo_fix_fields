@@ -4,7 +4,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.status import HTTP_200_OK
 
@@ -16,6 +16,7 @@ import academy_invite_link
 import academy_intent_alert
 import academy_assignment
 import academy_consent_stamp
+import academy_bothelp_upsert
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -442,6 +443,22 @@ async def contact_change(request: Request):
     academy_intent_alert.on_contact_change(contact_id, changed_field_ids)
     academy_consent_stamp.on_contact_change(contact_id, changed_field_ids)
     return {"status": "ok"}
+
+
+@app.post("/bothelp/academy/{secret}")
+async def bothelp_academy(secret: str, request: Request):
+    """Полный профиль подписчика BotHelp -> одна карточка Академии."""
+    if not academy_bothelp_upsert.authorized(secret):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    result = await academy_bothelp_upsert.process(payload if isinstance(payload, dict) else {})
+    if not result.get("ok"):
+        logger.error("ACADEMY_BOTHELP_UPSERT failed: %s", result)
+        raise HTTPException(status_code=503, detail=result.get("reason", "upsert_failed"))
+    return result
 
 
 @app.post("/lead_change")
