@@ -14,6 +14,7 @@ import telegram_bot
 from alerts import lead_link
 from tg_recipients import ACADEMY_ALERT_TAG, NOTIFY_CHAT_ID, NOTIFY_THREAD_ID, mentions_for
 from waybill_config import (
+    ACADEMY_CUTOVER_TS,
     ACADEMY_INTENT_ALERT_ENABLED,
     FIELD_ACADEMY_EVENT_REGISTRATION,
     FIELD_ACADEMY_MANAGER_ACTION,
@@ -50,7 +51,12 @@ async def _academy_lead(contact: dict) -> dict | None:
     candidates = []
     for lead_id in _lead_ids(contact):
         lead = await amo_service.get_lead_full(lead_id, with_=())
-        if lead and str(lead.get("pipeline_id")) == str(PIPELINE_ACADEMY):
+        if (
+            lead
+            and str(lead.get("pipeline_id")) == str(PIPELINE_ACADEMY)
+            and ACADEMY_CUTOVER_TS
+            and int(lead.get("created_at") or 0) >= ACADEMY_CUTOVER_TS
+        ):
             candidates.append(lead)
     if not candidates:
         return None

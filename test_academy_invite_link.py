@@ -12,6 +12,7 @@ def setup_function():
     invite.ACADEMY_INVITE_BOT_TOKEN = "test-token"
     invite.ACADEMY_PRACTICUM_CHAT_ID = "-100111"
     invite.ACADEMY_CONFERENCE_CHAT_ID = "-100222"
+    invite.ACADEMY_CUTOVER_TS = 100
     invite._locks.clear()
 
 
@@ -24,6 +25,7 @@ def lead(*, pipeline=None, link=None):
         })
     return {
         "id": 77,
+        "created_at": 101,
         "pipeline_id": pipeline or invite.PIPELINE_ACADEMY,
         "custom_fields_values": custom,
         "_embedded": {"contacts": [{"id": 88, "is_main": True}]},
@@ -94,6 +96,23 @@ def test_existing_link_does_not_create_another(monkeypatch):
 
     assert run(invite.process_lead(77)) == "already_filled"
     assert called == []
+
+
+def test_historical_lead_does_not_create_link(monkeypatch):
+    async def get_lead(*args, **kwargs):
+        old = lead()
+        old["created_at"] = 99
+        return old
+
+    created = []
+    async def create(*args, **kwargs):
+        created.append(1)
+
+    monkeypatch.setattr(invite.amo_service, "get_lead_full", get_lead)
+    monkeypatch.setattr(invite, "_create_link", create)
+
+    assert run(invite.process_lead(77)) == "before_cutover"
+    assert created == []
 
 
 def test_patch_failure_revokes_orphan(monkeypatch):

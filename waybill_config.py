@@ -823,6 +823,9 @@ ACADEMY_INVITE_BOT_TOKEN = os.getenv("ACADEMY_INVITE_BOT_TOKEN", "").strip()
 ACADEMY_PRACTICUM_CHAT_ID = os.getenv("ACADEMY_PRACTICUM_CHAT_ID", "").strip()
 ACADEMY_CONFERENCE_CHAT_ID = os.getenv("ACADEMY_CONFERENCE_CHAT_ID", "").strip()
 ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
+# Обязательный cutover-гард для всех новых автоматик Академии. При 0 они не
+# обрабатывают ни одну сделку, даже если мастер-флаг случайно включили.
+ACADEMY_CUTOVER_TS = int(os.getenv("ACADEMY_CUTOVER_TS", "0") or "0")
 
 # Поле-триггер находится в контакте, результат — в сделке.
 FIELD_ACADEMY_EVENT_REGISTRATION = 578259
@@ -839,6 +842,7 @@ ACADEMY_INTENT_ALERT_ENABLED = os.getenv("ACADEMY_INTENT_ALERT_ENABLED", "0") ==
 # назначаются Артёму Коннову. OFF до общего переключения BotHelp-копии.
 ACADEMY_ASSIGNMENT_ENABLED = os.getenv("ACADEMY_ASSIGNMENT_ENABLED", "0") == "1"
 ACADEMY_RESPONSIBLE_USER_ID = int(os.getenv("ACADEMY_RESPONSIBLE_USER_ID", "13822630"))
+ACADEMY_ASSIGNMENT_DELAY_S = float(os.getenv("ACADEMY_ASSIGNMENT_DELAY_S", "5"))
 
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)

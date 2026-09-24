@@ -14,6 +14,7 @@ import httpx
 import amo_service
 from waybill_config import (
     ACADEMY_CONFERENCE_CHAT_ID,
+    ACADEMY_CUTOVER_TS,
     ACADEMY_INVITE_BOT_TOKEN,
     ACADEMY_INVITE_DELAY_S,
     ACADEMY_INVITE_LINK_ENABLED,
@@ -158,6 +159,8 @@ async def process_lead(lead_id, *, delay: float = 0, contact: dict | None = None
                 return "no_lead"
             if str(lead.get("pipeline_id")) != str(PIPELINE_ACADEMY):
                 return "other_pipeline"
+            if not ACADEMY_CUTOVER_TS or int(lead.get("created_at") or 0) < ACADEMY_CUTOVER_TS:
+                return "before_cutover"
 
             contact_id = _main_contact_id(lead)
             if not contact_id:
