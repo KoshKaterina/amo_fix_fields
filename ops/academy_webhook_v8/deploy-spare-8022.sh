@@ -143,7 +143,11 @@ curl -fsS "http://127.0.0.1:${HOST_PORT}/health"
 docker exec "$NEW" python3 -m py_compile \
   /app/academy_invite_delivery.py /app/academy_invite_link.py \
   /app/academy_bothelp_upsert.py /app/academy_webhook_app.py
-docker exec "$NEW" python3 -m pytest -q \
+# The production image intentionally has no test dependencies. Keep pytest in
+# the spare container's ephemeral /tmp instead of mutating image site-packages.
+docker exec "$NEW" python3 -m pip install --disable-pip-version-check \
+  --no-cache-dir --target /tmp/academy-test-run 'pytest==8.3.5'
+docker exec -e PYTHONPATH=/tmp/academy-test-run:/app "$NEW" python3 -m pytest -q \
   /app/test_academy_invite_delivery.py /app/test_academy_bothelp_upsert.py \
   /app/test_academy_invite_link.py /app/test_academy_intent_alert.py
 docker inspect -f 'name={{.Name}} running={{.State.Running}} image={{.Config.Image}} mounts={{range .Mounts}}{{.Source}}:{{.Destination}};{{end}}' "$NEW"
