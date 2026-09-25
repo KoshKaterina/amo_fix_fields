@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _tasks: set[asyncio.Task] = set()
 _locks: dict[str, asyncio.Lock] = {}
 _PRE_INVITE_STATUSES = {87654850, 88838378, 88838382, 88838386}
+_EXPLICIT_PRACTICUM_ACTION = "записаться на практикум"
 
 
 def configured() -> bool:
@@ -82,6 +83,16 @@ def _valid_link(value: object) -> str:
 def _phone(payload: dict) -> str:
     digits = re.sub(r"\D", "", str(payload.get("phone") or ""))
     return digits if 10 <= len(digits) <= 15 else ""
+
+
+def _is_explicit_request(payload: dict) -> bool:
+    """Only the dedicated BotHelp CTA may start client delivery.
+
+    Registration is deliberately insufficient: it is also present on historical
+    profiles and on contacts who asked the manager to call instead.
+    """
+    value = payload.get("действие менеджера") or payload.get("manager_action")
+    return str(value or "").strip().casefold() == _EXPLICIT_PRACTICUM_ACTION
 
 
 async def _request(method: str, path: str, *, body: dict | None = None) -> httpx.Response | None:
@@ -139,6 +150,8 @@ async def _send(payload: dict, lead_id: int, link: str) -> str:
 async def process(payload: dict, lead_id: int, *, delay: float = 0) -> str:
     if not configured():
         return "disabled"
+    if not _is_explicit_request(payload):
+        return "not_explicit_request"
     if "практикум" not in str(payload.get("Регистрация на мероприятие") or "").casefold():
         return "not_practicum"
     if delay:
@@ -197,7 +210,7 @@ async def process(payload: dict, lead_id: int, *, delay: float = 0) -> str:
 
 
 def schedule(payload: dict, lead_id: int) -> None:
-    if not configured():
+    if not configured() or not _is_explicit_request(payload):
         return
     task = asyncio.create_task(process(dict(payload), int(lead_id), delay=ACADEMY_INVITE_MESSAGE_DELAY_S))
     _tasks.add(task)

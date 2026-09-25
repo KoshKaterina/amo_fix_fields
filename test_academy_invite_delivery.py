@@ -11,7 +11,8 @@ def run(coro): return asyncio.run(coro)
 
 def payload(**overrides):
     data = {"first_name": "Екатерина", "phone": "+79250833349",
-            "Регистрация на мероприятие": "Практикум октябрь 2026"}
+            "Регистрация на мероприятие": "Практикум октябрь 2026",
+            "действие менеджера": "записаться на практикум"}
     data.update(overrides)
     return data
 
@@ -27,6 +28,20 @@ def enable(monkeypatch, tmp_path):
 def test_message_uses_approved_copy(monkeypatch):
     monkeypatch.setattr(mod, "ACADEMY_MANAGER_FIRST_NAME", "Артем")
     assert "по ссылке: https://t.me/+one-use" in mod._message(payload(), "https://t.me/+one-use")
+
+
+def test_registration_without_explicit_cta_is_fail_closed(monkeypatch, tmp_path):
+    enable(monkeypatch, tmp_path)
+    called = []
+    async def get_lead(*_a, **_k): called.append(1)
+    monkeypatch.setattr(mod.amo_service, "get_lead_full", get_lead)
+    assert run(mod.process(payload(**{"действие менеджера": "связаться с клиентом"}), 10)) == "not_explicit_request"
+    assert called == []
+
+
+def test_english_manager_action_alias_is_exact():
+    assert mod._is_explicit_request({"manager_action": " Записаться на практикум "}) is True
+    assert mod._is_explicit_request({"manager_action": "узнать об участии"}) is False
 
 
 def test_process_rereads_then_sends_exact_channel_once(monkeypatch, tmp_path):
