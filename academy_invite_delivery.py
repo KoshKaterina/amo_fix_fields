@@ -21,6 +21,8 @@ from waybill_config import (
     ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID,
     ACADEMY_MANAGER_FIRST_NAME,
     FIELD_ACADEMY_PRACTICUM_LINK,
+    PIPELINE_ACADEMY,
+    STATUS_ACADEMY_RECORDED_PRACTICUM,
     WAZZUP_API_KEY,
     WAZZUP_API_URL,
 )
@@ -28,6 +30,7 @@ from waybill_config import (
 logger = logging.getLogger(__name__)
 _tasks: set[asyncio.Task] = set()
 _locks: dict[str, asyncio.Lock] = {}
+_PRE_INVITE_STATUSES = {87654850, 88838378, 88838382, 88838386}
 
 
 def configured() -> bool:
@@ -159,6 +162,29 @@ async def process(payload: dict, lead_id: int, *, delay: float = 0) -> str:
                 link = _valid_link(amo_service.get_custom_field_value(lead or {}, FIELD_ACADEMY_PRACTICUM_LINK))
             if not link:
                 return "link_missing"
+
+            current_status = int((lead or {}).get("status_id") or 0)
+            if current_status != STATUS_ACADEMY_RECORDED_PRACTICUM:
+                if current_status not in _PRE_INVITE_STATUSES:
+                    return "stage_guard"
+                patched = await amo_service.patch_lead(
+                    lead_id,
+                    status_id=STATUS_ACADEMY_RECORDED_PRACTICUM,
+                    pipeline_id=PIPELINE_ACADEMY,
+                )
+                if not patched.get("ok"):
+                    return "stage_error"
+
+            # Final amo readback: stage and the exact link must both survive.
+            lead = await amo_service.get_lead_full(lead_id, with_=())
+            confirmed_link = _valid_link(
+                amo_service.get_custom_field_value(lead or {}, FIELD_ACADEMY_PRACTICUM_LINK)
+            )
+            if (
+                confirmed_link != link
+                or int((lead or {}).get("status_id") or 0) != STATUS_ACADEMY_RECORDED_PRACTICUM
+            ):
+                return "stage_or_link_unconfirmed"
             result = await _send(payload, lead_id, link)
             if result == "sent":
                 sent.add(sent_key)

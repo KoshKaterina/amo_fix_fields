@@ -850,6 +850,7 @@ FIELD_ACADEMY_PD_CONSENT = 578239
 FIELD_ACADEMY_MARKETING_CONSENT = 578245
 FIELD_ACADEMY_MARKETING_DATE_TEXT = 578277
 FIELD_ACADEMY_PD_DATE_TEXT = 578279
+STATUS_ACADEMY_RECORDED_PRACTICUM = 88835666
 
 # Уведомления в топик УВЕДОМЛЕНИЯ отдела продаж по двум полям контакта Академии.
 # OFF до общего переключения сценария; обработчик реагирует только когда amo
