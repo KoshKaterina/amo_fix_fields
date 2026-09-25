@@ -16,18 +16,41 @@ logger = logging.getLogger("uvicorn")
 _bg_tasks: set[asyncio.Task] = set()
 
 
-def assign_bg(lead_id, pipeline_id, status_id) -> None:
-    """На любом событии новой сделки Академии удерживать ответственного Артёма."""
+def assign_bg(
+    lead_id,
+    pipeline_id,
+    status_id,
+    *,
+    is_new: bool = False,
+    initial_responsible_user_id=None,
+) -> None:
+    """Назначить Артёма только на действительно новую сделку Академии.
+
+    ``initial_responsible_user_id`` берётся из события ``leads.add``. Если за
+    время задержки менеджер уже успел вручную изменить ответственного, apply
+    увидит расхождение и не станет перезаписывать выбор человека.
+    """
     if not ACADEMY_ASSIGNMENT_ENABLED or lead_id is None:
+        return
+    if not is_new:
         return
     if str(pipeline_id) != str(PIPELINE_ACADEMY):
         return
-    task = asyncio.create_task(apply(lead_id, delay=ACADEMY_ASSIGNMENT_DELAY_S))
+    task = asyncio.create_task(apply(
+        lead_id,
+        delay=ACADEMY_ASSIGNMENT_DELAY_S,
+        expected_responsible_user_id=initial_responsible_user_id,
+    ))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
 
-async def apply(lead_id, *, delay: float = 0) -> str:
+async def apply(
+    lead_id,
+    *,
+    delay: float = 0,
+    expected_responsible_user_id=None,
+) -> str:
     if delay:
         await asyncio.sleep(delay)
     lead = await amo_service.get_lead_full(lead_id, with_=())
@@ -39,6 +62,14 @@ async def apply(lead_id, *, delay: float = 0) -> str:
         return "before_cutover"
     if str(lead.get("responsible_user_id")) == str(ACADEMY_RESPONSIBLE_USER_ID):
         return "already_assigned"
+    current_responsible = lead.get("responsible_user_id")
+    if expected_responsible_user_id is None and current_responsible:
+        return "initial_responsible_unknown"
+    if (
+        expected_responsible_user_id is not None
+        and str(current_responsible) != str(expected_responsible_user_id)
+    ):
+        return "responsible_changed"
     result = await amo_service.patch_lead(
         lead_id, responsible_user_id=ACADEMY_RESPONSIBLE_USER_ID,
     )

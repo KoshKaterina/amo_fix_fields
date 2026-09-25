@@ -148,7 +148,6 @@ async def _promote_forward_only_practicum(payload: dict, contact_id: int, lead: 
             int(lead["id"]),
             status_id=STATUS_RECORDED_PRACTICUM,
             pipeline_id=PIPELINE_ACADEMY,
-            responsible_user_id=ACADEMY_RESPONSIBLE_USER_ID,
         )
         if not patched.get("ok"):
             return "stage_update_failed"
@@ -290,7 +289,6 @@ async def process(payload: dict) -> dict[str, Any]:
     if target:
         result = await amo_service.patch_lead(
             lead["id"], status_id=target, pipeline_id=PIPELINE_ACADEMY,
-            responsible_user_id=ACADEMY_RESPONSIBLE_USER_ID,
         )
         if not result.get("ok"):
             return {"ok": False, "reason": "lead_update_failed", "contact_id": contact["id"], "lead_id": lead["id"]}

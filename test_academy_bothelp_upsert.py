@@ -59,7 +59,10 @@ def test_process_updates_existing_contact_and_lead(monkeypatch):
     result = run(mod.process(payload()))
     assert result["ok"] is True
     assert patched_contacts[0][0:2] == (10, "Тест Кат")
-    assert patched_leads == [(20, {"status_id": mod.STATUS_QUESTIONNAIRE_DONE, "pipeline_id": mod.PIPELINE_ACADEMY, "responsible_user_id": mod.ACADEMY_RESPONSIBLE_USER_ID})]
+    assert patched_leads == [(20, {
+        "status_id": mod.STATUS_QUESTIONNAIRE_DONE,
+        "pipeline_id": mod.PIPELINE_ACADEMY,
+    })]
 
 
 def test_old_flow_registration_moves_stage_without_delivery(monkeypatch):
@@ -103,7 +106,6 @@ def test_old_flow_registration_moves_stage_without_delivery(monkeypatch):
     assert patched == [(20, {
         "status_id": mod.STATUS_RECORDED_PRACTICUM,
         "pipeline_id": mod.PIPELINE_ACADEMY,
-        "responsible_user_id": mod.ACADEMY_RESPONSIBLE_USER_ID,
     })]
     assert scheduled == []
 

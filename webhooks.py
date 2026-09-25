@@ -477,9 +477,10 @@ async def lead_change(request: Request):
     promo_type = None
     comment = None
 
+    lead_add_id = await get_nested(nested, ["leads", "add", "0", "id"])
     lead_id = await get_nested(nested, ["leads", "update", "0", "id"])
     if lead_id is None:
-        lead_id = await get_nested(nested, ["leads", "add", "0", "id"])
+        lead_id = lead_add_id
 
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
@@ -548,7 +549,16 @@ async def lead_change(request: Request):
     # воронки и этапа, чтение сделки и отправка уходят в фон (academy_lead_alert).
     # Стоит ВЫШЕ блока `updates`: этап меняют и без правки полей сделки.
     academy_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
-    academy_assignment.assign_bg(lead_id, incoming_pipeline, incoming_status)
+    initial_responsible_user_id = await get_nested(
+        nested, ["leads", "add", "0", "responsible_user_id"],
+    )
+    academy_assignment.assign_bg(
+        lead_id,
+        incoming_pipeline,
+        incoming_status,
+        is_new=lead_add_id is not None,
+        initial_responsible_user_id=initial_responsible_user_id,
+    )
     # Одноразовая ссылка на чат мероприятия. Модуль выключен по умолчанию и
     # внутри ещё раз проверяет воронку, контакт, событие и пустое поле ссылки.
     academy_invite_link.on_lead_change(lead_id)
