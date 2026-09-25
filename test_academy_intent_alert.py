@@ -54,6 +54,7 @@ def test_process_sends_changed_action(monkeypatch):
 
     assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "sent"
     assert "написать менеджеру" in sent[0][0]
+    assert sent[0][0].count("<a href=") == 1
     assert alert.ACADEMY_ALERT_TAG in sent[0][0]
     assert sent[0][1]["chat_id"] == alert.NOTIFY_CHAT_ID
     assert sent[0][1]["message_thread_id"] == alert.NOTIFY_THREAD_ID

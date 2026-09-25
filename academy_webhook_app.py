@@ -5,15 +5,18 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 import academy_bothelp_upsert
+import academy_invite_delivery
 from api import init_api_pipeline, shutdown_api_pipeline
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_api_pipeline()
+    academy_invite_delivery.start()
     try:
         yield
     finally:
+        await academy_invite_delivery.stop()
         await shutdown_api_pipeline()
 
 

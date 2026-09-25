@@ -24,6 +24,7 @@ def test_target_status_progression_and_guard():
     assert mod._target_status(payload(размер_капитала="", зачем_капитал="", **no_event), mod.STATUS_BOT_STARTED) == mod.STATUS_QUESTIONNAIRE
     assert mod._target_status(payload(**no_event), mod.STATUS_QUESTIONNAIRE) == mod.STATUS_QUESTIONNAIRE_DONE
     assert mod._target_status(payload(), mod.STATUS_QUESTIONNAIRE_DONE) is None
+    assert mod._target_status(payload(размер_капитала="", зачем_капитал="", **no_event), mod.STATUS_QUESTIONNAIRE_DONE) is None
     assert mod._target_status(payload(), 88835666) is None
 
 
@@ -110,6 +111,36 @@ def test_old_flow_registration_moves_stage_without_delivery(monkeypatch):
     assert scheduled == []
 
 
+def test_old_flow_trusted_node_evidence_schedules_after_stage_readback(monkeypatch):
+    stored_contact = {
+        "id": 10,
+        "custom_fields_values": [
+            {"field_id": mod.FIELD_EVENT, "values": [{"value": "Практикум октябрь 2026"}]},
+            {"field_id": mod.FIELD_ACTION, "values": [{"value": "связаться с клиентом"}]},
+        ],
+        "_embedded": {"leads": [{"id": 20}]},
+    }
+    lead = {"id": 20, "pipeline_id": mod.PIPELINE_ACADEMY,
+            "status_id": mod.STATUS_QUESTIONNAIRE_DONE, "created_at": 200}
+    lead_reads = iter([lead, {**lead, "status_id": mod.STATUS_RECORDED_PRACTICUM}])
+    monkeypatch.setattr(mod, "configured", lambda: True)
+    monkeypatch.setattr(mod, "_candidate_contacts", lambda _p: _async([stored_contact]))
+    monkeypatch.setattr(mod, "_matches", lambda *_a: True)
+    monkeypatch.setattr(mod.amo_service, "get_contact_by_id", lambda *_a, **_k: _async(stored_contact))
+    monkeypatch.setattr(mod.amo_service, "get_leads_by_ids", lambda *_a: _async([lead]))
+    monkeypatch.setattr(mod.api, "update_contact", lambda *_a, **_k: _async(True))
+    monkeypatch.setattr(mod.amo_service, "get_lead_full", lambda *_a, **_k: _async(next(lead_reads)))
+    monkeypatch.setattr(mod.amo_service, "patch_lead", lambda *_a, **_k: _async({"ok": True}))
+    scheduled = []
+    monkeypatch.setattr(mod.academy_invite_delivery, "schedule", lambda *a: scheduled.append(a))
+    old = payload(**{
+        "действие менеджера": "связаться с клиентом",
+        "academy_intent_ref": mod._LEGACY_PRACTICUM_INTENT_REF,
+    })
+    assert run(mod.process(old))["progression"] == "recorded_practicum"
+    assert scheduled == [(old, 20)]
+
+
 def test_non_registration_keeps_questionnaire_progression():
     assert mod._is_forward_only_practicum(payload(**{
         "Регистрация на мероприятие": "",
@@ -119,3 +150,7 @@ def test_non_registration_keeps_questionnaire_progression():
         "Регистрация на мероприятие": "",
         "действие менеджера": "",
     }), mod.STATUS_QUESTIONNAIRE) == mod.STATUS_QUESTIONNAIRE_DONE
+
+
+async def _async(value):
+    return value

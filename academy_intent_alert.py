@@ -82,7 +82,7 @@ def _message(lead: dict, contact: dict, field_id: int, value: str) -> str:
         f"{html.escape(_mentions(lead))}\n"
         f"👤 {html.escape(_client_name(contact))}\n"
         f"🔹 <b>{html.escape(label)}:</b> {html.escape(value)}\n"
-        f'🔗 <a href="{lead_link(lead.get("id"))}">Открыть сделку</a>'
+        f"🔗 {lead_link(lead.get('id'))}"
     )
 
 

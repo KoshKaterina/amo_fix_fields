@@ -200,3 +200,18 @@ def test_conference_uses_separate_chat_and_field(monkeypatch):
     assert run(invite.process_lead(77)) == "written"
     assert created == ["-100222"]
     assert patched == [{invite.FIELD_ACADEMY_CONFERENCE_LINK: "https://t.me/+conference"}]
+
+
+def test_verify_practicum_link_uses_exact_chat_and_one_use(monkeypatch):
+    seen = []
+
+    async def telegram(method, body):
+        seen.append((method, body))
+        return {"invite_link": "https://t.me/+one-use"}
+
+    monkeypatch.setattr(invite, "_telegram", telegram)
+    assert run(invite.verify_practicum_link(10, "https://t.me/+one-use")) is True
+    assert seen == [("editChatInviteLink", {
+        "chat_id": "-100111", "invite_link": "https://t.me/+one-use",
+        "name": "academy lead 10", "member_limit": 1,
+    })]

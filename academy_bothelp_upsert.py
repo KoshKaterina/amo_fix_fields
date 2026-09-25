@@ -46,6 +46,7 @@ STATUS_QUESTIONNAIRE_DONE = 88838386
 STATUS_RECORDED_PRACTICUM = STATUS_ACADEMY_RECORDED_PRACTICUM
 _BOT_STATUSES = {STATUS_INBOUND, STATUS_BOT_STARTED, STATUS_QUESTIONNAIRE, STATUS_QUESTIONNAIRE_DONE}
 _FORWARD_ONLY_PRACTICUM_ACTION = "связаться с клиентом"
+_LEGACY_PRACTICUM_INTENT_REF = "179005890770899fb909ef"
 
 _CUSTOM_MAP = {
     "pd_consent": FIELD_PD_CONSENT,
@@ -125,6 +126,18 @@ def _is_practicum_registration(payload: dict) -> bool:
 def _is_forward_only_practicum(payload: dict) -> bool:
     action = _text(payload.get("действие менеджера") or payload.get("manager_action"))
     return _is_practicum_registration(payload) and action.casefold() == _FORWARD_ONLY_PRACTICUM_ACTION
+
+
+def _has_trusted_legacy_practicum_intent(payload: dict) -> bool:
+    """The generic legacy action is delivery intent only with node evidence.
+
+    BotHelp must add this immutable ref to the webhook payload from node 709.
+    A stored contact field or the generic action alone is deliberately rejected.
+    """
+    ref = _text(payload.get("academy_intent_ref") or payload.get("bothelp_step_ref"))
+    return _is_forward_only_practicum(payload) and hmac.compare_digest(
+        ref, _LEGACY_PRACTICUM_INTENT_REF,
+    )
 
 
 async def _promote_forward_only_practicum(payload: dict, contact_id: int, lead: dict) -> str:
@@ -223,10 +236,20 @@ def _target_status(payload: dict, current_status: int | None) -> int | None:
         return None
     answers = [_text(payload.get(k)) for k in ("опыт_в_инвестициях", "размер_капитала", "зачем_капитал")]
     if all(answers):
-        return STATUS_QUESTIONNAIRE_DONE if current_status != STATUS_QUESTIONNAIRE_DONE else None
-    if any(answers):
-        return STATUS_QUESTIONNAIRE
-    return STATUS_BOT_STARTED if current_status in (None, STATUS_INBOUND) else None
+        candidate = STATUS_QUESTIONNAIRE_DONE
+    elif any(answers):
+        candidate = STATUS_QUESTIONNAIRE
+    else:
+        candidate = STATUS_BOT_STARTED
+    rank = {
+        STATUS_INBOUND: 0,
+        STATUS_BOT_STARTED: 1,
+        STATUS_QUESTIONNAIRE: 2,
+        STATUS_QUESTIONNAIRE_DONE: 3,
+    }
+    if current_status is None:
+        return candidate
+    return candidate if rank[candidate] > rank[current_status] else None
 
 
 async def process(payload: dict) -> dict[str, Any]:
@@ -280,6 +303,8 @@ async def process(payload: dict) -> dict[str, Any]:
             "ACADEMY_BOTHELP_UPSERT forward-only cuid=%s contact=%s lead=%s",
             _text(payload.get("cuid")), contact["id"], lead["id"],
         )
+        if _has_trusted_legacy_practicum_intent(payload):
+            academy_invite_delivery.schedule(payload, int(lead["id"]))
         return {
             "ok": True, "contact_id": contact["id"], "lead_id": lead["id"],
             "resolution": resolution, "progression": progression,

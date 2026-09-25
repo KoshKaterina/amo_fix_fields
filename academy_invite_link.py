@@ -123,6 +123,27 @@ async def _revoke_link(chat_id: str, link: str) -> None:
     await _telegram("revokeChatInviteLink", {"chat_id": chat_id, "invite_link": link})
 
 
+async def verify_practicum_link(lead_id: int, link: str) -> bool:
+    """Prove an existing invite belongs to the configured practicum chat.
+
+    Telegram's editChatInviteLink is scoped by chat_id and rejects a link from
+    another chat. Re-applying the same one-use properties is an idempotent
+    verification and does not send anything to participants.
+    """
+    if not configured() or not ACADEMY_PRACTICUM_CHAT_ID or not str(link).startswith("https://t.me/"):
+        return False
+    result = await _telegram(
+        "editChatInviteLink",
+        {
+            "chat_id": ACADEMY_PRACTICUM_CHAT_ID,
+            "invite_link": link,
+            "name": f"academy lead {lead_id}",
+            "member_limit": 1,
+        },
+    )
+    return str((result or {}).get("invite_link") or "").strip() == str(link).strip()
+
+
 async def process_contact(contact_id, *, delay: float = 0) -> str:
     """Обработать изменение контакта и все его сделки Академии."""
     if not configured():

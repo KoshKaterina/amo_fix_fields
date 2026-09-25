@@ -12,7 +12,7 @@ import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
 import academy_lead_alert
-import academy_invite_link
+import academy_invite_delivery
 import academy_intent_alert
 import academy_assignment
 import academy_consent_stamp
@@ -70,6 +70,8 @@ from queue_manager import (
     shutdown_queue,
 )
 from waybill_config import (
+    PIPELINE_ACADEMY,
+    STATUS_ACADEMY_RECORDED_PRACTICUM,
     OFFICE_TRANSFER_ENABLED,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
@@ -135,6 +137,7 @@ async def lifespan(app):
     # смотрит флаг AUTOPILOT_ENABLED и без него не поднимает ни хранилища, ни опроса
     # панели, ни фонового цикла.
     await autopilot.init()
+    academy_invite_delivery.start()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -150,6 +153,7 @@ async def lifespan(app):
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
     await autopilot.shutdown()
+    await academy_invite_delivery.stop()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await alert_settings_client.stop()
@@ -335,6 +339,10 @@ async def wazzup_webhook(secret: str, request: Request):
         wazzup_delivery.handle_webhook(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка контроля доставки")
+    try:
+        academy_invite_delivery.record_webhook(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка статуса приглашения Академии")
     # Пересылка текстов в панель (wazzup_message) — независимо от остальных:
     # упавший таймер не должен терять сообщение (источник невосполним).
     try:
@@ -439,7 +447,6 @@ async def contact_change(request: Request):
     if contact_id is None:
         contact_id = await get_nested(nested, ["contacts", "add", "0", "id"])
     changed_field_ids = contact_changed_field_ids(nested)
-    academy_invite_link.on_contact_change(contact_id, changed_field_ids)
     academy_intent_alert.on_contact_change(contact_id, changed_field_ids)
     academy_consent_stamp.on_contact_change(contact_id, changed_field_ids)
     return {"status": "ok"}
@@ -559,9 +566,15 @@ async def lead_change(request: Request):
         is_new=lead_add_id is not None,
         initial_responsible_user_id=initial_responsible_user_id,
     )
-    # Одноразовая ссылка на чат мероприятия. Модуль выключен по умолчанию и
-    # внутри ещё раз проверяет воронку, контакт, событие и пустое поле ссылки.
-    academy_invite_link.on_lead_change(lead_id)
+    # Ручной перевод на «Записан на практикум» — явное намерение. Вебхук
+    # может прислать текущий status_id и при иной правке, поэтому worker дополнительно
+    # требует свежее amo-событие lead_status_changed именно для этой сделки.
+    if (
+        lead_id is not None
+        and str(incoming_pipeline) == str(PIPELINE_ACADEMY)
+        and str(incoming_status) == str(STATUS_ACADEMY_RECORDED_PRACTICUM)
+    ):
+        academy_invite_delivery.schedule_manual_stage(int(lead_id))
 
     # Протез отгрузок: пока amgroup лежит, отгрузку в МойСкладе не создаёт никто
     # и товар не списывается. Вешаемся на те же этапы воронки «Офис», на которых

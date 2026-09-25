@@ -828,10 +828,24 @@ ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
 ACADEMY_BOTHELP_CLIENT_ID = os.getenv("ACADEMY_BOTHELP_CLIENT_ID", "").strip()
 ACADEMY_BOTHELP_CLIENT_SECRET = os.getenv("ACADEMY_BOTHELP_CLIENT_SECRET", "").strip()
 ACADEMY_INVITE_MESSAGE_DELAY_S = float(os.getenv("ACADEMY_INVITE_MESSAGE_DELAY_S", "60"))
-ACADEMY_MANAGER_FIRST_NAME = os.getenv("ACADEMY_MANAGER_FIRST_NAME", "Артем").strip() or "Артем"
 ACADEMY_INVITE_SENT_PATH = os.getenv(
     "ACADEMY_INVITE_SENT_PATH", "/app/var/academy_invite_sent.json",
 ).strip()
+ACADEMY_INVITE_OUTBOX_PATH = os.getenv(
+    "ACADEMY_INVITE_OUTBOX_PATH", "/app/var/academy/academy_invite_outbox.sqlite3",
+).strip()
+ACADEMY_INVITE_HISTORY_REVIEW_PATH = os.getenv(
+    "ACADEMY_INVITE_HISTORY_REVIEW_PATH", "/app/var/academy/academy_invite_history_reviews.json",
+).strip()
+ACADEMY_WAZZUP_HISTORY_API_URL = os.getenv(
+    "ACADEMY_WAZZUP_HISTORY_API_URL", "https://tech.wazzup24.com/v2",
+).rstrip("/")
+# This is a Wazzup end-customer client_access_token, not the v3 User API key.
+ACADEMY_WAZZUP_HISTORY_TOKEN = os.getenv("ACADEMY_WAZZUP_HISTORY_TOKEN", "").strip()
+ACADEMY_INVITE_HISTORY_START_AT = os.getenv(
+    "ACADEMY_INVITE_HISTORY_START_AT", "2017-01-01T00:00:00.000Z",
+).strip()
+ACADEMY_INVITE_RETRY_S = float(os.getenv("ACADEMY_INVITE_RETRY_S", "60"))
 ACADEMY_INVITE_SEND_ENABLED = os.getenv("ACADEMY_INVITE_SEND_ENABLED", "0") == "1"
 ACADEMY_INVITE_WAZZUP_CHANNEL_ID = os.getenv("ACADEMY_INVITE_WAZZUP_CHANNEL_ID", "").strip()
 ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID = os.getenv(
