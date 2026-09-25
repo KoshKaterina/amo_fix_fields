@@ -47,9 +47,10 @@ def lead(status=88838386, link="https://t.me/+one-use"):
     }
 
 
-def test_message_uses_fresh_manager_first_name():
+def test_message_uses_approved_fixed_manager_name():
     text = mod._message(payload(), "https://t.me/+one-use", "Кирилл")
-    assert "Меня зовут Кирилл" in text
+    assert "Меня зовут Артем, менеджер академии Sunscrypt." in text
+    assert "Кирилл" not in text
     assert "по ссылке: https://t.me/+one-use" in text
 
 

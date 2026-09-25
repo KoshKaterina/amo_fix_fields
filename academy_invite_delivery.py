@@ -86,7 +86,7 @@ def _message(payload: dict, link: str, manager_first_name: str) -> str:
     greeting = f"Здравствуйте, {client}!" if client else "Здравствуйте!"
     return (
         f"{greeting}\n"
-        f"Меня зовут {manager_first_name}, менеджер академии Sunscrypt.\n\n"
+        "Меня зовут Артем, менеджер академии Sunscrypt.\n\n"
         f"Добавляйтесь в чат практикума по ссылке: {link}\n\n"
         "Если у Вас остались какие-то вопросы или нужна будет помощь - обращайтесь, я на связи!"
     )

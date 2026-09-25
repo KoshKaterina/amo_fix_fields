@@ -154,3 +154,61 @@ def test_non_registration_keeps_questionnaire_progression():
 
 async def _async(value):
     return value
+
+
+def test_unread_candidate_contact_never_creates_or_updates(monkeypatch):
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("An uncertain lookup must not write")
+
+    monkeypatch.setattr(mod, "configured", lambda: True)
+    monkeypatch.setattr(mod, "_candidate_contacts", lambda _: _async([{"id": 10}]))
+    monkeypatch.setattr(mod.amo_service, "get_contact_by_id", lambda *a, **k: _async(None))
+    for name in ("create_contact", "create_lead_direct", "update_contact"):
+        monkeypatch.setattr(mod.api, name, forbidden)
+    assert run(mod.process(payload())) == {"ok": False, "reason": "search_failed"}
+
+
+def test_incomplete_linked_leads_never_creates_or_updates(monkeypatch):
+    contact = {"id": 10, "_embedded": {"leads": [{"id": 20}, {"id": 21}]}}
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("An uncertain lookup must not write")
+
+    monkeypatch.setattr(mod, "configured", lambda: True)
+    monkeypatch.setattr(mod, "_candidate_contacts", lambda _: _async([contact]))
+    monkeypatch.setattr(mod, "_matches", lambda *a: True)
+    monkeypatch.setattr(mod.amo_service, "get_contact_by_id", lambda *a, **k: _async(contact))
+    for name in ("create_contact", "create_lead_direct", "update_contact"):
+        monkeypatch.setattr(mod.api, name, forbidden)
+    # Both a failed batch and a partly returned batch must fail closed, even
+    # when a visible row is closed (or an open match was already found).
+    for rows in ([], None, [{"id": 20, "pipeline_id": mod.PIPELINE_ACADEMY, "status_id": 143}],
+                 [{"id": 20, "pipeline_id": mod.PIPELINE_ACADEMY, "status_id": mod.STATUS_BOT_STARTED}]):
+        monkeypatch.setattr(mod.amo_service, "get_leads_by_ids", lambda *a: _async(rows))
+        assert run(mod.process(payload())) == {"ok": False, "reason": "search_failed"}
+
+
+def test_simultaneous_deliveries_are_serialized(monkeypatch):
+    active = 0
+    max_active = 0
+
+    async def unlocked(item):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"ok": True, "cuid": item["cuid"]}
+
+    async def exercise():
+        monkeypatch.setattr(mod, "_process_unlocked", unlocked)
+        return await asyncio.gather(
+            mod.process({"cuid": "first"}),
+            mod.process({"cuid": "second"}),
+        )
+
+    assert run(exercise()) == [
+        {"ok": True, "cuid": "first"},
+        {"ok": True, "cuid": "second"},
+    ]
+    assert max_active == 1

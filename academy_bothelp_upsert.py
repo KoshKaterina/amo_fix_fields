@@ -8,6 +8,7 @@ BotHelp, ищет человека по CUID/телефону/email и обно�
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -26,6 +27,11 @@ from waybill_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# One uvicorn worker serves this isolated webhook. Serializing the complete
+# resolve/create sequence closes the check-then-create race between simultaneous
+# BotHelp deliveries: the second request resolves again after the first commit.
+_UPSERT_LOCK = asyncio.Lock()
 
 FIELD_CUID = 573753
 FIELD_PD_CONSENT = 578239
@@ -206,7 +212,10 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
     candidates = []
     for row in rows:
         full = await amo_service.get_contact_by_id(row["id"], with_=("leads",))
-        if full and _matches(full, payload):
+        if not full or int(full.get("id") or 0) != int(row["id"]):
+            # An unread candidate is not evidence that the person is absent.
+            return None, None, "search_failed"
+        if _matches(full, payload):
             candidates.append(full)
 
     best_contact = None
@@ -214,6 +223,10 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
     for contact in candidates:
         lead_ids = [int(x["id"]) for x in (contact.get("_embedded") or {}).get("leads") or [] if x.get("id")]
         leads = await amo_service.get_leads_by_ids(lead_ids)
+        if {int(x.get("id") or 0) for x in leads or []} != set(lead_ids):
+            # The batch helper may return []/a partial batch after a read failure.
+            # Retry resolution later; never create a replacement on that basis.
+            return None, None, "search_failed"
         open_academy = [
             lead for lead in leads
             if int(lead.get("pipeline_id") or 0) == PIPELINE_ACADEMY
@@ -252,7 +265,7 @@ def _target_status(payload: dict, current_status: int | None) -> int | None:
     return candidate if rank[candidate] > rank[current_status] else None
 
 
-async def process(payload: dict) -> dict[str, Any]:
+async def _process_unlocked(payload: dict) -> dict[str, Any]:
     if not configured():
         return {"ok": False, "reason": "disabled"}
     contact, lead, resolution = await _resolve(payload)
@@ -324,3 +337,8 @@ async def process(payload: dict) -> dict[str, Any]:
     )
     academy_invite_delivery.schedule(payload, int(lead["id"]))
     return {"ok": True, "contact_id": contact["id"], "lead_id": lead["id"], "resolution": resolution}
+
+
+async def process(payload: dict) -> dict[str, Any]:
+    async with _UPSERT_LOCK:
+        return await _process_unlocked(payload)
