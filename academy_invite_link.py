@@ -23,6 +23,7 @@ from waybill_config import (
     FIELD_ACADEMY_EVENT_REGISTRATION,
     FIELD_ACADEMY_PRACTICUM_LINK,
     PIPELINE_ACADEMY,
+    TG_PROXY_URL,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -90,7 +91,7 @@ def on_contact_change(contact_id, changed_field_ids: set[int] | None = None) -> 
 async def _telegram(method: str, payload: dict) -> dict | None:
     url = f"https://api.telegram.org/bot{ACADEMY_INVITE_BOT_TOKEN}/{method}"
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, proxy=TG_PROXY_URL or None) as client:
             response = await client.post(url, json=payload)
         data = response.json()
     except Exception:
@@ -138,7 +139,10 @@ async def process_contact(contact_id, *, delay: float = 0) -> str:
     return "written" if "written" in outcomes else outcomes[0]
 
 
-async def process_lead(lead_id, *, delay: float = 0, contact: dict | None = None) -> str:
+async def process_lead(
+    lead_id, *, delay: float = 0, contact: dict | None = None,
+    allow_historical: bool = False,
+) -> str:
     """Создать ровно одну ссылку и записать её в пустое поле сделки.
 
     Возвраты стабильны для наблюдаемости/тестов: disabled, no_lead, other_pipeline,
@@ -159,7 +163,10 @@ async def process_lead(lead_id, *, delay: float = 0, contact: dict | None = None
                 return "no_lead"
             if str(lead.get("pipeline_id")) != str(PIPELINE_ACADEMY):
                 return "other_pipeline"
-            if not ACADEMY_CUTOVER_TS or int(lead.get("created_at") or 0) < ACADEMY_CUTOVER_TS:
+            if not allow_historical and (
+                not ACADEMY_CUTOVER_TS
+                or int(lead.get("created_at") or 0) < ACADEMY_CUTOVER_TS
+            ):
                 return "before_cutover"
 
             contact_id = _main_contact_id(lead)

@@ -1,10 +1,4 @@
-"""Доставка персонального приглашения через канал Академии в BotHelp.
-
-Ссылка создаётся отдельным Telegram-ботом и хранится в сделке amoCRM. Клиенту
-сообщение отправляет BotHelp по CUID, поэтому оно приходит из того же канала
-Академии, в котором человек проходил сценарий. Локальный журнал по lead_id
-защищает от повторной отправки при ретраях webhook.
-"""
+"""Fail-closed Academy invite delivery through the exact Wazzup channel."""
 
 from __future__ import annotations
 
@@ -12,20 +6,23 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Any
 
 import httpx
 
 import academy_invite_link
 import amo_service
 from waybill_config import (
-    ACADEMY_BOTHELP_CLIENT_ID,
-    ACADEMY_BOTHELP_CLIENT_SECRET,
     ACADEMY_INVITE_MESSAGE_DELAY_S,
+    ACADEMY_INVITE_SEND_ENABLED,
     ACADEMY_INVITE_SENT_PATH,
+    ACADEMY_INVITE_WAZZUP_CHANNEL_ID,
+    ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID,
     ACADEMY_MANAGER_FIRST_NAME,
     FIELD_ACADEMY_PRACTICUM_LINK,
+    WAZZUP_API_KEY,
+    WAZZUP_API_URL,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,7 +31,9 @@ _locks: dict[str, asyncio.Lock] = {}
 
 
 def configured() -> bool:
-    return bool(ACADEMY_BOTHELP_CLIENT_ID and ACADEMY_BOTHELP_CLIENT_SECRET)
+    return bool(ACADEMY_INVITE_SEND_ENABLED and WAZZUP_API_KEY
+                and ACADEMY_INVITE_WAZZUP_CHANNEL_ID
+                and ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID)
 
 
 def _sent_path() -> Path:
@@ -44,7 +43,7 @@ def _sent_path() -> Path:
 def _read_sent() -> set[str]:
     try:
         data = json.loads(_sent_path().read_text(encoding="utf-8"))
-        return {str(item) for item in data if item is not None} if isinstance(data, list) else set()
+        return {str(x) for x in data} if isinstance(data, list) else set()
     except (FileNotFoundError, OSError, ValueError, TypeError):
         return set()
 
@@ -55,48 +54,6 @@ def _write_sent(values: set[str]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(sorted(values), ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
-
-
-async def _token() -> str | None:
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                "https://oauth.bothelp.io/oauth2/token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": ACADEMY_BOTHELP_CLIENT_ID,
-                    "client_secret": ACADEMY_BOTHELP_CLIENT_SECRET,
-                },
-            )
-        data = response.json()
-    except Exception:
-        logger.exception("Академия-приглашения: не удалось получить токен BotHelp")
-        return None
-    if response.status_code != 200:
-        logger.warning("Академия-приглашения: BotHelp OAuth вернул %s", response.status_code)
-        return None
-    return str(data.get("access_token") or "").strip() or None
-
-
-async def _bothelp_request(method: str, path: str, *, body: Any, content_type: str) -> bool:
-    token = await _token()
-    if not token:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.request(
-                method,
-                f"https://api.bothelp.io{path}",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
-                json=body,
-            )
-    except Exception:
-        logger.exception("Академия-приглашения: BotHelp API недоступен")
-        return False
-    if response.status_code not in (200, 201, 202, 204):
-        logger.warning("Академия-приглашения: BotHelp API вернул %s", response.status_code)
-        return False
-    return True
 
 
 def _first_name(payload: dict) -> str:
@@ -114,59 +71,103 @@ def _message(payload: dict, link: str) -> str:
     )
 
 
+def _valid_link(value: object) -> str:
+    link = str(value or "").strip()
+    return link if re.fullmatch(r"https://t\.me/\S+", link) else ""
+
+
+def _phone(payload: dict) -> str:
+    digits = re.sub(r"\D", "", str(payload.get("phone") or ""))
+    return digits if 10 <= len(digits) <= 15 else ""
+
+
+async def _request(method: str, path: str, *, body: dict | None = None) -> httpx.Response | None:
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            return await client.request(
+                method, f"{WAZZUP_API_URL}{path}",
+                headers={"Authorization": f"Bearer {WAZZUP_API_KEY}"}, json=body,
+            )
+    except Exception:
+        logger.exception("Академия-приглашения: Wazzup API недоступен")
+        return None
+
+
+async def _channel_is_exact() -> bool:
+    response = await _request("GET", "/channels")
+    if response is None or response.status_code != 200:
+        return False
+    try:
+        channels = response.json()
+    except ValueError:
+        return False
+    if isinstance(channels, dict):
+        channels = channels.get("channels") or channels.get("data") or []
+    for channel in channels if isinstance(channels, list) else []:
+        if str(channel.get("channelId") or channel.get("id") or "") != ACADEMY_INVITE_WAZZUP_CHANNEL_ID:
+            continue
+        plain = str(channel.get("plainId") or channel.get("plain_id") or "")
+        state = str(channel.get("state") or channel.get("status") or "").lower()
+        transport = str(channel.get("transport") or channel.get("type") or "").lower()
+        return plain == ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID and state in ("active", "") and transport == "tgapi"
+    return False
+
+
+async def _send(payload: dict, lead_id: int, link: str) -> str:
+    phone = _phone(payload)
+    if not phone or not await _channel_is_exact():
+        return "channel_or_recipient_invalid"
+    response = await _request("POST", "/message", body={
+        "channelId": ACADEMY_INVITE_WAZZUP_CHANNEL_ID,
+        "chatType": "telegram", "phone": phone,
+        "text": _message(payload, link),
+        "crmMessageId": f"academy-practicum-{lead_id}",
+    })
+    if response is None:
+        return "message_error"
+    if response.status_code in (200, 201, 202):
+        return "sent"
+    if response.status_code == 400 and "repeatedCrmMessageId" in response.text:
+        return "already_sent"
+    logger.warning("Академия-приглашения: Wazzup API вернул %s", response.status_code)
+    return "message_error"
+
+
 async def process(payload: dict, lead_id: int, *, delay: float = 0) -> str:
     if not configured():
         return "disabled"
-    cuid = str(payload.get("cuid") or "").strip()
-    registration = str(payload.get("Регистрация на мероприятие") or "").casefold()
-    if not cuid or "практикум" not in registration:
+    if "практикум" not in str(payload.get("Регистрация на мероприятие") or "").casefold():
         return "not_practicum"
     if delay:
         await asyncio.sleep(delay)
-
-    key = str(lead_id)
-    lock = _locks.setdefault(key, asyncio.Lock())
+    lock_key = str(lead_id)
+    sent_key = f"wazzup:{lead_id}"
+    lock = _locks.setdefault(lock_key, asyncio.Lock())
     try:
         async with lock:
             sent = _read_sent()
-            if key in sent:
+            if sent_key in sent:
                 return "already_sent"
-
             lead = await amo_service.get_lead_full(lead_id, with_=())
-            link = str(amo_service.get_custom_field_value(lead or {}, FIELD_ACADEMY_PRACTICUM_LINK) or "").strip()
+            link = _valid_link(amo_service.get_custom_field_value(lead or {}, FIELD_ACADEMY_PRACTICUM_LINK))
             if not link:
                 result = await academy_invite_link.process_lead(lead_id)
                 if result not in ("written", "already_filled"):
                     return f"link_{result}"
+                # Mandatory readback: never trust the amo PATCH response alone.
                 lead = await amo_service.get_lead_full(lead_id, with_=())
-                link = str(amo_service.get_custom_field_value(lead or {}, FIELD_ACADEMY_PRACTICUM_LINK) or "").strip()
+                link = _valid_link(amo_service.get_custom_field_value(lead or {}, FIELD_ACADEMY_PRACTICUM_LINK))
             if not link:
                 return "link_missing"
-
-            field_ok = await _bothelp_request(
-                "PATCH",
-                f"/v1/subscribers/cuid/{cuid}/customFields",
-                body=[{"op": "replace", "path": "/invite_link", "value": link}],
-                content_type="application/json",
-            )
-            if not field_ok:
-                return "field_error"
-            message_ok = await _bothelp_request(
-                "POST",
-                f"/v1/subscribers/cuid/{cuid}/messages",
-                body=[{"content": _message(payload, link)}],
-                content_type="application/vnd.api+json",
-            )
-            if not message_ok:
-                return "message_error"
-
-            sent.add(key)
-            _write_sent(sent)
-            logger.info("Академия-приглашения: сообщение отправлено по сделке %s", lead_id)
-            return "sent"
+            result = await _send(payload, lead_id, link)
+            if result == "sent":
+                sent.add(sent_key)
+                _write_sent(sent)
+                logger.info("Академия-приглашения: Wazzup принял сообщение по сделке %s", lead_id)
+            return result
     finally:
         if not lock.locked():
-            _locks.pop(key, None)
+            _locks.pop(lock_key, None)
 
 
 def schedule(payload: dict, lead_id: int) -> None:

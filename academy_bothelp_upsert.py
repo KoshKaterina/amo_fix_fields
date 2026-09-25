@@ -180,13 +180,9 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
 def _target_status(payload: dict, current_status: int | None) -> int | None:
     if current_status is not None and current_status not in _BOT_STATUSES:
         return None
-    event = _text(payload.get("Регистрация на мероприятие")).lower()
-    manager_action = _text(payload.get("действие менеджера")).lower()
-    if "практикум" in event or "практикум" in manager_action:
-        return STATUS_RECORDED_PRACTICUM
     answers = [_text(payload.get(k)) for k in ("опыт_в_инвестициях", "размер_капитала", "зачем_капитал")]
     if all(answers):
-        return STATUS_QUESTIONNAIRE_DONE
+        return STATUS_QUESTIONNAIRE_DONE if current_status != STATUS_QUESTIONNAIRE_DONE else None
     if any(answers):
         return STATUS_QUESTIONNAIRE
     return STATUS_BOT_STARTED if current_status in (None, STATUS_INBOUND) else None

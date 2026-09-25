@@ -832,6 +832,11 @@ ACADEMY_MANAGER_FIRST_NAME = os.getenv("ACADEMY_MANAGER_FIRST_NAME", "Артем
 ACADEMY_INVITE_SENT_PATH = os.getenv(
     "ACADEMY_INVITE_SENT_PATH", "/app/var/academy_invite_sent.json",
 ).strip()
+ACADEMY_INVITE_SEND_ENABLED = os.getenv("ACADEMY_INVITE_SEND_ENABLED", "0") == "1"
+ACADEMY_INVITE_WAZZUP_CHANNEL_ID = os.getenv("ACADEMY_INVITE_WAZZUP_CHANNEL_ID", "").strip()
+ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID = os.getenv(
+    "ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID", "79250833349",
+).strip()
 # Обязательный cutover-гард для всех новых автоматик Академии. При 0 они не
 # обрабатывают ни одну сделку, даже если мастер-флаг случайно включили.
 ACADEMY_CUTOVER_TS = int(os.getenv("ACADEMY_CUTOVER_TS", "0") or "0")

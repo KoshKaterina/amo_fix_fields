@@ -115,6 +115,20 @@ def test_historical_lead_does_not_create_link(monkeypatch):
     assert created == []
 
 
+def test_historical_lead_can_be_explicitly_backfilled(monkeypatch):
+    old = lead()
+    old["created_at"] = 99
+    async def get_lead(*args, **kwargs): return old
+    async def get_contact(*args, **kwargs): return contact()
+    async def create(*args, **kwargs): return "https://t.me/+backfill"
+    async def patch(*args, **kwargs): return {"ok": True}
+    monkeypatch.setattr(invite.amo_service, "get_lead_full", get_lead)
+    monkeypatch.setattr(invite.amo_service, "get_contact_by_id", get_contact)
+    monkeypatch.setattr(invite.amo_service, "patch_lead", patch)
+    monkeypatch.setattr(invite, "_create_link", create)
+    assert run(invite.process_lead(77, allow_historical=True)) == "written"
+
+
 def test_patch_failure_revokes_orphan(monkeypatch):
     async def get_lead(*args, **kwargs):
         return lead()
