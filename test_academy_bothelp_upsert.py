@@ -60,3 +60,60 @@ def test_process_updates_existing_contact_and_lead(monkeypatch):
     assert result["ok"] is True
     assert patched_contacts[0][0:2] == (10, "Тест Кат")
     assert patched_leads == [(20, {"status_id": mod.STATUS_QUESTIONNAIRE_DONE, "pipeline_id": mod.PIPELINE_ACADEMY, "responsible_user_id": mod.ACADEMY_RESPONSIBLE_USER_ID})]
+
+
+def test_old_flow_registration_moves_stage_without_delivery(monkeypatch):
+    stored_contact = {
+        "id": 10,
+        "custom_fields_values": [
+            {"field_id": mod.FIELD_EVENT, "values": [{"value": "Практикум октябрь 2026"}]},
+            {"field_id": mod.FIELD_ACTION, "values": [{"value": "связаться с клиентом"}]},
+        ],
+        "_embedded": {"leads": [{"id": 20}]},
+    }
+    lead = {"id": 20, "pipeline_id": mod.PIPELINE_ACADEMY,
+            "status_id": mod.STATUS_QUESTIONNAIRE_DONE, "created_at": 200}
+    lead_reads = iter([
+        lead,
+        {**lead, "status_id": mod.STATUS_RECORDED_PRACTICUM},
+    ])
+    patched = []
+    scheduled = []
+
+    async def candidates(_payload): return [stored_contact]
+    async def contact_read(_id, with_=()): return stored_contact
+    async def leads(_ids): return [lead]
+    async def update(*_a, **_k): return True
+    async def get_lead(*_a, **_k): return next(lead_reads)
+    async def patch(lid, **kwargs): patched.append((lid, kwargs)); return {"ok": True}
+
+    monkeypatch.setattr(mod, "configured", lambda: True)
+    monkeypatch.setattr(mod, "_candidate_contacts", candidates)
+    monkeypatch.setattr(mod, "_matches", lambda c, p: True)
+    monkeypatch.setattr(mod.amo_service, "get_contact_by_id", contact_read)
+    monkeypatch.setattr(mod.amo_service, "get_leads_by_ids", leads)
+    monkeypatch.setattr(mod.api, "update_contact", update)
+    monkeypatch.setattr(mod.amo_service, "get_lead_full", get_lead)
+    monkeypatch.setattr(mod.amo_service, "patch_lead", patch)
+    monkeypatch.setattr(mod.academy_invite_delivery, "schedule", lambda *a: scheduled.append(a))
+
+    old709 = payload(**{"действие менеджера": "связаться с клиентом"})
+    result = run(mod.process(old709))
+    assert result["progression"] == "recorded_practicum"
+    assert patched == [(20, {
+        "status_id": mod.STATUS_RECORDED_PRACTICUM,
+        "pipeline_id": mod.PIPELINE_ACADEMY,
+        "responsible_user_id": mod.ACADEMY_RESPONSIBLE_USER_ID,
+    })]
+    assert scheduled == []
+
+
+def test_non_registration_keeps_questionnaire_progression():
+    assert mod._is_forward_only_practicum(payload(**{
+        "Регистрация на мероприятие": "",
+        "действие менеджера": "",
+    })) is False
+    assert mod._target_status(payload(**{
+        "Регистрация на мероприятие": "",
+        "действие менеджера": "",
+    }), mod.STATUS_QUESTIONNAIRE) == mod.STATUS_QUESTIONNAIRE_DONE

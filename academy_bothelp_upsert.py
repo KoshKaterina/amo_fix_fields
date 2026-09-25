@@ -45,6 +45,7 @@ STATUS_QUESTIONNAIRE = 88838382
 STATUS_QUESTIONNAIRE_DONE = 88838386
 STATUS_RECORDED_PRACTICUM = STATUS_ACADEMY_RECORDED_PRACTICUM
 _BOT_STATUSES = {STATUS_INBOUND, STATUS_BOT_STARTED, STATUS_QUESTIONNAIRE, STATUS_QUESTIONNAIRE_DONE}
+_FORWARD_ONLY_PRACTICUM_ACTION = "связаться с клиентом"
 
 _CUSTOM_MAP = {
     "pd_consent": FIELD_PD_CONSENT,
@@ -115,6 +116,46 @@ def _payload_fields(payload: dict) -> dict[int, str]:
         if value:
             out[field_id] = value
     return out
+
+
+def _is_practicum_registration(payload: dict) -> bool:
+    return "практикум" in _text(payload.get("Регистрация на мероприятие")).casefold()
+
+
+def _is_forward_only_practicum(payload: dict) -> bool:
+    action = _text(payload.get("действие менеджера") or payload.get("manager_action"))
+    return _is_practicum_registration(payload) and action.casefold() == _FORWARD_ONLY_PRACTICUM_ACTION
+
+
+async def _promote_forward_only_practicum(payload: dict, contact_id: int, lead: dict) -> str:
+    """Move legacy flow registrations forward without creating or sending a link."""
+    contact = await amo_service.get_contact_by_id(contact_id, with_=())
+    if not contact:
+        return "contact_readback_failed"
+    for field_id in (FIELD_EVENT, FIELD_ACTION):
+        expected = _payload_fields(payload).get(field_id, "")
+        if not expected or _field(contact, field_id).casefold() != expected.casefold():
+            return "contact_readback_mismatch"
+
+    current = await amo_service.get_lead_full(int(lead["id"]), with_=())
+    if not current:
+        return "lead_readback_failed"
+    status = int(current.get("status_id") or 0)
+    if status != STATUS_RECORDED_PRACTICUM:
+        if status not in _BOT_STATUSES:
+            return "stage_guard"
+        patched = await amo_service.patch_lead(
+            int(lead["id"]),
+            status_id=STATUS_RECORDED_PRACTICUM,
+            pipeline_id=PIPELINE_ACADEMY,
+            responsible_user_id=ACADEMY_RESPONSIBLE_USER_ID,
+        )
+        if not patched.get("ok"):
+            return "stage_update_failed"
+    confirmed = await amo_service.get_lead_full(int(lead["id"]), with_=())
+    if int((confirmed or {}).get("status_id") or 0) != STATUS_RECORDED_PRACTICUM:
+        return "stage_readback_mismatch"
+    return "recorded_practicum"
 
 
 async def _candidate_contacts(payload: dict) -> list[dict] | None:
@@ -228,6 +269,22 @@ async def process(payload: dict) -> dict[str, Any]:
         if not lead_id:
             return {"ok": False, "reason": "lead_create_failed", "contact_id": contact["id"]}
         lead = {"id": lead_id, "status_id": STATUS_BOT_STARTED, "created_at": ACADEMY_CUTOVER_TS}
+
+    if _is_forward_only_practicum(payload):
+        progression = await _promote_forward_only_practicum(payload, int(contact["id"]), lead)
+        if progression != "recorded_practicum":
+            return {
+                "ok": False, "reason": progression,
+                "contact_id": contact["id"], "lead_id": lead["id"],
+            }
+        logger.info(
+            "ACADEMY_BOTHELP_UPSERT forward-only cuid=%s contact=%s lead=%s",
+            _text(payload.get("cuid")), contact["id"], lead["id"],
+        )
+        return {
+            "ok": True, "contact_id": contact["id"], "lead_id": lead["id"],
+            "resolution": resolution, "progression": progression,
+        }
 
     target = _target_status(payload, int(lead.get("status_id") or 0))
     if target:
