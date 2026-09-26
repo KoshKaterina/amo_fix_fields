@@ -232,8 +232,12 @@ async def _create_lead_for_mail(
     return lead_id
 
 
-async def _handle_event(ev: dict) -> str:
-    """Разбор одного события письма. Возвращает решение (см. константы стора)."""
+async def _handle_event(ev: dict, created: list[dict] | None = None) -> str:
+    """Разбор одного события письма. Возвращает решение (см. константы стора).
+
+    `created` — список, куда дописываются детали сработавших писем (отправитель, тема,
+    ссылки). Из него собирается уведомление в Телеграм: Катя просила писать про КАЖДУЮ
+    созданную сделку, а «создано: 1» без темы и ссылок этого не даёт."""
     entity_type = str(ev.get("entity_type") or "")
     entity_id = ev.get("entity_id")
     value_after = ev.get("value_after") or []
@@ -335,6 +339,9 @@ async def _handle_event(ev: dict) -> str:
             "прежняя сделка %s)",
             sender, params.get("subject"), _lead_link(source_lead_id) if source_lead_id else "нет",
         )
+        if created is not None:
+            created.append({"sender": sender, "subject": params.get("subject"),
+                            "lead_id": None, "source_lead_id": source_lead_id})
         return _mark(store.DECISION_REPORT_ONLY)
 
     lead_id = await _create_lead_for_mail(
@@ -345,6 +352,9 @@ async def _handle_event(ev: dict) -> str:
     )
     if lead_id is None:
         return _mark(store.DECISION_FAILED)
+    if created is not None:
+        created.append({"sender": sender, "subject": params.get("subject"),
+                        "lead_id": lead_id, "source_lead_id": source_lead_id})
     return _mark(store.DECISION_CREATED, lead_id=lead_id)
 
 
@@ -387,10 +397,11 @@ async def reconcile_once() -> str:
         return "skipped-amo-silent"
 
     decisions: dict[str, int] = {}
+    created: list[dict] = []
     silent = 0
     for ev in events:
         try:
-            decision = await _handle_event(ev)
+            decision = await _handle_event(ev, created)
         except _AmoSilent as exc:
             silent += 1
             logger.warning("mail_watch: %s — письмо разберём следующим проходом", exc)
@@ -415,22 +426,31 @@ async def reconcile_once() -> str:
             f", отложено {silent}" if silent else "",
         )
 
-    interesting = decisions.get(store.DECISION_CREATED, 0) + decisions.get(store.DECISION_REPORT_ONLY, 0)
-    if interesting and MAIL_WATCH_ALERT_ENABLED:
-        await _notify(decisions)
+    if created and MAIL_WATCH_ALERT_ENABLED:
+        await _notify(created)
     return f"events={len(events)}"
 
 
-async def _notify(decisions: dict[str, int]) -> None:
-    created = decisions.get(store.DECISION_CREATED, 0)
-    would = decisions.get(store.DECISION_REPORT_ONLY, 0)
-    if created:
-        text = f"📬 Письмо клиента по закрытой сделке: создано новых сделок — {created}"
-    else:
-        text = (
-            f"📬 Письмо клиента по закрытой сделке: сторож завёл бы сделок — {would} "
-            "(режим отчёта, ничего не создано)"
-        )
+async def _notify(created: list[dict]) -> None:
+    """Сообщение про каждое сработавшее письмо (Катя 26.09.2026: писать каждый раз, когда
+    создаём сделку). Без темы, отправителя и двух ссылок уведомление бесполезно — из него
+    непонятно, что открывать."""
+    real = [c for c in created if c.get("lead_id")]
+    head = (
+        f"📬 Письмо клиента по закрытой сделке: новых сделок {len(real)}"
+        if real
+        else f"📬 Письмо клиента по закрытой сделке: сторож завёл бы сделок {len(created)} "
+             "(режим отчёта, ничего не создано)"
+    )
+    lines = [head]
+    for c in created:
+        subject = (c.get("subject") or "без темы").strip()
+        lines.append(f"— от {c.get('sender') or 'адрес не указан'}, тема «{subject}»")
+        if c.get("lead_id"):
+            lines.append(f"   новая сделка: {_lead_link(c['lead_id'])}")
+        if c.get("source_lead_id"):
+            lines.append(f"   письмо лежит здесь: {_lead_link(c['source_lead_id'])}")
+    text = "\n".join(lines)
     try:
         d = alerts.decide(
             "mail_watch",

@@ -405,6 +405,45 @@ def test_mail_attached_to_contact_without_leads(fresh, monkeypatch):
     assert [lead_id for lead_id, _ in amo.notes_added] == [amo.created[0]["id"]]
 
 
+def test_alert_names_sender_subject_and_both_links(fresh, monkeypatch):
+    """Катя просила писать про каждую созданную сделку. Значит в уведомлении должны быть
+    отправитель, тема и ДВЕ ссылки: на новую сделку и на ту, где лежит само письмо."""
+    amo = fresh
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_CREATE_ENABLED", True)
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_ALERT_ENABLED", True)
+    amo.leads[1] = _closed_lead(1, 55)
+    amo.contact_leads[55] = [1]
+    amo.notes[101] = _mail_note(101, message_id="m1", thread_id="t1",
+                               sender="client@example.com", subject="Возврат")
+    amo.events = [_event(101, entity_id=1)]
+
+    run(mail_watch.reconcile_once())
+
+    assert len(_sent) == 1, "на сработавшее письмо должно уйти ровно одно уведомление"
+    msg = _sent[0]
+    new_lead = amo.created[0]["id"]
+    assert "client@example.com" in msg
+    assert "Возврат" in msg
+    assert f"/leads/detail/{new_lead}" in msg, "нет ссылки на новую сделку"
+    assert "/leads/detail/1" in msg, "нет ссылки на сделку с письмом"
+
+
+def test_no_alert_when_nothing_happened(fresh, monkeypatch):
+    """Робот написал — уведомления быть не должно, иначе чат перестанут читать."""
+    amo = fresh
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_CREATE_ENABLED", True)
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_ALERT_ENABLED", True)
+    amo.leads[1] = _closed_lead(1, 55)
+    amo.contact_leads[55] = [1]
+    amo.notes[101] = _mail_note(101, message_id="m1", thread_id="t1",
+                               sender="mailer-daemon@yandex.ru")
+    amo.events = [_event(101, entity_id=1)]
+
+    run(mail_watch.reconcile_once())
+
+    assert _sent == []
+
+
 def test_module_does_not_move_or_delete_leads():
     """Сторож только создаёт и пишет примечания. Ни перевода этапов, ни удаления."""
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mail_watch.py"),
