@@ -25,6 +25,7 @@ import dup_autoclose
 import jivo_service
 import lead_distribution
 import lead_distribution_profiles_client
+import mail_watch
 import alert_settings_client
 import metrika_sync
 import migration_freeze
@@ -126,6 +127,10 @@ async def lifespan(app):
     await new_lead_watch.init()
     # Формы сайта: без SITE_FORM_ENABLED роут отвечает 404 и ничего не делает.
     await site_form_service.init()
+    # Сторож писем (26.09.2026): входящее письмо в закрытую сделку теряется для работы -
+    # amoCRM продолжает старую цепочку и нового «Неразобранного» не создаёт. Модуль сам
+    # первым делом смотрит MAIL_WATCH_ENABLED и без него не поднимает ни базу, ни цикл.
+    await mail_watch.init()
     # Протез amgroup (03.09.2026): их интеграция МойСклад -> amoCRM встала 02.09.
     # Сборку сделки подключаем точкой расширения, чтобы протез искал заказы, а
     # создавал их отдельный модуль - оба выключены флагами по умолчанию.
@@ -149,6 +154,7 @@ async def lifespan(app):
     await uis_missed_call.shutdown()
     await new_lead_watch.shutdown()
     await site_form_service.shutdown()
+    await mail_watch.shutdown()
     await amgroup_fallback.shutdown()
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
@@ -184,7 +190,8 @@ async def health():
     Блок telegram - состояние контура уведомлений: молчащий бот внутри живого
     контейнера иначе неотличим от тишины по отсутствию событий (инцидент 28.08.2026,
     сутки без алертов при зелёном контейнере)."""
-    return {"status": "ok", "telegram": telegram_bot.telegram_health(), **queue_stats()}
+    return {"status": "ok", "telegram": telegram_bot.telegram_health(),
+            "mail_watch": mail_watch.status(), **queue_stats()}
 
 
 def insert_nested(data, keys, value):

@@ -1208,6 +1208,64 @@ TAG_LEAD_DISTRIBUTION_ROUTED = "распределено автоматичес�
 # повторные попытки reconciliation (по образцу TAG_OFFICE_TRANSFER_ERROR).
 TAG_LEAD_DISTRIBUTION_ERROR = "ошибка распределения"
 
+# ---------------------------------------------------------------------------
+# Сторож писем (26.09.2026, решение Кати: делаем опросом, не хуком Цифровой
+# воронки). Входящее письмо клиента, упавшее ТОЛЬКО в закрытые сделки, теряется
+# для работы: amoCRM продолжает старую цепочку и нового «Неразобранного» не
+# создаёт. Замер за 30 дней: 105 из 117 входящих писем ушли в закрытые сделки.
+# Модуль — mail_watch.py, память — mail_watch_store.py.
+# ---------------------------------------------------------------------------
+# Мастер-флаг: поднимает цикл опроса. OFF по умолчанию.
+MAIL_WATCH_ENABLED = os.getenv("MAIL_WATCH_ENABLED", "").strip() == "1"
+# Разрешение СОЗДАВАТЬ сделки. Без него модуль работает в режиме отчёта: считает и
+# пишет в лог, что сделал бы. Сутки в отчёте перед включением записи — шаг 5 схемы
+# разбора (projects/amo-cleanup/knowledge/amo-povtornoe-pismo-ne-sozdaet-sdelku.md).
+MAIL_WATCH_CREATE_ENABLED = os.getenv("MAIL_WATCH_CREATE_ENABLED", "").strip() == "1"
+# Период опроса журнала событий. Три минуты выбраны не «на всякий случай»: медиана
+# времени до нашего ответа на письмо — 249 минут (39 переписок за 60 дней), быстрее
+# 5 минут не ответили ни разу. Чаще опрашивать нечего, реже — теряется смысл слова
+# «сторож». Цена — около 480 запросов в сутки, это 0,08% лимита интеграции.
+MAIL_WATCH_INTERVAL_S = int(os.getenv("MAIL_WATCH_INTERVAL_S", "180"))
+# Перекрытие окна: событие регистрируется не мгновенно, и письмо, пришедшее на
+# границе прохода, иначе выпало бы в щель между окнами. Дедуп по note_id делает
+# перечитывание бесплатным.
+MAIL_WATCH_OVERLAP_S = int(os.getenv("MAIL_WATCH_OVERLAP_S", "180"))
+# Потолок оглядки назад: после долгого простоя не читаем весь архив событий.
+MAIL_WATCH_MAX_LOOKBACK_S = int(os.getenv("MAIL_WATCH_MAX_LOOKBACK_S", "86400"))
+# ⚠️ Граница включения (unix-время). Без неё первый проход поехал бы по архиву —
+# та же защита, что OFFICE_TRANSFER_SINCE_TS. Не задана = модуль не работает.
+MAIL_WATCH_SINCE_TS = int(os.getenv("MAIL_WATCH_SINCE_TS", "0"))
+# Письмо старше этого (минуты) не разбираем: при догоне после простоя заводить
+# сделку по позавчерашнему письму бессмысленно, менеджер уже ответил или не ответит.
+MAIL_WATCH_MAX_AGE_MIN = int(os.getenv("MAIL_WATCH_MAX_AGE_MIN", "1440"))
+# Маски служебных отправителей: роботы, рассылки, уведомления площадок. В замере
+# ПОЛОВИНА писем, подходящих под правило, оказалась рассылками и холодными
+# предложениями услуг, поэтому список ведём через окружение, а не в коде.
+MAIL_WATCH_IGNORE_SENDERS = tuple(
+    s.strip().lower()
+    for s in os.getenv(
+        "MAIL_WATCH_IGNORE_SENDERS",
+        "mailer-daemon,postmaster@,noreply,no-reply,notification@,@360.yandex,"
+        "tips@avito,promotion@,market.yandex,hello@yandex-team,notify@,mail@sendpulse",
+    ).split(",")
+    if s.strip()
+)
+# Куда падает новая сделка. Значения не зашиты: воронку и этап называет Катя, без
+# них создание не включается (модуль ругается в лог и ничего не делает).
+MAIL_WATCH_TARGET_PIPELINE_ID = int(os.getenv("MAIL_WATCH_TARGET_PIPELINE_ID", "0"))
+MAIL_WATCH_TARGET_STATUS_ID = int(os.getenv("MAIL_WATCH_TARGET_STATUS_ID", "0"))
+# Ответственный. Обязателен при включённом создании: без него сделку никто не
+# увидит — на сделки сторожа ни распределитель, ни боты не настроены.
+MAIL_WATCH_RESPONSIBLE_USER_ID = int(os.getenv("MAIL_WATCH_RESPONSIBLE_USER_ID", "0"))
+# Имя сделки: «<префикс>: <тема письма>».
+MAIL_WATCH_LEAD_NAME_PREFIX = os.getenv("MAIL_WATCH_LEAD_NAME_PREFIX", "Письмо").strip()
+# Тег на созданных сделках — чтобы их было видно фильтром и можно было исключить
+# из чужой автоматики.
+MAIL_WATCH_TAG = os.getenv("MAIL_WATCH_TAG", "письмо по закрытой сделке").strip()
+# Уведомление в Телеграм по итогу прохода (только когда есть что сказать).
+MAIL_WATCH_ALERT_ENABLED = os.getenv("MAIL_WATCH_ALERT_ENABLED", "").strip() == "1"
+MAIL_WATCH_ALERT_CHAT_ID = os.getenv("MAIL_WATCH_ALERT_CHAT_ID", "").strip()
+
 # Секрет в пути для /admin/lead-distribution/* (пайплайны/источники/сотрудники —
 # CRUD профилей 09.08.2026 переехал в team-panel, см. lead_distribution_profiles_client.py).
 # Пусто → эндпоинты недоступны (403 на любой секрет).
