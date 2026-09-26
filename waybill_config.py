@@ -815,6 +815,68 @@ ACADEMY_LEAD_ALERT_DEDUP_H = int(os.getenv("ACADEMY_LEAD_ALERT_DEDUP_H", "24"))
 # Перебор = похоже на массовый перенос сделок: одно предупреждение и тишина до конца часа.
 ACADEMY_LEAD_ALERT_HOUR_LIMIT = int(os.getenv("ACADEMY_LEAD_ALERT_HOUR_LIMIT", "20"))
 
+# Одноразовые ссылки в закрытые чаты мероприятий Академии. Мастер-флаг OFF:
+# включать только после проверки токена и chat_id. Бот не пишет в чат — только
+# вызывает createChatInviteLink(member_limit=1), а ссылку кладёт в сделку amo.
+ACADEMY_INVITE_LINK_ENABLED = os.getenv("ACADEMY_INVITE_LINK_ENABLED", "0") == "1"
+ACADEMY_INVITE_BOT_TOKEN = os.getenv("ACADEMY_INVITE_BOT_TOKEN", "").strip()
+ACADEMY_BOTHELP_UPSERT_ENABLED = os.getenv("ACADEMY_BOTHELP_UPSERT_ENABLED", "0").strip() == "1"
+ACADEMY_BOTHELP_WEBHOOK_SECRET = os.getenv("ACADEMY_BOTHELP_WEBHOOK_SECRET", "").strip()
+ACADEMY_PRACTICUM_CHAT_ID = os.getenv("ACADEMY_PRACTICUM_CHAT_ID", "").strip()
+ACADEMY_CONFERENCE_CHAT_ID = os.getenv("ACADEMY_CONFERENCE_CHAT_ID", "").strip()
+ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
+ACADEMY_BOTHELP_CLIENT_ID = os.getenv("ACADEMY_BOTHELP_CLIENT_ID", "").strip()
+ACADEMY_BOTHELP_CLIENT_SECRET = os.getenv("ACADEMY_BOTHELP_CLIENT_SECRET", "").strip()
+ACADEMY_INVITE_MESSAGE_DELAY_S = float(os.getenv("ACADEMY_INVITE_MESSAGE_DELAY_S", "60"))
+ACADEMY_INVITE_SENT_PATH = os.getenv(
+    "ACADEMY_INVITE_SENT_PATH", "/app/var/academy_invite_sent.json",
+).strip()
+ACADEMY_INVITE_OUTBOX_PATH = os.getenv(
+    "ACADEMY_INVITE_OUTBOX_PATH", "/app/var/academy/academy_invite_outbox.sqlite3",
+).strip()
+ACADEMY_INVITE_HISTORY_REVIEW_PATH = os.getenv(
+    "ACADEMY_INVITE_HISTORY_REVIEW_PATH", "/app/var/academy/academy_invite_history_reviews.json",
+).strip()
+ACADEMY_WAZZUP_HISTORY_API_URL = os.getenv(
+    "ACADEMY_WAZZUP_HISTORY_API_URL", "https://tech.wazzup24.com/v2",
+).rstrip("/")
+# This is a Wazzup end-customer client_access_token, not the v3 User API key.
+ACADEMY_WAZZUP_HISTORY_TOKEN = os.getenv("ACADEMY_WAZZUP_HISTORY_TOKEN", "").strip()
+ACADEMY_INVITE_HISTORY_START_AT = os.getenv(
+    "ACADEMY_INVITE_HISTORY_START_AT", "2017-01-01T00:00:00.000Z",
+).strip()
+ACADEMY_INVITE_RETRY_S = float(os.getenv("ACADEMY_INVITE_RETRY_S", "60"))
+ACADEMY_INVITE_SEND_ENABLED = os.getenv("ACADEMY_INVITE_SEND_ENABLED", "0") == "1"
+ACADEMY_INVITE_WAZZUP_CHANNEL_ID = os.getenv("ACADEMY_INVITE_WAZZUP_CHANNEL_ID", "").strip()
+ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID = os.getenv(
+    "ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID", "79250833349",
+).strip()
+# Обязательный cutover-гард для всех новых автоматик Академии. При 0 они не
+# обрабатывают ни одну сделку, даже если мастер-флаг случайно включили.
+ACADEMY_CUTOVER_TS = int(os.getenv("ACADEMY_CUTOVER_TS", "0") or "0")
+
+# Поле-триггер находится в контакте, результат — в сделке.
+FIELD_ACADEMY_EVENT_REGISTRATION = 578259
+FIELD_ACADEMY_MANAGER_ACTION = 578269
+FIELD_ACADEMY_PRACTICUM_LINK = 578271
+FIELD_ACADEMY_CONFERENCE_LINK = 578273
+FIELD_ACADEMY_PD_CONSENT = 578239
+FIELD_ACADEMY_MARKETING_CONSENT = 578245
+FIELD_ACADEMY_MARKETING_DATE_TEXT = 578277
+FIELD_ACADEMY_PD_DATE_TEXT = 578279
+STATUS_ACADEMY_RECORDED_PRACTICUM = 88835666
+
+# Уведомления в топик УВЕДОМЛЕНИЯ отдела продаж по двум полям контакта Академии.
+# OFF до общего переключения сценария; обработчик реагирует только когда amo
+# прямо прислала изменившийся field_id, поэтому старые заполненные карточки не разошлёт.
+ACADEMY_INTENT_ALERT_ENABLED = os.getenv("ACADEMY_INTENT_ALERT_ENABLED", "0") == "1"
+
+# Временное правило распределения Академии (Катя 24.09.2026): все новые лиды
+# назначаются Артёму Коннову. OFF до общего переключения BotHelp-копии.
+ACADEMY_ASSIGNMENT_ENABLED = os.getenv("ACADEMY_ASSIGNMENT_ENABLED", "0") == "1"
+ACADEMY_RESPONSIBLE_USER_ID = int(os.getenv("ACADEMY_RESPONSIBLE_USER_ID", "13822630"))
+ACADEMY_ASSIGNMENT_DELAY_S = float(os.getenv("ACADEMY_ASSIGNMENT_DELAY_S", "5"))
+
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
 STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)
@@ -885,6 +947,21 @@ TEAM_INGEST_TOKEN = os.getenv("TEAM_INGEST_TOKEN", "").strip()
 # 0 = напоминания выключены. Час — договорённость встречи с Сашей 30.07.2026
 # (было 40 минут, порог никем не обсуждался).
 OZON_STALE_ALERT_MIN = int(os.getenv("OZON_STALE_ALERT_MIN", "60"))
+# Сделка стоит на тех-этапе «Оплата запрошена», а ссылки в 577617 нет. Это НЕ
+# «клиент не платит», это «счёт не создался»: вебхук потерялся, попытка упала в
+# дедуп-окно или менеджер очистил поле и больше сделку не трогал. Повторных
+# попыток по расписанию у модуля не было вовсе - только реакция на изменение
+# сделки, поэтому такая сделка могла стоять без ссылки сколько угодно.
+# Разбор - projects/ozon-pay/knowledge/ssylka-ne-sozdaetsya-dedup-120s.md.
+# Сверка пробует создать счёт заново, когда сделку не трогали столько минут:
+OZON_NO_LINK_RETRY_MIN = int(os.getenv("OZON_NO_LINK_RETRY_MIN", "5"))
+# ...и зовёт человека, если и после повторов ссылки нет столько минут (0 = молча):
+OZON_NO_LINK_ALERT_MIN = int(os.getenv("OZON_NO_LINK_ALERT_MIN", "15"))
+# ⚠️ Верхняя граница (Катя 23.09.2026: «сторож спамит нерелевантные сделки»).
+# Сделка, которую не трогали дольше этого, - не «счёт не создался минуту назад»,
+# а рабочая ситуация: клиент думает, менеджер ведёт переписку, сделка месяцами
+# стоит на этапе оплаты. Такие сторож не трогает вовсе: ни попыток, ни алертов.
+OZON_NO_LINK_MAX_QUIET_MIN = int(os.getenv("OZON_NO_LINK_MAX_QUIET_MIN", "120"))
 # Рабочее окно напоминаний, МСК. Без него они уходили ночью: инцидент
 # 31.07.2026, сообщения в 00:11 и 00:14. Совпадает с окном Wazzup SLA.
 OZON_ALERT_WINDOW_START_H = int(os.getenv("OZON_ALERT_WINDOW_START_H", "12"))

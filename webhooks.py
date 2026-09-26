@@ -4,7 +4,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.status import HTTP_200_OK
 
@@ -12,6 +12,11 @@ import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
 import academy_lead_alert
+import academy_invite_delivery
+import academy_intent_alert
+import academy_assignment
+import academy_consent_stamp
+import academy_bothelp_upsert
 import amgroup_shipment
 import amo_service
 import cdek_client
@@ -65,6 +70,8 @@ from queue_manager import (
     shutdown_queue,
 )
 from waybill_config import (
+    PIPELINE_ACADEMY,
+    STATUS_ACADEMY_RECORDED_PRACTICUM,
     OFFICE_TRANSFER_ENABLED,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
@@ -130,6 +137,7 @@ async def lifespan(app):
     # смотрит флаг AUTOPILOT_ENABLED и без него не поднимает ни хранилища, ни опроса
     # панели, ни фонового цикла.
     await autopilot.init()
+    academy_invite_delivery.start()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -145,6 +153,7 @@ async def lifespan(app):
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
     await autopilot.shutdown()
+    await academy_invite_delivery.stop()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await alert_settings_client.stop()
@@ -185,6 +194,21 @@ def insert_nested(data, keys, value):
             cur[key] = {}
         cur = cur[key]
     cur[keys[-1]] = value
+
+
+def contact_changed_field_ids(nested: dict) -> set[int]:
+    """field_id из payload contacts.add/update amoCRM (индексы приходят строками)."""
+    out: set[int] = set()
+    contacts = nested.get("contacts") or {}
+    for event in ("add", "update"):
+        for contact in (contacts.get(event) or {}).values():
+            fields = (contact or {}).get("custom_fields") or {}
+            for field in fields.values():
+                try:
+                    out.add(int((field or {}).get("id")))
+                except (TypeError, ValueError):
+                    continue
+    return out
 
 
 @app.get("/barcode/{ident}")
@@ -315,6 +339,10 @@ async def wazzup_webhook(secret: str, request: Request):
         wazzup_delivery.handle_webhook(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка контроля доставки")
+    try:
+        academy_invite_delivery.record_webhook(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка статуса приглашения Академии")
     # Пересылка текстов в панель (wazzup_message) — независимо от остальных:
     # упавший таймер не должен терять сообщение (источник невосполним).
     try:
@@ -403,6 +431,43 @@ async def talk_probe(request: Request):
     return {"ok": True}
 
 
+@app.post("/contact_change")
+async def contact_change(request: Request):
+    """Изменение контакта amoCRM — триггер одноразовой ссылки Академии.
+
+    Отвечаем сразу; чтение контакта/сделок и Telegram API работают в фоне.
+    Остальные интеграции контакта этот маршрут не затрагивает.
+    """
+    form = await request.form()
+    nested = {}
+    for raw_key, value in form.items():
+        keys = re.findall(r"([^\[\]]+)", raw_key)
+        insert_nested(nested, keys, value)
+    contact_id = await get_nested(nested, ["contacts", "update", "0", "id"])
+    if contact_id is None:
+        contact_id = await get_nested(nested, ["contacts", "add", "0", "id"])
+    changed_field_ids = contact_changed_field_ids(nested)
+    academy_intent_alert.on_contact_change(contact_id, changed_field_ids)
+    academy_consent_stamp.on_contact_change(contact_id, changed_field_ids)
+    return {"status": "ok"}
+
+
+@app.post("/bothelp/academy/{secret}")
+async def bothelp_academy(secret: str, request: Request):
+    """Полный профиль подписчика BotHelp -> одна карточка Академии."""
+    if not academy_bothelp_upsert.authorized(secret):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    result = await academy_bothelp_upsert.process(payload if isinstance(payload, dict) else {})
+    if not result.get("ok"):
+        logger.error("ACADEMY_BOTHELP_UPSERT failed: %s", result)
+        raise HTTPException(status_code=503, detail=result.get("reason", "upsert_failed"))
+    return result
+
+
 @app.post("/lead_change")
 async def lead_change(request: Request):
     form = await request.form()
@@ -419,9 +484,10 @@ async def lead_change(request: Request):
     promo_type = None
     comment = None
 
+    lead_add_id = await get_nested(nested, ["leads", "add", "0", "id"])
     lead_id = await get_nested(nested, ["leads", "update", "0", "id"])
     if lead_id is None:
-        lead_id = await get_nested(nested, ["leads", "add", "0", "id"])
+        lead_id = lead_add_id
 
     modified_by = await get_nested(nested, ["leads", "update", "0", "updated_by"])
     logger.info(f"lead_id: {lead_id}, modified_by: {modified_by}")
@@ -490,6 +556,25 @@ async def lead_change(request: Request):
     # воронки и этапа, чтение сделки и отправка уходят в фон (academy_lead_alert).
     # Стоит ВЫШЕ блока `updates`: этап меняют и без правки полей сделки.
     academy_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
+    initial_responsible_user_id = await get_nested(
+        nested, ["leads", "add", "0", "responsible_user_id"],
+    )
+    academy_assignment.assign_bg(
+        lead_id,
+        incoming_pipeline,
+        incoming_status,
+        is_new=lead_add_id is not None,
+        initial_responsible_user_id=initial_responsible_user_id,
+    )
+    # Ручной перевод на «Записан на практикум» — явное намерение. Вебхук
+    # может прислать текущий status_id и при иной правке, поэтому worker дополнительно
+    # требует свежее amo-событие lead_status_changed именно для этой сделки.
+    if (
+        lead_id is not None
+        and str(incoming_pipeline) == str(PIPELINE_ACADEMY)
+        and str(incoming_status) == str(STATUS_ACADEMY_RECORDED_PRACTICUM)
+    ):
+        academy_invite_delivery.schedule_manual_stage(int(lead_id))
 
     # Протез отгрузок: пока amgroup лежит, отгрузку в МойСкладе не создаёт никто
     # и товар не списывается. Вешаемся на те же этапы воронки «Офис», на которых
