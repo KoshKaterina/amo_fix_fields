@@ -64,6 +64,7 @@ from waybill_config import (
     MAIL_WATCH_ALERT_ENABLED,
     MAIL_WATCH_CREATE_ENABLED,
     MAIL_WATCH_ENABLED,
+    MAIL_WATCH_IGNORE_PIPELINES,
     MAIL_WATCH_IGNORE_SENDERS,
     MAIL_WATCH_INTERVAL_S,
     MAIL_WATCH_LEAD_NAME_PREFIX,
@@ -125,16 +126,29 @@ async def _lead_ids_of_contact(contact_id: int) -> list[int]:
 async def _has_open_lead(lead_ids: list[int], *, exclude: set[int]) -> int | None:
     """Есть ли среди сделок контакта ОТКРЫТАЯ (кроме тех, куда легло само письмо).
     Возвращает id первой найденной. amo не ответил — поднимаем _AmoSilent: молчание
-    площадки нельзя читать как «открытых сделок нет», иначе заведём лишнюю."""
+    площадки нельзя читать как «открытых сделок нет», иначе заведём лишнюю.
+
+    Воронки из MAIL_WATCH_IGNORE_PIPELINES не считаются работой: открытая сделка в
+    «Тесте» или в картотеке «Работа с базой» не значит, что письмо кто-то увидит."""
     ids = [i for i in lead_ids if i not in exclude]
     if not ids:
         return None
     leads = await amo_service.get_leads_by_ids(ids)
     if leads is None:
         raise _AmoSilent("список сделок контакта не прочитан")
+    skipped: list[int] = []
     for lead in leads:
-        if int(lead.get("status_id") or 0) not in _CLOSED_STATUSES:
-            return int(lead["id"])
+        if int(lead.get("status_id") or 0) in _CLOSED_STATUSES:
+            continue
+        if int(lead.get("pipeline_id") or 0) in MAIL_WATCH_IGNORE_PIPELINES:
+            skipped.append(int(lead["id"]))
+            continue
+        return int(lead["id"])
+    if skipped:
+        logger.info(
+            "mail_watch: открытые сделки %s лежат в воронках-исключениях — работой не считаю",
+            skipped,
+        )
     return None
 
 

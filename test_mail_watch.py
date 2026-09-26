@@ -236,7 +236,49 @@ def test_contact_with_other_open_lead(fresh, monkeypatch):
     amo = fresh
     monkeypatch.setattr(mail_watch, "MAIL_WATCH_CREATE_ENABLED", True)
     amo.leads[1] = _closed_lead(1, 55)
-    amo.leads[2] = {"id": 2, "status_id": 83537714, "_embedded": {"contacts": [{"id": 55}]}}
+    amo.leads[2] = {"id": 2, "status_id": 83537714, "pipeline_id": 10593102,
+                    "_embedded": {"contacts": [{"id": 55}]}}
+    amo.contact_leads[55] = [1, 2]
+    amo.notes[101] = _mail_note(101, message_id="m1", thread_id="t1")
+    amo.events = [_event(101, entity_id=1)]
+
+    run(mail_watch.reconcile_once())
+
+    assert amo.created == []
+    assert store.recent()[0]["decision"] == store.DECISION_CONTACT_HAS_OPEN
+
+
+def test_open_lead_in_ignored_pipeline_does_not_block(fresh, monkeypatch):
+    """Открытая сделка в воронке «Тест» или в картотеке — не признак работы.
+
+    Живой кейс 26.09.2026: письмо легло в закрытую сделку 36564831, а сторож промолчал,
+    потому что у контакта висели три прогона авто-режима в воронке «Тест» с 9 и 12 сентября.
+    """
+    amo = fresh
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_CREATE_ENABLED", True)
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_IGNORE_PIPELINES", frozenset({8642414}))
+    amo.leads[1] = _closed_lead(1, 55)
+    # открытая сделка, но в воронке «Тест»
+    amo.leads[2] = {"id": 2, "status_id": 70070986, "pipeline_id": 8642414,
+                    "_embedded": {"contacts": [{"id": 55}]}}
+    amo.contact_leads[55] = [1, 2]
+    amo.notes[101] = _mail_note(101, message_id="m1", thread_id="t1")
+    amo.events = [_event(101, entity_id=1)]
+
+    run(mail_watch.reconcile_once())
+
+    assert len(amo.created) == 1, "тестовая воронка не должна блокировать обращение"
+    assert store.recent()[0]["decision"] == store.DECISION_CREATED
+
+
+def test_open_lead_in_working_pipeline_still_blocks(fresh, monkeypatch):
+    """А открытая сделка в рабочей воронке блокирует по-прежнему."""
+    amo = fresh
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_CREATE_ENABLED", True)
+    monkeypatch.setattr(mail_watch, "MAIL_WATCH_IGNORE_PIPELINES", frozenset({8642414}))
+    amo.leads[1] = _closed_lead(1, 55)
+    amo.leads[2] = {"id": 2, "status_id": 83537714, "pipeline_id": 10593102,
+                    "_embedded": {"contacts": [{"id": 55}]}}
     amo.contact_leads[55] = [1, 2]
     amo.notes[101] = _mail_note(101, message_id="m1", thread_id="t1")
     amo.events = [_event(101, entity_id=1)]
