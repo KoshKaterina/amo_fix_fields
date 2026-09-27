@@ -35,8 +35,16 @@ WAZZUP_DELIVERY_BURST_MAX алертов за окно — шлём одну с�
 равно лежит в панели.
 
 Куда шлём: WAZZUP_DELIVERY_CHAT_ID, по умолчанию — технический чат
-(TG_ALLOWED_CHAT_ID, тот же, куда /print и сторож). Менеджеров и чат ОП пока
-НЕ трогаем (решение Кати: «в телеграм пока технический только»).
+(TG_ALLOWED_CHAT_ID, тот же, куда /print и сторож).
+
+⚠️ **Исключение с 27.09.2026 (Катя): сделка из воронки, которую ведёт авто-режим,
+идёт в рабочий чат ОП с тегом ответственного.** Её слова: «в авто-режиме менеджеры
+должны знать, если все не ок». Событие для такой недоставки отдельное —
+`wazzup_undelivered_op`, — чтобы настройка и текст у «нашей» и у «чужой» недоставки
+были разными, а не одним рубильником на оба случая. Всё остальное (ручные сообщения
+менеджеров, другие воронки, дайджест «висит sent») по-прежнему уходит только
+технарям: решение 01.08.2026 «в телеграм пока технический только» действует там,
+где сообщение никому в отделе не адресовано.
 """
 
 import asyncio
@@ -49,8 +57,11 @@ import httpx
 import amo_service
 import telegram_bot
 import alerts
+import autopilot_settings_client as ap_settings
+import tg_recipients
 from api import BASE_URL
 from waybill_config import (
+    AUTOPILOT_ENABLED,
     TEAM_INGEST_TOKEN,
     TEAM_INGEST_URL,
     WAZZUP_DELIVERY_BURST_MAX,
@@ -440,7 +451,7 @@ async def _sweep(threshold_s: int) -> None:
             continue
         # Сделку ищем здесь, а не в 18:00: висяки приходят по одному в течение
         # дня, и amo не получит полсотни запросов залпом в час дайджеста.
-        lead_id, _ = await _resolve_lead_safe(
+        lead_id, _, _ = await _resolve_lead_safe(
             info.get("chat_id") or info.get("contact_phone") or ""
         )
         _stuck_pending[message_id] = {**info, "lead_id": lead_id}
@@ -550,7 +561,9 @@ async def _alert(message_id: str, info: dict, error: dict | None) -> None:
         return
     try:
         allowed, first_suppressed = _burst_allow()
-        lead_id, _ = await _resolve_lead_safe(info.get("chat_id") or info.get("contact_phone") or "")
+        lead_id, responsible_id, pipeline_id = await _resolve_lead_safe(
+            info.get("chat_id") or info.get("contact_phone") or ""
+        )
 
         # Примечание в сделку пишем ДО антиспама и независимо от него (го Кати
         # 01.08): чат можно приглушить, а менеджер должен увидеть в своей сделке,
@@ -574,18 +587,40 @@ async def _alert(message_id: str, info: dict, error: dict | None) -> None:
                     await telegram_bot.send_alert(d.text, **d.send_kwargs())
             return
 
+        # Сделка из воронки авто-режима - событие для менеджера: тег, рабочий чат, своё
+        # событие в панели. Всё прочее - как раньше, технарям и без тегов.
+        target_pipeline = autopilot_pipeline_id()
+        for_op = bool(lead_id and target_pipeline and pipeline_id
+                      and int(pipeline_id) == int(target_pipeline))
+        values = _template_values(info, error, lead_id)
+        legacy = _build_message(info, error, lead_id)
+        event_key = "wazzup_undelivered"
+        chat_id, thread_id = WAZZUP_DELIVERY_CHAT_ID, WAZZUP_DELIVERY_THREAD_ID
+        if for_op:
+            event_key = "wazzup_undelivered_op"
+            chat_id, thread_id = tg_recipients.NOTIFY_CHAT_ID, tg_recipients.NOTIFY_THREAD_ID
+            mention = ""
+            try:
+                mention = tg_recipients.mentions_for(responsible_id)
+            except Exception:  # noqa: BLE001 - без тега алерт всё равно нужен
+                mention = ""
+            values["теги"] = mention
+            if mention:
+                legacy += "\n" + mention
+
         d = alerts.decide(
-            "wazzup_undelivered", legacy_text=_build_message(info, error, lead_id),
-            parse_mode="HTML", chat_id=WAZZUP_DELIVERY_CHAT_ID, thread_id=WAZZUP_DELIVERY_THREAD_ID,
-            values=_template_values(info, error, lead_id),
+            event_key, legacy_text=legacy,
+            parse_mode="HTML", chat_id=chat_id, thread_id=thread_id,
+            responsible_id=responsible_id if for_op else None,
+            values=values,
         )
         if d is None:
             logger.info("Wazzup доставка: алерт выключен в панели (сообщение %s)", message_id)
             return
         await telegram_bot.send_alert(d.text, **d.send_kwargs())
         logger.info(
-            "Wazzup доставка: алерт об ошибке по сообщению %s, беседа %s",
-            message_id, info.get("chat_id") or "—",
+            "Wazzup доставка: алерт об ошибке по сообщению %s, беседа %s, адресат %s",
+            message_id, info.get("chat_id") or "—", "чат ОП" if for_op else "технический",
         )
     except Exception:
         logger.exception("Wazzup доставка: не смогла отправить алерт %s", message_id)
@@ -677,20 +712,23 @@ _CLOSED_STATUS_IDS = {142, 143}
 
 
 async def _resolve_lead_safe(query: str):
-    """(lead_id, responsible_user_id) открытой сделки по телефону/chat_id.
-    Best-effort: не нашли, не успели, amo лёг → (None, None), алерт уходит без
+    """(lead_id, responsible_user_id, pipeline_id) открытой сделки по телефону/chat_id.
+    Best-effort: не нашли, не успели, amo лёг → (None, None, None), алерт уходит без
     ссылки. Своя копия, а не импорт из wazzup_sla — чтобы правки здесь не
-    задевали боевой SLA-модуль."""
+    задевали боевой SLA-модуль.
+
+    Воронка нужна с 27.09.2026: по ней решается, это «наша» недоставка в воронке
+    авто-режима (зовём менеджера) или чужая (говорим технарям)."""
     if not query:
-        return None, None
+        return None, None, None
     try:
         return await asyncio.wait_for(_resolve_lead(query), timeout=WAZZUP_RESPONSIBLE_TIMEOUT_S)
     except asyncio.TimeoutError:
         logger.warning("Wazzup доставка: сделка не определена за %sс (%s)", WAZZUP_RESPONSIBLE_TIMEOUT_S, query)
-        return None, None
+        return None, None, None
     except Exception:
         logger.exception("Wazzup доставка: поиск сделки не удался (%s)", query)
-        return None, None
+        return None, None, None
 
 
 async def _resolve_lead(query: str):
@@ -698,12 +736,30 @@ async def _resolve_lead(query: str):
     if leads is None:
         # Молчание amoCRM - не «сделок нет», сообщение не привязываем.
         logger.warning("wazzup_delivery: amoCRM не ответила на поиск сделки")
-        return None, None
+        return None, None, None
     open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
     if not open_leads:
-        return None, None
+        return None, None, None
     best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
-    return best.get("id"), best.get("responsible_user_id")
+    return best.get("id"), best.get("responsible_user_id"), best.get("pipeline_id")
+
+
+def autopilot_pipeline_id() -> int | None:
+    """Воронка, которую прямо сейчас ведёт авто-режим. None - режима нет, живём как раньше.
+
+    Спрашиваем кэш настроек авторежима, а не свою копию номера воронки: номер живёт в панели,
+    и вторая копия разошлась бы с первой при первой же правке маршрута. Кэш на диске, поэтому
+    ответ есть и когда панель недоступна.
+    """
+    if not AUTOPILOT_ENABLED:
+        return None
+    try:
+        if ap_settings.get_mode() == "off":
+            return None
+        return ap_settings.get_pipeline_id()
+    except Exception:  # noqa: BLE001 - недоставка важнее, чем разбор настроек
+        logger.exception("Wazzup доставка: не прочитал настройки авто-режима")
+        return None
 
 
 def _esc(s: str) -> str:

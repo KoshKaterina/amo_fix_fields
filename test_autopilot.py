@@ -75,7 +75,13 @@ def _settings(**over):
 def _clean():
     _SENT.clear()
     A.reset_hour_bucket()
+    A.reset_op_burst()
     _settings()
+    # Отметки «об этой заявке уже сказали» живут на диске и переживают рестарт - значит
+    # переживут и соседний тест. Чистим, иначе второй тест про заявку молчит «по дедупу».
+    S.init()
+    with S._connect() as conn:
+        conn.execute("DELETE FROM autopilot_notified")
     yield
 
 
@@ -374,6 +380,9 @@ def _lead(**over):
     lead = {
         "id": 111, "name": "Заказ 42", "pipeline_id": 8642414, "status_id": 70070982,
         "responsible_user_id": 0, "custom_fields_values": [], "_embedded": {"contacts": []},
+        # Свежая по умолчанию: уведомление о заявке живёт за гейтом возраста, и сделка без
+        # `created_at` для него - «неизвестно когда создана», то есть молчим.
+        "created_at": int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
     }
     lead.update(over)
     return lead
@@ -967,9 +976,9 @@ def test_full_live_mode_has_no_whitelist():
 # ── инбокс без менеджера: уведомления в ленту панели ────────────────────────────
 
 def test_every_new_lead_wakes_the_panel_inbox_in_live(monkeypatch):
-    """Правка Кати 12.09.2026: на ПОЛНОМ проде КАЖДАЯ заявка на входе воронки поднимает
-    уведомление в ленте панели - любого типа, до белого списка и условий ботов: без
-    менеджера инбокс проверяет панель."""
+    """Правка Кати 12.09.2026: на ПОЛНОМ проде заявка на входе воронки поднимает уведомление
+    в ленте панели. Заказ, который робот ведёт сам, - только лента: в чат идёт то, что
+    требует человека, а исправная работа робота этого не требует."""
     _settings(settings={"mode": "live", "work_hours": [],
                         "live_whitelist_enabled": False},
               pipeline_id=10593102, entry_status_id=83537714,
@@ -977,10 +986,12 @@ def test_every_new_lead_wakes_the_panel_inbox_in_live(monkeypatch):
     sent: list[dict] = []
     monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
     monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop())
     A._lead_notified.clear()
 
     async def fake_load(lead_id):
         return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714,
+                     custom_fields_values=[_cf(577671, "Заказ")],
                      _embedded={"contacts": [{"id": 11111111}]})
 
     monkeypatch.setattr(A, "load_lead", fake_load)
@@ -988,11 +999,38 @@ def test_every_new_lead_wakes_the_panel_inbox_in_live(monkeypatch):
     assert len(sent) == 1
     assert sent[0]["kind"] == "autopilot_lead"
     assert "424242" in sent[0]["url"]
-    # Контакт НЕ из белого списка: робот сделку не повёл, а уведомление всё равно ушло.
+    assert _SENT == []  # в чат про исправный заказ не пишем
 
     # Повторный вебхук той же сделки панель больше не дёргает.
     asyncio.run(A.handle_lead_change(424242))
     assert len(sent) == 1
+
+
+def test_stale_lead_on_entry_stage_does_not_look_new(monkeypatch):
+    """⚠️ Гейт возраста (Катя 27.09.2026). `/lead_change` приходит на ЛЮБОЕ изменение, и
+    сделка, неделю стоящая на входном этапе, от правки поля выглядела «новой заявкой».
+    Ровно это и случилось 27.09: уведомление о вчерашней заявке пришло утром, когда её
+    тронул синк."""
+    _settings(settings={"mode": "live", "work_hours": [],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              test_contact_ids=[], route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop())
+    A._lead_notified.clear()
+    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 3 * 24 * 3600
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714, created_at=old,
+                     custom_fields_values=[_cf(577671, "Заказ")],
+                     _embedded={"contacts": [{"id": 11111111}]})
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(424247))
+    assert sent == []
+    assert _SENT == []
 
 
 def test_test_mode_does_not_touch_the_panel_inbox(monkeypatch):
@@ -1059,8 +1097,9 @@ def test_empty_application_type_is_forgiven_only_in_test():
 
 
 def test_non_order_lead_is_left_alone_but_still_notifies(monkeypatch):
-    """Не-заказ робот не трогает СОВСЕМ - ни ботов, ни переводов. А уведомление о заявке
-    в ленту идёт, и тип в нём назван: инбокс без менеджера работает для любого типа."""
+    """Не-заказ робот не трогает СОВСЕМ - ни ботов, ни переводов. Зато теперь о такой
+    заявке говорят и в рабочий чат с тегом (Катя 27.09.2026): «уведы в чат тг при новой
+    сделке, если бот её не обрабатывает». Иначе предзаказ ложится в воронку молча."""
     _settings(settings={"mode": "live", "work_hours": [],
                         "live_whitelist_enabled": False},
               pipeline_id=10593102, entry_status_id=83537714,
@@ -1079,10 +1118,25 @@ def test_non_order_lead_is_left_alone_but_still_notifies(monkeypatch):
                      _embedded={"contacts": [{"id": 11111111}]})
 
     monkeypatch.setattr(A, "load_lead", fake_load)
-    asyncio.run(A.handle_lead_change(424244))
+
+    async def run():
+        await A.handle_lead_change(424244)
+        await asyncio.sleep(0)  # даём фоновой отправке дойти до стаба Телеграма
+
+    asyncio.run(run())
     assert len(sent) == 1
+    assert sent[0]["kind"] == "autopilot_lead_unhandled"
     assert "Резерв" in sent[0]["body"]
     assert ran == []
+    # ... и то же самое в чат: тег смены, суть и ссылка на сделку.
+    assert len(_SENT) == 1
+    assert "Резерв" in _SENT[0]["text"]
+    assert "424244" in _SENT[0]["text"]
+    assert _SENT[0]["chat_id"] == A.NOTIFY_CHAT_ID
+
+    # Второй вебхук по той же сделке в чат уже не пишет - дедуп на диске.
+    asyncio.run(A.handle_lead_change(424244))
+    assert len(_SENT) == 1
 
 
 # ── пилот: лента живёт только тест-контактами ───────────────────────────────────
@@ -1117,7 +1171,9 @@ def test_pilot_notifies_only_whitelisted_leads(monkeypatch):
     monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop())
     asyncio.run(A.handle_lead_change(424246))
     assert len(sent) == 1
-    assert sent[0]["kind"] == "autopilot_lead"
+    # Тип заявки у ручной сделки пуст, значит в бою это НЕ заказ: уведомление про заявку,
+    # которую робот не ведёт.
+    assert sent[0]["kind"] == "autopilot_lead_unhandled"
 
 
 def test_pilot_engine_forwards_inbound_of_led_chat_to_the_feed(monkeypatch):
@@ -1147,3 +1203,142 @@ def test_pilot_engine_forwards_inbound_of_led_chat_to_the_feed(monkeypatch):
     assert sent[0]["kind"] == "autopilot_inbox"
     assert sent[0]["dedupe_key"] == "ap-inbox-m-77"
     assert sent[0]["body"].startswith("Да")
+
+
+# ── алерты 27.09.2026: недоставка, непонятная оплата, любой сбой ────────────────
+
+def test_not_delivered_calls_the_manager_with_its_own_event(monkeypatch):
+    """Требование Кати 27.09.2026: «алерт в рабочий чат, если сообщение не доставлено».
+
+    Событие отдельное (`autopilot_not_delivered`), а не общий «нужен человек»: выключить
+    шум по одному поводу должно быть можно, не заглушив робота целиком.
+    """
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False, "delivery_wait_minutes": 0},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, bot_name="Бот подтверждения")])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 555, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_DELIVERY,
+        "launch_ok_at": "2020-01-01T00:00:00+00:00", "delivery": [
+            {"status": "error", "chatType": "whatsapp"},
+        ],
+    }])
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19294", pipeline_id=10593102,
+                     status_id=83537714, responsible_user_id=13929334)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.check_delivery_windows()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_not_delivered"
+    assert feed and feed[-1]["kind"] == "autopilot_not_delivered"
+    assert feed[-1]["title"] == "Авто-режим: сообщение не дошло"
+    text = _SENT[-1]["text"]
+    assert "не дошло" in text and "555" in text  # суть и ссылка на сделку
+    assert "@" in text                            # тег ответственного
+    assert _SENT[-1]["chat_id"] == A.NOTIFY_CHAT_ID
+
+
+def test_other_payment_method_stops_and_calls_a_human(monkeypatch):
+    """«Другой способ» (Катя 27.09.2026): робот такую сделку в успех НЕ ведёт и говорит об
+    этом. До правки она считалась онлайном и при оплате в МойСкладе уезжала в УР - то есть
+    решение о деньгах принималось по способу, которого робот не понимает."""
+    rows, moves, lead = _fork_env(monkeypatch, paid=True, method="Другой способ")
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+
+    async def run():
+        await A.payment_fork(lead, None, "конец маршрута")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_payment_unclear"
+    assert feed and feed[-1]["kind"] == "autopilot_payment_other"
+    assert "Другой способ" in _SENT[-1]["text"]
+
+
+def test_cash_and_evotor_are_not_touched_by_the_other_method_rule():
+    """Список «непонятных» способов узкий намеренно: «Наличными» и «Эвотор» - это шоурум,
+    там деньги берут на месте и заказ в МойСкладе помечен оплаченным. Расширять список -
+    решением Кати, а не догадкой кода."""
+    assert A.is_ambiguous_payment("Другой способ") is True
+    assert A.is_ambiguous_payment("другой способ оплаты") is True
+    assert A.is_ambiguous_payment("Наличными") is False
+    assert A.is_ambiguous_payment("Эвотор") is False
+    assert A.is_ambiguous_payment("Онлайн-оплата") is False
+    assert A.is_ambiguous_payment("") is False
+
+
+def test_any_crash_calls_a_human_with_link_and_tag(monkeypatch):
+    """«Любой сбой = алерт в чат» (Катя 27.09.2026). До правки необработанное исключение в
+    разборе вебхука уходило в `logger.exception` и всё: сделка стояла недоведённой, а знал
+    об этом только тот, кто открыл логи контейнера."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False})
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+
+    async def boom():
+        raise RuntimeError("amo вернул 500")
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19294", responsible_user_id=13929334)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.guarded(boom(), what="разбор изменения сделки", lead_id=777)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert feed and feed[-1]["kind"] == "autopilot_error"
+    text = _SENT[-1]["text"]
+    assert "amo вернул 500" in text and "777" in text and "@" in text
+
+
+def test_the_same_crash_is_not_repeated_in_the_chat(monkeypatch):
+    """Тик идёт раз в минуту: без дедупа одна незалеченная ошибка дала бы шестьдесят
+    одинаковых сообщений в час."""
+    _settings(settings={"mode": "live", "work_hours": [], "live_whitelist_enabled": False})
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+
+    async def run():
+        A.alert_error("ошибка фонового цикла: RuntimeError: раз", dedupe="tick")
+        A.alert_error("ошибка фонового цикла: RuntimeError: раз", dedupe="tick")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert len(_SENT) == 1
+
+
+def test_op_burst_mutes_the_chat_but_never_the_panel_feed(monkeypatch):
+    """Антиспам рабочего чата. Лента панели им НЕ режется: она основной канал, и полная
+    картина должна быть там даже тогда, когда чат замолчал."""
+    _settings(settings={"mode": "live", "work_hours": [], "live_whitelist_enabled": False})
+    monkeypatch.setattr(A, "AUTOPILOT_OP_BURST_MAX", 2)
+    A.reset_op_burst()
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+
+    async def run():
+        for i in range(5):
+            A.dispatch_op(A.EVENT_EVENT, f"сделка: событие {i}",
+                          values={"текст_события": f"событие {i}"},
+                          panel_title="Авто-режим: нужен человек")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert len(feed) == 5                       # в ленте все пять
+    said = [m for m in _SENT if "событие" in m["text"]]
+    assert len(said) == 2                       # в чат ушли два
+    assert any("молчу" in m["text"] for m in _SENT)   # и одно объявление технарям

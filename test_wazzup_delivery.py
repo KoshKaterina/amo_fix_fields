@@ -143,8 +143,10 @@ INBOUND = {
 
 async def _fake_resolve_lead(query):
     """Сделку в тестах не ищем: живой amo тут не нужен, а без стаба модуль честно
-    пошёл бы в API и тест бы просто ждал ретраев."""
-    return (12345, 13929334) if query else (None, None)
+    пошёл бы в API и тест бы просто ждал ретраев.
+
+    Третье значение - воронка: по ней модуль решает, звать менеджера или технарей."""
+    return (12345, 13929334, 9421022) if query else (None, None, None)
 
 
 wazzup_delivery._resolve_lead_safe = _fake_resolve_lead

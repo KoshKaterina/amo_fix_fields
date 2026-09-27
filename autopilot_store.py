@@ -124,6 +124,26 @@ def init() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_autopilot_state_wake ON autopilot_state (wake_at)"
         )
+        # Отметки «об этом по этой сделке уже сказали». Отдельная таблица, а не поле в
+        # состоянии: уведомляем и о сделках, которые робот НЕ ведёт (заявка не «Заказ»), -
+        # у них строки состояния нет и быть не должно.
+        #
+        # ⚠️ Почему на диске, а не в памяти процесса: пока дедуп жил множеством в памяти,
+        # каждая пересборка контейнера обнуляла его, и по всем сделкам, стоящим на входном
+        # этапе, уведомление уходило заново. Ключ - пара «сделка и повод».
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS autopilot_notified (
+                lead_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (lead_id, kind)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_autopilot_notified_at ON autopilot_notified (created_at)"
+        )
 
 
 def get(lead_id: int, status_id: int) -> dict | None:
@@ -318,6 +338,33 @@ def purge_older_than(days: int) -> int:
     cutoff = (datetime.datetime.now(_UTC) - datetime.timedelta(days=days)).isoformat()
     with _connect() as conn:
         cur = conn.execute("DELETE FROM autopilot_state WHERE updated_at < ?", (cutoff,))
+        return cur.rowcount
+
+
+def claim_notice(lead_id: int, kind: str) -> bool:
+    """Взять право сказать про сделку один раз. True - говорим, False - уже говорили.
+
+    Тот же приём, что в `claim`: атомарность даёт первичный ключ, а не «посмотрим и вставим».
+    Между «посмотрим» и «вставим» успевает пройти второй вебхук, а цена промаха здесь -
+    второе сообщение в рабочий чат по той же сделке.
+    """
+    with _connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO autopilot_notified (lead_id, kind, created_at) VALUES (?, ?, ?)",
+                (lead_id, kind, _now()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
+
+
+def purge_notices_older_than(days: int) -> int:
+    """Уборка отметок. Держать их вечно незачем: сделка, о которой говорили месяц назад, на
+    входной этап больше не вернётся, а вернётся - сказать о ней заново правильно."""
+    cutoff = (datetime.datetime.now(_UTC) - datetime.timedelta(days=days)).isoformat()
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM autopilot_notified WHERE created_at < ?", (cutoff,))
         return cur.rowcount
 
 

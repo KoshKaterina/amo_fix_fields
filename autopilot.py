@@ -26,6 +26,31 @@
 
 ⚠️ **Перевод в УР - ЗАВЕРШЕНИЕ маршрута, а не «сделку увели».** `office_transfer` уносит её в
 Офис за пару секунд, и без этой оговорки каждый успешный прогон кончался бы ложным алертом.
+
+## Кого и когда зовём (правка Кати 27.09.2026)
+
+Поводов четыре, и у каждого своё событие в панели - свой текст, свой выключатель, своя
+настройка получателей. Раньше всё шло одним кодом `autopilot_event`, и заглушить шум по
+одному поводу означало заглушить робота целиком.
+
+| Повод | Событие | Куда |
+|---|---|---|
+| заявка на входе воронки, которую робот НЕ ведёт (предзаказ, консультация, сделка по сообщению) | `autopilot_lead_unhandled` | чат ОП с тегом + лента |
+| сообщение до клиента не дошло | `autopilot_not_delivered` | чат ОП с тегом + лента |
+| способ оплаты «Другой способ» | `autopilot_payment_other` | чат ОП с тегом + лента |
+| любой сбой по сделке: amo не принял, МойСклад молчит, потолок действий, исключение | `autopilot_error` | чат ОП с тегом + лента |
+| нужен человек по ходу маршрута (клиент ответил не кнопкой, нет остатка) | `autopilot_event` | чат ОП с тегом + лента |
+| наша поломка БЕЗ сделки (панель не посчитала остаток) | `autopilot_failure` | технический чат |
+
+Три гейта, без которых алерт в живой чат заводить нельзя (`knowledge/alerty-kuda-shlem.md`),
+здесь такие:
+
+1. **Выключатель** - на каждое событие свой, в панели. Плюс режим робота: в «Тесте» и в
+   пилоте всё уходит в технический чат, менеджеров не дёргаем вовсе.
+2. **Дедуп** - про заявку говорим один раз (отметка на ДИСКЕ, переживает рестарт), про один
+   и тот же сбой по одной сделке - раз в `AUTOPILOT_ERROR_DEDUPE_S`.
+3. **Антиспам** - больше `AUTOPILOT_OP_BURST_MAX` сообщений в рабочий чат за окно, и чат
+   замолкает до конца окна с объявлением технарям. Лента панели антиспамом НЕ режется.
 """
 import asyncio
 import datetime
@@ -45,7 +70,11 @@ import alerts
 from tg_recipients import NOTIFY_CHAT_ID, NOTIFY_THREAD_ID, mentions_for
 from waybill_config import (
     AUTOPILOT_ENABLED,
+    AUTOPILOT_ERROR_DEDUPE_S,
     AUTOPILOT_HOURLY_CAP,
+    AUTOPILOT_LEAD_ALERT_MAX_AGE_H,
+    AUTOPILOT_OP_BURST_MAX,
+    AUTOPILOT_OP_BURST_WINDOW_S,
     AUTOPILOT_STATE_TTL_DAYS,
     AUTOPILOT_TICK_INTERVAL_S,
     FIELD_APPLICATION_TYPE,
@@ -170,10 +199,31 @@ def _send_bg(text: str, *, chat_id=None, thread_id=None, parse_mode=None) -> Non
     task.add_done_callback(_bg_tasks.discard)
 
 
+# Коды событий уведомлений. Раздельные, а не один «событие робота» на всё (правка Кати
+# 27.09.2026): у каждого свой текст на экране панели и свой выключатель. Пока код был один,
+# выключить шум по одному поводу означало заглушить робота целиком.
+EVENT_EVENT = "autopilot_event"                    # нужен человек: клиент ответил не как ждали
+EVENT_LEAD_UNHANDLED = "autopilot_lead_unhandled"  # заявка, которую робот НЕ ведёт
+EVENT_NOT_DELIVERED = "autopilot_not_delivered"    # сообщение до клиента не дошло
+EVENT_PAYMENT_OTHER = "autopilot_payment_other"    # способ оплаты, который робот не понимает
+EVENT_ERROR = "autopilot_error"                    # сбой на конкретной сделке
+EVENT_FAILURE = "autopilot_failure"                # наша поломка, сделки за ней нет
+
+# Антиспам рабочего чата: отметки времени отправок в топик УВЕДОМЛЕНИЯ и момент, до которого
+# молчим. Приём взят у `wazzup_delivery`: при массовом сбое сотня сообщений менеджеру не
+# помогает, а полная картина всё равно лежит в ленте панели - лента антиспамом не режется.
+_op_sent_at: list[float] = []
+_op_muted_until: float = 0.0
+
+# Сбои, о которых уже сказали: ключ → когда. Без этого ошибка фонового цикла звонила бы раз
+# в минуту (тик), а ошибка разбора вебхука - на каждый вебхук по сделке.
+_error_said_at: dict[str, float] = {}
+
+
 def alert_tech(text: str) -> None:
     """Наши поломки - в технический чат (адресат по умолчанию у `send_alert`)."""
     d = alerts.decide(
-        "autopilot_failure", legacy_text="🤖 Авто-режим" + chr(10) + text,
+        EVENT_FAILURE, legacy_text="🤖 Авто-режим" + chr(10) + text,
         values={"текст_поломки": text},
     )
     if d is None:
@@ -182,50 +232,136 @@ def alert_tech(text: str) -> None:
     _send_bg(d.text, chat_id=d.chat_id, thread_id=d.thread_id, parse_mode=d.parse_mode)
 
 
+def op_burst_allows(now: float | None = None) -> bool:
+    """Пускать ли ещё одно сообщение в рабочий чат. Первое «нет» за окно - с объявлением.
+
+    Окно скользящее, а не «сбрасываем счётчик каждые десять минут»: ровные окна дают всплеск
+    на стыке - девять сообщений в конце одного окна и девять в начале следующего.
+    """
+    global _op_muted_until
+    moment = now if now is not None else datetime.datetime.now(_UTC).timestamp()
+    if moment < _op_muted_until:
+        return False
+    edge = moment - AUTOPILOT_OP_BURST_WINDOW_S
+    _op_sent_at[:] = [t for t in _op_sent_at if t >= edge]
+    if len(_op_sent_at) < AUTOPILOT_OP_BURST_MAX:
+        _op_sent_at.append(moment)
+        return True
+    _op_muted_until = moment + AUTOPILOT_OP_BURST_WINDOW_S
+    alert_tech(
+        f"Алертов в рабочий чат больше {AUTOPILOT_OP_BURST_MAX} за "
+        f"{AUTOPILOT_OP_BURST_WINDOW_S // 60} мин - похоже на массовый сбой. Дальше в этом "
+        "окне в чат ОП молчу, чтобы не залить топик; всё видно в ленте панели и в журнале."
+    )
+    return False
+
+
+def reset_op_burst() -> None:
+    """Только для тестов: окно антиспама и заглушка - чистые."""
+    global _op_muted_until
+    _op_sent_at.clear()
+    _op_muted_until = 0.0
+    _error_said_at.clear()
+
+
+def error_is_fresh(key: str, now: float | None = None) -> bool:
+    """Про этот сбой ещё не говорили в пределах окна дедупа."""
+    moment = now if now is not None else datetime.datetime.now(_UTC).timestamp()
+    said = _error_said_at.get(key)
+    if said is not None and moment - said < AUTOPILOT_ERROR_DEDUPE_S:
+        return False
+    if len(_error_said_at) > 2000:
+        _error_said_at.clear()
+    _error_said_at[key] = moment
+    return True
+
+
 def alert_op(text: str, responsible_id=None) -> None:
     """Событие, требующее менеджера, - в чат отдела продаж, топик УВЕДОМЛЕНИЯ, с тегом
-    ответственного.
+    ответственного. Совместимая обёртка: события со своим кодом зовут `dispatch_op`.
 
     Правило Кати 28.08.2026: в чат ОП идёт СОБЫТИЕ (клиент ждёт), в чат руководства -
     ПРОВАЛ. Авто-режим шлёт только события: он останавливается ДО того, как что-то стало
     провалом, поэтому в чат руководства не пишет вовсе.
     """
-    # В ограниченных режимах (тест, пилот боя) менеджеров не дёргаем: события читает
-    # тот, кто тестирует, и читает он их в техническом чате. Иначе в рабочий топик
-    # УВЕДОМЛЕНИЯ полетело бы «клиент ответил...» по сделке с тестовым контактом.
-    # Дубль в ленту панели - всем, кто ведёт авто-режим. Лента важнее чата: Телеграм
-    # уже глушился на сутки. В «Тесте» ленту не трогаем - тестовый шум приучил бы
-    # людей её игнорировать.
+    dispatch_op(
+        EVENT_EVENT, text, responsible_id=responsible_id,
+        values={"текст_события": text},
+        panel_title="Авто-режим: нужен человек",
+    )
+
+
+def dispatch_op(event_key: str, text: str, *, responsible_id=None,
+                values: dict[str, Any] | None = None, panel_title: str,
+                panel_level: str = "critical", panel_url: str | None = None,
+                dedupe_key: str | None = None, bypass_burst: bool = False) -> None:
+    """Одно место, через которое авто-режим говорит с людьми: чат и лента панели.
+
+    Порядок именно такой, и он важен: **сперва лента, потом чат**. Лента - основной канал
+    (Телеграм у нас глушился на сутки одним сетевым сбоем 28-29.08.2026) и она не режется
+    антиспамом: там полная картина даже тогда, когда чат замолчал.
+
+    ⚠️ В ограниченных режимах (тест, пилот боя) менеджеров не дёргаем: события читает тот,
+    кто тестирует, и читает он их в техническом чате. Иначе в рабочий топик УВЕДОМЛЕНИЯ
+    полетело бы «клиент ответил...» по сделке с тестовым контактом.
+    """
+    plain = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+    found = _LINK_RE.search(text)
     if settings_client.get_mode() == "live":
-        plain = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
-        found = _LINK_RE.search(text)
+        # В «Тесте» ленту не трогаем - тестовый шум приучил бы людей её игнорировать.
         panel_notify_bg(
-            kind="autopilot_alert", level="critical",
-            title="Авто-режим: нужен человек", body=plain,
-            url=found.group(1) if found else None,
+            kind=event_key, level=panel_level, title=panel_title, body=plain,
+            url=panel_url or (found.group(1) if found else None),
+            dedupe_key=dedupe_key,
         )
     limited = limited_mode()
     if limited:
         label = "ТЕСТОВЫЙ прогон" if limited == "тест" else "ПИЛОТ прода"
         _send_bg("🤖 Авто-режим, " + label + chr(10) + text)
         return
-    body = "🤖 Авто-режим" + chr(10) + text
+    if not bypass_burst and not op_burst_allows():
+        logger.warning("autopilot: алерт в чат ОП придержан антиспамом (%s)", event_key)
+        return
     mention = ""
     if responsible_id:
         try:
             mention = mentions_for(responsible_id)
         except Exception:
             mention = ""
-        if mention:
-            body = body + chr(10) + mention
+    body = "🤖 Авто-режим" + chr(10) + text + ((chr(10) + mention) if mention else "")
     d = alerts.decide(
-        "autopilot_event", legacy_text=body, chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
-        responsible_id=responsible_id, values={"текст_события": text, "теги": mention},
+        event_key, legacy_text=body, chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+        responsible_id=responsible_id, values={**(values or {}), "теги": mention},
     )
     if d is None:
-        logger.info("Авто-режим: событие для менеджера выключено в панели")
+        logger.info("Авто-режим: событие %s выключено в панели", event_key)
         return
     _send_bg(d.text, chat_id=d.chat_id, thread_id=d.thread_id, parse_mode=d.parse_mode)
+
+
+def alert_error(what: str, *, lead: dict | None = None, lead_id: int | None = None,
+                dedupe: str | None = None) -> None:
+    """Сбой. Есть сделка - зовём менеджера в рабочий чат: робот по ней дальше не пойдёт, и
+    доделывать руками ему. Сделки нет - это только наша поломка, менеджеру делать нечего.
+
+    Требование Кати 27.09.2026: «любой сбой = алерт в чат», и в чате должны быть тег
+    ответственного, суть ошибки и ссылка на сделку.
+    """
+    ident = int((lead or {}).get("id") or lead_id or 0)
+    if not error_is_fresh(f"{ident}:{dedupe or what}"):
+        logger.info("autopilot: о сбое уже говорили, молчу: %s", what)
+        return
+    if not ident:
+        alert_tech(what)
+        return
+    name = str((lead or {}).get("name") or "").strip()
+    dispatch_op(
+        EVENT_ERROR, f"{lead_link(ident, name)}: {what}",
+        responsible_id=(lead or {}).get("responsible_user_id"),
+        values={"сделка": name or "без названия", "что_случилось": what,
+                "ссылка_на_сделку": alerts.lead_link(ident)},
+        panel_title="Авто-режим: сбой", panel_url=AMO_LEAD_URL.format(ident),
+    )
 
 
 # Ссылка в тексте алерта - html для Телеграма. Лента панели рендерит плоский текст,
@@ -526,8 +662,13 @@ async def load_lead(lead_id: int) -> dict | None:
         return await amo_service.get_lead_full(lead_id, with_=("contacts",))
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("autopilot: сделка %s не прочиталась", lead_id)
+        # Сделку не прочитали - значит ведение по ней сейчас не продолжится. Это сбой, и о
+        # нём говорим в чат: ссылка в алерте есть, а имя сделки взять негде - его как раз и
+        # не прочитали.
+        alert_error(f"не смог прочитать сделку в amoCRM: {type(exc).__name__}: {exc}",
+                    lead_id=lead_id, dedupe="load_lead")
         return None
 
 
@@ -750,12 +891,16 @@ def bot_by_id(stage: dict | None, bot_id) -> dict:
 
 async def stop_here(
     lead: dict, stage: dict | None, outcome: str, reason: str,
-    *, bot: dict | None = None, op_text: str = "",
+    *, bot: dict | None = None, op_text: str = "", event_key: str = EVENT_EVENT,
+    values: dict[str, Any] | None = None, panel_title: str = "Авто-режим: нужен человек",
 ) -> None:
     """Снять сделку с ведения и позвать человека.
 
     Останавливаемся ОХОТНО. Робот в этой воронке пишет живым людям и двигает деньги: цена
     лишней остановки - минута менеджера, цена лишнего хода - клиент, получивший не то.
+
+    `event_key` выбирает, каким событием это уйдёт в панель и в чат: у недоставки, у
+    непонятного способа оплаты и у сбоя свои тексты и свои выключатели.
     """
     lead_id = int(lead.get("id") or 0)
     status_id = int(lead.get("status_id") or 0)
@@ -763,9 +908,13 @@ async def stop_here(
     log_run(lead, stage, bot=bot, action="route", outcome=outcome, reason=reason,
             alert_target="op" if op_text else "")
     if op_text:
-        alert_op(
-            f"{lead_link(lead_id, lead.get('name'))}: {op_text}",
-            lead.get("responsible_user_id"),
+        name = str(lead.get("name") or "").strip()
+        dispatch_op(
+            event_key, f"{lead_link(lead_id, name)}: {op_text}",
+            responsible_id=lead.get("responsible_user_id"),
+            values={"сделка": name or "без названия", "текст_события": op_text,
+                    "ссылка_на_сделку": alerts.lead_link(lead_id), **(values or {})},
+            panel_title=panel_title, panel_url=AMO_LEAD_URL.format(lead_id) if lead_id else None,
         )
 
 
@@ -836,13 +985,21 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
 
     if str(bot.get("launched_by") or "engine") == "engine":
         if not allow_action():
-            await stop_here(lead, stage, "failed", "упёрся в потолок действий в час", bot=bot)
+            await stop_here(
+                lead, stage, "failed", "упёрся в потолок действий в час", bot=bot,
+                op_text="упёрся в потолок действий в час и остановился, "
+                        "сообщение клиенту не отправлял - напишите сами",
+                event_key=EVENT_ERROR, panel_title="Авто-режим: сбой",
+                values={"что_случилось": "упёрся в потолок действий в час"},
+            )
             return
         await asyncio.to_thread(store.mark_launch_attempted, lead_id, status_id, bot_id)
         if not await launch_bot(lead_id, bot_id):
             await stop_here(
                 lead, stage, "failed", "amoCRM не принял запуск бота", bot=bot,
                 op_text="не смог запустить бота, напишите клиенту сами",
+                event_key=EVENT_ERROR, panel_title="Авто-режим: сбой",
+                values={"что_случилось": "amoCRM не принял запуск бота"},
             )
             return
     else:
@@ -917,7 +1074,13 @@ async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: s
     lead_id = int(lead["id"])
     was = int(lead.get("status_id") or 0)
     if not allow_action():
-        await stop_here(lead, stage, "failed", "упёрся в потолок действий в час")
+        await stop_here(
+            lead, stage, "failed", "упёрся в потолок действий в час",
+            op_text=f"упёрся в потолок действий в час, сделку на этап «{status_name}» "
+                    "не перевёл - сделайте это руками",
+            event_key=EVENT_ERROR, panel_title="Авто-режим: сбой",
+            values={"что_случилось": "упёрся в потолок действий в час"},
+        )
         return
     result = await amo_service.patch_lead(
         lead_id, status_id=status_id, pipeline_id=int(lead.get("pipeline_id") or 0) or None,
@@ -926,6 +1089,8 @@ async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: s
         await stop_here(
             lead, stage, "failed", f"amoCRM не принял перевод на «{status_name}»",
             op_text=f"не смог перевести сделку на этап «{status_name}», сделайте это руками",
+            event_key=EVENT_ERROR, panel_title="Авто-режим: сбой",
+            values={"что_случилось": f"amoCRM не принял перевод на «{status_name}»"},
         )
         return
     await asyncio.to_thread(store.finish, lead_id, was, store.PHASE_DONE, reason)
@@ -944,6 +1109,24 @@ def is_cod_strict(payment_method) -> bool:
     успешную реализацию мимо оплаты. Расхождение намеренное, оно описано в DESIGN.md.
     """
     return "при получении" in str(payment_method or "").lower()
+
+
+# Способы оплаты, по которым робот не понимает, чего ждать (Катя 27.09.2026). «Другой способ»
+# приходит с сайта, когда человек в корзине выбрал оплату не из списка: за этим стоит счёт
+# юрлицу, перевод, рассрочка - что именно, знает менеджер, а не мы. Дальше такую сделку не
+# ведём и говорим об этом вслух.
+AMBIGUOUS_PAYMENT_MARKERS = ("другой способ",)
+
+
+def is_ambiguous_payment(payment_method) -> bool:
+    """Способ оплаты назван, но роботу непонятен.
+
+    ⚠️ Список УЗКИЙ и держится именно таким. «Наличными» и «Эвотор» сюда не входят: это
+    шоурум, деньги берут на месте, и в МойСкладе такой заказ помечается оплаченным - развилка
+    разберётся с ним по факту оплаты. Расширять список - решением Кати, не догадкой.
+    """
+    value = str(payment_method or "").casefold()
+    return any(marker in value for marker in AMBIGUOUS_PAYMENT_MARKERS)
 
 
 async def order_is_paid(order_uuid) -> bool | None:
@@ -1002,6 +1185,21 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
                       "оплата при получении")
         return
 
+    # ⚠️ Смена поведения 27.09.2026 по просьбе Кати: «Другой способ» больше НЕ считается
+    # онлайном. Раньше такая сделка уезжала в успех, если в МойСкладе стояла оплата, - то
+    # есть решение о деньгах принималось по способу, которого робот не понимает.
+    if is_ambiguous_payment(method):
+        await stop_here(
+            lead, stage, "stop_payment_unclear",
+            f"способ оплаты «{method}» роботу непонятен",
+            op_text=f"способ оплаты «{method}» - не понимаю, ждать ли оплату. "
+                    "В успех не веду, посмотрите сделку.",
+            event_key=EVENT_PAYMENT_OTHER,
+            values={"способ_оплаты": str(method)},
+            panel_title="Авто-режим: непонятный способ оплаты",
+        )
+        return
+
     order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
     if not order_uuid:
         # Онлайн-оплата, а сверяться не с чем. В бою такой сделки быть не должно (заказ
@@ -1024,6 +1222,8 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
         await stop_here(
             lead, stage, "failed", "МойСклад не сказал, оплачен ли заказ",
             op_text="не смог узнать в МойСкладе, оплачен ли заказ, дальше не веду",
+            event_key=EVENT_ERROR, panel_title="Авто-режим: сбой",
+            values={"что_случилось": "МойСклад не ответил, оплачен ли заказ"},
         )
         return
     await stop_here(
@@ -1046,10 +1246,19 @@ async def force_ur(lead: dict, stage: dict | None, note: str) -> None:
         why = "заказ оплачен" if paid else "оплата при получении"
         log_run(lead, stage, action="payment_fork", outcome="advanced",
                 reason=f"шаблоны не дошли ({note}), но {why}", alert_target="op")
-        alert_op(
-            f"{lead_link(int(lead['id']), lead.get('name'))}: заказ ушёл БЕЗ подтверждения "
-            f"клиентом, {note}. Веду в успешную реализацию, потому что {why}.",
-            lead.get("responsible_user_id"),
+        lead_id = int(lead["id"])
+        name = str(lead.get("name") or "").strip()
+        dispatch_op(
+            EVENT_NOT_DELIVERED,
+            f"{lead_link(lead_id, name)}: заказ ушёл БЕЗ подтверждения клиентом, {note}. "
+            f"Веду в успешную реализацию, потому что {why}.",
+            responsible_id=lead.get("responsible_user_id"),
+            values={"сделка": name or "без названия", "что_с_доставкой": note,
+                    "текст_события": f"заказ ушёл без подтверждения клиентом, {note}",
+                    "этап": str((stage or {}).get("status_name") or ""),
+                    "бот": "", "ссылка_на_сделку": alerts.lead_link(lead_id)},
+            panel_title="Авто-режим: сообщение не дошло",
+            panel_url=AMO_LEAD_URL.format(lead_id),
         )
         await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
                       "шаблоны не дошли, но оплата не под вопросом")
@@ -1078,6 +1287,106 @@ def is_order(lead: dict) -> bool:
     return value.casefold() == "заказ"
 
 
+def lead_is_fresh(lead: dict, now: datetime.datetime | None = None) -> bool:
+    """Заявка правда новая, а не старая сделка, которую кто-то тронул.
+
+    ⚠️ Без этого гейта уведомление о «новой заявке» уходило по сделке любого возраста:
+    `/lead_change` приходит на ЛЮБОЕ изменение, и сделка, неделю стоящая на входном этапе,
+    от правки поля выглядит новее некуда. 27.09.2026 так и вышло - уведомление о заявке,
+    созданной вчера вечером, пришло утром следующего дня, когда её тронул синк.
+    """
+    try:
+        created = int(lead.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if created <= 0:
+        return False
+    moment = now or datetime.datetime.now(_UTC)
+    age_h = (moment.timestamp() - created) / 3600
+    return 0 <= age_h <= AUTOPILOT_LEAD_ALERT_MAX_AGE_H
+
+
+async def notify_entry_lead(lead: dict) -> None:
+    """Заявка встала на вход воронки: лента панели, а для «не наших» - ещё и рабочий чат.
+
+    Два разных случая, и адресат у них разный (правка Кати 27.09.2026):
+
+    * заявка с типом «Заказ» - её ведёт робот, человеку делать нечего: только лента;
+    * всё остальное (предзаказ, консультация, сделка по сообщению, звонок) - **робот её не
+      ведёт**, и если об этом не сказать, заявка ляжет в воронку молча. Такие идут в топик
+      УВЕДОМЛЕНИЯ с тегом ответственного и ссылкой.
+
+    ⚠️ Дедуп чата - на диске (`store.claim_notice`), а не множеством в памяти: пересборка
+    контейнера обнуляла память, и по всем сделкам на входном этапе уведомление уходило
+    заново. Лента переживает повтор сама, по `dedupe_key`.
+    """
+    if settings_client.get_mode() != "live":
+        return
+    # В ПИЛОТЕ (тумблер «на проде вести только тестовые контакты») - только белый список:
+    # пока робот обкатывается, ни чат, ни лента не должны шуметь живым потоком.
+    if limited_mode() == "пилот" and not whitelist_ok(lead):
+        return
+    lead_id = int(lead["id"])
+    if not lead_is_fresh(lead):
+        logger.info("autopilot: сделка %s старше окна уведомления, о заявке молчу", lead_id)
+        return
+    name = str(lead.get("name") or "").strip() or "сделка без названия"
+    app_type = str(amo_service.get_custom_field_value(
+        lead, FIELD_APPLICATION_TYPE) or "").strip()
+
+    if is_order(lead):
+        if lead_id in _lead_notified:
+            return
+        _lead_notified.add(lead_id)
+        if len(_lead_notified) > 5000:
+            _lead_notified.clear()
+        panel_notify_bg(
+            kind="autopilot_lead", level="warn",
+            title="Новая заявка в рознице",
+            body=name + ", тип: " + (app_type or "не указан"),
+            url=AMO_LEAD_URL.format(lead_id),
+            dedupe_key=f"ap-lead-{lead_id}",
+        )
+        return
+
+    if not await asyncio.to_thread(store.claim_notice, lead_id, "lead_unhandled"):
+        return
+    kind = app_type or "не указан"
+    dispatch_op(
+        EVENT_LEAD_UNHANDLED,
+        f"{lead_link(lead_id, name)}: заявка «{kind}», робот такие не ведёт - возьмите в работу.",
+        responsible_id=lead.get("responsible_user_id"),
+        values={"сделка": name, "тип_заявки": kind,
+                "ссылка_на_сделку": alerts.lead_link(lead_id)},
+        panel_title="Заявка без робота", panel_level="warn",
+        panel_url=AMO_LEAD_URL.format(lead_id),
+        dedupe_key=f"ap-unhandled-{lead_id}",
+    )
+
+
+async def guarded(coro, *, what: str, lead_id=None) -> None:
+    """Обёртка вокруг фоновой работы: исключение НЕ остаётся в логе молча.
+
+    Требование Кати 27.09.2026 - «любой сбой = алерт в чат». До этого необработанное
+    исключение в разборе вебхука или в фоновом цикле писалось в `logger.exception` и всё:
+    сделка стояла недоведённой, а знал об этом только тот, кто открыл логи контейнера.
+    """
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("autopilot: %s", what)
+        lead = None
+        if lead_id:
+            try:
+                lead = await load_lead(int(lead_id))
+            except Exception:  # noqa: BLE001 - на алерт это влиять не должно
+                lead = None
+        alert_error(f"{what}: {type(exc).__name__}: {exc}",
+                    lead=lead, lead_id=lead_id, dedupe=what)
+
+
 def on_lead_change(lead_id) -> None:
     """Врезка в вебхук `/lead_change`. Синхронная и мгновенная: amoCRM ждёт быстрый ответ,
     а при задержке повторяет вебхук - и повтор стоил бы клиенту второго сообщения."""
@@ -1087,7 +1396,9 @@ def on_lead_change(lead_id) -> None:
         lead_id = int(lead_id)
     except (TypeError, ValueError):
         return
-    task = asyncio.create_task(handle_lead_change(lead_id))
+    task = asyncio.create_task(guarded(
+        handle_lead_change(lead_id), what="разбор изменения сделки", lead_id=lead_id,
+    ))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
@@ -1113,29 +1424,8 @@ async def handle_lead_change(lead_id: int) -> None:
         await on_payment_received(lead)
         return
 
-    # Инбокс без менеджера (Катя 12.09.2026): в режиме «Прод» заявка на входе воронки
-    # поднимает уведомление в ленте панели - любого типа, до условий ботов. На полном
-    # проде - КАЖДАЯ заявка; в ПИЛОТЕ (тумблер «На проде вести только тестовые
-    # контакты») - только заявки белого списка: пока робот обкатывается, лента не должна
-    # шуметь живым потоком (правка Кати 12.09.2026, вечер). Дедуп на панели держит один
-    # вебхук-шторм за одну заявку, локальное множество бережёт панель от лишних запросов.
-    if (settings_client.get_mode() == "live"
-            and status_id == (settings_client.get_entry_status_id() or 0)
-            and (limited_mode() != "пилот" or whitelist_ok(lead))
-            and lead_id not in _lead_notified):
-        _lead_notified.add(lead_id)
-        if len(_lead_notified) > 5000:
-            _lead_notified.clear()
-        app_type = str(amo_service.get_custom_field_value(
-            lead, FIELD_APPLICATION_TYPE) or "").strip()
-        panel_notify_bg(
-            kind="autopilot_lead", level="warn",
-            title="Новая заявка в рознице",
-            body=str(lead.get("name") or "сделка без названия")
-            + ", тип: " + (app_type or "не указан"),
-            url=AMO_LEAD_URL.format(lead_id),
-            dedupe_key=f"ap-lead-{lead_id}",
-        )
+    if status_id == (settings_client.get_entry_status_id() or 0):
+        await notify_entry_lead(lead)
 
     if not is_order(lead):
         # Не заказ (консультация, предзаказ, резерв) - работа человека: робот такую
@@ -1222,28 +1512,37 @@ def on_wazzup(payload) -> None:
     """
     if not is_enabled() or not isinstance(payload, dict):
         return
-    task = asyncio.create_task(handle_wazzup(payload))
+    task = asyncio.create_task(guarded(handle_wazzup(payload), what="разбор события Wazzup"))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
 
 async def handle_wazzup(payload: dict) -> None:
+    """Разбор по элементам: сбой на одном сообщении не должен мешать соседним.
+
+    Поэтому исключение ловим ЗДЕСЬ, а не только внешней обёрткой, - но теперь оно ещё и
+    зовёт человека, а не просто ложится в лог (Катя 27.09.2026).
+    """
     for message in payload.get("messages") or []:
         if isinstance(message, dict):
             try:
                 await _handle_message(message)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception("autopilot: не разобрал сообщение Wazzup")
+                alert_error(f"не разобрал сообщение Wazzup: {type(exc).__name__}: {exc}",
+                            dedupe="wazzup_message")
     for status in payload.get("statuses") or []:
         if isinstance(status, dict):
             try:
                 await _handle_status(status)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception("autopilot: не разобрал статус Wazzup")
+                alert_error(f"не разобрал статус доставки Wazzup: {type(exc).__name__}: {exc}",
+                            dedupe="wazzup_status")
 
 
 def _pick_row(rows: list[dict], phase: str) -> dict | None:
@@ -1479,6 +1778,11 @@ async def check_delivery_windows() -> None:
         await stop_here(
             lead, stage, "stop_not_delivered", note, bot=bot,
             op_text=f"сообщение до клиента не дошло: {note}. Дальше не веду.",
+            event_key=EVENT_NOT_DELIVERED,
+            values={"что_с_доставкой": note,
+                    "этап": str((stage or {}).get("status_name") or ""),
+                    "бот": str((bot or {}).get("bot_name") or "")},
+            panel_title="Авто-режим: сообщение не дошло",
         )
 
 
@@ -1520,9 +1824,14 @@ async def report_unfinished_launches() -> None:
             store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
             "рестарт в момент запуска бота",
         )
-        alert_op(
-            f"{lead_link(row['lead_id'])}: робот перезапустился в момент запуска бота и не "
-            "знает, ушло сообщение или нет. Повторно не отправляю, посмотрите переписку."
+        # Сделку читаем ради тега ответственного и названия: алерт без тега легко теряется
+        # в топике, а «сделка» без имени заставляет менеджера открывать ссылку, чтобы
+        # понять, о ком речь.
+        lead = await load_lead(row["lead_id"])
+        alert_error(
+            "робот перезапустился в момент запуска бота и не знает, ушло сообщение или нет. "
+            "Повторно не отправляю, посмотрите переписку.",
+            lead=lead, lead_id=row["lead_id"], dedupe=f"unfinished-{row['status_id']}",
         )
     if rows:
         logger.warning("autopilot: %s незавершённых запусков после рестарта", len(rows))
@@ -1534,8 +1843,11 @@ async def _tick_loop() -> None:
             await tick_once()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("autopilot: ошибка фонового цикла")
+            # Дедуп обязателен: тик идёт раз в минуту, и одна незалеченная ошибка без него
+            # дала бы шестьдесят одинаковых сообщений в час.
+            alert_error(f"ошибка фонового цикла: {type(exc).__name__}: {exc}", dedupe="tick")
         await asyncio.sleep(AUTOPILOT_TICK_INTERVAL_S)
 
 
@@ -1551,6 +1863,9 @@ async def tick_once() -> None:
     dropped = await asyncio.to_thread(store.purge_older_than, AUTOPILOT_STATE_TTL_DAYS)
     if dropped:
         logger.info("autopilot: снято с ведения по сроку давности: %s", dropped)
+    # Отметки «об этой заявке уже сказали» живут дольше состояния: сделка, о которой
+    # сказали месяц назад, на входной этап не вернётся, а вернётся - сказать заново верно.
+    await asyncio.to_thread(store.purge_notices_older_than, 60)
     await check_delivery_windows()
     if not in_work_hours():
         return
