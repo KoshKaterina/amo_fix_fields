@@ -2030,3 +2030,41 @@ def test_panel_verdict_ignores_human_echo(monkeypatch):
     monkeypatch.setattr(A, "fetch_chat_activity", only_human)
     assert asyncio.run(
         A.panel_delivery_verdict("79609323338", "2026-09-27T00:00:00+00:00")) is None
+
+
+def test_catchup_reports_error_even_when_waiting_for_reply(monkeypatch):
+    """Кейс 19303 до конца: сделка уже переведена в «жду ответ», а в переписке лежит отказ
+    канала. Раньше он просто ложился в копилку, и робот ждал бы сутки ответа от клиента,
+    которого нет в WhatsApp."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    A._catchup_at = 0.0
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565341, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79609323338", "launch_ok_at": "2026-09-27T13:58:57+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_activity(chat_id, since):
+        return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
+                                         "author_name": "Admin"}]}
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19303", pipeline_id=10593102, status_id=83537714)
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.catch_up_on_chats()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_not_delivered"
+    assert feed and feed[-1]["kind"] == "autopilot_not_delivered"
+    assert "не дошло" in _SENT[-1]["text"]

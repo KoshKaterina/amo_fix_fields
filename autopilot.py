@@ -2001,6 +2001,24 @@ async def fetch_chat_activity(chat_id: str, since: str) -> dict[str, Any] | None
         return None
 
 
+async def report_not_delivered(lead: dict, stage: dict | None, bot: dict | None,
+                               status: str, chat_type: str, source: str) -> None:
+    """Объявить недоставку: снять с ведения и позвать менеджера. Одно место на три пути -
+    сразу после запуска бота, на истечении окна и в подборе из переписки."""
+    note = f"{chat_type or 'канал'}: отказ канала ({source})"
+    log_run(lead, stage, bot=bot, action="delivery", outcome="stop_not_delivered",
+            reason=note, delivery={"statuses": [{"status": status, "chatType": chat_type}]})
+    await stop_here(
+        lead, stage, "stop_not_delivered", note, bot=bot,
+        op_text=f"сообщение до клиента не дошло: {note}. Дальше не веду.",
+        event_key=EVENT_NOT_DELIVERED,
+        values={"что_с_доставкой": note,
+                "этап": str((stage or {}).get("status_name") or ""),
+                "бот": str((bot or {}).get("bot_name") or "")},
+        panel_title="Авто-режим: сообщение не дошло",
+    )
+
+
 async def panel_delivery_verdict(chat_id: str, since: str) -> tuple[str, str, str] | None:
     """Что панель знает о судьбе НАШЕГО сообщения в этом чате после `since`.
 
@@ -2068,18 +2086,7 @@ async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) ->
         logger.info("autopilot: по сделке %s шаблон уже подтверждён (%s), жду ответ",
                     lead_id, status)
         return
-    note = f"{chat_type or 'канал'}: отказ канала (по переписке панели)"
-    log_run(lead, stage, bot=bot, action="delivery", outcome="stop_not_delivered",
-            reason=note, delivery={"statuses": [{"status": status, "chatType": chat_type}]})
-    await stop_here(
-        lead, stage, "stop_not_delivered", note, bot=bot,
-        op_text=f"сообщение до клиента не дошло: {note}. Дальше не веду.",
-        event_key=EVENT_NOT_DELIVERED,
-        values={"что_с_доставкой": note,
-                "этап": str((stage or {}).get("status_name") or ""),
-                "бот": str((bot or {}).get("bot_name") or "")},
-        panel_title="Авто-режим: сообщение не дошло",
-    )
+    await report_not_delivered(lead, stage, bot, status, chat_type, "по переписке панели")
 
 
 async def catch_up_on_chats() -> None:
@@ -2118,8 +2125,20 @@ async def catch_up_on_chats() -> None:
                 if not is_robot_echo(item.get("author_name")):
                     continue
                 status = str(item.get("status") or "").lower()
-                if status in DELIVERED_STATUSES or status in ("sent", "error"):
-                    await record_delivery(row, status, str(item.get("chat_type") or ""))
+                chat_type = str(item.get("chat_type") or "")
+                if status == "error":
+                    # ⚠️ Отказ канала зовёт человека НЕМЕДЛЕННО, даже если сделка уже ждёт
+                    # ответа. Иначе выходит кейс 19303: робот сутки ждёт ответа от клиента,
+                    # которого нет в WhatsApp, при том что ошибка уже лежит в переписке.
+                    lead = await load_lead(row["lead_id"])
+                    if lead is None:
+                        break
+                    stage = settings_client.get_stage(row["status_id"])
+                    await report_not_delivered(lead, stage, bot_by_id(stage, row.get("bot_id")),
+                                               status, chat_type, "по переписке панели")
+                    break
+                if status in DELIVERED_STATUSES or status == "sent":
+                    await record_delivery(row, status, chat_type)
                     break
             continue
         newest = inbound[0]
@@ -2211,19 +2230,8 @@ async def check_delivery_windows() -> None:
             if from_panel is not None:
                 outcome, status, chat_type = from_panel
                 if outcome == "error":
-                    note_err = f"{chat_type or 'канал'}: отказ канала (по переписке панели)"
-                    log_run(lead, stage, bot=bot, action="delivery",
-                            outcome="stop_not_delivered", reason=note_err,
-                            delivery={"statuses": [{"status": status, "chatType": chat_type}]})
-                    await stop_here(
-                        lead, stage, "stop_not_delivered", note_err, bot=bot,
-                        op_text=f"сообщение до клиента не дошло: {note_err}. Дальше не веду.",
-                        event_key=EVENT_NOT_DELIVERED,
-                        values={"что_с_доставкой": note_err,
-                                "этап": str((stage or {}).get("status_name") or ""),
-                                "бот": str((bot or {}).get("bot_name") or "")},
-                        panel_title="Авто-режим: сообщение не дошло",
-                    )
+                    await report_not_delivered(lead, stage, bot, status, chat_type,
+                                               "по переписке панели")
                     continue
                 await record_delivery(row, status, chat_type)
                 continue
