@@ -33,6 +33,17 @@ from contextlib import contextmanager
 # пересборке, то есть ровно то, ради чего хранилище заводится, не работало бы.
 DB_PATH = os.getenv("AUTOPILOT_DB_PATH", "/app/var/autopilot_state.sqlite3")
 
+# ⚠️ У режима «Призрак» состояние ОТДЕЛЬНОЕ, и это не удобство, а необходимость (27.09.2026).
+# Ключ состояния - пара «сделка и этап», и занятая пара второй раз не берётся никогда: так
+# работает гейт от повторного вебхука. Гоняй призрак по боевому потоку в общей базе - он занял
+# бы пары по всем живым сделкам, и после включения боя робот эти сделки уже не тронул бы. То
+# же и наоборот: призрак не должен видеть боевые ожидания и менять им фазу.
+SHADOW_DB_PATH = os.getenv("AUTOPILOT_SHADOW_DB_PATH", DB_PATH + ".shadow")
+
+# Как узнать, что сейчас режим призрака. Ставит `autopilot.py` при старте; без него считаем,
+# что призрака нет - хранилище само про режимы ничего не знает и знать не должно.
+_shadow_probe = None
+
 _UTC = datetime.timezone.utc
 
 # Фазы ведения. Это не «красивое перечисление», а ответ на вопрос «чего мы ждём прямо
@@ -45,9 +56,29 @@ PHASE_DONE = "done"              # этап пройден, бот больше 
 PHASE_STOPPED = "stopped"        # остановились и позвали человека
 
 
+def set_shadow_probe(probe) -> None:
+    """Сказать хранилищу, чем узнавать режим призрака. `None` - забыть (нужно тестам)."""
+    global _shadow_probe
+    _shadow_probe = probe
+
+
+def db_path() -> str:
+    """База, в которую пишем прямо сейчас. Спрашиваем режим на КАЖДОМ обращении, а не
+    запоминаем при старте: режим меняют руками на экране в любой момент, и запомненный
+    выбор увёл бы часть операций в чужую базу."""
+    if _shadow_probe is None:
+        return DB_PATH
+    try:
+        return SHADOW_DB_PATH if _shadow_probe() else DB_PATH
+    except Exception:
+        # Не смогли узнать режим - пишем в боевую базу. Это честнее обратного: боевое
+        # ведение сделки важнее чистоты репетиции.
+        return DB_PATH
+
+
 @contextmanager
 def _connect():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(db_path(), timeout=10)
     try:
         yield conn
         conn.commit()
@@ -94,56 +125,71 @@ def _loads(raw) -> list[dict]:
 
 
 def init() -> None:
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    with _connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS autopilot_state (
-                lead_id INTEGER NOT NULL,
-                status_id INTEGER NOT NULL,
-                pipeline_id INTEGER NOT NULL,
-                bot_id INTEGER,
-                phase TEXT NOT NULL,
-                launch_attempted_at TEXT,
-                launch_ok_at TEXT,
-                chat_id TEXT,
-                wake_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT '',
-                delivery TEXT NOT NULL DEFAULT '[]',
-                PRIMARY KEY (lead_id, status_id)
-            )
-            """
+    """Схема - в ОБЕИХ базах, боевой и призрачной: режим переключают на экране в любой
+    момент, и база должна быть готова заранее, а не создаваться на первом же событии."""
+    for path in (DB_PATH, SHADOW_DB_PATH):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        _init_one(path)
+
+
+def _init_one(path: str) -> None:
+    conn = sqlite3.connect(path, timeout=10)
+    try:
+        _create_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _create_schema(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS autopilot_state (
+            lead_id INTEGER NOT NULL,
+            status_id INTEGER NOT NULL,
+            pipeline_id INTEGER NOT NULL,
+            bot_id INTEGER,
+            phase TEXT NOT NULL,
+            launch_attempted_at TEXT,
+            launch_ok_at TEXT,
+            chat_id TEXT,
+            wake_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            delivery TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (lead_id, status_id)
         )
-        # По чату ищем сделку, когда прилетает сообщение от клиента: Wazzup знает чат, но не
-        # знает сделку. Без индекса это был бы полный перебор на каждое входящее.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_autopilot_state_chat ON autopilot_state (chat_id)"
+        """
+    )
+    # По чату ищем сделку, когда прилетает сообщение от клиента: Wazzup знает чат, но не
+    # знает сделку. Без индекса это был бы полный перебор на каждое входящее.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_autopilot_state_chat ON autopilot_state (chat_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_autopilot_state_wake ON autopilot_state (wake_at)"
+    )
+    # Отметки «об этом по этой сделке уже сказали». Отдельная таблица, а не поле в
+    # состоянии: уведомляем и о сделках, которые робот НЕ ведёт (заявка не «Заказ»), -
+    # у них строки состояния нет и быть не должно.
+    #
+    # ⚠️ Почему на диске, а не в памяти процесса: пока дедуп жил множеством в памяти,
+    # каждая пересборка контейнера обнуляла его, и по всем сделкам, стоящим на входном
+    # этапе, уведомление уходило заново. Ключ - пара «сделка и повод».
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS autopilot_notified (
+            lead_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (lead_id, kind)
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_autopilot_state_wake ON autopilot_state (wake_at)"
-        )
-        # Отметки «об этом по этой сделке уже сказали». Отдельная таблица, а не поле в
-        # состоянии: уведомляем и о сделках, которые робот НЕ ведёт (заявка не «Заказ»), -
-        # у них строки состояния нет и быть не должно.
-        #
-        # ⚠️ Почему на диске, а не в памяти процесса: пока дедуп жил множеством в памяти,
-        # каждая пересборка контейнера обнуляла его, и по всем сделкам, стоящим на входном
-        # этапе, уведомление уходило заново. Ключ - пара «сделка и повод».
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS autopilot_notified (
-                lead_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (lead_id, kind)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_autopilot_notified_at ON autopilot_notified (created_at)"
-        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_autopilot_notified_at ON autopilot_notified (created_at)"
+    )
 
 
 def get(lead_id: int, status_id: int) -> dict | None:
@@ -334,11 +380,24 @@ def drop_lead(lead_id: int) -> int:
 def purge_older_than(days: int) -> int:
     """Уборка за собой. Своих напоминаний молчащему клиенту мы не шлём (решение Кати
     08.09.2026), значит запись «ждём ответа» иначе живёт вечно, и каждое изменение сделки
-    будет пытаться её продолжить. Снимаем МОЛЧА: это уборка, а не дожим клиента."""
+    будет пытаться её продолжить. Снимаем МОЛЧА: это уборка, а не дожим клиента.
+
+    Чистим ОБЕ базы, боевую и призрачную: призрачную иначе не убирает никто - робот живёт в
+    ней только в дни репетиций, а уборка идёт из его же фонового цикла.
+    """
     cutoff = (datetime.datetime.now(_UTC) - datetime.timedelta(days=days)).isoformat()
-    with _connect() as conn:
-        cur = conn.execute("DELETE FROM autopilot_state WHERE updated_at < ?", (cutoff,))
-        return cur.rowcount
+    gone = 0
+    for path in {db_path(), DB_PATH, SHADOW_DB_PATH}:
+        if not os.path.exists(path):
+            continue
+        conn = sqlite3.connect(path, timeout=10)
+        try:
+            cur = conn.execute("DELETE FROM autopilot_state WHERE updated_at < ?", (cutoff,))
+            gone += cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    return gone
 
 
 def claim_notice(lead_id: int, kind: str) -> bool:

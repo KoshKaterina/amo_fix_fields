@@ -853,7 +853,10 @@ def test_live_lead_without_ms_order_stops(monkeypatch):
     asyncio.run(A.payment_fork(lead, None, "конец маршрута"))
     assert moves == []
     assert rows[-1]["outcome"] == "stop_unpaid"
-    assert "нет заказа" in rows[-1]["reason"]
+    # Причина называет и способ оплаты, и то, чего не хватило: способ решает всё, и без него
+    # строку журнала не проверить (правка Кати 27.09.2026).
+    assert "заказа МойСклада в сделке нет" in rows[-1]["reason"]
+    assert "Счет" in rows[-1]["reason"]
 
 
 def test_test_mode_alerts_go_to_tech_chat_not_managers(monkeypatch):
@@ -2110,3 +2113,226 @@ def test_shift_iso_and_at_or_after():
     assert A._at_or_after("2026-09-27T11:59:59+00:00", "2026-09-27T12:00:00+00:00") is False
     # нечитаемую отметку пропускаем: потерять ответ клиента дороже, чем разобрать лишнее
     assert A._at_or_after("не дата", "2026-09-27T12:00:00+00:00") is True
+
+
+# ── режим призрака ──────────────────────────────────────────────────────────────
+
+def _shadow_settings():
+    """Боевая воронка и боевые настройки, режим - призрак. В этом и смысл: репетиция идёт на
+    том же потоке, что и бой, иначе она ничего не проверяет."""
+    _settings(settings={"mode": "shadow", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")]),
+                     _stage(A.STATUS_SUCCESS, "Успешно реализовано", [], is_final=True)])
+
+
+def test_shadow_does_not_launch_the_bot_it_would_launch(monkeypatch):
+    """Бота, которого запускает наша интеграция, призрак не запускает - и говорит об этом
+    журналом, а не молчанием. Строка «сбой запуска» здесь была бы ложью: никто не пробовал."""
+    _shadow_settings()
+    rows = _capture(monkeypatch)
+    posts: list[tuple] = []
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "mark_launch_attempted", lambda *a: None)
+    monkeypatch.setattr(A.store, "mark_launch_ok", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+
+    async def fake_post(*a, **k):
+        posts.append(a)
+        return {"ok": True}
+
+    async def fake_contact(lead):
+        return {"id": 1, "custom_fields_values": [_cf(413385, "79001234567")]}
+
+    monkeypatch.setattr(A.amo_service, "_do_post", fake_post)
+    monkeypatch.setattr(A, "main_contact", fake_contact)
+    lead = _lead(id=36565400, name="Заказ №19300", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.run_bot(lead, _stage(83537714, "Новый лид", []),
+                          _bot(7131, launched_by="engine")))
+
+    assert posts == []                                    # в amoCRM не ходили вовсе
+    assert rows[-1]["outcome"] == "shadow_would_send"
+    assert "отправил бы" in rows[-1]["reason"]
+    assert _SENT == []                                    # и никого не дёрнули
+
+
+def test_shadow_keeps_leading_a_grid_bot(monkeypatch):
+    """А бота с грида Цифровой воронки отправляет сама amoCRM - значит сообщение клиенту уйдёт
+    и без нас, и призрак спокойно доводит репетицию до ожидания доставки."""
+    _shadow_settings()
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "mark_launch_ok", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+    monkeypatch.setattr(A, "confirm_grid_send", lambda *a, **k: _noop())
+
+    async def fake_contact(lead):
+        return {"id": 1, "custom_fields_values": [_cf(413385, "79001234567")]}
+
+    monkeypatch.setattr(A, "main_contact", fake_contact)
+    lead = _lead(id=36565401, name="Заказ №19301", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.run_bot(lead, _stage(83537714, "Новый лид", []),
+                          _bot(7131, launched_by="amo_grid")))
+
+    assert rows[-1]["outcome"] == "waiting_delivery"
+
+
+def test_shadow_does_not_move_the_lead(monkeypatch):
+    """Перевод сделки - то единственное, чего призрак не сделает никогда. И репетиция на этом
+    честно кончается: дальше по маршруту сделка не окажется, значит и продолжать нечего."""
+    _shadow_settings()
+    rows = _capture(monkeypatch)
+    patched: list[tuple] = []
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+
+    async def fake_patch(*a, **k):
+        patched.append(a)
+        return {"ok": True}
+
+    monkeypatch.setattr(A.amo_service, "patch_lead", fake_patch)
+    lead = _lead(id=36565402, name="Заказ №19302", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.move_to(lead, _stage(83537714, "Новый лид", []),
+                          A.STATUS_SUCCESS, "Успешно реализовано", "заказ оплачен"))
+
+    assert patched == []
+    assert rows[-1]["outcome"] == "shadow_would_move"
+    assert "Успешно реализовано" in rows[-1]["reason"]
+    assert rows[-1]["moved_to_status_name"] == "Успешно реализовано"
+
+
+def test_shadow_says_nothing_to_anybody(monkeypatch):
+    """Ни чат ОП, ни технический чат, ни лента панели. Сообщение о событии, которого не было,
+    пугает менеджера ровно так же, как настоящее."""
+    _shadow_settings()
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "_panel_notify", lambda **kw: _noop(feed.append(kw)))
+    A.alert_tech("что-то сломалось")
+    A.dispatch_op(A.EVENT_ERROR, "сделка: сбой", panel_title="Авто-режим: сбой")
+    A.panel_notify_bg(kind="autopilot_error", title="Сбой", body="текст")
+    assert _SENT == []
+    assert feed == []
+
+
+def test_shadow_state_does_not_occupy_live_pairs():
+    """Состояние призрака - в своей базе. Иначе он занял бы пары «сделка и этап» по всем живым
+    сделкам, и после включения боя робот эти сделки уже не взял бы: занятая пара второй раз
+    не берётся никогда."""
+    shadow = {"on": False}
+    S.set_shadow_probe(lambda: shadow["on"])
+    try:
+        S.init()
+        shadow["on"] = True
+        assert S.claim(36565403, 83537714, 10593102) is True      # взял призрак
+        shadow["on"] = False
+        assert S.claim(36565403, 83537714, 10593102) is True      # бой берёт заново
+        assert S.db_path() == S.DB_PATH
+        shadow["on"] = True
+        assert S.db_path() == S.SHADOW_DB_PATH
+    finally:
+        S.set_shadow_probe(None)
+
+
+def test_shadow_counts_the_alerts_it_would_send(monkeypatch):
+    """Заявка, которую робот не ведёт: в бою это сообщение в чат, в призраке - строка журнала.
+    По ней видно, сколько шума даст этот поток, не заливая топик."""
+    _shadow_settings()
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A.store, "claim_notice", lambda *a: True)
+    lead = _lead(id=36565404, name="Заявка с сайта", pipeline_id=10593102,
+                 status_id=83537714, custom_fields_values=[_cf(577671, "Предзаказ")])
+
+    asyncio.run(A.notify_entry_lead(lead))
+
+    assert rows[-1]["outcome"] == "shadow_would_alert"
+    assert "Предзаказ" in rows[-1]["reason"]
+    assert rows[-1]["alert_target"] == "op"
+    assert _SENT == []
+
+
+# ── журнал словами: разбор ответа, оплата, этап ─────────────────────────────────
+
+def test_reply_log_explains_the_rule_and_the_list():
+    """Просьба Кати 27.09.2026: в журнале должен быть РАЗБОР, а не вердикт. Какое правило у
+    бота, что было в списке и чем совпал ответ - иначе проверить робота нечем."""
+    bot = _bot(7131, stop_mode="listed", stop_answers=["Да", "Да, всё верно"])
+    note = A.answer_verdict_note(bot, "Да, все верно", "advance")
+    assert "Да, все верно" in note
+    assert "только на эти ответы" in note
+    assert "Да, всё верно" in note            # список показан целиком
+    assert "веду дальше" in note
+
+    miss = A.answer_verdict_note(bot, "а можно другой цвет?", "stop")
+    assert "ответа в списке НЕТ" in miss
+    assert "дальше не веду" in miss
+
+    other = A.answer_verdict_note(_bot(7131, stop_mode="except", stop_answers=["Нет"]),
+                                  "Нет", "stop")
+    assert "на любой ответ, кроме этих" in other
+    assert "ответ в списке-исключении" in other
+
+
+def test_payment_note_names_method_and_what_ms_said():
+    """«Заказ оплачен, сверено с МойСкладом» не отвечало ни на один вопрос разбора: способ
+    оплаты решает всё, а его в строке не было."""
+    assert A.payment_note("Онлайн-оплата", True, 15900) == (
+        "способ оплаты «Онлайн-оплата», в МойСкладе оплата есть: 15 900 ₽")
+    assert "оплаты нет" in A.payment_note("Онлайн-оплата", False)
+    assert "не ответил" in A.payment_note("Онлайн-оплата", None)
+    assert "не заполнен" in A.payment_note("", False)
+
+
+def test_paid_order_log_carries_the_sum(monkeypatch):
+    """Развилка оплаты пишет в журнал способ и сумму, которую увидела в МойСкладе."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "move_to", lambda *a, **k: _noop())
+
+    async def fake_ms_get(path):
+        return {"payedSum": 1590000}
+
+    monkeypatch.setattr(A.ms_client, "get", fake_ms_get)
+    lead = _lead(id=36565405, pipeline_id=10593102, status_id=83537714,
+                 custom_fields_values=[_cf(577373, "Онлайн-оплата"), _cf(576689, "uuid-1")])
+
+    asyncio.run(A.payment_fork(lead, _stage(83537714, "Новый лид", []), "конец маршрута"))
+
+    assert rows[-1]["outcome"] == "advanced"
+    assert "Онлайн-оплата" in rows[-1]["reason"]
+    assert "15 900 ₽" in rows[-1]["reason"]
+
+
+def test_cod_log_says_why_moysklad_was_not_asked(monkeypatch):
+    """Наложка: МойСклад не спрашиваем вовсе, и в журнале должно быть сказано почему."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "move_to", lambda *a, **k: _noop())
+    lead = _lead(id=36565406, pipeline_id=10593102, status_id=83537714,
+                 custom_fields_values=[_cf(577373, "При получении")])
+
+    asyncio.run(A.payment_fork(lead, _stage(83537714, "Новый лид", []), "конец маршрута"))
+
+    assert "При получении" in rows[-1]["reason"]
+    assert "при вручении" in rows[-1]["reason"]
+
+
+def test_route_log_names_the_stage_it_passed(monkeypatch):
+    """«Прошёл этап» без имени этапа не говорит ничего (замечание Кати 27.09.2026)."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "advance", lambda *a, **k: _noop())
+    lead = _lead(id=36565407, pipeline_id=10593102, status_id=87280230)
+
+    asyncio.run(A.run_stage(lead, _stage(87280230, "Оплата запрошена", [])))
+
+    assert rows[-1]["outcome"] == "skipped_no_bots"
+    assert "Оплата запрошена" in rows[-1]["reason"]

@@ -132,6 +132,25 @@ def is_enabled() -> bool:
     return AUTOPILOT_ENABLED and settings_client.get_mode() != "off"
 
 
+def is_shadow() -> bool:
+    """Режим «Призрак»: думает как в бою, наружу не делает ничего (Катя 27.09.2026).
+
+    Воронка боевая, настройки боевые, поток сделок боевой - разница ровно в том, что робот
+    не отправляет сообщений, не переводит сделки и не пишет людям. Каждое решение уходит в
+    журнал словами «сделал бы то-то».
+
+    ⚠️ Проверка стоит у САМОЙ границы с внешним миром - в `launch_bot`, `move_to` и
+    `dispatch_op`, - а не в начале разбора. Если бы призрак отваливался раньше, он бы и
+    думал иначе, чем бой, и смысла в такой репетиции не было бы никакого.
+    """
+    return settings_client.get_mode() == "shadow"
+
+
+def shadow_note(text: str) -> str:
+    """Причина в журнале от лица призрака: не «сделал», а «сделал бы»."""
+    return f"призрак: {text}" if is_shadow() else text
+
+
 # ── рабочие часы ────────────────────────────────────────────────────────────────
 
 def _work_hours() -> list[dict[str, str]]:
@@ -182,6 +201,10 @@ def next_work_moment(now: datetime.datetime | None = None) -> datetime.datetime 
 def allow_action() -> bool:
     """Потолок в час. Упёрлись - один раз пишем в технический чат и молчим до нового часа."""
     global _hour_bucket, _cap_warned_hour
+    # Призраку потолок не нужен: он ничего не делает, а расходуя бюджет, он бы упирался в
+    # него и записывал в журнал «остановился из-за потолка» - то есть врал бы о бое.
+    if is_shadow():
+        return True
     hour = int(datetime.datetime.now(_UTC).timestamp() // 3600)
     bucket_hour, count = _hour_bucket
     if bucket_hour != hour:
@@ -254,6 +277,9 @@ _moved_by_us: set[tuple[int, int]] = set()
 
 def alert_tech(text: str) -> None:
     """Наши поломки - в технический чат (адресат по умолчанию у `send_alert`)."""
+    if is_shadow():
+        logger.info("autopilot: призрак молчит, сказал бы в техчат: %s", text)
+        return
     d = alerts.decide(
         EVENT_FAILURE, legacy_text="🤖 Авто-режим" + chr(10) + text,
         values={"текст_поломки": text},
@@ -345,6 +371,13 @@ def dispatch_op(event_key: str, text: str, *, responsible_id=None,
     кто тестирует, и читает он их в техническом чате. Иначе в рабочий топик УВЕДОМЛЕНИЯ
     полетело бы «клиент ответил...» по сделке с тестовым контактом.
     """
+    # ⚠️ Призрак не говорит ни с кем: ни чат ОП, ни технический, ни лента панели. Сообщение
+    # о событии, которого не было, пугает менеджера ровно так же, как настоящее, - а робот в
+    # этом режиме ничего не сделал (решение Кати 27.09.2026). Что алерт УШЁЛ БЫ, видно в
+    # строке журнала: там стоит адресат.
+    if is_shadow():
+        logger.info("autopilot: призрак молчит, сказал бы людям (%s): %s", event_key, text)
+        return
     plain = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
     found = _LINK_RE.search(text)
     if settings_client.get_mode() == "live":
@@ -416,7 +449,14 @@ def panel_notify_bg(*, kind: str, title: str, body: str, url: str | None = None,
     Лента, а не чат - основной канал: Телеграм у нас уже глушился на сутки одним
     сетевым сбоем (28-29.08.2026). Шлём фоном и не ждём: сбой доставки уведомления
     не должен трогать ведение сделки.
+
+    ⚠️ Призрак в ленту не пишет: лента - такой же разговор с человеком, как чат, и
+    уведомление о событии, которого не было, читается наравне с настоящим. Гейт стоит
+    ЗДЕСЬ, у самой отправки, чтобы его не приходилось помнить в каждом вызове.
     """
+    if is_shadow():
+        logger.info("autopilot: призрак молчит, положил бы в ленту (%s): %s", kind, title)
+        return
     task = asyncio.create_task(_panel_notify(kind=kind, title=title, body=body,
                                              url=url, level=level,
                                              dedupe_key=dedupe_key))
@@ -602,6 +642,46 @@ def answer_decision(bot: dict, answer: str) -> str:
     if mode == "except":
         return "stop" if got in listed else "advance"
     return "stop"
+
+
+# Правила движения вперёд - словами экрана. Заголовок там «Когда идём дальше», и в журнале
+# правило должно называться ровно так же: человек сверяет строку журнала с настройкой бота,
+# и два разных названия одного правила эту сверку ломают.
+STOP_MODE_TITLES = {
+    "any": "как только клиент ответит",
+    "listed": "только на эти ответы",
+    "except": "на любой ответ, кроме этих",
+    "never": "ответ не нужен",
+}
+
+
+def answer_verdict_note(bot: dict, answer: str, decision: str) -> str:
+    """Разбор ответа клиента словами - для строки журнала (просьба Кати 27.09.2026).
+
+    Дословно: «почему нет в логе анализа ответа клиента на бота? типа ответ клиента такой-то,
+    он есть в белом списке (или нет в чёрном списке, в зависимости от правила движения вперед
+    для бота) - ведем сделку далее». До этого в журнале стояло «ответ клиента подходит под
+    условие успеха» - вердикт без разбора: ни правила, ни списка, ни того, чем совпало.
+
+    Список в журнал кладём ЦЕЛИКОМ, а не «совпало с одним из вариантов»: настройки бота могут
+    поменять завтра, а журнал читают через месяц, и тогда восстановить, с чем сравнивали, будет
+    уже нечем. Длинный список подрезаем - в журнал, а не в роман.
+    """
+    mode = str(bot.get("stop_mode") or "any")
+    said = str(answer or "").strip()
+    rule = STOP_MODE_TITLES.get(mode, mode)
+    listed = [str(a).strip() for a in (bot.get("stop_answers") or []) if str(a).strip()]
+    shown = "; ".join(listed[:8]) + (" и ещё" if len(listed) > 8 else "")
+    head = f"клиент ответил «{said[:200]}»" if said else "клиент ответил пустым сообщением"
+    tail = "веду дальше" if decision == "advance" else "дальше не веду"
+
+    if mode == "listed":
+        hit = "ответ в списке" if decision == "advance" else "ответа в списке НЕТ"
+        return f"{head}. Правило бота - «{rule}»: {shown or 'список пуст'}. {hit}, {tail}"
+    if mode == "except":
+        hit = "ответ в списке-исключении" if decision == "stop" else "в списке-исключении его нет"
+        return f"{head}. Правило бота - «{rule}»: {shown or 'список пуст'}. {hit}, {tail}"
+    return f"{head}. Правило бота - «{rule}», сравнивать не с чем, {tail}"
 
 
 # Вердикт доставки. Ровно четыре исхода, и «провал» среди них - самый дорогой.
@@ -846,6 +926,9 @@ async def launch_bot(lead_id: int, bot_id: int) -> bool:
     замере от запуска до отправки прошло 35. Поэтому гейт доставки не считает первые минуты
     молчания провалом - окно ожидания задаётся на экране и по умолчанию равно четверти часа.
     """
+    if is_shadow():
+        logger.info("autopilot: призрак не запускает бота %s по сделке %s", bot_id, lead_id)
+        return False
     result = await amo_service._do_post(
         "/api/v2/salesbot/run",
         [{"bot_id": int(bot_id), "entity_id": int(lead_id), "entity_type": SALESBOT_ENTITY_LEAD}],
@@ -1017,8 +1100,9 @@ async def run_stage(lead: dict, stage: dict, *, moved_by_us: bool = True) -> Non
     if bot is None:
         # Этап без ботов - ПРОХОДНОЙ (правка Кати 09.09.2026): сделку в него перевели, чужая
         # автоматика этапа получила своё событие, нам здесь делать нечего - идём дальше.
-        reason = ("этап проходной, ботов на нём нет" if not (stage.get("bots") or [])
-                  else "ни один бот этапа не подошёл по условиям")
+        where = str(stage.get("status_name") or "этап без названия")
+        reason = (f"этап «{where}» проходной, ботов на нём нет" if not (stage.get("bots") or [])
+                  else f"на этапе «{where}» ни один бот не подошёл по условиям")
         log_run(lead, stage, action="route", outcome="skipped_no_bots", reason=reason)
         await advance(lead, stage, reason, moved_by_us=moved_by_us)
         return
@@ -1077,6 +1161,21 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
             values={"что_случилось": "в карточке контакта нет телефона, чат Wazzup не определить"},
             panel_title="Авто-режим: не вижу чат клиента",
         )
+        return
+
+    # ⚠️ Призрак и шаблон: развилка ровно здесь. Бота с грида Цифровой воронки отправляет сама
+    # amoCRM - значит сообщение клиенту уйдёт и без нас, и призрак спокойно доводит репетицию
+    # до конца: ждёт доставку, читает ответ, разбирает его. А бота, которого запускает наша
+    # интеграция, в призраке не запускает никто, ждать нечего - пишем, что отправили бы, и
+    # ведение на этом заканчиваем. Иначе окно доставки истекло бы ложным «не дошло».
+    if is_shadow() and str(bot.get("launched_by") or "engine") == "engine":
+        await asyncio.to_thread(
+            store.finish, lead_id, status_id, store.PHASE_STOPPED, "призрак: шаблон не отправлял",
+        )
+        refresh_watched_chats()
+        log_run(lead, stage, bot=bot, action="launch_bot", outcome="shadow_would_send",
+                reason=f"отправил бы клиенту шаблон ботом «{bot.get('bot_name') or bot_id}», "
+                       "но в режиме призрака сообщений не отправляю")
         return
 
     if str(bot.get("launched_by") or "engine") == "engine":
@@ -1154,8 +1253,10 @@ async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None
             store.finish, int(lead["id"]), status_id, store.PHASE_DONE, reason,
         )
         log_run(lead, stage, action="route", outcome="done",
-                reason=("маршрут пройден, дальше сделку уводит перевод в офис" if moved_by_us
-                        else "в успех сделку перевёл не робот, маршрут считаю пройденным"))
+                reason=("маршрут пройден до «Успешно реализовано», дальше сделку уводит перевод "
+                        "в офис" if moved_by_us else
+                        "в успех сделку перевёл не робот, маршрут считаю пройденным"),
+                moved_to_status_name="Успешно реализовано" if moved_by_us else "")
         return
     nxt = next_stage(status_id)
     # На этап запроса оплаты, как и в успех, по порядку карточек не переходим. Сам этап
@@ -1179,6 +1280,20 @@ async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: s
     """
     lead_id = int(lead["id"])
     was = int(lead.get("status_id") or 0)
+    # ⚠️ Призрак сделку не двигает, и на этом его репетиция кончается: следующий шаг маршрута
+    # начинается с того, что сделка УЖЕ на новом этапе, а она там не окажется. Обходного пути
+    # нет, поэтому говорим об этом прямо в журнале, а не делаем вид, что прошли дальше.
+    if is_shadow():
+        await asyncio.to_thread(
+            store.finish, lead_id, was, store.PHASE_STOPPED,
+            f"призрак: перевёл бы на «{status_name}»",
+        )
+        refresh_watched_chats()
+        log_run(lead, stage, action="route", outcome="shadow_would_move",
+                reason=f"перевёл бы сделку на этап «{status_name}»: {reason}. В режиме призрака "
+                       "сделку не двигаю, дальше по маршруту репетиция не идёт",
+                moved_to_status_name=status_name)
+        return
     if not allow_action():
         await stop_here(
             lead, stage, "failed", "упёрся в потолок действий в час",
@@ -1238,8 +1353,12 @@ def is_ambiguous_payment(payment_method) -> bool:
     return any(marker in value for marker in AMBIGUOUS_PAYMENT_MARKERS)
 
 
-async def order_is_paid(order_uuid) -> bool | None:
-    """Оплачен ли заказ в МойСкладе. None - склад не ответил, и это НЕ «не оплачен».
+async def order_payment(order_uuid) -> tuple[bool | None, float]:
+    """Оплата заказа в МойСкладе: оплачен ли и на какую сумму.
+
+    Сумма нужна ЖУРНАЛУ (просьба Кати 27.09.2026 - «в этапе проверки оплаты хорошо писать,
+    какой способ оплаты и статус в мс»): «оплачен» без цифры не отличить от «оплачен на рубль»,
+    а разбирают такие сделки как раз по цифре.
 
     ⚠️ Признак оплаты - `payedSum > 0`, а не сравнение с суммой заказа. Сумма первые минуты
     пляшет: `woocommerce-sklad` раз в три минуты обнуляет цену доставки по правилу «предоплата
@@ -1250,20 +1369,45 @@ async def order_is_paid(order_uuid) -> bool | None:
     у неизвестности своя честная причина остановки.
     """
     if not order_uuid:
-        return None
+        return None, 0.0
     try:
         data = await ms_client.get(f"entity/customerorder/{order_uuid}")
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("autopilot: заказ %s не прочитался из МойСклада", order_uuid)
-        return None
+        return None, 0.0
     if not data:
-        return None
+        return None, 0.0
     try:
-        return float(data.get("payedSum") or 0) > 0
+        # В МойСкладе деньги лежат в копейках - так же их читает раздел цен панели
+        # (`app/prices/digest.py`), второй трактовки этой цифры у нас нет.
+        payed = float(data.get("payedSum") or 0) / 100
     except (TypeError, ValueError):
-        return None
+        return None, 0.0
+    return payed > 0, payed
+
+
+async def order_is_paid(order_uuid) -> bool | None:
+    """Оплачен ли заказ в МойСкладе. None - склад не ответил, и это НЕ «не оплачен»."""
+    paid, _ = await order_payment(order_uuid)
+    return paid
+
+
+def payment_note(method, paid: bool | None, payed: float = 0.0) -> str:
+    """Строка для журнала: способ оплаты и что сказал МойСклад.
+
+    Без этой строки в журнале стояло «заказ оплачен, сверено с МойСкладом» - верно, но по ней
+    нельзя ни проверить робота, ни понять сделку: способ оплаты решает всё, а его в строке не
+    было вовсе.
+    """
+    name = str(method or "").strip() or "не заполнен"
+    if paid is None:
+        return f"способ оплаты «{name}», МойСклад про оплату не ответил"
+    if paid:
+        amount = f"{payed:,.0f}".replace(",", " ")
+        return f"способ оплаты «{name}», в МойСкладе оплата есть: {amount} ₽"
+    return f"способ оплаты «{name}», в МойСкладе оплаты нет"
 
 
 async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
@@ -1289,7 +1433,8 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
 
     if is_cod_strict(method):
         log_run(lead, stage, action="payment_fork", outcome="advanced",
-                reason="оплата при получении, деньги возьмут при вручении")
+                reason=f"способ оплаты «{method}» - деньги возьмут при вручении, "
+                       "МойСклад об оплате не спрашиваю")
         await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано",
                       "оплата при получении")
         return
@@ -1315,28 +1460,29 @@ async def payment_fork(lead: dict, stage: dict | None, reason: str) -> None:
         # создаёт интеграция), в тесте это ручная сделка - исход один: без подтверждённой
         # оплаты в успех не ведём, сделка стоит где стояла, человек смотрит.
         await stop_here(
-            lead, stage, "stop_unpaid", "в сделке нет заказа МойСклада, оплату не проверить",
+            lead, stage, "stop_unpaid",
+            f"способ оплаты «{method}», а заказа МойСклада в сделке нет - оплату не проверить",
             op_text="онлайн-оплата, а заказа МойСклада в сделке нет - оплату не проверить, "
                     "дальше не веду",
         )
         return
 
-    paid = await order_is_paid(order_uuid)
+    paid, payed = await order_payment(order_uuid)
+    note = payment_note(method, paid, payed)
     if paid:
-        log_run(lead, stage, action="payment_fork", outcome="advanced",
-                reason="заказ оплачен, сверено с МойСкладом")
+        log_run(lead, stage, action="payment_fork", outcome="advanced", reason=note)
         await move_to(lead, stage, STATUS_SUCCESS, "Успешно реализовано", "заказ оплачен")
         return
     if paid is None:
         await stop_here(
-            lead, stage, "failed", "МойСклад не сказал, оплачен ли заказ",
+            lead, stage, "failed", note,
             op_text="не смог узнать в МойСкладе, оплачен ли заказ, дальше не веду",
             event_key=EVENT_ERROR, panel_title="Авто-режим: сбой",
             values={"что_случилось": "МойСклад не ответил, оплачен ли заказ"},
         )
         return
     await stop_here(
-        lead, stage, "stop_unpaid", "онлайн-заказ не оплачен",
+        lead, stage, "stop_unpaid", note,
         op_text="онлайн-заказ не оплачен - в успех не веду, посмотрите оплату",
     )
 
@@ -1350,11 +1496,12 @@ async def force_ur(lead: dict, stage: dict | None, note: str) -> None:
     """
     method = amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD)
     order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
-    paid = await order_is_paid(order_uuid)
+    paid, payed = await order_payment(order_uuid)
     if paid or is_cod_strict(method):
         why = "заказ оплачен" if paid else "оплата при получении"
         log_run(lead, stage, action="payment_fork", outcome="advanced",
-                reason=f"шаблоны не дошли ({note}), но {why}", alert_target="op")
+                reason=f"шаблоны не дошли ({note}), но {payment_note(method, paid, payed)}",
+                alert_target="op")
         lead_id = int(lead["id"])
         name = str(lead.get("name") or "").strip()
         dispatch_op(
@@ -1465,7 +1612,10 @@ async def notify_entry_lead(lead: dict) -> None:
     контейнера обнуляла память, и по всем сделкам на входном этапе уведомление уходило
     заново. Лента переживает повтор сама, по `dedupe_key`.
     """
-    if settings_client.get_mode() != "live":
+    # Призрак сюда доходит намеренно: сказать он ничего не скажет (гейты в `dispatch_op` и
+    # `panel_notify_bg`), зато в журнале останется строка «сказал бы в чат» - по ней видно,
+    # сколько шума даёт этот поток, не заливая топик.
+    if settings_client.get_mode() not in ("live", "shadow"):
         return
     # В ПИЛОТЕ (тумблер «на проде вести только тестовые контакты») - только белый список:
     # пока робот обкатывается, ни чат, ни лента не должны шуметь живым потоком.
@@ -1497,6 +1647,11 @@ async def notify_entry_lead(lead: dict) -> None:
     if not await asyncio.to_thread(store.claim_notice, lead_id, "lead_unhandled"):
         return
     kind = app_type or "не указан"
+    if is_shadow():
+        log_run(lead, None, action="lead_change", outcome="shadow_would_alert",
+                reason=f"сказал бы в чат: заявка «{kind}», робот такие не ведёт",
+                alert_target="op")
+        return
     dispatch_op(
         EVENT_LEAD_UNHANDLED,
         f"{lead_link(lead_id, name)}: заявка «{kind}», робот такие не ведёт - возьмите в работу.",
@@ -1982,7 +2137,7 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
 
     if answer_decision(bot, text) == "advance":
         log_run(lead, stage, bot=bot, action="reply", outcome="advanced",
-                reason="ответ клиента подходит под условие успеха", client_answer=text)
+                reason=answer_verdict_note(bot, text, "advance"), client_answer=text)
         await advance(lead, stage, "клиент ответил так, как ждали", from_bot=bot)
         return
 
@@ -1990,10 +2145,13 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
                                             or bot.get("stop_answers") or [])]
     known = normalize_answer(text) in listed
     outcome = "stop_fix_requested" if known else "stop_free_text"
-    reason = ("клиент выбрал ответ, на котором робот останавливается" if known
-              else "клиент ответил не кнопкой, а своими словами")
+    # Состоянию сделки нужна короткая причина, журналу - разбор целиком: в состоянии эта
+    # строка живёт как пометка «почему стоим», её читают в отладке, а не человек на экране.
+    note = ("клиент выбрал ответ, на котором робот останавливается" if known
+            else "клиент ответил не кнопкой, а своими словами")
+    reason = f"{answer_verdict_note(bot, text, 'stop')}. {note}"
     await asyncio.to_thread(
-        store.update, row["lead_id"], row["status_id"], phase=store.PHASE_STOPPED, note=reason,
+        store.update, row["lead_id"], row["status_id"], phase=store.PHASE_STOPPED, note=note,
     )
     log_run(lead, stage, bot=bot, action="reply", outcome=outcome, reason=reason,
             client_answer=text, alert_target="op")
@@ -2306,6 +2464,9 @@ async def init() -> None:
     if not AUTOPILOT_ENABLED:
         logger.info("autopilot: выключен флагом AUTOPILOT_ENABLED")
         return
+    # Хранилище само про режимы не знает: говорим ему, чем спросить про призрака, - у него
+    # для призрака отдельная база, иначе репетиция заняла бы боевые пары «сделка и этап».
+    store.set_shadow_probe(is_shadow)
     await asyncio.to_thread(store.init)
     await asyncio.to_thread(refresh_watched_chats)
     settings_client.start()
