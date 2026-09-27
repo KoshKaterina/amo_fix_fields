@@ -150,19 +150,35 @@ def test_rejected_order_unblocks():
 
 
 def test_missing_order_unblocks():
-    err = cdek_client.CdekError("CDEK GET /orders/x: 404")
-    err.status = 404
+    err = cdek_client.CdekError("CDEK GET /orders/x: 404", status=404)
     _reset(lambda u: err)
     waybill_pending_store.put(LEAD, UUID_FIRST, "webhook")
-    res = asyncio.run(waybill_service._resume_or_block_pending(LEAD, [], "retry"))
+    # Заявка должна быть «не свежей», иначе 404 намеренно не считается честным.
+    waybill_service.PENDING_404_TRUST_AFTER_S = 0.0
+    try:
+        res = asyncio.run(waybill_service._resume_or_block_pending(LEAD, [], "retry"))
+    finally:
+        waybill_service.PENDING_404_TRUST_AFTER_S = 120.0
     assert res is None, "заказа нет — создавать новый можно, это выход для менеджера"
     assert waybill_pending_store.get(LEAD) is None
     print("ok  отсутствующий заказ (404) снимает блокировку")
 
 
+def test_fresh_404_is_not_trusted():
+    """404 по только что созданной заявке — не доказательство, что заказа нет.
+    Поверить ему значит создать второе реальное отправление."""
+    err = cdek_client.CdekError("CDEK GET /orders/x: 404", status=404)
+    _reset(lambda u: err)
+    waybill_pending_store.put(LEAD, UUID_FIRST, "webhook")
+    res = asyncio.run(waybill_service._resume_or_block_pending(LEAD, [], "webhook"))
+    assert res is not None and res["reason"] == "pending-unverified", res
+    assert _created == [], "по свежему 404 второй заказ создавать нельзя"
+    assert waybill_pending_store.get(LEAD) is not None, "блокировку снимать рано"
+    print("ok  свежий 404 не снимает блокировку")
+
+
 def test_cdek_unreachable_blocks():
-    err = cdek_client.CdekError("CDEK GET /orders/x: 500")
-    err.status = 500
+    err = cdek_client.CdekError("CDEK GET /orders/x: 500", status=500)
     _reset(lambda u: err)
     waybill_pending_store.put(LEAD, UUID_FIRST, "webhook")
     res = asyncio.run(waybill_service._resume_or_block_pending(LEAD, [], "webhook"))
@@ -201,6 +217,7 @@ if __name__ == "__main__":
     test_number_arrived_later_is_committed_by_guard()
     test_rejected_order_unblocks()
     test_missing_order_unblocks()
+    test_fresh_404_is_not_trusted()
     test_cdek_unreachable_blocks()
     test_resume_reads_tags_fresh_and_does_not_wipe_them()
     print("\nвсе проверки гейта пройдены")

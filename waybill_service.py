@@ -521,6 +521,28 @@ async def _commit_success(
 # не создастся, но десяток параллельных опросов одного заказа не нужен никому.
 _pending_pollers: set[str] = set()
 
+# Сколько заявка должна прожить, чтобы 404 от СДЭК считать честным «заказа нет».
+# Молодой заявке СДЭК может ещё не отдавать чтение, и поверить такому 404 значит
+# создать второе реальное отправление — то, от чего гейт и заводился.
+PENDING_404_TRUST_AFTER_S = float(os.getenv("WAYBILL_PENDING_404_TRUST_AFTER_S", "120"))
+
+
+def _row_older_than(row: dict, seconds: float) -> bool:
+    """True, если заявку запомнили раньше, чем `seconds` назад. Время не разобралось —
+    считаем строку старой: иначе непарсящаяся дата заблокировала бы сделку навсегда."""
+    import datetime
+
+    raw = row.get("created_at")
+    try:
+        created = datetime.datetime.fromisoformat(str(raw))
+    except Exception:
+        logger.warning("Незавершённый заказ: не разобрал created_at=%r, считаю строку старой", raw)
+        return True
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+    return age >= seconds
+
 
 async def _pending_touch(lead_id, *, gave_up: bool | None = None) -> None:
     try:
@@ -588,13 +610,23 @@ async def _resume_or_block_pending(lead_id, current_tags: list[dict], source: st
     try:
         order_info = await cdek_client.get_order(order_uuid)
     except cdek_client.CdekError as exc:
-        if getattr(exc, "status", None) == 404:
+        if getattr(exc, "status", None) == 404 and _row_older_than(row, PENDING_404_TRUST_AFTER_S):
             logger.info(
                 "Lead %s: запомненного заказа %s в СДЭК нет (404) — снимаю блокировку, создаём новый",
                 lead_id, order_uuid,
             )
             await _pending_drop(lead_id)
             return None
+        if getattr(exc, "status", None) == 404:
+            # Свежая заявка и уже 404 — скорее всего СДЭК просто ещё не отдаёт её на
+            # чтение. Верить такому 404 нельзя: поверим — создадим второе отправление,
+            # то есть ровно то, от чего гейт и заводился.
+            logger.warning(
+                "Lead %s: заказ %s отдаёт 404, но заявке меньше %.0fс — не верю, второй заказ не создаю",
+                lead_id, order_uuid, PENDING_404_TRUST_AFTER_S,
+            )
+            return {"ok": False, "lead_id": lead_id, "reason": "pending-unverified",
+                    "cdek_number": None, "skipped": True}
         logger.warning(
             "Lead %s: СДЭК не ответил про запомненный заказ %s (%s) — не создаю второй заказ",
             lead_id, order_uuid, exc,
