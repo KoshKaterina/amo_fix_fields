@@ -1581,3 +1581,60 @@ def test_success_stage_of_our_own_lead_still_finishes_the_route(monkeypatch):
     monkeypatch.setattr(A, "load_lead", fake_load)
     asyncio.run(A.handle_lead_change(36565053))
     assert rows and rows[-1]["outcome"] == "done"
+
+
+def test_stale_entry_is_journalled_once_not_on_every_webhook(monkeypatch):
+    """⚠️ Поймано в бою 27.09.2026, через час после выкатки гейта: по одному залежавшемуся
+    заказу натекло 28 строк журнала за семь минут. Гейт стоит ДО `claim`, значит отбивает
+    каждый вебхук, а их по стоящей сделке десятки."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop())
+    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 15 * 3600
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714, created_at=old,
+                     custom_fields_values=[_cf(577671, "Заказ")])
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    for _ in range(5):
+        asyncio.run(A.handle_lead_change(36564965))
+    stale = [r for r in rows if r["outcome"] == "skipped_stale_entry"]
+    assert len(stale) == 1
+
+
+def test_payment_mismatch_alert_does_not_repeat(monkeypatch):
+    """⚠️ Поймано в бою 27.09.2026: «платёжная система говорит оплачено, а в МойСкладе оплаты
+    нет» ушло дважды за полторы минуты по одному заказу. Ветка «Оплата получена» живёт ДО
+    `store.claim`, поэтому гейт от повторного вебхука её не защищает, а вебхуков по сделке,
+    стоящей на этапе, приходят десятки."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "list_for_lead",
+                        lambda lead_id: [{"lead_id": lead_id, "status_id": 83537714}])
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+
+    async def unpaid(path, params=None, retries=3):
+        return {"payedSum": 0}
+
+    monkeypatch.setattr(A.ms_client, "get", unpaid)
+    lead = _lead(id=36564965, name="Заказ №19286", pipeline_id=10593102,
+                 status_id=A.STATUS_PAYMENT_RECEIVED,
+                 custom_fields_values=[_cf(576689, "uuid-1"), _cf(577373, "Онлайн-оплата")])
+
+    async def run():
+        await A.on_payment_received(lead)
+        await A.on_payment_received(lead)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    said = [m for m in _SENT if "МойСкладе оплаты нет" in m["text"]]
+    assert len(said) == 1
+    assert len([r for r in rows if r["outcome"] == "failed"]) == 1

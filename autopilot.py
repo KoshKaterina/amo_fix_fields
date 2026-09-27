@@ -1500,8 +1500,13 @@ async def handle_lead_change(lead_id: int) -> None:
             and not lead_is_fresh(lead, max_age_h=AUTOPILOT_MAX_ENTRY_AGE_H)):
         logger.info("autopilot: сделка %s стоит на входном этапе дольше окна, в ведение не беру",
                     lead_id)
-        log_run(lead, stage, action="route", outcome="skipped_stale_entry",
-                reason=f"на входном этапе дольше {AUTOPILOT_MAX_ENTRY_AGE_H} ч, в ведение не беру")
+        # ⚠️ В журнал - ОДИН раз на сделку и этап. Гейт стоит до `claim`, значит отбивает каждый
+        # вебхук, а их по стоящей сделке десятки: 27.09.2026 по одному заказу натекло 28 строк за
+        # семь минут. Отметка на диске тут ровно к месту - её и так проверяет уведомление о заявке.
+        if await asyncio.to_thread(store.claim_notice, lead_id, f"stale-{status_id}"):
+            log_run(lead, stage, action="route", outcome="skipped_stale_entry",
+                    reason=f"на входном этапе дольше {AUTOPILOT_MAX_ENTRY_AGE_H} ч, "
+                           "в ведение не беру")
         return
 
     if not whitelist_ok(lead):
@@ -1538,6 +1543,12 @@ async def on_payment_received(lead: dict) -> None:
     order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
     paid = await order_is_paid(order_uuid)
     if paid is False:
+        # ⚠️ Один раз на сделку. Эта ветка живёт ДО `store.claim`, поэтому её не защищает гейт
+        # от повторного вебхука: 27.09.2026 по одному заказу такой алерт ушёл дважды за минуту с
+        # половиной, а вебхуков по сделке, стоящей на этапе, приходят десятки.
+        if not await asyncio.to_thread(store.claim_notice, lead_id, "pay-mismatch"):
+            logger.info("autopilot: о расхождении оплаты по сделке %s уже говорили", lead_id)
+            return
         await stop_here(
             lead, None, "failed",
             "платёжная система сообщила об оплате, а в МойСкладе заказ не оплачен",
