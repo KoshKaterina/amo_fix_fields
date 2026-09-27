@@ -576,6 +576,7 @@ def test_client_reply_is_proof_of_delivery(monkeypatch):
     _route(_stage(70070982, "Первичный контакт", [_bot(7131, stop_mode="never")]))
     S.claim(222, 70070982, 8642414)
     S.update(222, 70070982, bot_id=7131, chat_id="79099371845", phase=S.PHASE_DELIVERY)
+    A.refresh_watched_chats()
     seen: list[str] = []
 
     async def fake_answer(row, text, chat_type=""):
@@ -904,6 +905,7 @@ def test_telegram_reply_is_matched_by_contact_phone(monkeypatch):
     _route(_stage(70070982, "Первичный контакт", [_bot(7169)]))
     S.claim(888, 70070982, 8642414)
     S.update(888, 70070982, bot_id=7169, chat_id="79956109902", phase=S.PHASE_REPLY)
+    A.refresh_watched_chats()
     seen: list[str] = []
 
     async def fake_answer(row, text, chat_type=""):
@@ -925,6 +927,7 @@ def test_telegram_outbound_status_lands_in_the_right_piggy_bank(monkeypatch):
     _route(_stage(70070982, "Первичный контакт", [_bot(7169)]))
     S.claim(999, 70070982, 8642414)
     S.update(999, 70070982, bot_id=7169, chat_id="79956109902", phase=S.PHASE_DELIVERY)
+    A.refresh_watched_chats()
     S.mark_launch_ok(999, 70070982, "79956109902")
     delivered: list[int] = []
 
@@ -1187,6 +1190,7 @@ def test_pilot_engine_forwards_inbound_of_led_chat_to_the_feed(monkeypatch):
     monkeypatch.setattr(A.store, "find_by_chat",
                         lambda chat: [{"lead_id": 1, "status_id": 2, "phase": "done"}]
                         if chat == "79956109902" else [])
+    A._watched_chats.add("79956109902")
 
     async def run(chat_id):
         await A._handle_message({
@@ -1857,3 +1861,87 @@ def test_event_alert_carries_the_deal_link(monkeypatch):
 
     asyncio.run(run())
     assert sent and sent[-1]["url"].endswith("36564965")
+
+
+# ── узкая задача: только свои чаты, только наши шаблоны (Катя 27.09.2026) ────────
+
+def test_manager_message_is_not_proof_of_template_delivery(monkeypatch):
+    """Доставку шаблона закрывало ЛЮБОЕ эхо в чат - в том числе то, что менеджер написал руками.
+    Wazzup помечает автоматику автором `Admin`, людей - их именами; по этому и различаем."""
+    S.claim(901, 70070982, 8642414)
+    S.update(901, 70070982, bot_id=7131, chat_id="79099371845", phase=S.PHASE_DELIVERY)
+    A.refresh_watched_chats()
+    recorded: list[str] = []
+
+    async def fake_record(row, status, chat_type):
+        recorded.append(status)
+
+    monkeypatch.setattr(A, "record_delivery", fake_record)
+
+    # менеджер написал сам - не считаем
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "79099371845", "chatType": "whatsapp", "isEcho": True,
+        "status": "delivered", "messageId": "m-hand", "authorName": "Егор Константинов",
+    }]}))
+    assert recorded == []
+
+    # то же сообщение от автоматики - считаем
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "79099371845", "chatType": "whatsapp", "isEcho": True,
+        "status": "delivered", "messageId": "m-bot", "authorName": "Admin",
+    }]}))
+    assert recorded == ["delivered"]
+
+
+def test_is_robot_echo_treats_empty_author_as_ours():
+    """У части каналов Wazzup имени не присылает вовсе. Читать пустоту как «написал менеджер»
+    значило бы терять подтверждения доставки, поэтому пустой автор - наш."""
+    assert A.is_robot_echo("Admin") is True
+    assert A.is_robot_echo("admin") is True
+    assert A.is_robot_echo("") is True
+    assert A.is_robot_echo(None) is True
+    assert A.is_robot_echo("Егор Константинов") is False
+
+
+def test_foreign_chat_is_dropped_before_any_work(monkeypatch):
+    """«Хотелось бы, чтобы он хорошо выполнял эту одну узкую задачу и остальное его не касалось».
+    Вебхук Wazzup приходит на КАЖДОЕ сообщение аккаунта - чужой чат не должен доходить даже до
+    базы состояния."""
+    A._watched_chats.clear()
+    A._watched_chats.add("79099371845")
+    touched: list[str] = []
+    monkeypatch.setattr(A.store, "find_by_chat", lambda chat: touched.append(chat) or [])
+
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "79001234567", "chatType": "whatsapp", "isEcho": False, "text": "привет",
+    }]}))
+    assert touched == []          # в базу не ходили вовсе
+
+    asyncio.run(A.handle_wazzup({"messages": [{
+        "chatId": "79099371845", "chatType": "whatsapp", "isEcho": False, "text": "привет",
+    }]}))
+    assert touched == ["79099371845"]
+
+
+def test_grid_send_is_confirmed_right_away_not_after_the_window(monkeypatch):
+    """Кейс 19288: бот грида отстрелял вечером, статусы прошли до включения робота, и окно
+    ожидания кончалось ложным «не дошло». Теперь факт отправки спрашиваем у панели сразу."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    rows = _capture(monkeypatch)
+    updates: list[dict] = []
+    monkeypatch.setattr(A.store, "update", lambda *a, **kw: updates.append(kw))
+
+    async def fake_activity(chat_id, since):
+        return {"inbound": [], "echo": [{"status": "delivered", "chat_type": "whatsapp",
+                                         "author_name": "Admin"}]}
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    lead = _lead(id=36564989, name="Заказ №19288", pipeline_id=10593102, status_id=83537714)
+    stage = _stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])
+    asyncio.run(A.confirm_grid_send(lead, stage, _bot(7131, launched_by="amo_grid"), "79998993959"))
+
+    assert rows[-1]["outcome"] == "waiting_reply"
+    assert "уже уходил и подтверждён" in rows[-1]["reason"]
+    assert updates and updates[-1]["phase"] == S.PHASE_REPLY

@@ -109,6 +109,22 @@ _cap_warned_hour: int = -1
 DELIVERED_STATUSES = {"delivered", "read"}
 TELEGRAM_CHAT_TYPES = {"telegram", "tgapi"}
 
+# ⚠️ Автор исходящего, которого мы считаем НАШИМ сообщением. Wazzup ставит `Admin` всему, что
+# отправила автоматика amoCRM (боты, CRM), а сообщения людей приходят с их именами. Без этого
+# фильтра доставку шаблона закрывало ЛЮБОЕ эхо в чат - в том числе то, что менеджер написал
+# руками (правка Кати 27.09.2026). Замер за неделю: автоматика 259 в WhatsApp и 118 в Telegram
+# против 417 и 505 человеческих - шума больше, чем сигнала.
+ROBOT_AUTHORS = {"admin", "bot", ""}
+
+
+def is_robot_echo(author: Any) -> bool:
+    """Это исходящее отправила автоматика, а не человек.
+
+    ⚠️ Пустой автор считаем нашим намеренно: у части каналов Wazzup имени не присылает вовсе,
+    и трактовать пустоту как «написал менеджер» значило бы терять подтверждения доставки.
+    """
+    return str(author or "").strip().lower() in ROBOT_AUTHORS
+
 
 def is_enabled() -> bool:
     """Два независимых рубильника: флаг на сервере и режим в панели. Любой из них выключает."""
@@ -928,6 +944,7 @@ async def stop_here(
     lead_id = int(lead.get("id") or 0)
     status_id = int(lead.get("status_id") or 0)
     await asyncio.to_thread(store.finish, lead_id, status_id, store.PHASE_STOPPED, reason)
+    refresh_watched_chats()
     log_run(lead, stage, bot=bot, action="route", outcome=outcome, reason=reason,
             alert_target="op" if op_text else "")
     if op_text:
@@ -1086,6 +1103,14 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
         # ожидания доставки.
         await asyncio.to_thread(store.update, lead_id, status_id, bot_id=bot_id)
     await asyncio.to_thread(store.mark_launch_ok, lead_id, status_id, chat_id)
+    refresh_watched_chats()
+
+    # ⚠️ Факт отправки спрашиваем СРАЗУ, а не ждём вебхуков (правка Кати 27.09.2026). Бот грида
+    # мог отстрелять задолго до того, как робот взял сделку: по заказу 19288 шаблон ушёл вечером,
+    # статусы прошли до включения робота, и пятнадцать минут ожидания кончились ложным «не
+    # дошло». Один запрос к панели снимает весь этот класс: у неё вся переписка уже лежит.
+    if str(bot.get("launched_by") or "engine") != "engine":
+        await confirm_grid_send(lead, stage, bot, chat_id)
 
     if str(bot.get("stop_mode") or "any") == "never":
         # «Ответ не нужен» - информационное сообщение, а не разговор. Ни доставки, ни ответа
@@ -1653,6 +1678,34 @@ async def on_payment_received(lead: dict) -> None:
 # осознанно: САМИ статусы копятся на диске, поэтому рестарт теряет лишь связку свежих
 # сообщений, а не результат ожидания.
 _msg_owner: dict[str, tuple[int, int, str]] = {}
+# ⚠️ Чаты ведомых сделок. Вебхук Wazzup приходит на КАЖДОЕ сообщение аккаунта - все чаты, все
+# менеджеры, все воронки, - а роботу нужны только свои. Держим их множеством в памяти и выходим
+# до всякой работы (правка Кати 27.09.2026: «хотелось бы, чтобы он хорошо выполнял эту одну
+# узкую задачу и остальное его не касалось»). Множество обновляется при взятии сделки в ведение,
+# при снятии и каждым фоновым тиком - то есть отстать от состояния оно может лишь на секунды.
+_watched_chats: set[str] = set()
+
+
+def refresh_watched_chats() -> None:
+    """Перечитать чаты, которые робот сейчас ведёт. Дёшево: две выборки по индексу фазы."""
+    try:
+        rows = list(store.list_by_phase(store.PHASE_DELIVERY))
+        rows += list(store.list_by_phase(store.PHASE_REPLY))
+    except Exception:  # noqa: BLE001 - фильтр не должен ронять разбор сообщений
+        logger.exception("autopilot: не смог обновить список ведомых чатов")
+        return
+    _watched_chats.clear()
+    for row in rows:
+        chat = str(row.get("chat_id") or "")
+        if chat:
+            _watched_chats.add(chat)
+
+
+def watches_chat(candidates: list[str]) -> bool:
+    """Есть ли среди ключей сообщения чат, который робот ведёт."""
+    return any(c in _watched_chats for c in candidates)
+
+
 # Заявки, о которых уже уведомили, - чтобы не дёргать панель на каждый вебхук сделки.
 _lead_notified: set[int] = set()
 _MSG_OWNER_MAX = 5000
@@ -1728,8 +1781,13 @@ def _chat_candidates(message: dict) -> list[str]:
 
 
 async def _handle_message(message: dict) -> None:
+    candidates = _chat_candidates(message)
+    if not watches_chat(candidates):
+        # Чужой чат: ни одной ведомой сделки по нему нет. Дальше не идём - ни в базу, ни в
+        # разбор. Это и есть «остальное его не касается».
+        return
     rows: list[dict] = []
-    for chat in _chat_candidates(message):
+    for chat in candidates:
         for row in await asyncio.to_thread(store.find_by_chat, chat):
             if row not in rows:
                 rows.append(row)
@@ -1741,6 +1799,12 @@ async def _handle_message(message: dict) -> None:
         row = _pick_row(rows, store.PHASE_DELIVERY)
         if row is None:
             return
+        if not is_robot_echo(message.get("authorName")):
+            # Менеджер написал клиенту сам - это не доставка нашего шаблона, и судить по ней
+            # нельзя. Молча выходим: работа человека роботу не мешает и его не касается.
+            logger.info("autopilot: исходящее от человека в чате сделки %s - не считаю доставкой",
+                        row["lead_id"])
+            return
         message_id = str(message.get("messageId") or "").strip()
         if message_id:
             if len(_msg_owner) >= _MSG_OWNER_MAX:
@@ -1751,12 +1815,12 @@ async def _handle_message(message: dict) -> None:
             await record_delivery(row, status, chat_type)
         return
 
-    # Пилот прода: лента живёт только тест-контактами (правка Кати 12.09.2026, вечер).
-    # Панель в пилоте входящие не уведомляет вовсе (см. inbox.notify_inbound) - сообщение
-    # ведомого чата в ленту доносит движок: чат нашёлся в состоянии, значит контакт из
-    # белого списка. Дедуп тот же, что у панели, - на полном проде дубля не будет.
-    if not message.get("isEcho") and limited_mode() == "пилот":
-        _pilot_inbox_notify(message)
+    # ⚠️ Уведомление ленты о входящем шлёт ДВИЖОК, и только по своим сделкам (правка Кати
+    # 27.09.2026). Раньше их поднимала панель по КАЖДОМУ входящему аккаунта - она не знает,
+    # ведёт ли робот эту сделку, и лента шумела чужими диалогами. Сюда мы попадаем, только
+    # если чат нашёлся в ведомых, значит уведомление адресное по определению.
+    if not message.get("isEcho") and settings_client.get_mode() == "live":
+        inbox_notify(message)
 
     # Входящее. Ответ клиента - сам по себе доказательство доставки: человек не отвечает на
     # сообщение, которого не видел. Поэтому ждущую доставки сделку он закрывает вместе с
@@ -1767,8 +1831,8 @@ async def _handle_message(message: dict) -> None:
     await on_client_answer(row, str(message.get("text") or ""), chat_type)
 
 
-def _pilot_inbox_notify(message: dict) -> None:
-    """Уведомление ленты о входящем сообщении ведомого чата - только в пилоте.
+def inbox_notify(message: dict) -> None:
+    """Уведомление ленты о входящем сообщении ведомой сделки.
 
     Формат повторяет панельный `inbox.message_notification`: тот же вид, тот же
     `dedupe_key` по номеру сообщения - кто бы ни доносил, уведомление одно.
@@ -1937,6 +2001,41 @@ async def fetch_chat_activity(chat_id: str, since: str) -> dict[str, Any] | None
         return None
 
 
+async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) -> None:
+    """Проверить у панели, ушёл ли шаблон грида, и если ушёл - сразу ждать ответ.
+
+    Ищем с момента создания сделки: бот грида срабатывает на входе воронки, то есть почти
+    одновременно с ней, а робот может прийти и через десять часов - после ночи.
+    """
+    if not chat_id:
+        return
+    lead_id = int(lead["id"])
+    try:
+        created = int(lead.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created = 0
+    since = datetime.datetime.fromtimestamp(created, _UTC) if created else         datetime.datetime.now(_UTC) - datetime.timedelta(hours=24)
+    data = await fetch_chat_activity(chat_id, since.isoformat())
+    if not data:
+        return
+    for item in (data.get("echo") or []):
+        if not is_robot_echo(item.get("author_name")):
+            continue
+        status = str(item.get("status") or "").lower()
+        if status in DELIVERED_STATUSES or status == "sent":
+            log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
+                    reason=f"шаблон уже уходил и подтверждён ({status}), жду ответ клиента",
+                    delivery={"statuses": [{"status": status,
+                                            "chatType": item.get("chat_type")}]})
+            await asyncio.to_thread(
+                store.update, lead_id, int(lead.get("status_id") or 0),
+                phase=store.PHASE_REPLY, note="шаблон подтверждён по переписке панели",
+            )
+            logger.info("autopilot: по сделке %s шаблон уже подтверждён (%s), жду ответ",
+                        lead_id, status)
+            return
+
+
 async def catch_up_on_chats() -> None:
     """Подбор пропущенного по ведомым сделкам: раз в `AUTOPILOT_CATCHUP_INTERVAL_S`.
 
@@ -1970,6 +2069,8 @@ async def catch_up_on_chats() -> None:
         if not inbound:
             # Доставка могла подтвердиться статусом, вебхук которого не дошёл.
             for item in echo:
+                if not is_robot_echo(item.get("author_name")):
+                    continue
                 status = str(item.get("status") or "").lower()
                 if status in DELIVERED_STATUSES or status == "sent":
                     await record_delivery(row, status, str(item.get("chat_type") or ""))
@@ -2094,6 +2195,7 @@ async def init() -> None:
         logger.info("autopilot: выключен флагом AUTOPILOT_ENABLED")
         return
     await asyncio.to_thread(store.init)
+    await asyncio.to_thread(refresh_watched_chats)
     settings_client.start()
     await report_unfinished_launches()
     global _loop_task
@@ -2161,6 +2263,7 @@ async def tick_once() -> None:
     """
     if not is_enabled():
         return
+    await asyncio.to_thread(refresh_watched_chats)
     dropped = await asyncio.to_thread(store.purge_older_than, AUTOPILOT_STATE_TTL_DAYS)
     if dropped:
         logger.info("autopilot: снято с ведения по сроку давности: %s", dropped)
