@@ -1342,3 +1342,97 @@ def test_op_burst_mutes_the_chat_but_never_the_panel_feed(monkeypatch):
     said = [m for m in _SENT if "событие" in m["text"]]
     assert len(said) == 2                       # в чат ушли два
     assert any("молчу" in m["text"] for m in _SENT)   # и одно объявление технарям
+
+
+def test_stale_lead_on_entry_stage_is_not_taken_into_work(monkeypatch):
+    """⚠️ Поймано боем 27.09.2026. В 11:13 робот забрал девять заказов, простоявших на «Новом
+    лиде» с вечера (вебхук приходит на любое изменение), а в 11:28 выдал по ним девять алертов
+    «сообщение до клиента не дошло». Ложных: бота на этапе запускает грид, робот его не
+    вызывал, клиентам ничего не уходило."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    ran: list[int] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop(ran.append(1)))
+    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 15 * 3600
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714, created_at=old,
+                     custom_fields_values=[_cf(577671, "Заказ")])
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(36564965))
+    assert ran == []
+    assert rows[-1]["outcome"] == "skipped_stale_entry"
+
+
+def test_grid_bot_without_statuses_does_not_claim_undelivered(monkeypatch):
+    """«Ни одного статуса» по боту, которого запускал ГРИД, - это не «не доставлено».
+
+    Мы его не вызывали и не знаем, стрелял ли он: утверждать при этом, что клиент не получил
+    сообщение, значит врать менеджеру. Снимаем с ведения и говорим технарям."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False, "delivery_wait_minutes": 0},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид",
+                            [_bot(7131, launched_by="amo_grid", bot_name="Бот грида")])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36564965, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_DELIVERY,
+        "launch_ok_at": "2020-01-01T00:00:00+00:00", "delivery": [],
+    }])
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19286", pipeline_id=10593102,
+                     status_id=83537714, responsible_user_id=13929334)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.check_delivery_windows()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_no_delivery_proof"
+    assert feed == []                                   # ленту не будим
+    assert _SENT and _SENT[-1]["chat_id"] is None       # технический чат, не топик ОП
+
+
+def test_engine_bot_without_statuses_still_alerts(monkeypatch):
+    """А вот бота, которого запускал САМ робот, молчание Wazzup изобличает: мы точно
+    отправляли, значит «ни одного статуса» - это повод звать человека."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False, "delivery_wait_minutes": 0},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид",
+                            [_bot(7131, launched_by="engine", bot_name="Бот робота")])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36564966, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_DELIVERY,
+        "launch_ok_at": "2020-01-01T00:00:00+00:00", "delivery": [],
+    }])
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19295", pipeline_id=10593102,
+                     status_id=83537714, responsible_user_id=13929334)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.check_delivery_windows()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_not_delivered"
+    assert feed and feed[-1]["kind"] == "autopilot_not_delivered"
+    assert _SENT[-1]["chat_id"] == A.NOTIFY_CHAT_ID

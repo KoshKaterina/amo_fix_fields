@@ -73,6 +73,7 @@ from waybill_config import (
     AUTOPILOT_ERROR_DEDUPE_S,
     AUTOPILOT_HOURLY_CAP,
     AUTOPILOT_LEAD_ALERT_MAX_AGE_H,
+    AUTOPILOT_MAX_ENTRY_AGE_H,
     AUTOPILOT_OP_BURST_MAX,
     AUTOPILOT_OP_BURST_WINDOW_S,
     AUTOPILOT_STATE_TTL_DAYS,
@@ -1287,7 +1288,8 @@ def is_order(lead: dict) -> bool:
     return value.casefold() == "заказ"
 
 
-def lead_is_fresh(lead: dict, now: datetime.datetime | None = None) -> bool:
+def lead_is_fresh(lead: dict, now: datetime.datetime | None = None,
+                  max_age_h: float | None = None) -> bool:
     """Заявка правда новая, а не старая сделка, которую кто-то тронул.
 
     ⚠️ Без этого гейта уведомление о «новой заявке» уходило по сделке любого возраста:
@@ -1303,7 +1305,8 @@ def lead_is_fresh(lead: dict, now: datetime.datetime | None = None) -> bool:
         return False
     moment = now or datetime.datetime.now(_UTC)
     age_h = (moment.timestamp() - created) / 3600
-    return 0 <= age_h <= AUTOPILOT_LEAD_ALERT_MAX_AGE_H
+    limit = AUTOPILOT_LEAD_ALERT_MAX_AGE_H if max_age_h is None else max_age_h
+    return 0 <= age_h <= limit
 
 
 async def notify_entry_lead(lead: dict) -> None:
@@ -1435,6 +1438,22 @@ async def handle_lead_change(lead_id: int) -> None:
 
     stage = settings_client.get_stage(status_id)
     if stage is None:
+        return
+
+    # ⚠️ Гейт залежавшейся сделки (поймано боем 27.09.2026). `/lead_change` приходит на ЛЮБОЕ
+    # изменение, поэтому сделка, простоявшая на входном этапе сутки, от синка или правки поля
+    # попадает в ведение как новая. В 11:13 так забрались девять заказов с вечера, а в 11:28
+    # по ним ушли девять алертов «сообщение до клиента не дошло» - ложных: бота на этом этапе
+    # запускает грид, робот его не вызывал, и статусы по вчерашним сообщениям уже не придут.
+    #
+    # Ночная заявка гейтом не страдает: её вебхук приходит в момент создания, робот берёт её
+    # сразу и просто спит до начала рабочих часов.
+    if (status_id == (settings_client.get_entry_status_id() or 0)
+            and not lead_is_fresh(lead, max_age_h=AUTOPILOT_MAX_ENTRY_AGE_H)):
+        logger.info("autopilot: сделка %s стоит на входном этапе дольше окна, в ведение не беру",
+                    lead_id)
+        log_run(lead, stage, action="route", outcome="skipped_stale_entry",
+                reason=f"на входном этапе дольше {AUTOPILOT_MAX_ENTRY_AGE_H} ч, в ведение не беру")
         return
 
     if not whitelist_ok(lead):
@@ -1770,6 +1789,27 @@ async def check_delivery_windows() -> None:
         bot = bot_by_id(stage, row.get("bot_id"))
         note = (delivery_note(items) if verdict == VERDICT_FAILED
                 else "ни одного статуса от Wazzup, похоже, сообщение и не отправлялось")
+
+        # ⚠️ «Ни одного статуса» по боту, которого запускал ГРИД, - это не «не доставлено».
+        # Мы его не вызывали и не знаем, стрелял ли он вообще: утверждать при этом, что клиент
+        # не получил сообщение, значит врать менеджеру. 27.09.2026 такая ложь ушла девятью
+        # сообщениями подряд по заказам, которые просто давно стояли на входном этапе.
+        # Снимаем с ведения и говорим ТЕХНАРЯМ: сигнал не теряем, отдел не дёргаем.
+        if verdict == VERDICT_SILENT and str((bot or {}).get("launched_by") or "engine") != "engine":
+            await asyncio.to_thread(
+                store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+                "статусов доставки не было, бота запускал грид - судить не можем",
+            )
+            log_run(lead, stage, bot=bot, action="delivery", outcome="stop_no_delivery_proof",
+                    reason="статусов от Wazzup не было; бота запускает грид, отправку "
+                           "подтвердить нечем - в чат ОП не пишу")
+            alert_tech(
+                f"{lead_link(row['lead_id'], lead.get('name'))}: статусов доставки от Wazzup не "
+                "пришло, а бота на этапе запускает грид - отправку подтвердить нечем. Снял с "
+                "ведения молча, менеджеру не писал."
+            )
+            continue
+
         log_run(lead, stage, bot=bot, action="delivery", outcome="stop_not_delivered",
                 reason=note, delivery={"statuses": items})
         if _flag("force_ur_when_templates_failed"):
