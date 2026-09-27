@@ -18,8 +18,19 @@
     заказа. Значит сумма «по товарам» у старой сделки меняется задним числом.
 
 Что делаем: сверяем поле «Бюджет» со строкой «Итого» из поля «Состав заказа» (его пишет
-мост по заказу МойСклада, это наш источник правды) и зовём человека, когда они разошлись.
-Сам бюджет модуль НЕ правит - только смотрит и сообщает.
+мост по заказу МойСклада, это наш источник правды). Разошлось - выравниваем бюджет по
+заказу и сообщаем в чат.
+
+────────────────────────── чем лечим, а не только сторожим ──────────────────────────
+Поддержка amoCRM 27.09.2026: отключить пересчёт нельзя, но он **перестаёт трогать сделку
+навсегда, если бюджет хоть раз правили вручную**. Опыт на тест-сделках в тот же день показал
+границу «вручную»: обычный PATCH от интеграции пересчёт перебивает, а PATCH с полем
+`updated_by` живого пользователя amo считает ручной правкой - и сделка закрывается от
+пересчёта насовсем. Поэтому починка идёт от имени Гладкова (решение Кати), а рядом ложится
+примечание: иначе человек прочитает чужую правку в ленте как свою.
+
+⚠️ Правку ЧЕЛОВЕКА модуль не трогает никогда: расхождение, сделанное руками, - это решение
+менеджера (скидка, доплата, округление), а не поломка.
 
 ────────────────────────── почему опрос, а не вебхук ──────────────────────────
 Вебхук приходит на КАЖДУЮ из шести перезаписей бюджета, то есть ровно в те секунды,
@@ -56,6 +67,10 @@ from waybill_config import (
     BUDGET_WATCH_ALERT_CHAT_ID,
     BUDGET_WATCH_ALERT_ENABLED,
     BUDGET_WATCH_ENABLED,
+    BUDGET_WATCH_FIX_AS_USER_ID,
+    BUDGET_WATCH_FIX_ENABLED,
+    BUDGET_WATCH_FIX_MAX_TOTAL,
+    BUDGET_WATCH_FIX_NOTE_ENABLED,
     BUDGET_WATCH_INTERVAL_S,
     BUDGET_WATCH_LOOKBACK_MIN,
     BUDGET_WATCH_MAX_PER_PASS,
@@ -203,6 +218,86 @@ async def _still_mismatched(lead_id: int, price: float, total: float) -> tuple[s
     return "ok", lead
 
 
+async def _human_touched(lead_id: int) -> bool | None:
+    """Правил ли бюджет этой сделки ЖИВОЙ человек. None - amo не ответил.
+
+    Зачем: расхождение, сделанное человеком осознанно (скидка, доплата, округление), -
+    не поломка, и затирать его нельзя. Заодно такая сделка уже привита от пересчёта, то
+    есть спорить с ней больше некому.
+
+    Ходим напрямую в `/api/v4/events`: готовой обёртки для событий в `amo_service` нет, а
+    заводить её ради одного места - лишняя правка общего файла перед выкаткой.
+    """
+    params = [
+        ("filter[entity]", "lead"),
+        ("filter[entity_id]", str(int(lead_id))),
+        ("filter[type]", "sale_field_changed"),
+        ("limit", "100"),
+    ]
+    data = await amo_service._do_get("/api/v4/events", params)
+    if data is None:
+        return None
+    events = (data.get("_embedded") or {}).get("events") or []
+    # created_by 0 - это роботы и интеграции, любой другой id - живой пользователь.
+    return any(int(e.get("created_by") or 0) != 0 for e in events)
+
+
+async def _fix(lead: dict, price: float, total: float) -> str:
+    """Выровнять бюджет по заказу. "fixed" · "unsafe" · "failed".
+
+    ⚠️ Правка уходит с полем `updated_by`, и это не украшение: обычный PATCH от интеграции
+    amo считает машинным, и следующее же изменение товаров перебивает нашу цифру обратно.
+    С `updated_by` живого пользователя правка считается ручной - и тогда amo **больше
+    никогда** не пересчитывает бюджет этой сделки по товарам. Проверено опытом 27.09.2026
+    на тест-сделках, обе ветки.
+
+    Цена решения принята осознанно (решение Кати 27.09.2026): в ленте автором правки
+    значится Гладков, поэтому рядом кладём примечание, объясняющее человеку, что это
+    автоматика, а не он сам.
+    """
+    lead_id = int(lead["id"])
+    target = int(round(total))
+    if target <= 0 or target > BUDGET_WATCH_FIX_MAX_TOTAL:
+        # Мусор в «Составе заказа» не должен превратиться в боевой бюджет, да ещё и
+        # навсегда выключить пересчёт этой сделке.
+        logger.error(
+            "Сторож бюджета: сумма %s по сделке %s вне разумных границ, НЕ правлю",
+            target, lead_id,
+        )
+        return "unsafe"
+    if not BUDGET_WATCH_FIX_AS_USER_ID:
+        logger.error("Сторож бюджета: не задан BUDGET_WATCH_FIX_AS_USER_ID, НЕ правлю")
+        return "unsafe"
+
+    resp = await amo_service._do_patch(
+        f"/api/v4/leads/{lead_id}",
+        {"price": target, "updated_by": int(BUDGET_WATCH_FIX_AS_USER_ID)},
+    )
+    if not resp.get("ok"):
+        logger.error(
+            "Сторож бюджета: не удалось выровнять бюджет сделки %s (%s -> %s), ответ %s",
+            lead_id, int(round(price)), target, resp.get("status_code"),
+        )
+        return "failed"
+
+    logger.info(
+        "Сторож бюджета: бюджет сделки %s выровнен по заказу (%s -> %s)",
+        lead_id, int(round(price)), target,
+    )
+    if BUDGET_WATCH_FIX_NOTE_ENABLED:
+        try:
+            await amo_service.add_note(
+                lead_id,
+                f"Бюджет выровнен по заказу МойСклада автоматически: было "
+                f"{fmt_money(price)}, стало {fmt_money(target)}. Разошлось из-за того, что "
+                f"amoCRM пересчитывает бюджет по списку товаров и теряет вторую строку "
+                f"того же товара с другой ценой.",
+            )
+        except Exception:
+            logger.exception("Сторож бюджета: примечание к сделке %s не легло", lead_id)
+    return "fixed"
+
+
 # ─────────────────────────────── проход ───────────────────────────────
 
 
@@ -234,7 +329,21 @@ async def sweep_once() -> dict:
             if state != "ok":
                 decisions[state] = decisions.get(state, 0) + 1
                 continue
-            if BUDGET_WATCH_ALERT_ENABLED:
+
+            # Человек правил бюджет руками - значит это его решение, а не поломка.
+            # Такая сделка вдобавок уже привита, спорить с ней некому. Ключ не жжём:
+            # молчим и не трогаем.
+            touched = await _human_touched(lead_id)
+            if touched is None:
+                decisions["silent"] = decisions.get("silent", 0) + 1
+                continue
+            if touched:
+                decisions["human-edited"] = decisions.get("human-edited", 0) + 1
+                continue
+
+            acting = BUDGET_WATCH_FIX_ENABLED or BUDGET_WATCH_ALERT_ENABLED
+            if acting:
+                # Ключ берём ДО действия: лучше не сделать, чем сделать дважды.
                 claimed = await asyncio.to_thread(
                     notices.claim_notice, lead_id, notice_kind(price, total)
                 )
@@ -243,12 +352,20 @@ async def sweep_once() -> dict:
                     continue
             else:
                 decisions["would-fire"] = decisions.get("would-fire", 0) + 1
+
+            fixed = False
+            if BUDGET_WATCH_FIX_ENABLED:
+                result = await _fix(fresh or lead, price, total)
+                decisions[result] = decisions.get(result, 0) + 1
+                fixed = result == "fixed"
+
             decisions["fire"] = decisions.get("fire", 0) + 1
             found.append({
                 "lead_id": lead_id,
                 "name": (fresh or lead).get("name") or "",
                 "price": price,
                 "total": total,
+                "fixed": fixed,
             })
         except Exception:
             logger.exception("Сторож бюджета: ошибка по сделке %s", lead_id)
@@ -269,15 +386,16 @@ async def sweep_once() -> dict:
 
 
 async def report_once() -> dict:
-    """Проход без тревог, чем бы ни был выставлен флаг - для обкатки и разбора.
-    Ключи дедупа не жжёт."""
-    global BUDGET_WATCH_ALERT_ENABLED
-    saved = BUDGET_WATCH_ALERT_ENABLED
+    """Проход вхолостую: не правит бюджет и не пишет в чат, чем бы ни были выставлены
+    флаги. Для обкатки и разбора. Ключи дедупа не жжёт."""
+    global BUDGET_WATCH_ALERT_ENABLED, BUDGET_WATCH_FIX_ENABLED
+    saved = (BUDGET_WATCH_ALERT_ENABLED, BUDGET_WATCH_FIX_ENABLED)
     BUDGET_WATCH_ALERT_ENABLED = False
+    BUDGET_WATCH_FIX_ENABLED = False
     try:
         return await sweep_once()
     finally:
-        BUDGET_WATCH_ALERT_ENABLED = saved
+        BUDGET_WATCH_ALERT_ENABLED, BUDGET_WATCH_FIX_ENABLED = saved
 
 
 async def _purge_if_due(now_ts: int) -> None:
@@ -298,19 +416,31 @@ async def _purge_if_due(now_ts: int) -> None:
 
 async def _notify(found: list[dict]) -> None:
     """Сообщение человеку. Без ID и без точек посередине - правила Кати."""
-    head = (f"💰 Бюджет сделки разошёлся с суммой заказа: {len(found)}"
-            if len(found) > 1 else "💰 Бюджет сделки разошёлся с суммой заказа")
+    fixed = [f for f in found if f.get("fixed")]
+    if fixed and len(fixed) == len(found):
+        head = ("💰 Бюджет разошёлся с заказом и выровнен автоматически"
+                if len(found) == 1
+                else f"💰 Бюджет разошёлся с заказом и выровнен автоматически: {len(found)}")
+    else:
+        head = ("💰 Бюджет сделки разошёлся с суммой заказа"
+                if len(found) == 1
+                else f"💰 Бюджет сделки разошёлся с суммой заказа: {len(found)}")
     lines = [head]
     for f in found:
         diff = f["total"] - f["price"]
         side = "меньше заказа на" if diff > 0 else "больше заказа на"
         name = (f.get("name") or "").strip()
         title = f"{name}: " if name else ""
+        tail = " — поправлено" if f.get("fixed") else ""
         lines.append(
             f"— {title}в сделке {fmt_money(f['price'])}, в заказе {fmt_money(f['total'])} "
-            f"({side} {fmt_money(abs(diff))})\n  {alerts.lead_link(f['lead_id'])}"
+            f"({side} {fmt_money(abs(diff))}){tail}\n  {alerts.lead_link(f['lead_id'])}"
         )
-    lines.append("Верная сумма - из заказа МойСклада, поле «Состав заказа».")
+    if fixed:
+        lines.append("Бюджет выставлен по заказу МойСклада, пересчёт по товарам этим сделкам "
+                     "больше не грозит.")
+    else:
+        lines.append("Верная сумма - из заказа МойСклада, поле «Состав заказа».")
     try:
         await telegram_bot.send_alert(
             "\n".join(lines),
@@ -350,10 +480,12 @@ async def init() -> None:
         _task = asyncio.create_task(_loop())
         logger.info(
             "Сторож бюджета: поднят (опрос %ss, окно %s мин, отстойник %s мин, "
-            "порог %s руб, воронок %s, тревоги %s)",
+            "порог %s руб, воронок %s, тревоги %s, починка %s)",
             BUDGET_WATCH_INTERVAL_S, BUDGET_WATCH_LOOKBACK_MIN, BUDGET_WATCH_SETTLE_MIN,
             BUDGET_WATCH_TOLERANCE, len(BUDGET_WATCH_PIPELINES),
             "ВКЛ" if BUDGET_WATCH_ALERT_ENABLED else "выкл (режим отчёта)",
+            f"ВКЛ (от пользователя {BUDGET_WATCH_FIX_AS_USER_ID})"
+            if BUDGET_WATCH_FIX_ENABLED else "выкл",
         )
 
 
@@ -375,6 +507,8 @@ def status() -> dict:
     return {
         "enabled": True,
         "alert": BUDGET_WATCH_ALERT_ENABLED,
+        "fix": BUDGET_WATCH_FIX_ENABLED,
+        "fix_as_user_id": BUDGET_WATCH_FIX_AS_USER_ID if BUDGET_WATCH_FIX_ENABLED else None,
         "interval_s": BUDGET_WATCH_INTERVAL_S,
         "lookback_min": BUDGET_WATCH_LOOKBACK_MIN,
         "settle_min": BUDGET_WATCH_SETTLE_MIN,

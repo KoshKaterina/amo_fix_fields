@@ -213,6 +213,9 @@ def _with_window(leads):
     async def fake_recent(now_ts):
         return leads
     B._recent_leads = fake_recent
+    # По умолчанию считаем, что человек бюджет не трогал: иначе каждый тест прохода
+    # полез бы в живой amo за авторами правок.
+    _with_human(False)
 
 
 def test_report_mode_does_not_burn_keys_and_does_not_write():
@@ -261,6 +264,142 @@ async def _noop_alert(*a, **k):
 
 
 # ─────────────────────────────── текст человеку ───────────────────────────────
+
+
+# ─────────────────────────────── починка с прививкой ───────────────────────────────
+
+
+def _with_human(answer):
+    async def fake(lead_id):
+        return answer
+    B._human_touched = fake
+
+
+def _capture_patch():
+    calls = []
+
+    async def fake_patch(path, body):
+        calls.append((path, body))
+        return {"ok": True, "status_code": 200}
+
+    B.amo_service._do_patch = fake_patch
+    return calls
+
+
+def test_fix_sends_updated_by():
+    """⚠️ Сердце фичи: без updated_by пересчёт перебьёт нашу правку обратно."""
+    calls = _capture_patch()
+    B.amo_service.add_note = _noop_alert
+    out = _run(B._fix(lead(ORDER, price=20909, lead_id=55), 20909, 25802))
+    assert out == 'fixed'
+    path, body = calls[0]
+    assert path.endswith('/leads/55')
+    assert body['price'] == 25802
+    assert body['updated_by'] == B.BUDGET_WATCH_FIX_AS_USER_ID
+    assert B.BUDGET_WATCH_FIX_AS_USER_ID, 'без пользователя прививка не ставится'
+
+
+def test_fix_refuses_insane_total():
+    """Мусор в составе заказа не должен стать боевым бюджетом и выключить пересчёт."""
+    calls = _capture_patch()
+    assert _run(B._fix(lead(ORDER, lead_id=56), 100, 99_000_000)) == 'unsafe'
+    assert _run(B._fix(lead(ORDER, lead_id=56), 100, 0)) == 'unsafe'
+    assert calls == [], 'в amo ничего не ушло'
+
+
+def test_fix_refuses_without_user():
+    """Пустой BUDGET_WATCH_FIX_AS_USER_ID — правка была бы бесполезной, а сделка испорчена."""
+    calls = _capture_patch()
+    saved = B.BUDGET_WATCH_FIX_AS_USER_ID
+    B.BUDGET_WATCH_FIX_AS_USER_ID = 0
+    try:
+        assert _run(B._fix(lead(ORDER, lead_id=57), 100, 25802)) == 'unsafe'
+    finally:
+        B.BUDGET_WATCH_FIX_AS_USER_ID = saved
+    assert calls == []
+
+
+def test_sweep_fixes_and_leaves_note():
+    bad = lead(ORDER, price=20909, updated_at=NOW - 3600, lead_id=800)
+    _with_window([bad])
+    _with_lead(bad)
+    _with_human(False)
+    calls = _capture_patch()
+    notes = []
+
+    async def fake_note(lead_id, text):
+        notes.append((lead_id, text))
+
+    B.amo_service.add_note = fake_note
+    B.telegram_bot.send_alert = _noop_alert
+    B.notices.claim_notice = lambda lead_id, kind: True
+    B.BUDGET_WATCH_FIX_ENABLED = True
+    try:
+        decisions = _run(B.sweep_once())
+    finally:
+        B.BUDGET_WATCH_FIX_ENABLED = False
+
+    assert decisions.get('fixed') == 1
+    assert calls[0][1]['price'] == 25802
+    assert notes and notes[0][0] == 800
+    assert 'ID' not in notes[0][1] and '·' not in notes[0][1]
+
+
+def test_sweep_never_touches_human_edit():
+    """Менеджер поправил бюджет сам — это решение, а не поломка. Не трогаем и не зовём."""
+    bad = lead(ORDER, price=20909, updated_at=NOW - 3600, lead_id=801)
+    _with_window([bad])
+    _with_lead(bad)
+    _with_human(True)
+    calls = _capture_patch()
+    sent = []
+    B.telegram_bot.send_alert = lambda *a, **k: sent.append(a)
+    B.BUDGET_WATCH_FIX_ENABLED = True
+    try:
+        decisions = _run(B.sweep_once())
+    finally:
+        B.BUDGET_WATCH_FIX_ENABLED = False
+
+    assert decisions.get('human-edited') == 1
+    assert 'fire' not in decisions
+    assert calls == [] and sent == []
+
+
+def test_sweep_is_silent_when_amo_does_not_answer_about_author():
+    """amo не ответил, кто правил — это не «правил робот». Молчим и ключ не жжём."""
+    bad = lead(ORDER, price=20909, updated_at=NOW - 3600, lead_id=802)
+    _with_window([bad])
+    _with_lead(bad)
+    _with_human(None)
+    calls = _capture_patch()
+    claimed = []
+    B.notices.claim_notice = lambda lead_id, kind: claimed.append(kind) or True
+    B.BUDGET_WATCH_FIX_ENABLED = True
+    try:
+        decisions = _run(B.sweep_once())
+    finally:
+        B.BUDGET_WATCH_FIX_ENABLED = False
+
+    assert decisions.get('silent') == 1
+    assert calls == [] and claimed == []
+
+
+def test_report_mode_does_not_fix():
+    """Сутки обкатки не должны ничего править в бою."""
+    bad = lead(ORDER, price=20909, updated_at=NOW - 3600, lead_id=803)
+    _with_window([bad])
+    _with_lead(bad)
+    _with_human(False)
+    calls = _capture_patch()
+    B.BUDGET_WATCH_FIX_ENABLED = True
+    try:
+        decisions = _run(B.report_once())
+        assert B.BUDGET_WATCH_FIX_ENABLED is True, 'флаг возвращён на место после прохода'
+    finally:
+        B.BUDGET_WATCH_FIX_ENABLED = False
+
+    assert decisions.get('would-fire') == 1
+    assert calls == [], 'в режиме отчёта бюджет не правим'
 
 
 def test_money_is_readable():
