@@ -1840,3 +1840,20 @@ def test_lead_moved_away_while_waiting_does_not_alert(monkeypatch):
     asyncio.run(A.check_reply_windows())
     assert rows == []
     assert _SENT == []
+
+
+def test_event_alert_carries_the_deal_link(monkeypatch):
+    """⚠️ Замечание Кати 27.09.2026: «почему такие уведы ушли в чат без ссылки на сделку».
+    Причина была в панели - у события не была объявлена переменная ссылки, - но и движок
+    обязан её передавать: шаблон без значения строку выбросит."""
+    _settings(settings={"mode": "live", "work_hours": [], "live_whitelist_enabled": False})
+    sent: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: sent.append(kw))
+
+    async def run():
+        A.alert_op("что-то случилось", 13929334,
+                   lead={"id": 36564965, "name": "Заказ №19286"})
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert sent and sent[-1]["url"].endswith("36564965")

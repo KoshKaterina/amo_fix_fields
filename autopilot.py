@@ -291,18 +291,26 @@ def error_is_fresh(key: str, now: float | None = None) -> bool:
     return True
 
 
-def alert_op(text: str, responsible_id=None) -> None:
+def alert_op(text: str, responsible_id=None, lead: dict | None = None) -> None:
     """Событие, требующее менеджера, - в чат отдела продаж, топик УВЕДОМЛЕНИЯ, с тегом
     ответственного. Совместимая обёртка: события со своим кодом зовут `dispatch_op`.
 
     Правило Кати 28.08.2026: в чат ОП идёт СОБЫТИЕ (клиент ждёт), в чат руководства -
     ПРОВАЛ. Авто-режим шлёт только события: он останавливается ДО того, как что-то стало
     провалом, поэтому в чат руководства не пишет вовсе.
+
+    ⚠️ `lead` нужен ради ссылки и названия. Без него шаблон панели остаётся без ссылки на
+    сделку: 27.09.2026 так и ушло «платёжная система говорит оплачено, а в МойСкладе оплаты
+    нет» - текст был, тег был, а открыть сделку из чата было нечем.
     """
+    lead_id = int((lead or {}).get("id") or 0)
+    name = str((lead or {}).get("name") or "").strip()
     dispatch_op(
         EVENT_EVENT, text, responsible_id=responsible_id,
-        values={"текст_события": text},
+        values={"текст_события": text, "сделка": name or "без названия",
+                "ссылка_на_сделку": alerts.lead_link(lead_id) if lead_id else ""},
         panel_title="Авто-режим: нужен человек",
+        panel_url=AMO_LEAD_URL.format(lead_id) if lead_id else None,
     )
 
 
@@ -1631,7 +1639,7 @@ async def on_payment_received(lead: dict) -> None:
         "оплата получена, МойСклад промолчал - веду по событию платёжной системы"
     alert_op(
         f"{lead_link(lead_id, lead.get('name'))}: оплата получена, перевожу в успешную реализацию.",
-        lead.get("responsible_user_id"),
+        lead.get("responsible_user_id"), lead=lead,
     )
     log_run(lead, None, action="payment_fork", outcome="advanced",
             reason=checked, alert_target="op")
@@ -1902,7 +1910,7 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
     alert_op(
         f"{lead_link(int(lead['id']), lead.get('name'))}: клиент ответил «{answer[:200]}». "
         "Дальше не веду, посмотрите переписку.",
-        lead.get("responsible_user_id"),
+        lead.get("responsible_user_id"), lead=lead,
     )
 
 
