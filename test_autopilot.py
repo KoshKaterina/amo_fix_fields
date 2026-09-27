@@ -1945,3 +1945,88 @@ def test_grid_send_is_confirmed_right_away_not_after_the_window(monkeypatch):
     assert rows[-1]["outcome"] == "waiting_reply"
     assert "уже уходил и подтверждён" in rows[-1]["reason"]
     assert updates and updates[-1]["phase"] == S.PHASE_REPLY
+
+
+# ── робот знает о недоставке не меньше сторожа (кейс 19303, 27.09.2026) ──────────
+
+def test_grid_send_error_from_panel_calls_a_human_right_away(monkeypatch):
+    """⚠️ Кейс заказа 19303. Wazzup отбил шаблон с `BAD_CONTACT` за 21 секунду ДО того, как робот
+    начал слушать чат (он ждал телефон): вебхук статуса связать было нельзя, подбор смотрел только
+    на успешные статусы - и робот сказал «подтвердить нечем, жду ответ клиента», хотя сторож
+    доставки в том же контейнере уже написал в сделку, что клиент сообщения не получил.
+
+    Ждать ответа от клиента, которого нет в WhatsApp, бессмысленно - зовём человека сразу."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "update", lambda *a, **kw: None)
+
+    async def fake_activity(chat_id, since):
+        return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
+                                         "author_name": "Admin"}]}
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    lead = _lead(id=36565341, name="Заказ №19303", pipeline_id=10593102, status_id=83537714,
+                 responsible_user_id=11513202)
+    stage = _stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])
+
+    async def run():
+        await A.confirm_grid_send(lead, stage, _bot(7131, launched_by="amo_grid"), "79609323338")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_not_delivered"
+    assert "отказ канала" in rows[-1]["reason"]
+    assert feed and feed[-1]["kind"] == "autopilot_not_delivered"
+    assert "не дошло" in _SENT[-1]["text"]
+
+
+def test_delivery_window_asks_the_panel_before_saying_it_cannot_judge(monkeypatch):
+    """Тот же кейс, но ошибка нашлась уже на истечении окна: прежде чем сказать «подтвердить
+    нечем», робот спрашивает панель - и находит там отказ канала."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
+                        "live_whitelist_enabled": False, "delivery_wait_minutes": 0},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "update", lambda *a, **kw: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565341, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_DELIVERY,
+        "chat_id": "79609323338", "launch_ok_at": "2020-01-01T00:00:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_DELIVERY else [])
+
+    async def fake_activity(chat_id, since):
+        return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
+                                         "author_name": "Admin"}]}
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19303", pipeline_id=10593102, status_id=83537714)
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.check_delivery_windows()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_not_delivered"
+    assert "переписке панели" in rows[-1]["reason"]
+
+
+def test_panel_verdict_ignores_human_echo(monkeypatch):
+    """Отказ по сообщению МЕНЕДЖЕРА - не наш случай: робот судит только о своём шаблоне."""
+    async def only_human(chat_id, since):
+        return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
+                                         "author_name": "Александер Гладков"}]}
+
+    monkeypatch.setattr(A, "fetch_chat_activity", only_human)
+    assert asyncio.run(
+        A.panel_delivery_verdict("79609323338", "2026-09-27T00:00:00+00:00")) is None

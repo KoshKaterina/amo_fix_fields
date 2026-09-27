@@ -2001,39 +2001,85 @@ async def fetch_chat_activity(chat_id: str, since: str) -> dict[str, Any] | None
         return None
 
 
-async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) -> None:
-    """Проверить у панели, ушёл ли шаблон грида, и если ушёл - сразу ждать ответ.
+async def panel_delivery_verdict(chat_id: str, since: str) -> tuple[str, str, str] | None:
+    """Что панель знает о судьбе НАШЕГО сообщения в этом чате после `since`.
 
-    Ищем с момента создания сделки: бот грида срабатывает на входе воронки, то есть почти
-    одновременно с ней, а робот может прийти и через десять часов - после ночи.
+    Возвращает `(исход, статус, канал)`: `ok` - дошло, `error` - Wazzup отбил явной ошибкой.
+    None - панель не ответила или сказать нечего.
+
+    ⚠️ Ошибку ищем наравне с успехом, и это главное. 27.09.2026 по заказу 19303 Wazzup отбил
+    шаблон с `BAD_CONTACT` за 21 секунду ДО того, как робот начал слушать чат: вебхук статуса
+    он связать не мог, а подбор смотрел только на успешные статусы - и робот сказал «отправку
+    подтвердить нечем, жду ответ клиента», тогда как сторож доставки в том же контейнере уже
+    знал, что клиент сообщения не получил, и написал об этом примечание в сделку.
     """
-    if not chat_id:
-        return
-    lead_id = int(lead["id"])
-    try:
-        created = int(lead.get("created_at") or 0)
-    except (TypeError, ValueError):
-        created = 0
-    since = datetime.datetime.fromtimestamp(created, _UTC) if created else         datetime.datetime.now(_UTC) - datetime.timedelta(hours=24)
-    data = await fetch_chat_activity(chat_id, since.isoformat())
+    data = await fetch_chat_activity(chat_id, since)
     if not data:
-        return
+        return None
     for item in (data.get("echo") or []):
         if not is_robot_echo(item.get("author_name")):
             continue
         status = str(item.get("status") or "").lower()
+        chat_type = str(item.get("chat_type") or "")
         if status in DELIVERED_STATUSES or status == "sent":
-            log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
-                    reason=f"шаблон уже уходил и подтверждён ({status}), жду ответ клиента",
-                    delivery={"statuses": [{"status": status,
-                                            "chatType": item.get("chat_type")}]})
-            await asyncio.to_thread(
-                store.update, lead_id, int(lead.get("status_id") or 0),
-                phase=store.PHASE_REPLY, note="шаблон подтверждён по переписке панели",
-            )
-            logger.info("autopilot: по сделке %s шаблон уже подтверждён (%s), жду ответ",
-                        lead_id, status)
-            return
+            return "ok", status, chat_type
+        if status == "error":
+            return "error", status, chat_type
+    return None
+
+
+def lead_since_iso(lead: dict, fallback_hours: int = 24) -> str:
+    """С какого момента спрашивать переписку: от создания сделки, но не глубже суток.
+
+    От создания, потому что бот грида срабатывает на входе воронки - почти одновременно со
+    сделкой, а робот может прийти и через десять часов, после ночи.
+    """
+    try:
+        created = int(lead.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created = 0
+    now = datetime.datetime.now(_UTC)
+    floor = now - datetime.timedelta(hours=fallback_hours)
+    moment = datetime.datetime.fromtimestamp(created, _UTC) if created else floor
+    return max(moment, floor).isoformat()
+
+
+async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) -> None:
+    """Сразу узнать у панели, что стало с шаблоном грида: дошёл, отбит или пока ничего.
+
+    Дошёл - переходим к ожиданию ответа, не тратя окно. Отбит - это доказанная недоставка,
+    зовём человека немедленно: ждать ответа от клиента, которого нет в WhatsApp, бессмысленно.
+    """
+    if not chat_id:
+        return
+    lead_id = int(lead["id"])
+    verdict = await panel_delivery_verdict(chat_id, lead_since_iso(lead))
+    if verdict is None:
+        return
+    outcome, status, chat_type = verdict
+    if outcome == "ok":
+        log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
+                reason=f"шаблон уже уходил и подтверждён ({status}), жду ответ клиента",
+                delivery={"statuses": [{"status": status, "chatType": chat_type}]})
+        await asyncio.to_thread(
+            store.update, lead_id, int(lead.get("status_id") or 0),
+            phase=store.PHASE_REPLY, note="шаблон подтверждён по переписке панели",
+        )
+        logger.info("autopilot: по сделке %s шаблон уже подтверждён (%s), жду ответ",
+                    lead_id, status)
+        return
+    note = f"{chat_type or 'канал'}: отказ канала (по переписке панели)"
+    log_run(lead, stage, bot=bot, action="delivery", outcome="stop_not_delivered",
+            reason=note, delivery={"statuses": [{"status": status, "chatType": chat_type}]})
+    await stop_here(
+        lead, stage, "stop_not_delivered", note, bot=bot,
+        op_text=f"сообщение до клиента не дошло: {note}. Дальше не веду.",
+        event_key=EVENT_NOT_DELIVERED,
+        values={"что_с_доставкой": note,
+                "этап": str((stage or {}).get("status_name") or ""),
+                "бот": str((bot or {}).get("bot_name") or "")},
+        panel_title="Авто-режим: сообщение не дошло",
+    )
 
 
 async def catch_up_on_chats() -> None:
@@ -2067,12 +2113,12 @@ async def catch_up_on_chats() -> None:
         inbound = (data.get("inbound") or [])
         echo = (data.get("echo") or [])
         if not inbound:
-            # Доставка могла подтвердиться статусом, вебхук которого не дошёл.
+            # Доставка могла подтвердиться - или отбиться - статусом, вебхук которого не дошёл.
             for item in echo:
                 if not is_robot_echo(item.get("author_name")):
                     continue
                 status = str(item.get("status") or "").lower()
-                if status in DELIVERED_STATUSES or status == "sent":
+                if status in DELIVERED_STATUSES or status in ("sent", "error"):
                     await record_delivery(row, status, str(item.get("chat_type") or ""))
                     break
             continue
@@ -2156,6 +2202,31 @@ async def check_delivery_windows() -> None:
         # Поэтому переходим к ожиданию ОТВЕТА и продолжаем слушать чат: ответ клиента сам по
         # себе доказательство доставки. Менеджера не дёргаем, технарям говорим один раз.
         if verdict == VERDICT_SILENT and str((bot or {}).get("launched_by") or "engine") != "engine":
+            # ⚠️ Прежде чем сказать «подтвердить нечем», спрашиваем панель. По заказу 19303
+            # Wazzup отбил шаблон за 21 секунду ДО того, как робот начал слушать чат: связать
+            # вебхук статуса он не мог, а в переписке панели ошибка лежала - и сторож доставки
+            # уже написал о ней примечание в сделку. Робот обязан знать не меньше сторожа.
+            from_panel = await panel_delivery_verdict(
+                str(row.get("chat_id") or ""), lead_since_iso(lead))
+            if from_panel is not None:
+                outcome, status, chat_type = from_panel
+                if outcome == "error":
+                    note_err = f"{chat_type or 'канал'}: отказ канала (по переписке панели)"
+                    log_run(lead, stage, bot=bot, action="delivery",
+                            outcome="stop_not_delivered", reason=note_err,
+                            delivery={"statuses": [{"status": status, "chatType": chat_type}]})
+                    await stop_here(
+                        lead, stage, "stop_not_delivered", note_err, bot=bot,
+                        op_text=f"сообщение до клиента не дошло: {note_err}. Дальше не веду.",
+                        event_key=EVENT_NOT_DELIVERED,
+                        values={"что_с_доставкой": note_err,
+                                "этап": str((stage or {}).get("status_name") or ""),
+                                "бот": str((bot or {}).get("bot_name") or "")},
+                        panel_title="Авто-режим: сообщение не дошло",
+                    )
+                    continue
+                await record_delivery(row, status, chat_type)
+                continue
             await asyncio.to_thread(
                 store.update, row["lead_id"], row["status_id"], phase=store.PHASE_REPLY,
                 note="подтверждения доставки не было, слушаю ответ клиента",
