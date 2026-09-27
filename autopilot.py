@@ -75,6 +75,7 @@ from waybill_config import (
     AUTOPILOT_ERROR_DEDUPE_S,
     AUTOPILOT_HOURLY_CAP,
     AUTOPILOT_CATCHUP_INTERVAL_S,
+    AUTOPILOT_CATCHUP_LOOKBACK_S,
     AUTOPILOT_CONTACT_RETRY_S,
     AUTOPILOT_OP_BURST_MAX,
     AUTOPILOT_OP_BURST_WINDOW_S,
@@ -1887,6 +1888,32 @@ def waiting_for_reply_s(row: dict, now: datetime.datetime | None = None) -> floa
     return _seconds_since(row.get("updated_at") or row.get("launch_ok_at"), now)
 
 
+def shift_iso(stamp: str, seconds: int) -> str:
+    """Сдвинуть отметку времени на `seconds` (может быть отрицательным). Битую отдаём как есть."""
+    try:
+        moment = datetime.datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return str(stamp)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_UTC)
+    return (moment + datetime.timedelta(seconds=seconds)).isoformat()
+
+
+def _at_or_after(stamp, edge: str) -> bool:
+    """Отметка `stamp` не раньше `edge`. Нечитаемую отметку пропускаем: лучше разобрать лишнее
+    сообщение, чем потерять ответ клиента из-за формата даты."""
+    try:
+        a = datetime.datetime.fromisoformat(str(stamp))
+        b = datetime.datetime.fromisoformat(str(edge))
+    except (TypeError, ValueError):
+        return True
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=_UTC)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=_UTC)
+    return a >= b
+
+
 def _seconds_since(stamp, now: datetime.datetime | None = None) -> float:
     try:
         moment = datetime.datetime.fromisoformat(str(stamp))
@@ -2114,10 +2141,16 @@ async def catch_up_on_chats() -> None:
         since = str(row.get("launch_ok_at") or row.get("created_at") or "")
         if not chat_id or not since:
             continue
-        data = await fetch_chat_activity(chat_id, since)
+        # ⚠️ Спрашиваем с ЗАПАСОМ назад, а не от начала ожидания. По заказу 19303 отказ канала
+        # пришёл за 21 секунду ДО того, как робот начал слушать (он ждал телефон), и подбор с
+        # точным `since` его не находил - ровно тот же зазор, из-за которого кейс и случился.
+        data = await fetch_chat_activity(chat_id, shift_iso(since, -AUTOPILOT_CATCHUP_LOOKBACK_S))
         if not data:
             continue
-        inbound = (data.get("inbound") or [])
+        # ⚠️ А вот ВХОДЯЩИЕ берём строго после начала ожидания: сообщение, написанное до
+        # запуска бота, ответом на шаблон не является, и принять его за ответ значило бы
+        # двинуть сделку по чужим словам.
+        inbound = [i for i in (data.get("inbound") or []) if _at_or_after(i.get("at"), since)]
         echo = (data.get("echo") or [])
         if not inbound:
             # Доставка могла подтвердиться - или отбиться - статусом, вебхук которого не дошёл.

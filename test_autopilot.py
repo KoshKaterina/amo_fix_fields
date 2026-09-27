@@ -2068,3 +2068,45 @@ def test_catchup_reports_error_even_when_waiting_for_reply(monkeypatch):
     assert rows[-1]["outcome"] == "stop_not_delivered"
     assert feed and feed[-1]["kind"] == "autopilot_not_delivered"
     assert "не дошло" in _SENT[-1]["text"]
+
+
+def test_catchup_looks_back_but_takes_only_fresh_inbound(monkeypatch):
+    """Два требования разом. Отказ канала ищем с запасом НАЗАД - по заказу 19303 он пришёл за 21
+    секунду до начала ожидания. А входящие берём строго после начала: сообщение, написанное до
+    запуска бота, ответом на шаблон не является."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    A._catchup_at = 0.0
+    asked: list[str] = []
+    answers: list[str] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565195, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79935370419", "launch_ok_at": "2026-09-27T12:00:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_activity(chat_id, since):
+        asked.append(since)
+        return {"inbound": [{"text": "старое сообщение", "chat_type": "whatsapp",
+                             "at": "2026-09-27T11:30:00+00:00"}], "echo": []}
+
+    async def fake_answer(row, text, chat_type=""):
+        answers.append(text)
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    asyncio.run(A.catch_up_on_chats())
+
+    assert asked and asked[0] < "2026-09-27T12:00:00"   # спросили с запасом назад
+    assert answers == []                                # но старое сообщение ответом не сочли
+
+
+def test_shift_iso_and_at_or_after():
+    """Два помощника времени: сдвиг отметки и сравнение «не раньше»."""
+    assert A.shift_iso("2026-09-27T12:00:00+00:00", -3600).startswith("2026-09-27T11:00:00")
+    assert A._at_or_after("2026-09-27T12:00:01+00:00", "2026-09-27T12:00:00+00:00") is True
+    assert A._at_or_after("2026-09-27T11:59:59+00:00", "2026-09-27T12:00:00+00:00") is False
+    # нечитаемую отметку пропускаем: потерять ответ клиента дороже, чем разобрать лишнее
+    assert A._at_or_after("не дата", "2026-09-27T12:00:00+00:00") is True
