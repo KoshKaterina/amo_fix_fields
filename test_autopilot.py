@@ -1617,7 +1617,7 @@ def test_stale_entry_is_journalled_once_not_on_every_webhook(monkeypatch):
     """⚠️ Поймано в бою 27.09.2026, через час после выкатки гейта: по одному залежавшемуся
     заказу натекло 28 строк журнала за семь минут. Гейт стоит ДО `claim`, значит отбивает
     каждый вебхук, а их по стоящей сделке десятки."""
-    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
                         "live_whitelist_enabled": False},
               pipeline_id=10593102, entry_status_id=83537714,
               route=[_stage(83537714, "Новый лид", [_bot(7131)])])
@@ -1625,7 +1625,7 @@ def test_stale_entry_is_journalled_once_not_on_every_webhook(monkeypatch):
     monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
     monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
     monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop())
-    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 15 * 3600
+    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 3 * 24 * 3600
 
     async def fake_load(lead_id):
         return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714, created_at=old,
@@ -1766,3 +1766,77 @@ def test_journal_says_who_moved_the_lead_into_success(monkeypatch):
 
     asyncio.run(A.advance(lead, stage, "конец", moved_by_us=True))
     assert "уводит перевод в офис" in rows[-1]["reason"]
+
+
+# ── клиент молчит сутки (Катя 27.09.2026) ───────────────────────────────────────
+
+def test_silent_client_calls_a_human_after_the_wait(monkeypatch):
+    """«Он должен ждать ответа день, потом слать алерт». До этой правки у фазы ожидания срока не
+    было вовсе: сделка висела, пока её молча не уберёт уборка по давности, и о неподтверждённом
+    заказе не узнавал никто."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565195, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79935370419", "launch_ok_at": "2026-09-26T09:00:00+00:00",
+        "updated_at": "2026-09-26T09:05:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19296", pipeline_id=10593102,
+                     status_id=83537714, responsible_user_id=13929334)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    async def run():
+        await A.check_reply_windows()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert rows[-1]["outcome"] == "stop_no_reply"
+    assert feed and feed[-1]["kind"] == "autopilot_no_reply"
+    assert "не подтвердил заказ" in _SENT[-1]["text"]
+    assert _SENT[-1]["chat_id"] == A.NOTIFY_CHAT_ID
+
+
+def test_client_still_within_the_wait_is_left_alone(monkeypatch):
+    """Сутки не вышли - молчим: клиент имеет право подумать, а лишний алерт учит игнорировать чат."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]},
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    recent = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(hours=3)).isoformat()
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565195, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79935370419", "launch_ok_at": recent, "updated_at": recent, "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+    asyncio.run(A.check_reply_windows())
+    assert rows == []
+
+
+def test_lead_moved_away_while_waiting_does_not_alert(monkeypatch):
+    """Сделку увели с этапа, пока ждали ответа, - это право человека, шуметь не о чем."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]},
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565195, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79935370419", "launch_ok_at": "2026-09-26T09:00:00+00:00",
+        "updated_at": "2026-09-26T09:05:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, pipeline_id=10593102, status_id=83537718)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.check_reply_windows())
+    assert rows == []
+    assert _SENT == []

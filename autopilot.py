@@ -39,6 +39,7 @@
 | сообщение до клиента не дошло | `autopilot_not_delivered` | чат ОП с тегом + лента |
 | способ оплаты «Другой способ» - говорим на ВХОДЕ маршрута, не в конце | `autopilot_payment_other` | чат ОП с тегом + лента |
 | чат клиента неизвестен: в карточке нет телефона, отследить нечем | `autopilot_no_chat` | чат ОП с тегом + лента |
+| клиент молчит дольше срока ожидания (по умолчанию сутки) | `autopilot_no_reply` | чат ОП с тегом + лента |
 | любой сбой по сделке: amo не принял, МойСклад молчит, потолок действий, исключение | `autopilot_error` | чат ОП с тегом + лента |
 | нужен человек по ходу маршрута (клиент ответил не кнопкой, нет остатка) | `autopilot_event` | чат ОП с тегом + лента |
 | наша поломка БЕЗ сделки (панель не посчитала остаток) | `autopilot_failure` | технический чат |
@@ -77,6 +78,7 @@ from waybill_config import (
     AUTOPILOT_CONTACT_RETRY_S,
     AUTOPILOT_OP_BURST_MAX,
     AUTOPILOT_OP_BURST_WINDOW_S,
+    AUTOPILOT_REPLY_WAIT_H,
     AUTOPILOT_STATE_TTL_DAYS,
     AUTOPILOT_TICK_INTERVAL_S,
     FIELD_APPLICATION_TYPE,
@@ -209,6 +211,7 @@ EVENT_LEAD_UNHANDLED = "autopilot_lead_unhandled"  # заявка, котору�
 EVENT_NOT_DELIVERED = "autopilot_not_delivered"    # сообщение до клиента не дошло
 EVENT_PAYMENT_OTHER = "autopilot_payment_other"    # способ оплаты, который робот не понимает
 EVENT_NO_CHAT = "autopilot_no_chat"                # чат клиента неизвестен: отследить нечем
+EVENT_NO_REPLY = "autopilot_no_reply"              # клиент молчит дольше срока ожидания
 EVENT_ERROR = "autopilot_error"                    # сбой на конкретной сделке
 EVENT_FAILURE = "autopilot_failure"                # наша поломка, сделки за ней нет
 
@@ -1800,9 +1803,21 @@ async def _handle_status(status: dict) -> None:
 def waited_s(row: dict, now: datetime.datetime | None = None) -> float:
     """Сколько секунд ждём доставку. Отсчёт от отметки запуска, а не от создания строки:
     сделка могла проспать ночь, и та ночь к ожиданию доставки отношения не имеет."""
-    started = row.get("launch_ok_at") or row.get("created_at")
+    return _seconds_since(row.get("launch_ok_at") or row.get("created_at"), now)
+
+
+def waiting_for_reply_s(row: dict, now: datetime.datetime | None = None) -> float:
+    """Сколько секунд ждём ОТВЕТ клиента - от входа в фазу ожидания, а не от запуска бота.
+
+    Отдельно от `waited_s`, потому что это другие часы: сообщение могло уйти вечером, доставка
+    подтвердиться ночью, а ожидание ответа начаться только с этого момента.
+    """
+    return _seconds_since(row.get("updated_at") or row.get("launch_ok_at"), now)
+
+
+def _seconds_since(stamp, now: datetime.datetime | None = None) -> float:
     try:
-        moment = datetime.datetime.fromisoformat(str(started))
+        moment = datetime.datetime.fromisoformat(str(stamp))
     except (TypeError, ValueError):
         return 0.0
     if moment.tzinfo is None:
@@ -1959,6 +1974,45 @@ async def catch_up_on_chats() -> None:
                               str(newest.get("chat_type") or ""))
 
 
+async def check_reply_windows() -> None:
+    """Клиент молчит сутки - зовём человека и снимаем сделку с ведения (Катя 27.09.2026).
+
+    ⚠️ До этого фаза «ждём ответ» не имела срока вообще: сделка висела, пока её молча не уберёт
+    уборка по давности (14 дней). То есть заказ без подтверждения лежал, и НИКТО об этом не
+    узнавал - ни менеджер, ни мы.
+
+    ⚠️ Это не «напоминание клиенту». Своих напоминаний молчащему клиенту робот не шлёт (решение
+    Кати 08.09.2026) - сообщение идёт МЕНЕДЖЕРУ, а клиента дальше ведёт человек.
+    """
+    limit = AUTOPILOT_REPLY_WAIT_H * 3600
+    for row in await asyncio.to_thread(store.list_by_phase, store.PHASE_REPLY):
+        waited = waiting_for_reply_s(row)
+        if waited < limit:
+            continue
+        lead = await load_lead(row["lead_id"])
+        if lead is None:
+            continue
+        stage = settings_client.get_stage(row["status_id"])
+        bot = bot_by_id(stage, row.get("bot_id"))
+        hours = int(waited // 3600)
+        if int(lead.get("status_id") or 0) != int(row["status_id"]):
+            # Сделку увели с этапа - это право человека, и шуметь не о чем.
+            await asyncio.to_thread(
+                store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+                "сделку увели с этапа, пока ждали ответа",
+            )
+            continue
+        await stop_here(
+            lead, stage, "stop_no_reply", f"клиент не ответил за {hours} ч", bot=bot,
+            op_text=f"клиент не подтвердил заказ за {hours} ч - напишите или позвоните сами. "
+                    "Дальше не веду.",
+            event_key=EVENT_NO_REPLY,
+            values={"сколько_ждали": f"{hours} ч",
+                    "этап": str((stage or {}).get("status_name") or "")},
+            panel_title="Авто-режим: клиент не отвечает",
+        )
+
+
 async def check_delivery_windows() -> None:
     """Окно ожидания доставки истекает молча - никакого события об этом не приходит.
 
@@ -2106,6 +2160,7 @@ async def tick_once() -> None:
     # сказали месяц назад, на входной этап не вернётся, а вернётся - сказать заново верно.
     await asyncio.to_thread(store.purge_notices_older_than, 60)
     await check_delivery_windows()
+    await check_reply_windows()
     await catch_up_on_chats()
     if not in_work_hours():
         return
