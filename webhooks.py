@@ -32,6 +32,7 @@ import migration_freeze
 import autopilot
 import new_lead_watch
 import ms_client
+import office_record_watch
 import office_transfer
 import order_note
 import preorder_lead_name
@@ -125,6 +126,10 @@ async def lifespan(app):
     await order_watchdog.init()
     await uis_missed_call.init()
     await new_lead_watch.init()
+    # Сторож записи в офис (27.09.2026): время приёма прошло, сделка стоит - задача
+    # менеджеру перезаписать клиента. Модуль сам первым делом смотрит
+    # OFFICE_RECORD_WATCH_ENABLED и без него не поднимает ни таблицу отметок, ни цикл.
+    await office_record_watch.init()
     # Формы сайта: без SITE_FORM_ENABLED роут отвечает 404 и ничего не делает.
     await site_form_service.init()
     # Сторож писем (26.09.2026): входящее письмо в закрытую сделку теряется для работы -
@@ -153,6 +158,7 @@ async def lifespan(app):
     await order_watchdog.shutdown()
     await uis_missed_call.shutdown()
     await new_lead_watch.shutdown()
+    await office_record_watch.shutdown()
     await site_form_service.shutdown()
     await mail_watch.shutdown()
     await amgroup_fallback.shutdown()
@@ -191,7 +197,8 @@ async def health():
     контейнера иначе неотличим от тишины по отсутствию событий (инцидент 28.08.2026,
     сутки без алертов при зелёном контейнере)."""
     return {"status": "ok", "telegram": telegram_bot.telegram_health(),
-            "mail_watch": mail_watch.status(), **queue_stats()}
+            "mail_watch": mail_watch.status(),
+            "office_record": office_record_watch.status(), **queue_stats()}
 
 
 def insert_nested(data, keys, value):
