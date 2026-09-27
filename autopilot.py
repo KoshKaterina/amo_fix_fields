@@ -73,8 +73,8 @@ from waybill_config import (
     AUTOPILOT_ENABLED,
     AUTOPILOT_ERROR_DEDUPE_S,
     AUTOPILOT_HOURLY_CAP,
-    AUTOPILOT_LEAD_ALERT_MAX_AGE_H,
-    AUTOPILOT_MAX_ENTRY_AGE_H,
+    AUTOPILOT_CATCHUP_INTERVAL_S,
+    AUTOPILOT_CONTACT_RETRY_S,
     AUTOPILOT_OP_BURST_MAX,
     AUTOPILOT_OP_BURST_WINDOW_S,
     AUTOPILOT_STATE_TTL_DAYS,
@@ -221,6 +221,15 @@ _op_muted_until: float = 0.0
 # Сбои, о которых уже сказали: ключ → когда. Без этого ошибка фонового цикла звонила бы раз
 # в минуту (тик), а ошибка разбора вебхука - на каждый вебхук по сделке.
 _error_said_at: dict[str, float] = {}
+
+# Когда последний раз подбирали пропущенное из переписки панели (unix, UTC).
+_catchup_at: float = 0.0
+
+# ⚠️ Пары «сделка и этап», куда сделку перевёл САМ робот. Нужны журналу: без них запись
+# «маршрут пройден» появлялась и там, где этап сменил человек, и читалась как заслуга робота
+# (замечание Кати 27.09.2026 по сделке 36564965). Метка живёт секунды - от `move_to` до входа
+# в `handle_lead_change`, который её и снимает.
+_moved_by_us: set[tuple[int, int]] = set()
 
 
 def alert_tech(text: str) -> None:
@@ -923,8 +932,13 @@ async def stop_here(
 
 # ── ход по маршруту ─────────────────────────────────────────────────────────────
 
-async def run_stage(lead: dict, stage: dict) -> None:
-    """Этап маршрута: оплата, остаток, первый бот цепочки. Вызывается уже ПОСЛЕ `store.claim`."""
+async def run_stage(lead: dict, stage: dict, *, moved_by_us: bool = True) -> None:
+    """Этап маршрута: оплата, остаток, первый бот цепочки. Вызывается уже ПОСЛЕ `store.claim`.
+
+    `moved_by_us` - перевёл ли сделку в этот этап сам робот. Нужно ТОЛЬКО журналу: строка
+    «маршрут пройден» по сделке, которую в успех перетащил человек, читается как заслуга
+    робота, а это неправда (замечание Кати 27.09.2026).
+    """
     lead_id = int(lead["id"])
     status_id = int(lead["status_id"])
 
@@ -977,7 +991,7 @@ async def run_stage(lead: dict, stage: dict) -> None:
         reason = ("этап проходной, ботов на нём нет" if not (stage.get("bots") or [])
                   else "ни один бот этапа не подошёл по условиям")
         log_run(lead, stage, action="route", outcome="skipped_no_bots", reason=reason)
-        await advance(lead, stage, reason)
+        await advance(lead, stage, reason, moved_by_us=moved_by_us)
         return
 
     # Гейт остатка - на входе в маршрут, до первого слова клиенту. Дальше по маршруту заказ
@@ -1005,11 +1019,25 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
     chat_id = chat_id_of(contact)
     bot_id = int(bot.get("bot_id") or 0)
 
-    # ⚠️ Чат клиента неизвестен - зовём человека СРАЗУ (Катя 27.09.2026). Склейка с Wazzup идёт
-    # по телефону контакта: нет телефона в карточке - робот не увидит ни статусов доставки, ни
-    # ответа клиента, и сделка просто провисит до конца окна. Молчать тут нельзя: с виду робот
-    # ведёт сделку, а на деле он слеп. Проверяем ДО запуска бота - для ботов, которых запускает
-    # сам робот, иначе сообщение уже ушло бы, а отследить его было бы нечем.
+    # ⚠️ Чат клиента неизвестен - зовём человека (Катя 27.09.2026). Склейка с Wazzup идёт по
+    # телефону контакта: нет телефона в карточке - робот не увидит ни статусов доставки, ни
+    # ответа клиента, и сделка просто провисит до конца окна. Проверяем ДО запуска бота: у
+    # ботов, которых запускает сам робот, иначе сообщение уже ушло бы, а отследить его нечем.
+    #
+    # ⚠️ Но сперва ПЕРЕСПРАШИВАЕМ. Заказ создаёт интеграция: сначала сделка, через секунды -
+    # привязанный контакт с телефоном. Вебхук успевает прийти в зазор, и 27.09.2026 это дало
+    # ложное «в карточке контакта нет телефона» по заказу 07975, где телефон был. Тот же зазор
+    # уже ловил `telegram_contact` - он ждёт не только заказ МойСклада, но и контакт сделки.
+    if not chat_id and str(bot.get("stop_mode") or "any") != "never":
+        await asyncio.sleep(AUTOPILOT_CONTACT_RETRY_S)
+        fresh = await load_lead(lead_id)
+        if fresh is not None:
+            lead = fresh
+            contact = await main_contact(lead)
+            chat_id = chat_id_of(contact)
+        if chat_id:
+            logger.info("autopilot: телефон по сделке %s приехал со второй попытки", lead_id)
+
     if not chat_id and str(bot.get("stop_mode") or "any") != "never":
         await stop_here(
             lead, stage, "stop_no_chat", "в карточке контакта нет телефона, чат не определить",
@@ -1060,7 +1088,8 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
             reason="жду подтверждения доставки от Wazzup")
 
 
-async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None = None) -> None:
+async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None = None,
+                  moved_by_us: bool = True) -> None:
     """Следующий шаг. Сперва следующий БОТ этого этапа, и только когда боты кончились - этап.
 
     Боты этапа идут цепочкой: первый спросил «всё верно?», клиент ответил «да» - слово берёт
@@ -1088,7 +1117,8 @@ async def advance(lead: dict, stage: dict, reason: str, *, from_bot: dict | None
             store.finish, int(lead["id"]), status_id, store.PHASE_DONE, reason,
         )
         log_run(lead, stage, action="route", outcome="done",
-                reason="маршрут пройден, дальше сделку уводит перевод в офис")
+                reason=("маршрут пройден, дальше сделку уводит перевод в офис" if moved_by_us
+                        else "в успех сделку перевёл не робот, маршрут считаю пройденным"))
         return
     nxt = next_stage(status_id)
     # На этап запроса оплаты, как и в успех, по порядку карточек не переходим. Сам этап
@@ -1135,6 +1165,9 @@ async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: s
     await asyncio.to_thread(store.finish, lead_id, was, store.PHASE_DONE, reason)
     log_run(lead, stage, action="route", outcome="advanced", reason=reason,
             moved_to_status_name=status_name)
+    if len(_moved_by_us) > 2000:
+        _moved_by_us.clear()
+    _moved_by_us.add((lead_id, int(status_id)))
     await handle_lead_change(lead_id)
 
 
@@ -1326,14 +1359,45 @@ def is_order(lead: dict) -> bool:
     return value.casefold() == "заказ"
 
 
-def lead_is_fresh(lead: dict, now: datetime.datetime | None = None,
-                  max_age_h: float | None = None) -> bool:
-    """Заявка правда новая, а не старая сделка, которую кто-то тронул.
+def entry_window_start(now: datetime.datetime | None = None) -> datetime.datetime | None:
+    """С какого момента сделка считается «этого захода»: конец ПРЕДЫДУЩИХ рабочих часов.
 
-    ⚠️ Без этого гейта уведомление о «новой заявке» уходило по сделке любого возраста:
-    `/lead_change` приходит на ЛЮБОЕ изменение, и сделка, неделю стоящая на входном этапе,
-    от правки поля выглядит новее некуда. 27.09.2026 так и вышло - уведомление о заявке,
-    созданной вчера вечером, пришло утром следующего дня, когда её тронул синк.
+    Правило Кати 27.09.2026 дословно: «если бота включили сегодня в 10, то он будет работать
+    со всем, что появилось сегодня плюс сделки с 19 вчерашней даты до 10 сегодняшней». То есть
+    ночные заказы - наши: их никто не видел, потому что смены не было. А заказ, пролежавший
+    рабочий день, робот не трогает - его уже видели люди.
+
+    Порогом в часах это не выражается: в понедельник «вчера» это пятница, а не воскресенье.
+    Поэтому считаем по самим рабочим окнам - как `worktime_minutes` в стороже нового лида.
+
+    None - часы работы не заданы: тогда гейта нет, решают другие проверки.
+    """
+    hours = _work_hours()
+    if not hours:
+        return None
+    moment = (now or datetime.datetime.now(_MSK)).astimezone(_MSK)
+    ends: list[datetime.datetime] = []
+    for back in range(0, 9):
+        day = (moment - datetime.timedelta(days=back)).date()
+        for iv in hours:
+            hh, mm = (int(x) for x in iv["end"].split(":"))
+            end = datetime.datetime.combine(day, datetime.time(hh, mm), tzinfo=_MSK)
+            if end <= moment:
+                ends.append(end)
+    return max(ends) if ends else None
+
+
+def lead_is_fresh(lead: dict, now: datetime.datetime | None = None) -> bool:
+    """Сделка появилась в этом заходе, а не лежит с прошлых дней.
+
+    ⚠️ Гейт нужен в двух местах, и оба стоили нам шума. Уведомление о «новой заявке» уходило
+    по сделке любого возраста: `/lead_change` приходит на ЛЮБОЕ изменение, и сделка, неделю
+    стоящая на входном этапе, от правки поля выглядит новее некуда. А ведение по такой сделке
+    27.09.2026 дало девять ложных «сообщение до клиента не дошло».
+
+    ⚠️ Раньше здесь стоял потолок в часах (шесть на ведение, сутки на уведомление), и он
+    отрезал ровно то, что отрезать нельзя: ночной заказ, пришедший в 21:12, к утру «старел».
+    Теперь правило одно на оба случая - рабочие окна.
     """
     try:
         created = int(lead.get("created_at") or 0)
@@ -1341,10 +1405,13 @@ def lead_is_fresh(lead: dict, now: datetime.datetime | None = None,
         return False
     if created <= 0:
         return False
-    moment = now or datetime.datetime.now(_UTC)
-    age_h = (moment.timestamp() - created) / 3600
-    limit = AUTOPILOT_LEAD_ALERT_MAX_AGE_H if max_age_h is None else max_age_h
-    return 0 <= age_h <= limit
+    moment = (now or datetime.datetime.now(_MSK)).astimezone(_MSK)
+    if created > moment.timestamp() + 60:
+        return False           # сделка «из будущего» - данные врут, не угадываем
+    start = entry_window_start(moment)
+    if start is None:
+        return True
+    return created >= start.timestamp()
 
 
 async def notify_entry_lead(lead: dict) -> None:
@@ -1496,17 +1563,15 @@ async def handle_lead_change(lead_id: int) -> None:
     #
     # Ночная заявка гейтом не страдает: её вебхук приходит в момент создания, робот берёт её
     # сразу и просто спит до начала рабочих часов.
-    if (status_id == (settings_client.get_entry_status_id() or 0)
-            and not lead_is_fresh(lead, max_age_h=AUTOPILOT_MAX_ENTRY_AGE_H)):
-        logger.info("autopilot: сделка %s стоит на входном этапе дольше окна, в ведение не беру",
+    if status_id == (settings_client.get_entry_status_id() or 0) and not lead_is_fresh(lead):
+        logger.info("autopilot: сделка %s лежит с прошлых рабочих часов, в ведение не беру",
                     lead_id)
         # ⚠️ В журнал - ОДИН раз на сделку и этап. Гейт стоит до `claim`, значит отбивает каждый
         # вебхук, а их по стоящей сделке десятки: 27.09.2026 по одному заказу натекло 28 строк за
         # семь минут. Отметка на диске тут ровно к месту - её и так проверяет уведомление о заявке.
         if await asyncio.to_thread(store.claim_notice, lead_id, f"stale-{status_id}"):
             log_run(lead, stage, action="route", outcome="skipped_stale_entry",
-                    reason=f"на входном этапе дольше {AUTOPILOT_MAX_ENTRY_AGE_H} ч, "
-                           "в ведение не беру")
+                    reason="сделка лежит с прошлых рабочих часов, в ведение не беру")
         return
 
     if not whitelist_ok(lead):
@@ -1519,7 +1584,9 @@ async def handle_lead_change(lead_id: int) -> None:
     if not await asyncio.to_thread(store.claim, lead_id, status_id, pipeline_id):
         return
 
-    await run_stage(lead, stage)
+    ours = (lead_id, status_id) in _moved_by_us
+    _moved_by_us.discard((lead_id, status_id))
+    await run_stage(lead, stage, moved_by_us=ours)
 
 
 async def on_payment_received(lead: dict) -> None:
@@ -1824,6 +1891,74 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
     )
 
 
+async def fetch_chat_activity(chat_id: str, since: str) -> dict[str, Any] | None:
+    """Что было в чате после `since` - спрашиваем панель. None - спросить не удалось."""
+    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN or not chat_id:
+        return None
+    base = TEAM_PANEL_BASE_URL.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                base + "/api/ingest/autopilot/chat-activity",
+                params={"chat": chat_id, "since": since},
+                headers={"X-Ingest-Token": TEAM_PANEL_INGEST_TOKEN},
+            )
+        if resp.status_code >= 400:
+            logger.warning("autopilot: панель не отдала переписку, ответ %s", resp.status_code)
+            return None
+        return resp.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("autopilot: не смог спросить у панели переписку чата")
+        return None
+
+
+async def catch_up_on_chats() -> None:
+    """Подбор пропущенного по ведомым сделкам: раз в `AUTOPILOT_CATCHUP_INTERVAL_S`.
+
+    ⚠️ Зачем вообще, если есть вебхуки. Потому что вебхук может не дойти, и тогда сделка
+    зависает молча. По заказу 19288 (27.09.2026) так и вышло: бот грида отправил шаблон вечером,
+    клиент ответил «Да, всё верно» в 14:00, а робот ответа не увидел. Просьба Кати в тот же
+    день - «отслеживаемые сделки надо проверять хотя бы каждые 5 мин».
+
+    Спрашиваем ПАНЕЛЬ, а не Wazzup: всю переписку она и так собирает, второй копии не нужно.
+    Нашлось входящее - ведём себя точно так же, как по вебхуку: тот же `on_client_answer`, то
+    же решение по режиму бота. Нашлось только эхо со статусом - дозаписываем статус доставки.
+    """
+    global _catchup_at
+    now = datetime.datetime.now(_UTC).timestamp()
+    if now - _catchup_at < AUTOPILOT_CATCHUP_INTERVAL_S:
+        return
+    _catchup_at = now
+
+    rows = list(await asyncio.to_thread(store.list_by_phase, store.PHASE_REPLY))
+    rows += list(await asyncio.to_thread(store.list_by_phase, store.PHASE_DELIVERY))
+    for row in rows:
+        chat_id = str(row.get("chat_id") or "")
+        since = str(row.get("launch_ok_at") or row.get("created_at") or "")
+        if not chat_id or not since:
+            continue
+        data = await fetch_chat_activity(chat_id, since)
+        if not data:
+            continue
+        inbound = (data.get("inbound") or [])
+        echo = (data.get("echo") or [])
+        if not inbound:
+            # Доставка могла подтвердиться статусом, вебхук которого не дошёл.
+            for item in echo:
+                status = str(item.get("status") or "").lower()
+                if status in DELIVERED_STATUSES or status == "sent":
+                    await record_delivery(row, status, str(item.get("chat_type") or ""))
+                    break
+            continue
+        newest = inbound[0]
+        logger.info("autopilot: подобрал ответ клиента по сделке %s из переписки панели (%s)",
+                    row["lead_id"], str(newest.get("at") or ""))
+        await on_client_answer(row, str(newest.get("text") or ""),
+                              str(newest.get("chat_type") or ""))
+
+
 async def check_delivery_windows() -> None:
     """Окно ожидания доставки истекает молча - никакого события об этом не приходит.
 
@@ -1849,24 +1984,29 @@ async def check_delivery_windows() -> None:
         note = (delivery_note(items) if verdict == VERDICT_FAILED
                 else "ни одного статуса от Wazzup, похоже, сообщение и не отправлялось")
 
-        # ⚠️ «Ни одного статуса» по боту, которого запускал ГРИД, - это не «не доставлено».
-        # Мы его не вызывали и не знаем, стрелял ли он вообще: утверждать при этом, что клиент
-        # не получил сообщение, значит врать менеджеру. 27.09.2026 такая ложь ушла девятью
-        # сообщениями подряд по заказам, которые просто давно стояли на входном этапе.
-        # Снимаем с ведения и говорим ТЕХНАРЯМ: сигнал не теряем, отдел не дёргаем.
+        # ⚠️ «Ни одного статуса» по боту, которого запускал ГРИД, - это не «не доставлено» и
+        # НЕ повод бросать сделку. Мы его не вызывали и не знаем, стрелял ли он вообще: по
+        # заказу 19288 бот грида отправил шаблон ВЧЕРА в 21:12 (ночная версия бота, «в не вр»),
+        # статусы по нему прошли до включения робота, а клиент ответил «Да, всё верно» в 14:00 -
+        # и этот ответ ушёл в пустоту, потому что в 11:28 сделку сняли с ведения.
+        #
+        # Поэтому переходим к ожиданию ОТВЕТА и продолжаем слушать чат: ответ клиента сам по
+        # себе доказательство доставки. Менеджера не дёргаем, технарям говорим один раз.
         if verdict == VERDICT_SILENT and str((bot or {}).get("launched_by") or "engine") != "engine":
             await asyncio.to_thread(
-                store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
-                "статусов доставки не было, бота запускал грид - судить не можем",
+                store.update, row["lead_id"], row["status_id"], phase=store.PHASE_REPLY,
+                note="подтверждения доставки не было, слушаю ответ клиента",
             )
-            log_run(lead, stage, bot=bot, action="delivery", outcome="stop_no_delivery_proof",
-                    reason="статусов от Wazzup не было; бота запускает грид, отправку "
-                           "подтвердить нечем - в чат ОП не пишу")
-            alert_tech(
-                f"{lead_link(row['lead_id'], lead.get('name'))}: статусов доставки от Wazzup не "
-                "пришло, а бота на этапе запускает грид - отправку подтвердить нечем. Снял с "
-                "ведения молча, менеджеру не писал."
-            )
+            log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
+                    reason="статусов от Wazzup нет, бота запускает грид - жду ответ клиента, "
+                           "с ведения не снимаю")
+            if await asyncio.to_thread(store.claim_notice, row["lead_id"],
+                                       f"no-proof-{row['status_id']}"):
+                alert_tech(
+                    f"{lead_link(row['lead_id'], lead.get('name'))}: статусов доставки от Wazzup "
+                    "не пришло, а бота на этапе запускает грид - отправку подтвердить нечем. "
+                    "Сделку не бросаю, жду ответ клиента; менеджеру не писал."
+                )
             continue
 
         log_run(lead, stage, bot=bot, action="delivery", outcome="stop_not_delivered",
@@ -1966,6 +2106,7 @@ async def tick_once() -> None:
     # сказали месяц назад, на входной этап не вернётся, а вернётся - сказать заново верно.
     await asyncio.to_thread(store.purge_notices_older_than, 60)
     await check_delivery_windows()
+    await catch_up_on_chats()
     if not in_work_hours():
         return
     for row in await asyncio.to_thread(store.list_due):

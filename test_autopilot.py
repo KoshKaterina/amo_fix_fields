@@ -1007,11 +1007,10 @@ def test_every_new_lead_wakes_the_panel_inbox_in_live(monkeypatch):
 
 
 def test_stale_lead_on_entry_stage_does_not_look_new(monkeypatch):
-    """⚠️ Гейт возраста (Катя 27.09.2026). `/lead_change` приходит на ЛЮБОЕ изменение, и
-    сделка, неделю стоящая на входном этапе, от правки поля выглядела «новой заявкой».
-    Ровно это и случилось 27.09: уведомление о вчерашней заявке пришло утром, когда её
-    тронул синк."""
-    _settings(settings={"mode": "live", "work_hours": [],
+    """⚠️ Гейт «этого захода» (Катя 27.09.2026). `/lead_change` приходит на ЛЮБОЕ изменение, и
+    сделка, неделю стоящая на входном этапе, от правки поля выглядела «новой заявкой». Ровно это
+    и случилось 27.09: уведомление о вчерашней заявке пришло утром, когда её тронул синк."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
                         "live_whitelist_enabled": False},
               pipeline_id=10593102, entry_status_id=83537714,
               test_contact_ids=[], route=[_stage(83537714, "Новый лид", [_bot(7131)])])
@@ -1347,9 +1346,8 @@ def test_op_burst_mutes_the_chat_but_never_the_panel_feed(monkeypatch):
 def test_stale_lead_on_entry_stage_is_not_taken_into_work(monkeypatch):
     """⚠️ Поймано боем 27.09.2026. В 11:13 робот забрал девять заказов, простоявших на «Новом
     лиде» с вечера (вебхук приходит на любое изменение), а в 11:28 выдал по ним девять алертов
-    «сообщение до клиента не дошло». Ложных: бота на этапе запускает грид, робот его не
-    вызывал, клиентам ничего не уходило."""
-    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+    «сообщение до клиента не дошло»."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
                         "live_whitelist_enabled": False},
               pipeline_id=10593102, entry_status_id=83537714,
               route=[_stage(83537714, "Новый лид", [_bot(7131)])])
@@ -1358,7 +1356,7 @@ def test_stale_lead_on_entry_stage_is_not_taken_into_work(monkeypatch):
     monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
     monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
     monkeypatch.setattr(A, "run_stage", lambda *a, **k: _noop(ran.append(1)))
-    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 15 * 3600
+    old = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - 3 * 24 * 3600
 
     async def fake_load(lead_id):
         return _lead(id=lead_id, pipeline_id=10593102, status_id=83537714, created_at=old,
@@ -1370,11 +1368,36 @@ def test_stale_lead_on_entry_stage_is_not_taken_into_work(monkeypatch):
     assert rows[-1]["outcome"] == "skipped_stale_entry"
 
 
-def test_grid_bot_without_statuses_does_not_claim_undelivered(monkeypatch):
-    """«Ни одного статуса» по боту, которого запускал ГРИД, - это не «не доставлено».
+def test_entry_window_covers_the_night_before_the_shift():
+    """Слово Кати 27.09.2026: «если бота включили сегодня в 10, то он будет работать со всем, что
+    появилось сегодня плюс сделки с 19 вчерашней даты до 10 сегодняшней».
 
-    Мы его не вызывали и не знаем, стрелял ли он: утверждать при этом, что клиент не получил
-    сообщение, значит врать менеджеру. Снимаем с ведения и говорим технарям."""
+    Порогом в часах это не выражается - считаем по рабочим окнам. Проверяем на фиксированном
+    времени, иначе тест начал бы зависеть от часа своего запуска."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]})
+    now = datetime.datetime(2026, 9, 27, 11, 13, tzinfo=_MSK)
+    assert A.entry_window_start(now) == datetime.datetime(2026, 9, 26, 19, 0, tzinfo=_MSK)
+
+    def lead_at(y, m, d, hh, mm):
+        ts = int(datetime.datetime(y, m, d, hh, mm, tzinfo=_MSK).timestamp())
+        return _lead(created_at=ts)
+
+    # ночной заказ 21:12 - наш: смены не было, его никто не видел
+    assert A.lead_is_fresh(lead_at(2026, 9, 26, 21, 12), now=now) is True
+    # заказ этого утра - наш
+    assert A.lead_is_fresh(lead_at(2026, 9, 27, 10, 40), now=now) is True
+    # заказ, пролежавший вчерашний рабочий день, - не наш, его видели люди
+    assert A.lead_is_fresh(lead_at(2026, 9, 26, 15, 55), now=now) is False
+    # до начала работы: правило то же, ночь остаётся нашей
+    early = datetime.datetime(2026, 9, 27, 8, 0, tzinfo=_MSK)
+    assert A.lead_is_fresh(lead_at(2026, 9, 27, 1, 38), now=early) is True
+
+
+def test_grid_bot_without_statuses_keeps_listening_for_the_answer(monkeypatch):
+    """⚠️ Правка 27.09.2026, вечер. «Ни одного статуса» по боту ГРИДА - не «не доставлено» и не
+    повод бросать сделку: по заказу 19288 бот грида отправил шаблон вечером, статусы прошли до
+    включения робота, а клиент ответил «Да, всё верно» в 14:00 - и ответ ушёл в пустоту, потому
+    что сделку сняли с ведения. Теперь переходим к ожиданию ОТВЕТА и слушаем чат дальше."""
     _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
                         "live_whitelist_enabled": False, "delivery_wait_minutes": 0},
               pipeline_id=10593102, entry_status_id=83537714,
@@ -1382,15 +1405,18 @@ def test_grid_bot_without_statuses_does_not_claim_undelivered(monkeypatch):
                             [_bot(7131, launched_by="amo_grid", bot_name="Бот грида")])])
     rows = _capture(monkeypatch)
     feed: list[dict] = []
+    updates: list[dict] = []
+    finished: list[tuple] = []
     monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
     monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
-        "lead_id": 36564965, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_DELIVERY,
+        "lead_id": 36564989, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_DELIVERY,
         "launch_ok_at": "2020-01-01T00:00:00+00:00", "delivery": [],
-    }])
-    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    }] if phase == S.PHASE_DELIVERY else [])
+    monkeypatch.setattr(A.store, "update", lambda *a, **kw: updates.append(kw))
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: finished.append(a))
 
     async def fake_load(lead_id):
-        return _lead(id=lead_id, name="Заказ №19286", pipeline_id=10593102,
+        return _lead(id=lead_id, name="Заказ №19288", pipeline_id=10593102,
                      status_id=83537714, responsible_user_id=13929334)
 
     monkeypatch.setattr(A, "load_lead", fake_load)
@@ -1400,9 +1426,11 @@ def test_grid_bot_without_statuses_does_not_claim_undelivered(monkeypatch):
         await asyncio.sleep(0)
 
     asyncio.run(run())
-    assert rows[-1]["outcome"] == "stop_no_delivery_proof"
-    assert feed == []                                   # ленту не будим
-    assert _SENT and _SENT[-1]["chat_id"] is None       # технический чат, не топик ОП
+    assert rows[-1]["outcome"] == "waiting_reply"
+    assert updates and updates[-1]["phase"] == S.PHASE_REPLY   # слушаем дальше
+    assert finished == []                                      # с ведения НЕ снимаем
+    assert feed == []                                          # ленту не будим
+    assert _SENT and _SENT[-1]["chat_id"] is None              # технический чат
 
 
 def test_engine_bot_without_statuses_still_alerts(monkeypatch):
@@ -1488,6 +1516,7 @@ def test_contact_without_phone_calls_a_human_right_away(monkeypatch):
     monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
     monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
     monkeypatch.setattr(A, "launch_bot", lambda *a, **k: _noop(started.append(1)))
+    monkeypatch.setattr(A, "AUTOPILOT_CONTACT_RETRY_S", 0)
 
     async def no_contact(lead):
         return None
@@ -1517,6 +1546,7 @@ def test_informational_bot_does_not_need_a_chat(monkeypatch):
     monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
     monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
     monkeypatch.setattr(A, "advance", lambda *a, **k: _noop())
+    monkeypatch.setattr(A, "AUTOPILOT_CONTACT_RETRY_S", 0)
 
     async def no_contact(lead):
         return None
@@ -1638,3 +1668,101 @@ def test_payment_mismatch_alert_does_not_repeat(monkeypatch):
     said = [m for m in _SENT if "МойСкладе оплаты нет" in m["text"]]
     assert len(said) == 1
     assert len([r for r in rows if r["outcome"] == "failed"]) == 1
+
+
+# ── подбор пропущенного из переписки панели (27.09.2026) ────────────────────────
+
+def test_catchup_picks_up_the_answer_a_webhook_lost(monkeypatch):
+    """⚠️ Кейс заказа 19288. Бот грида отправил шаблон вечером, клиент ответил «Да, всё верно» в
+    14:00 - робот ответа не увидел, потому что вебхука не было (или сделка уже не слушалась), и
+    заказ, уже ОПЛАЧЕННЫЙ, остался стоять на «Новом лиде».
+
+    Просьба Кати: «отслеживаемые сделки надо проверять хотя бы каждые 5 мин». Подбор спрашивает
+    панель - у неё вся переписка - и ведёт себя точно так же, как по вебхуку."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    A._catchup_at = 0.0
+    answers: list[tuple] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "list_by_phase",
+                        lambda phase: [{
+                            "lead_id": 36564989, "status_id": 83537714, "bot_id": 7131,
+                            "phase": phase, "chat_id": "79998993959",
+                            "launch_ok_at": "2026-09-27T08:13:00+00:00", "delivery": [],
+                        }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_activity(chat_id, since):
+        assert chat_id == "79998993959"
+        return {"inbound": [{"text": "Да, всё верно", "chat_type": "whatsapp",
+                             "at": "2026-09-27T11:00:00+00:00"}], "echo": []}
+
+    async def fake_answer(row, text, chat_type=""):
+        answers.append((row["lead_id"], text, chat_type))
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    asyncio.run(A.catch_up_on_chats())
+    assert answers == [(36564989, "Да, всё верно", "whatsapp")]
+
+
+def test_catchup_runs_not_more_often_than_its_interval(monkeypatch):
+    """Подбор ходит в панель по КАЖДОЙ ведомой сделке, поэтому частить ему нельзя: тик робота
+    раз в минуту, а спрашиваем раз в пять."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]})
+    A._catchup_at = 0.0
+    calls: list[str] = []
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [])
+    monkeypatch.setattr(A, "fetch_chat_activity",
+                        lambda chat_id, since: calls.append(chat_id))
+
+    async def run():
+        await A.catch_up_on_chats()
+        await A.catch_up_on_chats()
+
+    asyncio.run(run())
+    assert calls == []          # сделок нет - и ходить незачем
+    assert A._catchup_at > 0    # но отметка времени поставлена, значит второй проход отложен
+
+
+def test_catchup_records_delivery_when_only_echo_is_there(monkeypatch):
+    """Ответа нет, но эхо с подтверждением доставки есть - дозаписываем статус: вебхук статуса
+    мог не дойти так же, как вебхук сообщения."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]})
+    A._catchup_at = 0.0
+    recorded: list[tuple] = []
+    monkeypatch.setattr(A.store, "list_by_phase",
+                        lambda phase: [{
+                            "lead_id": 36565195, "status_id": 83537714, "bot_id": 7131,
+                            "phase": phase, "chat_id": "79935370419",
+                            "launch_ok_at": "2026-09-27T09:29:17+00:00", "delivery": [],
+                        }] if phase == S.PHASE_DELIVERY else [])
+
+    async def fake_activity(chat_id, since):
+        return {"inbound": [], "echo": [{"status": "delivered", "chat_type": "whatsapp"}]}
+
+    async def fake_record(row, status, chat_type):
+        recorded.append((row["lead_id"], status, chat_type))
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "record_delivery", fake_record)
+    asyncio.run(A.catch_up_on_chats())
+    assert recorded == [(36565195, "delivered", "whatsapp")]
+
+
+def test_journal_says_who_moved_the_lead_into_success(monkeypatch):
+    """Замечание Кати 27.09.2026 по сделке 36564965: «двинули вперёд не мы, но в лог ушло, будто
+    это бот двинул». Теперь причина в журнале называет автора перевода."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "10:00", "end": "19:00"}]},
+              route=[_stage(A.STATUS_SUCCESS, "Успешно реализовано", [], is_final=True)])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    lead = _lead(id=36564965, status_id=A.STATUS_SUCCESS)
+    stage = _stage(A.STATUS_SUCCESS, "Успешно реализовано", [], is_final=True)
+
+    asyncio.run(A.advance(lead, stage, "конец", moved_by_us=False))
+    assert "перевёл не робот" in rows[-1]["reason"]
+
+    asyncio.run(A.advance(lead, stage, "конец", moved_by_us=True))
+    assert "уводит перевод в офис" in rows[-1]["reason"]
