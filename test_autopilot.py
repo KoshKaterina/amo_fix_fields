@@ -1527,3 +1527,57 @@ def test_informational_bot_does_not_need_a_chat(monkeypatch):
     asyncio.run(A.run_bot(lead, _stage(83537714, "Новый лид", []),
                           _bot(7131, launched_by="amo_grid", stop_mode="never")))
     assert all(r["outcome"] != "stop_no_chat" for r in rows)
+
+
+def test_success_stage_of_a_lead_we_never_led_is_left_alone(monkeypatch):
+    """⚠️ Поймано наблюдением 27.09.2026. В маршруте есть карточка «Успешно реализовано», и по
+    ней робот брал в ведение ЛЮБУЮ успешную сделку компании: августовский «Заказ №17860» попал
+    в УР и получил две строки журнала. Записи и блокировки на сделки, которых робот не касался,
+    не нужны никому."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)]),
+                     _stage(A.STATUS_SUCCESS, "Успешно реализовано", [], is_final=True)])
+    rows = _capture(monkeypatch)
+    claims: list[tuple] = []
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "claim", lambda *a: claims.append(a) or True)
+    monkeypatch.setattr(A.store, "list_for_lead", lambda lead_id: [])
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №17860", pipeline_id=10593102,
+                     status_id=A.STATUS_SUCCESS,
+                     custom_fields_values=[_cf(577671, "Заказ")])
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(36508695))
+    assert claims == []                 # ведение не заводим
+    assert rows == []                   # и журнал не пачкаем
+
+
+def test_success_stage_of_our_own_lead_still_finishes_the_route(monkeypatch):
+    """А свою сделку робот в финале дочитывает: иначе успешный прогон остался бы без записи
+    «маршрут пройден», и следующая сессия не поняла бы, чем он кончился."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)]),
+                     _stage(A.STATUS_SUCCESS, "Успешно реализовано", [], is_final=True)])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "AUTOPILOT_ENABLED", True)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "claim", lambda *a: True)
+    monkeypatch.setattr(A.store, "list_for_lead",
+                        lambda lead_id: [{"lead_id": lead_id, "status_id": 83537714}])
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19294", pipeline_id=10593102,
+                     status_id=A.STATUS_SUCCESS,
+                     custom_fields_values=[_cf(577671, "Заказ")])
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    asyncio.run(A.handle_lead_change(36565053))
+    assert rows and rows[-1]["outcome"] == "done"

@@ -29,7 +29,10 @@
 
 import asyncio
 import datetime
+import json
 import logging
+import os
+import pathlib
 
 import amo_service
 import telegram_bot
@@ -54,9 +57,64 @@ _watch_task: asyncio.Task | None = None
 # Двое суток: за это время лид либо взяли, либо про него уже сказали руководству.
 _TTL_HOURS = 48
 
+# ⚠️ Счётчики лежат на ДИСКЕ, а не только в памяти (27.09.2026). Раньше состояние жило в
+# памяти процесса, и это тихо съедало эскалации: 27.09 контейнер пересобирался дважды, и пять
+# заказов, простоявших на входном этапе с вечера (11-21 час), не дали алерта руководству
+# вообще - ожидания по ним были потеряны первой же пересборкой. Файл на томе `var` рядом с
+# базой авто-режима и дедупами соседей.
+STATE_PATH = pathlib.Path(os.getenv("NEW_LEAD_WATCH_PATH", "/app/var/new_lead_watch.json"))
+
 
 def _now_msk() -> datetime.datetime:
     return datetime.datetime.now(_MSK)
+
+
+def _save() -> None:
+    """Слепок счётчиков на диск. Best-effort: не записалось - сторож работает как раньше.
+
+    Пишем атомарно (файл рядом плюс `os.replace`), тем же приёмом, что
+    `autopilot_settings_client`: половинчатый файл читался бы как пустое состояние, то есть
+    ровно как та потеря, из-за которой всё это и появилось.
+    """
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at": _now_msk().isoformat(),
+            "pending": {str(k): {"since": v["since"].isoformat()} for k, v in _pending.items()},
+        }
+        tmp = STATE_PATH.with_name(STATE_PATH.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        logger.exception("Новый лид: не смог сохранить счётчики в %s", STATE_PATH)
+
+
+def _load() -> None:
+    """Поднять счётчики после рестарта. Битый или отсутствующий файл - начинаем с чистого.
+
+    ⚠️ Отметки времени берём КАК БЫЛИ, а не «с этой минуты»: лид, пролежавший на входе три
+    рабочих часа до пересборки, обязан остаться просроченным и после неё.
+    """
+    if not STATE_PATH.exists():
+        return
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8")) or {}
+    except (ValueError, OSError):
+        logger.exception("Новый лид: не смог прочитать счётчики %s", STATE_PATH)
+        return
+    restored = 0
+    for raw_id, st in (data.get("pending") or {}).items():
+        try:
+            lead_id = int(raw_id)
+            since = datetime.datetime.fromisoformat(str((st or {}).get("since")))
+        except (TypeError, ValueError):
+            continue
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=_MSK)
+        _pending[lead_id] = {"since": since}
+        restored += 1
+    if restored:
+        logger.info("Новый лид: с диска поднято счётчиков: %s", restored)
 
 
 def worktime_minutes(start: datetime.datetime, end: datetime.datetime) -> float:
@@ -103,10 +161,12 @@ def note_lead(lead_id, pipeline_id, status_id) -> None:
         if lead_id not in _pending:
             _pending[lead_id] = {"since": _now_msk()}
             logger.info("Новый лид %s встал на вход воронки - счётчик пошёл", lead_id)
+            _save()
         return
     # Ушёл с входа: взяли в работу (или увели куда-то ещё) - сторожить нечего.
     if _pending.pop(lead_id, None) is not None:
         logger.info("Новый лид %s ушёл с входа воронки - счётчик снят", lead_id)
+        _save()
 
 
 async def _still_untouched(lead_id: int) -> tuple[bool | None, dict | None]:
@@ -154,9 +214,11 @@ def _esc(s) -> str:
 async def _sweep() -> None:
     now = _now_msk()
     due: list[tuple[int, dict, float]] = []
+    changed = False
     for lead_id, st in list(_pending.items()):
         if (now - st["since"]).total_seconds() >= _TTL_HOURS * 3600:
             _pending.pop(lead_id, None)
+            changed = True
             continue
         waited = worktime_minutes(st["since"], now)
         if waited >= NEW_LEAD_ESCALATE_MINUTES:
@@ -168,6 +230,7 @@ async def _sweep() -> None:
             if untouched is None:
                 continue  # amo не ответил - вернёмся на следующем проходе
             _pending.pop(lead_id, None)
+            changed = True
             if not untouched:
                 continue  # взяли, вебхук о смене этапа просто не дошёл
             d = alerts.decide(
@@ -191,6 +254,11 @@ async def _sweep() -> None:
         except Exception:
             logger.exception("Новый лид: ошибка проверки сделки %s", lead_id)
 
+    # Снятые счётчики фиксируем ОДНОЙ записью за проход, а не на каждую сделку: проход
+    # разбирает пачку, и десять записей файла подряд ничего не добавляют к одной.
+    if changed:
+        _save()
+
 
 async def _loop() -> None:
     while True:
@@ -208,6 +276,7 @@ async def init() -> None:
     if ROP_CHAT_ID is None:
         logger.info("Новый лид: ROP_ALERT_CHAT_ID не задан - счётчик выключен")
         return
+    _load()
     if _watch_task is None:
         _watch_task = asyncio.create_task(_loop())
         logger.info(

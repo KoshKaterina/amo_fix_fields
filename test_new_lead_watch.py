@@ -14,7 +14,10 @@
 
 import asyncio
 import datetime
+import json
+import os
 import sys
+import tempfile
 import types
 
 
@@ -29,6 +32,9 @@ def _stub(name, **attrs):
 if "dotenv" not in sys.modules:
     _stub("dotenv", load_dotenv=lambda *a, **k: None)
 _stub("telegram_bot", send_alert=None)
+
+# Счётчики лежат на диске - в тесте во временном файле, а не в боевом /app/var.
+os.environ["NEW_LEAD_WATCH_PATH"] = os.path.join(tempfile.mkdtemp(), "new_lead_watch.json")
 
 import new_lead_watch as N  # noqa: E402
 from waybill_config import (  # noqa: E402
@@ -248,3 +254,44 @@ if __name__ == "__main__":
             print(f"❌ {fn.__name__}")
             traceback.print_exc()
     print(f"\n{ok}/{len(fns)} прошли")
+
+
+# ── счётчики переживают рестарт (27.09.2026) ────────────────────────────────────
+
+def test_clock_survives_a_restart():
+    """⚠️ Поймано наблюдением 27.09.2026. Состояние жило в памяти процесса, и пересборка
+    контейнера тихо съедала эскалации: пять заказов, простоявших на входе с вечера, не дали
+    алерта руководству вообще - ожидания потерялись первой же пересборкой.
+
+    Отметка времени поднимается КАК БЫЛА: лид, пролежавший три рабочих часа до рестарта,
+    обязан остаться просроченным и после него.
+    """
+    N._pending.clear()
+    was = datetime.datetime(2026, 9, 26, 20, 19, tzinfo=N._MSK)
+    N._pending[36564965] = {"since": was}
+    N._save()
+
+    N._pending.clear()          # как будто контейнер пересобрали
+    N._load()
+    assert list(N._pending) == [36564965]
+    assert N._pending[36564965]["since"] == was
+
+
+def test_broken_state_file_does_not_break_the_watch():
+    """Битый файл - начинаем с чистого листа и работаем как раньше, а не падаем на старте."""
+    N.STATE_PATH.write_text("{не json", encoding="utf-8")
+    N._pending.clear()
+    N._load()
+    assert N._pending == {}
+
+
+def test_state_file_keeps_only_pending_leads():
+    """Ушёл с входа - из файла исчез: иначе после рестарта сторож сторожил бы взятые лиды."""
+    N._pending.clear()
+    N.note_lead(36565217, PIPELINE_CLEVER_MAIN, STATUS_NEW_LEAD)
+    saved = json.loads(N.STATE_PATH.read_text(encoding="utf-8"))
+    assert list(saved["pending"]) == ["36565217"]
+
+    N.note_lead(36565217, PIPELINE_CLEVER_MAIN, STATUS_CLEVER_IN_PROGRESS)
+    saved = json.loads(N.STATE_PATH.read_text(encoding="utf-8"))
+    assert saved["pending"] == {}
