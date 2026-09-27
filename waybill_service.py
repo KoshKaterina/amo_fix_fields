@@ -10,6 +10,7 @@ from typing import Awaitable, Callable
 import cdek_client
 import picking_pdf
 import amo_service
+import waybill_pending_store
 from waybill_config import (
     FIELD_CDEK_ORDER_NUMBER,
     FIELD_COMPOSITION,
@@ -167,6 +168,17 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
             lead_id, current_tags, error_tag=TAG_ERROR, target_status=STATUS_WAYBILL_READY,
         )
         return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": existing_cdek, "skipped": True}
+
+    # Гейт незавершённого заказа (разбор 27.09.2026). Поле 571657 пустое ещё НЕ значит,
+    # что заказа в СДЭК нет: СДЭК умеет держать заявку в ACCEPTED без номера часами, и
+    # тогда предыдущий гейт пропускает нас к повторному созданию. Ровно так родились
+    # настоящие дубли отправлений на сделках 36565053 и 36553383 — эхо тега ошибки
+    # вернулось вебхуком с тем же статусом «Сделать накладную» и создало второй заказ
+    # через секунду после отказа. Спрашиваем СДЭК про ЗАПОМНЕННЫЙ заказ, а не создаём
+    # новый: это же закрывает и ручной /retry поверх живого заказа.
+    guarded = await _resume_or_block_pending(lead_id, current_tags, source)
+    if guarded is not None:
+        return guarded
 
     # 1. Парс полей
     order_text = amo_service.get_custom_field_value(lead, FIELD_ORDER_TOTAL)
@@ -385,6 +397,11 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     if not order_uuid:
         return await _fail(lead_id, f"СДЭК не вернул UUID: {cdek_resp}", source, current_tags)
 
+    # Запоминаем заказ СРАЗУ, до первого же опроса. Именно здесь начинается окно, в
+    # котором сделка уже имеет живой заказ в СДЭК, а поле 571657 ещё пусто — и любой
+    # эхо-вебхук в это окно раньше приводил ко второму настоящему отправлению.
+    await _pending_put(lead_id, order_uuid, source)
+
     # 7. Polling cdek_number (до 60 секунд).
     #    СДЭК валидирует заказ асинхронно: сразу после POST он висит ACCEPTED, а через
     #    пару секунд либо получает номер, либо падает в INVALID с причиной в requests[].errors.
@@ -407,6 +424,9 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
 
     if not cdek_number:
         if reject_reason:
+            # Отказ = отправления нет, сделку держать незачем: снимаем строку, иначе
+            # гейт заблокировал бы честный повторный /retry после правки данных.
+            await _pending_drop(lead_id)
             return await _fail(
                 lead_id,
                 f"СДЭК отклонил заказ: {reject_reason}. Отправление НЕ создано, "
@@ -439,7 +459,9 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
         return {"ok": False, "lead_id": lead_id, "reason": "pending", "cdek_number": None, "skipped": False}
 
     cdek_value = str(cdek_number)
-    if not await _commit_success(lead_id, order_uuid, cdek_value, current_tags, used_cost_placeholder):
+    committed = await _commit_success(lead_id, order_uuid, cdek_value, current_tags, used_cost_placeholder)
+    await _pending_drop(lead_id)
+    if not committed:
         return {"ok": False, "lead_id": lead_id, "reason": "AMO PATCH failed", "cdek_number": cdek_value, "skipped": False}
     return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}
 
@@ -494,6 +516,188 @@ async def _commit_success(
     return True
 
 
+# Сделки, по которым фоновый опрос УЖЕ крутится в этом процессе. Нужно, чтобы гейт
+# не плодил вторую задачу на тот же uuid при каждом эхо-вебхуке: сам заказ второй раз
+# не создастся, но десяток параллельных опросов одного заказа не нужен никому.
+_pending_pollers: set[str] = set()
+
+# Сколько заявка должна прожить, чтобы 404 от СДЭК считать честным «заказа нет».
+# Молодой заявке СДЭК может ещё не отдавать чтение, и поверить такому 404 значит
+# создать второе реальное отправление — то, от чего гейт и заводился.
+PENDING_404_TRUST_AFTER_S = float(os.getenv("WAYBILL_PENDING_404_TRUST_AFTER_S", "120"))
+
+
+def _row_older_than(row: dict, seconds: float) -> bool:
+    """True, если заявку запомнили раньше, чем `seconds` назад. Время не разобралось —
+    считаем строку старой: иначе непарсящаяся дата заблокировала бы сделку навсегда."""
+    import datetime
+
+    raw = row.get("created_at")
+    try:
+        created = datetime.datetime.fromisoformat(str(raw))
+    except Exception:
+        logger.warning("Незавершённый заказ: не разобрал created_at=%r, считаю строку старой", raw)
+        return True
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+    return age >= seconds
+
+
+async def _pending_touch(lead_id, *, gave_up: bool | None = None) -> None:
+    try:
+        await asyncio.to_thread(waybill_pending_store.touch, lead_id, gave_up=gave_up)
+    except Exception:
+        logger.exception("Lead %s: не смог обновить строку незавершённого заказа", lead_id)
+
+
+async def _pending_drop(lead_id) -> None:
+    try:
+        await asyncio.to_thread(waybill_pending_store.drop, lead_id)
+    except Exception:
+        logger.exception("Lead %s: не смог снять строку незавершённого заказа", lead_id)
+
+
+async def _fresh_tags(lead_id, fallback: list[dict]) -> list[dict]:
+    """Теги сделки, перечитанные ПРЯМО СЕЙЧАС.
+
+    commit_waybill и _fail пишут теги целиком, значит устаревший снимок молча
+    затирает всё, что появилось на сделке за время ожидания СДЭК — а ждём мы до
+    одиннадцати минут. На возобновлении после рестарта снимка нет вовсе, и
+    пустой список снёс бы сделке все теги. Не смогли перечитать — берём то, что
+    было: затереть теги хуже, чем оставить лишний.
+    """
+    try:
+        lead = await amo_service.get_lead_full(lead_id, with_=())
+    except Exception:
+        logger.exception("Lead %s: не смог перечитать теги, беру прежний снимок", lead_id)
+        return fallback
+    if not lead:
+        return fallback
+    return amo_service.get_tags(lead)
+
+
+async def _pending_put(lead_id, order_uuid: str, source: str) -> None:
+    try:
+        await asyncio.to_thread(waybill_pending_store.put, lead_id, order_uuid, source)
+    except Exception:
+        logger.exception("Lead %s: не смог запомнить незавершённый заказ %s", lead_id, order_uuid)
+
+
+async def _resume_or_block_pending(lead_id, current_tags: list[dict], source: str) -> dict | None:
+    """Гейт незавершённого заказа СДЭК. None — путь свободен, создавайте заказ.
+    dict — создавать НЕЛЬЗЯ, вот результат.
+
+    Четыре исхода по ответу СДЭК про запомненный заказ:
+      номер есть          → коммитим его и отдаём успех, нового заказа не надо;
+      СДЭК отклонил       → отправления нет, строку снимаем, путь свободен;
+      заказа нет (404)    → то же самое: снимаем строку, путь свободен (это и есть
+                            выход из блокировки для менеджера — просто /retry);
+      висит без номера    → блокируем и при необходимости поднимаем опрос заново.
+
+    СДЭК недоступен — блокируем осознанно: лучше не создать накладную сейчас, чем
+    создать второе реальное отправление на ту же посылку.
+    """
+    try:
+        row = await asyncio.to_thread(waybill_pending_store.get, lead_id)
+    except Exception:
+        logger.exception("Lead %s: не смог прочитать незавершённые заказы — пропускаю гейт", lead_id)
+        return None
+    if not row:
+        return None
+
+    order_uuid = row["order_uuid"]
+    try:
+        order_info = await cdek_client.get_order(order_uuid)
+    except cdek_client.CdekError as exc:
+        if getattr(exc, "status", None) == 404 and _row_older_than(row, PENDING_404_TRUST_AFTER_S):
+            logger.info(
+                "Lead %s: запомненного заказа %s в СДЭК нет (404) — снимаю блокировку, создаём новый",
+                lead_id, order_uuid,
+            )
+            await _pending_drop(lead_id)
+            return None
+        if getattr(exc, "status", None) == 404:
+            # Свежая заявка и уже 404 — скорее всего СДЭК просто ещё не отдаёт её на
+            # чтение. Верить такому 404 нельзя: поверим — создадим второе отправление,
+            # то есть ровно то, от чего гейт и заводился.
+            logger.warning(
+                "Lead %s: заказ %s отдаёт 404, но заявке меньше %.0fс — не верю, второй заказ не создаю",
+                lead_id, order_uuid, PENDING_404_TRUST_AFTER_S,
+            )
+            return {"ok": False, "lead_id": lead_id, "reason": "pending-unverified",
+                    "cdek_number": None, "skipped": True}
+        logger.warning(
+            "Lead %s: СДЭК не ответил про запомненный заказ %s (%s) — не создаю второй заказ",
+            lead_id, order_uuid, exc,
+        )
+        return {"ok": False, "lead_id": lead_id, "reason": "pending-unverified",
+                "cdek_number": None, "skipped": True}
+
+    entity = order_info.get("entity") or {}
+    cdek_number = entity.get("cdek_number")
+    if cdek_number:
+        logger.info(
+            "Lead %s: у запомненного заказа %s появился номер %s — коммичу без создания нового",
+            lead_id, order_uuid, cdek_number,
+        )
+        committed = await _commit_success(lead_id, order_uuid, str(cdek_number), current_tags, False)
+        await _pending_drop(lead_id)
+        return {"ok": bool(committed), "lead_id": lead_id,
+                "reason": None if committed else "AMO PATCH failed",
+                "cdek_number": str(cdek_number), "skipped": True}
+
+    reject_reason = _extract_reject_reason(order_info)
+    if reject_reason:
+        logger.info(
+            "Lead %s: запомненный заказ %s отклонён СДЭК (%s) — отправления нет, путь свободен",
+            lead_id, order_uuid, reject_reason,
+        )
+        await _pending_drop(lead_id)
+        return None
+
+    logger.warning(
+        "Lead %s: заказ %s всё ещё без номера — второй заказ НЕ создаю (гейт незавершённого заказа)",
+        lead_id, order_uuid,
+    )
+    await _pending_touch(lead_id)
+    if str(lead_id) not in _pending_pollers:
+        logger.info("Lead %s: опрос заказа %s не крутится — поднимаю заново", lead_id, order_uuid)
+        asyncio.create_task(
+            _resolve_pending_order(lead_id, order_uuid, source, current_tags, False)
+        )
+    return {"ok": False, "lead_id": lead_id, "reason": "pending", "cdek_number": None, "skipped": True}
+
+
+async def resume_pending_orders() -> int:
+    """Поднять опрос незавершённых заказов на старте процесса. Зовётся из
+    webhooks.py: до 27.09.2026 фоновый опрос жил только в памяти, и пересборка
+    контейнера убивала его молча — заказ оставался без присмотра, а человека об
+    этом никто не предупреждал. Возвращает число поднятых опросов."""
+    try:
+        await asyncio.to_thread(waybill_pending_store.init)
+        rows = await asyncio.to_thread(waybill_pending_store.all_rows)
+    except Exception:
+        logger.exception("Не смог прочитать незавершённые заказы СДЭК на старте")
+        return 0
+    started = 0
+    for row in rows:
+        lead_id = row["lead_id"]
+        if str(lead_id) in _pending_pollers:
+            continue
+        logger.info(
+            "Возобновляю опрос заказа СДЭК %s по сделке %s (заявка от %s, сдавались=%s)",
+            row["order_uuid"], lead_id, row["created_at"], row["gave_up"],
+        )
+        asyncio.create_task(
+            _resolve_pending_order(lead_id, row["order_uuid"], "resume", [], False)
+        )
+        started += 1
+    if rows:
+        logger.info("Незавершённых заказов СДЭК: %d, поднято опросов: %d", len(rows), started)
+    return started
+
+
 async def _resolve_pending_order(
     lead_id, order_uuid: str, source: str, current_tags: list[dict], used_cost_placeholder: bool,
 ) -> None:
@@ -504,38 +708,54 @@ async def _resolve_pending_order(
     этого шанса просто не было — код сдавался на первой минуте); СДЭК так и не
     ответил за WAYBILL_BACKGROUND_POLL_SECONDS → сдаёмся и алертим человека, но
     без намёка на «удалите дубль» — раз мы не создавали второй заказ, дубля и
-    нет, есть один непонятный uuid, который нужно посмотреть в кабинете."""
-    deadline = time.monotonic() + WAYBILL_BACKGROUND_POLL_SECONDS
-    while time.monotonic() < deadline:
-        await asyncio.sleep(WAYBILL_BACKGROUND_POLL_INTERVAL_S)
-        try:
-            order_info = await cdek_client.get_order(order_uuid)
-        except cdek_client.CdekError:
-            continue
-        entity = order_info.get("entity") or {}
-        cdek_number = entity.get("cdek_number")
-        if cdek_number:
-            await _commit_success(lead_id, order_uuid, str(cdek_number), current_tags, used_cost_placeholder)
-            return
-        reject_reason = _extract_reject_reason(order_info)
-        if reject_reason:
-            await _fail(
-                lead_id,
-                f"СДЭК отклонил заказ: {reject_reason}. Отправление НЕ создано, "
-                f"в кабинете удалять нечего — исправьте данные и повторите /retry. "
-                f"UUID заказа: {order_uuid}.",
-                source, current_tags,
-            )
-            return
+    нет, есть один непонятный uuid, который нужно посмотреть в кабинете.
 
-    total_wait = WAYBILL_BACKGROUND_POLL_SECONDS + 60
-    await _fail(
-        lead_id,
-        f"СДЭК так и не ответил за {total_wait:.0f}с (UUID {order_uuid}). Второй заказ "
-        f"НЕ создавался — проверьте этот UUID в кабинете СДЭК: если заказ там валиден, "
-        f"впишите номер в поле вручную; если заказа нет вообще, тогда уже можно /retry.",
-        source, current_tags,
-    )
+    Строку в waybill_pending_store снимаем только на двух первых исходах. На
+    третьем оставляем с пометкой gave_up: она держит гейт в
+    create_waybill_for_lead, чтобы эхо тега и ручной /retry не создали второй
+    заказ поверх этого, ещё живого (разбор 27.09.2026)."""
+    _pending_pollers.add(str(lead_id))
+    try:
+        deadline = time.monotonic() + WAYBILL_BACKGROUND_POLL_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(WAYBILL_BACKGROUND_POLL_INTERVAL_S)
+            try:
+                order_info = await cdek_client.get_order(order_uuid)
+            except cdek_client.CdekError:
+                continue
+            await _pending_touch(lead_id)
+            entity = order_info.get("entity") or {}
+            cdek_number = entity.get("cdek_number")
+            if cdek_number:
+                tags = await _fresh_tags(lead_id, current_tags)
+                await _commit_success(lead_id, order_uuid, str(cdek_number), tags, used_cost_placeholder)
+                await _pending_drop(lead_id)
+                return
+            reject_reason = _extract_reject_reason(order_info)
+            if reject_reason:
+                await _pending_drop(lead_id)
+                await _fail(
+                    lead_id,
+                    f"СДЭК отклонил заказ: {reject_reason}. Отправление НЕ создано, "
+                    f"в кабинете удалять нечего — исправьте данные и повторите /retry. "
+                    f"UUID заказа: {order_uuid}.",
+                    source, await _fresh_tags(lead_id, current_tags),
+                )
+                return
+
+        total_wait = WAYBILL_BACKGROUND_POLL_SECONDS + 60
+        await _pending_touch(lead_id, gave_up=True)
+        await _fail(
+            lead_id,
+            f"СДЭК так и не ответил за {total_wait:.0f}с (UUID {order_uuid}). Второй заказ "
+            f"НЕ создавался и создан не будет, пока этот висит: проверьте UUID в кабинете "
+            f"СДЭК. Если заказ там валиден — впишите номер в поле «Трек-номер» вручную. "
+            f"Если заказа в СДЭК нет вовсе — просто повторите /retry: автоматика увидит, "
+            f"что заказа нет, и создаст новый.",
+            source, await _fresh_tags(lead_id, current_tags),
+        )
+    finally:
+        _pending_pollers.discard(str(lead_id))
 
 
 async def _last_field_clear_actor(lead_id, field_id: int) -> int | None:

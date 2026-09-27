@@ -19,6 +19,7 @@ import academy_consent_stamp
 import academy_bothelp_upsert
 import amgroup_shipment
 import amo_service
+import budget_mismatch_watch
 import cdek_client
 import cdek_status_sync
 import dup_autoclose
@@ -123,6 +124,15 @@ async def lifespan(app):
     # Настройки уведомлений из панели: без ALERT_SETTINGS_FROM_PANEL ничего не опрашивает.
     alert_settings_client.start()
     await showroom_store.init()
+    # Незавершённые заказы СДЭК (27.09.2026): заявка принята, номера ещё нет. До этого
+    # дожидание жило только в памяти процесса, и пересборка контейнера убивала его молча -
+    # заказ оставался без присмотра, человека никто не предупреждал. Теперь опрос
+    # поднимается заново на каждом старте. Флага нет намеренно: это не фича, а
+    # восстановление уже начатой работы, терять её нельзя ни в каком режиме.
+    # Импорт локальный: waybill_service в этом модуле на верхнем уровне не импортируется
+    # (очередь подтягивает его лениво), и менять это ради одной строки не нужно.
+    from waybill_service import resume_pending_orders
+    await resume_pending_orders()
     await order_watchdog.init()
     await uis_missed_call.init()
     await new_lead_watch.init()
@@ -130,6 +140,11 @@ async def lifespan(app):
     # менеджеру перезаписать клиента. Модуль сам первым делом смотрит
     # OFFICE_RECORD_WATCH_ENABLED и без него не поднимает ни таблицу отметок, ни цикл.
     await office_record_watch.init()
+    # Сторож бюджета (27.09.2026): бюджет сделки пишут мост amgroup и встроенный
+    # пересчёт amo по товарам, и они перебивают друг друга. Модуль сверяет бюджет с
+    # «Итого» из состава заказа и зовёт человека. Сам первым делом смотрит
+    # BUDGET_WATCH_ENABLED и без него не поднимает ни таблицу отметок, ни цикл.
+    await budget_mismatch_watch.init()
     # Формы сайта: без SITE_FORM_ENABLED роут отвечает 404 и ничего не делает.
     await site_form_service.init()
     # Сторож писем (26.09.2026): входящее письмо в закрытую сделку теряется для работы -
@@ -159,6 +174,7 @@ async def lifespan(app):
     await uis_missed_call.shutdown()
     await new_lead_watch.shutdown()
     await office_record_watch.shutdown()
+    await budget_mismatch_watch.shutdown()
     await site_form_service.shutdown()
     await mail_watch.shutdown()
     await amgroup_fallback.shutdown()
@@ -198,7 +214,8 @@ async def health():
     сутки без алертов при зелёном контейнере)."""
     return {"status": "ok", "telegram": telegram_bot.telegram_health(),
             "mail_watch": mail_watch.status(),
-            "office_record": office_record_watch.status(), **queue_stats()}
+            "office_record": office_record_watch.status(),
+            "budget_watch": budget_mismatch_watch.status(), **queue_stats()}
 
 
 def insert_nested(data, keys, value):
