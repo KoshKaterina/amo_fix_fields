@@ -1436,3 +1436,94 @@ def test_engine_bot_without_statuses_still_alerts(monkeypatch):
     assert rows[-1]["outcome"] == "stop_not_delivered"
     assert feed and feed[-1]["kind"] == "autopilot_not_delivered"
     assert _SENT[-1]["chat_id"] == A.NOTIFY_CHAT_ID
+
+
+def test_other_payment_method_is_named_at_the_entry_not_at_the_end(monkeypatch):
+    """Катя 27.09.2026: по заказу 19296 алерт «Другой способ» не пришёл вовсе - робот честно
+    ждал ответа клиента на бота, а развилка оплаты стоит в КОНЦЕ маршрута. Менеджеру надо знать
+    в момент заказа: такую оплату роботу не понять, сколько шагов он ни пройди."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    launched: list[int] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A, "run_bot", lambda *a, **k: _noop(launched.append(1)))
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "stock_gate", lambda lead: _stock_ok())
+
+    lead = _lead(id=36565195, name="Заказ №19296", pipeline_id=10593102, status_id=83537714,
+                 custom_fields_values=[_cf(577671, "Заказ"), _cf(577373, "Другой способ")])
+
+    async def run():
+        await A.run_stage(lead, _stage(83537714, "Новый лид", [_bot(7131)]))
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert launched == []                       # бота не запускаем, маршрут не начинаем
+    assert rows[-1]["outcome"] == "stop_payment_unclear"
+    assert feed and feed[-1]["kind"] == "autopilot_payment_other"
+    assert "Другой способ" in _SENT[-1]["text"]
+
+
+async def _stock_ok():
+    return True, "остаток есть"
+
+
+def test_contact_without_phone_calls_a_human_right_away(monkeypatch):
+    """Кейс Кати 27.09.2026: «у контакта нет телефона в карточке Wazzup - это кейс для алерта».
+
+    Склейка с Wazzup идёт по телефону контакта. Нет телефона - робот не увидит ни статусов
+    доставки, ни ответа: с виду ведёт сделку, а на деле слеп. Раньше такая сделка просто
+    провисала до конца окна ожидания."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    feed: list[dict] = []
+    started: list[int] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: feed.append(kw))
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "launch_bot", lambda *a, **k: _noop(started.append(1)))
+
+    async def no_contact(lead):
+        return None
+
+    monkeypatch.setattr(A, "main_contact", no_contact)
+    lead = _lead(id=36565196, name="Заказ №19297", pipeline_id=10593102, status_id=83537714,
+                 custom_fields_values=[_cf(577671, "Заказ")])
+
+    async def run():
+        await A.run_bot(lead, _stage(83537714, "Новый лид", [_bot(7131)]), _bot(7131))
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert started == []                        # до отправки дело не дошло
+    assert rows[-1]["outcome"] == "stop_no_chat"
+    assert feed and feed[-1]["kind"] == "autopilot_no_chat"
+    assert "нет телефона" in _SENT[-1]["text"]
+
+
+def test_informational_bot_does_not_need_a_chat(monkeypatch):
+    """Бот с режимом «ответ не нужен» ничего не ждёт, поэтому отсутствие телефона ему не
+    мешает - алерта тут быть не должно, иначе робот начнёт шуметь на информационных шагах."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "advance", lambda *a, **k: _noop())
+
+    async def no_contact(lead):
+        return None
+
+    monkeypatch.setattr(A, "main_contact", no_contact)
+    lead = _lead(id=36565197, pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.run_bot(lead, _stage(83537714, "Новый лид", []),
+                          _bot(7131, launched_by="amo_grid", stop_mode="never")))
+    assert all(r["outcome"] != "stop_no_chat" for r in rows)
