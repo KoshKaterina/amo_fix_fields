@@ -346,6 +346,27 @@ def is_prepaid_payment(payment_method) -> bool:
     s = str(payment_method or "").lower()
     return any(t in s for t in _PREPAID_TOKENS)
 
+
+# Способы оплаты, по которым счёт Ozon Pay НЕ выставляем (Катя 28.09.2026).
+# Криптовалюту принимают мимо эквайринга: ссылка на СБП там не нужна и сбивает
+# с толку и клиента, и менеджера. Сравнение по вхождению и без учёта регистра,
+# поэтому «Крипта», «криптой», «Оплата криптой», «USDT TRC20», «Trust Wallet»
+# ловятся одинаково. «ustd» — частая опечатка в «usdt», держим оба написания.
+OZON_INVOICE_BLOCKED_PAYMENT_TOKENS = ("крипт", "usdt", "ustd", "trc", "wallet")
+
+
+def blocked_invoice_payment_token(payment_method) -> str:
+    """Стоп-слово из способа оплаты, если ссылку по нему создавать нельзя.
+
+    Возвращает само слово (его показываем менеджеру в примечании) или пустую
+    строку, когда способ обычный."""
+    s = str(payment_method or "").lower()
+    for token in OZON_INVOICE_BLOCKED_PAYMENT_TOKENS:
+        if token in s:
+            return token
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # WooCommerce — простановка статуса заказа 'completed' для рефералки (amo → WC).
 # Передаём ТОЛЬКО статус и ТОЛЬКО когда заказ оплачен (PAID по логике Метрики,
@@ -815,6 +836,68 @@ ACADEMY_LEAD_ALERT_DEDUP_H = int(os.getenv("ACADEMY_LEAD_ALERT_DEDUP_H", "24"))
 # Перебор = похоже на массовый перенос сделок: одно предупреждение и тишина до конца часа.
 ACADEMY_LEAD_ALERT_HOUR_LIMIT = int(os.getenv("ACADEMY_LEAD_ALERT_HOUR_LIMIT", "20"))
 
+# Одноразовые ссылки в закрытые чаты мероприятий Академии. Мастер-флаг OFF:
+# включать только после проверки токена и chat_id. Бот не пишет в чат — только
+# вызывает createChatInviteLink(member_limit=1), а ссылку кладёт в сделку amo.
+ACADEMY_INVITE_LINK_ENABLED = os.getenv("ACADEMY_INVITE_LINK_ENABLED", "0") == "1"
+ACADEMY_INVITE_BOT_TOKEN = os.getenv("ACADEMY_INVITE_BOT_TOKEN", "").strip()
+ACADEMY_BOTHELP_UPSERT_ENABLED = os.getenv("ACADEMY_BOTHELP_UPSERT_ENABLED", "0").strip() == "1"
+ACADEMY_BOTHELP_WEBHOOK_SECRET = os.getenv("ACADEMY_BOTHELP_WEBHOOK_SECRET", "").strip()
+ACADEMY_PRACTICUM_CHAT_ID = os.getenv("ACADEMY_PRACTICUM_CHAT_ID", "").strip()
+ACADEMY_CONFERENCE_CHAT_ID = os.getenv("ACADEMY_CONFERENCE_CHAT_ID", "").strip()
+ACADEMY_INVITE_DELAY_S = float(os.getenv("ACADEMY_INVITE_DELAY_S", "5"))
+ACADEMY_BOTHELP_CLIENT_ID = os.getenv("ACADEMY_BOTHELP_CLIENT_ID", "").strip()
+ACADEMY_BOTHELP_CLIENT_SECRET = os.getenv("ACADEMY_BOTHELP_CLIENT_SECRET", "").strip()
+ACADEMY_INVITE_MESSAGE_DELAY_S = float(os.getenv("ACADEMY_INVITE_MESSAGE_DELAY_S", "60"))
+ACADEMY_INVITE_SENT_PATH = os.getenv(
+    "ACADEMY_INVITE_SENT_PATH", "/app/var/academy_invite_sent.json",
+).strip()
+ACADEMY_INVITE_OUTBOX_PATH = os.getenv(
+    "ACADEMY_INVITE_OUTBOX_PATH", "/app/var/academy/academy_invite_outbox.sqlite3",
+).strip()
+ACADEMY_INVITE_HISTORY_REVIEW_PATH = os.getenv(
+    "ACADEMY_INVITE_HISTORY_REVIEW_PATH", "/app/var/academy/academy_invite_history_reviews.json",
+).strip()
+ACADEMY_WAZZUP_HISTORY_API_URL = os.getenv(
+    "ACADEMY_WAZZUP_HISTORY_API_URL", "https://tech.wazzup24.com/v2",
+).rstrip("/")
+# This is a Wazzup end-customer client_access_token, not the v3 User API key.
+ACADEMY_WAZZUP_HISTORY_TOKEN = os.getenv("ACADEMY_WAZZUP_HISTORY_TOKEN", "").strip()
+ACADEMY_INVITE_HISTORY_START_AT = os.getenv(
+    "ACADEMY_INVITE_HISTORY_START_AT", "2017-01-01T00:00:00.000Z",
+).strip()
+ACADEMY_INVITE_RETRY_S = float(os.getenv("ACADEMY_INVITE_RETRY_S", "60"))
+ACADEMY_INVITE_SEND_ENABLED = os.getenv("ACADEMY_INVITE_SEND_ENABLED", "0") == "1"
+ACADEMY_INVITE_WAZZUP_CHANNEL_ID = os.getenv("ACADEMY_INVITE_WAZZUP_CHANNEL_ID", "").strip()
+ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID = os.getenv(
+    "ACADEMY_INVITE_WAZZUP_CHANNEL_PLAIN_ID", "79250833349",
+).strip()
+# Обязательный cutover-гард для всех новых автоматик Академии. При 0 они не
+# обрабатывают ни одну сделку, даже если мастер-флаг случайно включили.
+ACADEMY_CUTOVER_TS = int(os.getenv("ACADEMY_CUTOVER_TS", "0") or "0")
+
+# Поле-триггер находится в контакте, результат — в сделке.
+FIELD_ACADEMY_EVENT_REGISTRATION = 578259
+FIELD_ACADEMY_MANAGER_ACTION = 578269
+FIELD_ACADEMY_PRACTICUM_LINK = 578271
+FIELD_ACADEMY_CONFERENCE_LINK = 578273
+FIELD_ACADEMY_PD_CONSENT = 578239
+FIELD_ACADEMY_MARKETING_CONSENT = 578245
+FIELD_ACADEMY_MARKETING_DATE_TEXT = 578277
+FIELD_ACADEMY_PD_DATE_TEXT = 578279
+STATUS_ACADEMY_RECORDED_PRACTICUM = 88835666
+
+# Уведомления в топик УВЕДОМЛЕНИЯ отдела продаж по двум полям контакта Академии.
+# OFF до общего переключения сценария; обработчик реагирует только когда amo
+# прямо прислала изменившийся field_id, поэтому старые заполненные карточки не разошлёт.
+ACADEMY_INTENT_ALERT_ENABLED = os.getenv("ACADEMY_INTENT_ALERT_ENABLED", "0") == "1"
+
+# Временное правило распределения Академии (Катя 24.09.2026): все новые лиды
+# назначаются Артёму Коннову. OFF до общего переключения BotHelp-копии.
+ACADEMY_ASSIGNMENT_ENABLED = os.getenv("ACADEMY_ASSIGNMENT_ENABLED", "0") == "1"
+ACADEMY_RESPONSIBLE_USER_ID = int(os.getenv("ACADEMY_RESPONSIBLE_USER_ID", "13822630"))
+ACADEMY_ASSIGNMENT_DELAY_S = float(os.getenv("ACADEMY_ASSIGNMENT_DELAY_S", "5"))
+
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)
 STATUS_PAYMENT_RECEIVED = 83537874    # «Оплата получена» (этап 2 — автодвижение по факту оплаты)
@@ -1146,6 +1229,197 @@ TAG_LEAD_DISTRIBUTION_ROUTED = "распределено автоматичес�
 # повторные попытки reconciliation (по образцу TAG_OFFICE_TRANSFER_ERROR).
 TAG_LEAD_DISTRIBUTION_ERROR = "ошибка распределения"
 
+# ---------------------------------------------------------------------------
+# Сторож писем (26.09.2026, решение Кати: делаем опросом, не хуком Цифровой
+# воронки). Входящее письмо клиента, упавшее ТОЛЬКО в закрытые сделки, теряется
+# для работы: amoCRM продолжает старую цепочку и нового «Неразобранного» не
+# создаёт. Замер за 30 дней: 105 из 117 входящих писем ушли в закрытые сделки.
+# Модуль — mail_watch.py, память — mail_watch_store.py.
+# ---------------------------------------------------------------------------
+# Мастер-флаг: поднимает цикл опроса. OFF по умолчанию.
+MAIL_WATCH_ENABLED = os.getenv("MAIL_WATCH_ENABLED", "").strip() == "1"
+# Разрешение СОЗДАВАТЬ сделки. Без него модуль работает в режиме отчёта: считает и
+# пишет в лог, что сделал бы. Сутки в отчёте перед включением записи — шаг 5 схемы
+# разбора (projects/amo-cleanup/knowledge/amo-povtornoe-pismo-ne-sozdaet-sdelku.md).
+MAIL_WATCH_CREATE_ENABLED = os.getenv("MAIL_WATCH_CREATE_ENABLED", "").strip() == "1"
+# Период опроса журнала событий. Три минуты выбраны не «на всякий случай»: медиана
+# времени до нашего ответа на письмо — 249 минут (39 переписок за 60 дней), быстрее
+# 5 минут не ответили ни разу. Чаще опрашивать нечего, реже — теряется смысл слова
+# «сторож». Цена — около 480 запросов в сутки, это 0,08% лимита интеграции.
+MAIL_WATCH_INTERVAL_S = int(os.getenv("MAIL_WATCH_INTERVAL_S", "180"))
+# Перекрытие окна: событие регистрируется не мгновенно, и письмо, пришедшее на
+# границе прохода, иначе выпало бы в щель между окнами. Дедуп по note_id делает
+# перечитывание бесплатным.
+MAIL_WATCH_OVERLAP_S = int(os.getenv("MAIL_WATCH_OVERLAP_S", "180"))
+# Потолок оглядки назад: после долгого простоя не читаем весь архив событий.
+MAIL_WATCH_MAX_LOOKBACK_S = int(os.getenv("MAIL_WATCH_MAX_LOOKBACK_S", "86400"))
+# ⚠️ Граница включения (unix-время). Без неё первый проход поехал бы по архиву —
+# та же защита, что OFFICE_TRANSFER_SINCE_TS. Не задана = модуль не работает.
+MAIL_WATCH_SINCE_TS = int(os.getenv("MAIL_WATCH_SINCE_TS", "0"))
+# Письмо старше этого (минуты) не разбираем: при догоне после простоя заводить
+# сделку по позавчерашнему письму бессмысленно, менеджер уже ответил или не ответит.
+MAIL_WATCH_MAX_AGE_MIN = int(os.getenv("MAIL_WATCH_MAX_AGE_MIN", "1440"))
+# Маски служебных отправителей: роботы, рассылки, уведомления площадок. В замере
+# ПОЛОВИНА писем, подходящих под правило, оказалась рассылками и холодными
+# предложениями услуг, поэтому список ведём через окружение, а не в коде.
+MAIL_WATCH_IGNORE_SENDERS = tuple(
+    s.strip().lower()
+    for s in os.getenv(
+        "MAIL_WATCH_IGNORE_SENDERS",
+        "mailer-daemon,postmaster@,noreply,no-reply,notification@,@360.yandex,"
+        "tips@avito,promotion@,market.yandex,hello@yandex-team,notify@,mail@sendpulse",
+    ).split(",")
+    if s.strip()
+)
+# Куда падает новая сделка. Значения не зашиты: воронку и этап называет Катя, без
+# них создание не включается (модуль ругается в лог и ничего не делает).
+MAIL_WATCH_TARGET_PIPELINE_ID = int(os.getenv("MAIL_WATCH_TARGET_PIPELINE_ID", "0"))
+MAIL_WATCH_TARGET_STATUS_ID = int(os.getenv("MAIL_WATCH_TARGET_STATUS_ID", "0"))
+# Ответственный. Обязателен при включённом создании: без него сделку никто не
+# увидит — на сделки сторожа ни распределитель, ни боты не настроены.
+MAIL_WATCH_RESPONSIBLE_USER_ID = int(os.getenv("MAIL_WATCH_RESPONSIBLE_USER_ID", "0"))
+# Имя сделки: «<префикс>: <тема письма>».
+MAIL_WATCH_LEAD_NAME_PREFIX = os.getenv("MAIL_WATCH_LEAD_NAME_PREFIX", "Письмо").strip()
+# Тег на созданных сделках — чтобы их было видно фильтром и можно было исключить
+# из чужой автоматики.
+MAIL_WATCH_TAG = os.getenv("MAIL_WATCH_TAG", "письмо по закрытой сделке").strip()
+# ⚠️ Воронки, сделки в которых НЕ считаются «клиент в работе» (Катя 26.09.2026).
+# Поймано на живом кейсе: письмо легло в закрытую сделку, сторож промолчал с решением
+# «у клиента есть другая открытая сделка» - а этими сделками оказались три прогона
+# авто-режима в воронке «Тест», висящие с 9 и 12 сентября. В картотеке «Работа с базой»
+# сделки стоят открытыми месяцами по смыслу самой воронки. Ни то, ни другое не значит,
+# что письмо кто-то увидит.
+MAIL_WATCH_IGNORE_PIPELINES = frozenset(
+    int(x.strip())
+    for x in os.getenv("MAIL_WATCH_IGNORE_PIPELINES", "8642414,11166334").split(",")
+    if x.strip().isdigit()
+)
+# Уведомление в Телеграм по итогу прохода (только когда есть что сказать).
+MAIL_WATCH_ALERT_ENABLED = os.getenv("MAIL_WATCH_ALERT_ENABLED", "").strip() == "1"
+MAIL_WATCH_ALERT_CHAT_ID = os.getenv("MAIL_WATCH_ALERT_CHAT_ID", "").strip()
+
+# ---------------------------------------------------------------------------
+# Сторож просроченной записи в офис (27.09.2026, постановка Кати). Клиент
+# записывается на приём через виджет NOVA «Онлайн-запись», сделка встаёт на этап
+# «Запись в офис» - и дальше этап не протухает никак: ни автозадачи, ни
+# автоперевода, ни алерта. Клиент не приехал, менеджер сделку не двинул - сделка
+# стоит молча. Замер этапа 27.09.2026: из 17 сделок у 13 запись уже прошла, от 3
+# до 40 дней, медиана 17 дней. Модуль - office_record_watch.py, дедуп -
+# autopilot_store.claim_notice.
+# ---------------------------------------------------------------------------
+# Поля виджета NOVA (группа leads_38011782219580), сверено живьём 27.09.2026.
+# ⚠️ В постановке оба поля были названы номером 578063 - это опечатка, судим по 578065.
+FIELD_OFFICE_RECORD_START = 578063  # «Дата начала записи» (date_time, unix)
+FIELD_OFFICE_RECORD_END = 578065  # «Дата окончания записи» (date_time, unix) - по нему судим
+# Мастер-флаг: поднимает цикл опроса. OFF по умолчанию.
+OFFICE_RECORD_WATCH_ENABLED = os.getenv("OFFICE_RECORD_WATCH_ENABLED", "").strip() == "1"
+# Разрешение СОЗДАВАТЬ задачи. Без него модуль работает в режиме отчёта: считает и
+# пишет в лог, что сделал бы, и НЕ жжёт ключи дедупа. Сутки в отчёте перед боем.
+OFFICE_RECORD_WATCH_CREATE_ENABLED = os.getenv("OFFICE_RECORD_WATCH_CREATE_ENABLED", "").strip() == "1"
+# Период опроса этапа. Этап крошечный (17 сделок влезают в одну страницу), проход
+# стоит ОДИН GET: 144 запроса в сутки, 0,02% лимита интеграции. Быстрее незачем -
+# запас после записи и так 10 минут, а медиана просрочки на этапе 17 дней.
+OFFICE_RECORD_WATCH_INTERVAL_S = int(os.getenv("OFFICE_RECORD_WATCH_INTERVAL_S", "600"))
+# Запас после конца записи (из постановки Кати): клиент опаздывает, менеджер двигает
+# сделку не в ту же минуту.
+OFFICE_RECORD_GRACE_MIN = int(os.getenv("OFFICE_RECORD_GRACE_MIN", "10"))
+# ⚠️ Потолок давности записи - он же защита от истории. У соседей (office_transfer,
+# mail_watch) эту роль играет метка времени включения; здесь граница по давности САМОЙ
+# ЗАПИСИ точнее и понятнее: задача по приёму, который был 40 дней назад, бессмысленна
+# независимо от даты выкатки. Поэтому отдельного *_SINCE_TS у модуля нет.
+OFFICE_RECORD_MAX_AGE_DAYS = int(os.getenv("OFFICE_RECORD_MAX_AGE_DAYS", "3"))
+# Предохранитель: сколько задач максимум за один проход. Ошибка в конфиге не должна
+# давать пачку задач одному человеку (на 27.09 у 11 из 13 просроченных один ответственный).
+OFFICE_RECORD_MAX_PER_PASS = int(os.getenv("OFFICE_RECORD_MAX_PER_PASS", "5"))
+# Тип задачи в amo: 1 «Связаться» (решение Кати 27.09.2026 - базовый тип, точно не
+# ломает чужие отчёты по типам). ⚠️ В amo живут боты 7255 «Задача закрыта ботом» и
+# 7245 «ЗИН. Автозакрытие задач и бесед»; закроют нашу - сменить тип здесь.
+OFFICE_RECORD_TASK_TYPE_ID = int(os.getenv("OFFICE_RECORD_TASK_TYPE_ID", "1"))
+# Срок задачи от момента постановки, часы. Зажимается в рабочее окно: задача со
+# сроком в три ночи рождается просроченной, и менеджер читает это как сбой.
+OFFICE_RECORD_TASK_DEADLINE_H = int(os.getenv("OFFICE_RECORD_TASK_DEADLINE_H", "4"))
+OFFICE_RECORD_WINDOW_START_H = int(os.getenv("OFFICE_RECORD_WINDOW_START_H", "10"))
+OFFICE_RECORD_WINDOW_END_H = int(os.getenv("OFFICE_RECORD_WINDOW_END_H", "19"))
+# 0 - текущий ответственный по сделке, перечитанный прямо перед постановкой.
+# ⚠️ На входе в этап работает автоматика change_responsible, поэтому ответственный
+# обычно офис-менеджер, а не МОП, записавший клиента. Поставить на МОПа сейчас нельзя:
+# FIELD_FORMER_RESPONSIBLE хранит ИМЯ, а не id пользователя.
+OFFICE_RECORD_TASK_RESPONSIBLE_USER_ID = int(os.getenv("OFFICE_RECORD_TASK_RESPONSIBLE_USER_ID", "0"))
+# Текст задачи. Без ID и тегов (правило Кати 03.08.2026), без точек посередине
+# (26.08.2026). Живёт в окружении, чтобы формулировку правили без выкатки.
+# Намеренно НЕ говорит «клиент не приехал»: по данным этапа не отличить «не пришёл» от
+# «был, а менеджер сделку не двинул», и обвинять клиента в задаче хуже нейтральной фразы.
+OFFICE_RECORD_TASK_TEXT = os.getenv(
+    "OFFICE_RECORD_TASK_TEXT",
+    "Запись в офис на {когда} прошла. Свяжитесь с клиентом и запишите его на новое "
+    "время или закройте сделку с причиной.",
+)
+# Примечание рядом с задачей: след, который переживёт автозакрытие задачи ботом.
+OFFICE_RECORD_NOTE_ENABLED = os.getenv("OFFICE_RECORD_NOTE_ENABLED", "").strip() == "1"
+# Телеграм: итог прохода в режиме отчёта и жалоба, если задачу создать не удалось.
+OFFICE_RECORD_ALERT_ENABLED = os.getenv("OFFICE_RECORD_ALERT_ENABLED", "").strip() == "1"
+OFFICE_RECORD_ALERT_CHAT_ID = os.getenv("OFFICE_RECORD_ALERT_CHAT_ID", "").strip()
+
+# ---------------------------------------------------------------------------
+# Сторож расхождения бюджета с суммой заказа (27.09.2026, постановка Кати).
+# Бюджет пишут ДВА источника: мост amgroup зеркалит сумму заказа МойСклада, а
+# встроенный механизм amo «Товары» пересчитывает его по списку привязанных
+# товаров. За полминуты после создания сделки бюджет успевает смениться
+# четыре-шесть раз, и остаётся то, что записали последним. Пока побеждал мост,
+# но это гонка, а не защита. Модуль - budget_mismatch_watch.py, дедуп -
+# autopilot_store.claim_notice. Разбор - knowledge/budzhet-sdelki-migaet-dva-schetchika.md
+# ---------------------------------------------------------------------------
+# Мастер-флаг: поднимает цикл опроса. OFF по умолчанию.
+BUDGET_WATCH_ENABLED = os.getenv("BUDGET_WATCH_ENABLED", "").strip() == "1"
+# Разрешение ПИСАТЬ в чат. Без него модуль работает в режиме отчёта: считает и пишет
+# в лог, кого позвал бы, и НЕ жжёт ключи дедупа. Сутки в отчёте перед боем.
+BUDGET_WATCH_ALERT_ENABLED = os.getenv("BUDGET_WATCH_ALERT_ENABLED", "").strip() == "1"
+# Период опроса. Проход стоит по одному GET на воронку (окно 180 минут влезает в
+# страницу 250): 192 запроса в сутки на две воронки, 0,03% лимита интеграции.
+BUDGET_WATCH_INTERVAL_S = int(os.getenv("BUDGET_WATCH_INTERVAL_S", "900"))
+# Окно просмотра: сделки, изменённые за последние N минут. Должно быть заметно
+# БОЛЬШЕ периода опроса, иначе рестарт контейнера между проходами создаёт слепое
+# пятно. 180 против 15 - запас двенадцатикратный.
+BUDGET_WATCH_LOOKBACK_MIN = int(os.getenv("BUDGET_WATCH_LOOKBACK_MIN", "180"))
+# ⚠️ Отстойник - сердце модуля. Сделку, изменённую позже этого срока, НЕ судим:
+# именно в эти минуты мост и пересчёт перебивают друг друга, и любое значение
+# бюджета законно. Замер 27.09: гонка укладывалась в 33 и 77 секунд, но соседний
+# woocommerce-sklad правит заказ и через три минуты после создания.
+BUDGET_WATCH_SETTLE_MIN = int(os.getenv("BUDGET_WATCH_SETTLE_MIN", "15"))
+# Порог значимости, рубли. Менеджеры округляют бюджет руками: 13 500 вместо 13 483.
+# Замер 27.09 по 1250 сделкам - 11 расхождений, десять из них такие округления в
+# пределах 71 рубля, и только одно настоящее (бюджет 0 при заказе 5 490).
+BUDGET_WATCH_TOLERANCE = int(os.getenv("BUDGET_WATCH_TOLERANCE", "100"))
+# Предохранитель: сколько сделок максимум за проход. Массовая поломка (мост лёг,
+# пересчёт всех перебил) не должна вылиться пачкой сообщений в чат.
+BUDGET_WATCH_MAX_PER_PASS = int(os.getenv("BUDGET_WATCH_MAX_PER_PASS", "10"))
+# Воронки со сделками из заказов: ОП розница - где мост их создаёт, Офис - куда они
+# переезжают на отгрузку. Поле «Состав заказа» едет с ними, сверять можно и там.
+BUDGET_WATCH_PIPELINES = tuple(
+    int(x) for x in os.getenv(
+        "BUDGET_WATCH_PIPELINES", f"{PIPELINE_CLEVER_MAIN},{PIPELINE_OFFICE}"
+    ).replace(" ", "").split(",") if x
+)
+# Пусто - чат по умолчанию из telegram_bot.
+BUDGET_WATCH_ALERT_CHAT_ID = os.getenv("BUDGET_WATCH_ALERT_CHAT_ID", "").strip()
+# Разрешение ПРАВИТЬ бюджет, а не только звать человека. OFF по умолчанию.
+BUDGET_WATCH_FIX_ENABLED = os.getenv("BUDGET_WATCH_FIX_ENABLED", "").strip() == "1"
+# ⚠️ От чьего имени уходит правка. Это НЕ украшение: обычный PATCH от интеграции amo
+# считает машинным, и следующее изменение товаров перебивает нашу цифру обратно. С
+# `updated_by` живого пользователя amo считает правку ручной и больше НИКОГДА не
+# пересчитывает бюджет этой сделки по товарам (опыт 27.09.2026 на тест-сделках, обе
+# ветки проверены). Неактивные учётки amo отвергает с 400 NotSupportedChoice, поэтому
+# нейтрального техпользователя взять не выйдет. Решение Кати 27.09.2026 - Гладков,
+# админ и технический владелец CRM.
+# ⚠️ Прививка необратима: после неё менеджер, добавивший товар руками, вписывает сумму сам.
+BUDGET_WATCH_FIX_AS_USER_ID = int(os.getenv("BUDGET_WATCH_FIX_AS_USER_ID", "11513202"))
+# Примечание рядом с правкой. По умолчанию ВКЛ и это осознанно: в ленте автором значится
+# живой человек, и без объяснения он читает это как свою правку.
+BUDGET_WATCH_FIX_NOTE_ENABLED = os.getenv("BUDGET_WATCH_FIX_NOTE_ENABLED", "1").strip() == "1"
+# Потолок вменяемости суммы. Мусор в «Составе заказа» не должен стать боевым бюджетом,
+# да ещё и навсегда выключить сделке пересчёт.
+BUDGET_WATCH_FIX_MAX_TOTAL = int(os.getenv("BUDGET_WATCH_FIX_MAX_TOTAL", "3000000"))
+
 # Секрет в пути для /admin/lead-distribution/* (пайплайны/источники/сотрудники —
 # CRUD профилей 09.08.2026 переехал в team-panel, см. lead_distribution_profiles_client.py).
 # Пусто → эндпоинты недоступны (403 на любой секрет).
@@ -1207,6 +1481,46 @@ AUTOPILOT_STATE_TTL_DAYS = int(os.getenv("AUTOPILOT_STATE_TTL_DAYS", "14"))
 # Потолок действий в час. Упёрлись - останавливаемся и пишем в чат один раз. Страховка от
 # того, что массовая правка в amoCRM высыпет сотни вебхуков разом.
 AUTOPILOT_HOURLY_CAP = int(os.getenv("AUTOPILOT_HOURLY_CAP", "60"))
+
+# ⚠️ Как часто робот подбирает пропущенное из переписки, которую собрала панель (Катя
+# 27.09.2026: «отслеживаемые сделки надо проверять хотя бы каждые 5 мин»). Нужно потому, что
+# движок живёт на вебхуках, а вебхук может не дойти: по заказу 19288 клиент ответил «Да, всё
+# верно», робот ответа не увидел, и сделка зависла. Пять минут - её слово.
+AUTOPILOT_CATCHUP_INTERVAL_S = int(os.getenv("AUTOPILOT_CATCHUP_INTERVAL_S", "300"))
+
+# Насколько подбор смотрит переписку НАЗАД от начала ожидания. Нужно из-за зазора между
+# отправкой шаблона и моментом, когда робот начал слушать: по заказу 19303 отказ канала пришёл
+# за 21 секунду до этого, и точный `since` его не находил. Входящие при этом всё равно берутся
+# строго после начала ожидания - иначе старое сообщение клиента сошло бы за ответ на шаблон.
+AUTOPILOT_CATCHUP_LOOKBACK_S = int(os.getenv("AUTOPILOT_CATCHUP_LOOKBACK_S", "3600"))
+
+# Пауза перед вторым взглядом на карточку клиента. Заказ создаёт интеграция: сначала сделка,
+# через секунды - привязанный контакт с телефоном, и вебхук успевает прийти в этот зазор.
+# 27.09.2026 зазор дал ложный алерт «в карточке контакта нет телефона» по заказу 07975.
+AUTOPILOT_CONTACT_RETRY_S = int(os.getenv("AUTOPILOT_CONTACT_RETRY_S", "45"))
+
+# Сколько ждём ОТВЕТА клиента, прежде чем позвать менеджера (Катя 27.09.2026: «он должен ждать
+# ответа день, потом слать алерт»). До этого у фазы ожидания срока не было вообще: сделка висела,
+# пока её молча не уберёт уборка по давности, и о неподтверждённом заказе никто не узнавал.
+# ⚠️ Это алерт МЕНЕДЖЕРУ, а не напоминание клиенту - своих напоминаний робот не шлёт.
+AUTOPILOT_REPLY_WAIT_H = int(os.getenv("AUTOPILOT_REPLY_WAIT_H", "24"))
+
+# Антиспам алертов в рабочий чат: больше этого за окно - одна строка «дальше молчу» технарям
+# и тишина до конца окна. Приём взят у `wazzup_delivery`: массовый сбой не должен залить топик
+# УВЕДОМЛЕНИЯ, менеджеру от сотни сообщений не легче, а полная картина лежит в ленте панели.
+AUTOPILOT_OP_BURST_MAX = int(os.getenv("AUTOPILOT_OP_BURST_MAX", "12"))
+AUTOPILOT_OP_BURST_WINDOW_S = int(os.getenv("AUTOPILOT_OP_BURST_WINDOW_S", "600"))
+
+# Окно, в которое один и тот же сбой по одной сделке не повторяется в чате. Без него ошибка
+# фонового цикла звонила бы раз в минуту (тик), а ошибка разбора вебхука - на каждый вебхук.
+AUTOPILOT_ERROR_DEDUPE_S = int(os.getenv("AUTOPILOT_ERROR_DEDUPE_S", "1800"))
+
+# ⚠️ Порога «возраст сделки в часах» здесь больше НЕТ, и это осознанная замена (Катя
+# 27.09.2026). Шесть часов отрезали ровно то, что отрезать нельзя: ночной заказ, пришедший в
+# 21:12, к утру «старел» и робот его не брал. Правило теперь считается по рабочим окнам -
+# `autopilot.entry_window_start`: берём всё, что появилось с конца прошлых рабочих часов.
+# Её слова: «если бота включили сегодня в 10, то он будет работать со всем, что появилось
+# сегодня плюс сделки с 19 вчерашней даты до 10 сегодняшней».
 
 
 

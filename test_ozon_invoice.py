@@ -53,7 +53,8 @@ _alerts: list = []
 _ozon_calls: list = []
 
 
-def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None, other=None, by_card=None):
+def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None,
+          other=None, by_card=None, method=None):
     cf = []
     if uuid is not None:
         cf.append({"field_id": FIELD_MOYSKLAD_ORDER_UUID, "values": [{"value": uuid}]})
@@ -63,6 +64,8 @@ def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=U
         cf.append({"field_id": ozon_invoice.FIELD_INVOICE_OTHER_AMOUNT, "values": [{"value": other}]})
     if by_card is not None:
         cf.append({"field_id": ozon_invoice.FIELD_INVOICE_BY_CARD, "values": [{"value": by_card}]})
+    if method is not None:
+        cf.append({"field_id": ozon_invoice.FIELD_PAYMENT_METHOD, "values": [{"value": method}]})
     return {
         "id": LEAD_ID,
         "name": "Заказ №4242",
@@ -118,6 +121,7 @@ def _reset():
     for coll in (_patches, _notes, _tags, _alerts, _ozon_calls):
         coll.clear()
     ozon_invoice._recent.clear()
+    ozon_invoice._blocked_noted.clear()
 
 
 def run(coro):
@@ -293,6 +297,45 @@ assert res == "failed-ms-fetch", res
 assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
 print("✓ без «Другой суммы»: молчащий МойСклад — счёт не создаём")
 
+# ── 11) стоп-список способов оплаты: крипта и прочее ───────────────────
+# Катя 28.09.2026: по таким способам оплата идёт мимо эквайринга, ссылка Ozon Pay
+# там не нужна. Сначала чистая функция — все написания разом.
+for raw in ("Крипта", "криптой", "ОПЛАТА КРИПТОЙ", "Crypto USDT", "usdt", "USDT TRC20",
+            "ustd", "Trust Wallet", "wallet", "TRC-20"):
+    assert ozon_invoice.blocked_invoice_payment_token(raw), raw
+for raw in ("Онлайн-оплата", "Картой на сайте", "При получении", "Безналичный перевод",
+            "Наличные", "СберПей", "", None):
+    assert ozon_invoice.blocked_invoice_payment_token(raw) == "", raw
+print("✓ стоп-список: крипта/USDT/USTD/TRC/wallet в любом регистре, обычные способы живы")
+
+# ── 11a) способ оплаты «Крипта» → ссылку не создаём, Ozon не дёргаем ────────
+_reset()
+_install_mocks(_lead(method="Крипта"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-payment-method", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+assert not _tags and not _alerts, "это не ошибка менеджера: ни тега, ни алерта в ТГ"
+assert len(_notes) == 1 and "Крипта" in _notes[0][1], _notes
+print("✓ «Крипта»: ссылки нет, Ozon не дёрнут, в карточке объяснение без тега и алерта")
+
+# ── 11b) «Другая сумма» стоп-список не отменяет ─────────────────────────
+# Запрет стоит ВЫШЕ развилки про сумму: крипта не пускает счёт ни при какой сумме.
+_reset()
+_install_mocks(_lead(method="криптой", uuid=None, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-payment-method", res
+assert not _ozon_calls, _ozon_calls
+print("✓ стоп-список сильнее «Другой суммы»: счёт не создаётся вообще")
+
+# ── 11c) повторные вебхуки той же сделки не сыплют примечаниями ─────────
+_reset()
+_install_mocks(_lead(method="USDT TRC20"))
+run(ozon_invoice.process_invoice_lead(LEAD_ID))
+ozon_invoice._recent.clear()          # следующий вебхук вне дедуп-окна
+run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert len(_notes) == 1, _notes
+print("✓ стоп-список: объяснение в карточке одно, сколько бы вебхуков ни пришло")
+
 # ── 10a) _is_checked: форматы amo checkbox ─────────────────────────────────
 for raw in (True, "1", "on", "true", "YES"):
     assert ozon_invoice._is_checked(raw) is True, raw
@@ -405,6 +448,21 @@ academy["updated_at"] = int(time.time() - 10 * 60)
 assert run(ozon_invoice._retry_missing_link(academy)) == 0
 assert not _ozon_calls and not _notes and not _tags, "Академию сторож не трогает вовсе"
 print("✓ сторож не лезет в Академию: там счёт выставляют иначе")
+
+# ── сторож молчит о сделках со стоп-способом оплаты ─────────────────────────
+# Ссылки нет ПО ЗАМЫСЛУ. Без этого гейта сторож звал бы человека каждые сутки
+# по каждой сделке, где клиент платит криптой.
+_reset()
+_REAL_IN_WINDOW_CRYPTO = ozon_invoice._in_alert_window
+ozon_invoice._in_alert_window = lambda now=None: True
+_install_mocks(_lead(method="Оплата криптой"))
+crypto = _lead(method="Оплата криптой")
+crypto["updated_at"] = int(time.time() - 30 * 60)     # висит полчаса, порог алерта 15 мин
+assert run(ozon_invoice._retry_missing_link(crypto)) == 0
+assert not _alerts and not _tags, (_alerts, _tags)
+assert not _ozon_calls, _ozon_calls
+ozon_invoice._in_alert_window = _REAL_IN_WINDOW_CRYPTO
+print("✓ сторож: у сделки со стоп-способом ссылки нет законно — человека не зовём")
 
 # ═══ Этап 2: вебхук факта оплаты ════════════════════════════════════════════
 

@@ -11,6 +11,11 @@ Ozon оба в копейках, 1:1) или из поля «Другая сум
 переводим сделку в «Ссылка отправлена» (83537866) — там штатные DP-боты (7173)
 шлют клиенту шаблон с уже заполненным полем.
 
+Способ оплаты (577373) со словом «крипт», «usdt»/«ustd», «trc» или «wallet» —
+ссылку НЕ создаём вовсе (Катя 28.09.2026): такие оплаты идут мимо эквайринга.
+Это не ошибка, поэтому без тега и алерта — только примечание в карточке, и
+сторож зависших счетов такие сделки тоже пропускает.
+
 Любая ошибка (нет 576689 и пуста «Другая сумма» / МС недоступен / sum=0 / Ozon отказал / PATCH не
 прошёл) → сделка ОСТАЁТСЯ на тех-этапе (видно в воронке): тег «ошибка счёта» +
 примечание с причиной + алерт в ТГ ОП с @ответственного менеджера. Клиент в
@@ -43,6 +48,7 @@ from waybill_config import (
     FIELD_INVOICE_OTHER_AMOUNT,
     FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_PAYMENT_LINK,
+    FIELD_PAYMENT_METHOD,
     OZON_INVOICE_ENABLED,
     OZON_INVOICE_REDIRECT_URL,
     OZON_INVOICE_TTL_S,
@@ -68,6 +74,7 @@ from waybill_config import (
     PIPELINE_DB_WORK,
     PUBLIC_BASE_URL,
     TAG_INVOICE_ERROR,
+    blocked_invoice_payment_token,
     looks_like_uuid,
 )
 
@@ -347,6 +354,35 @@ async def _fail(lead: dict, reason: str, detail: str = "") -> None:
         await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
+# Кому уже объяснили, что по этому способу оплаты ссылки не будет. Вебхук
+# update_lead прилетает на ЛЮБУЮ правку сделки, а сделка с криптой может стоять
+# на этапе долго — без этого окна в карточку насыпалась бы пачка одинаковых
+# примечаний. Память процесса: после пересборки контейнера объясним ещё раз, и
+# это дешевле, чем лишний запрос примечаний на каждый вебхук.
+_blocked_noted: dict[int, float] = {}
+_BLOCKED_NOTE_GAP_S = 6 * 3600
+
+
+async def _note_blocked_once(lead_id, payment_method: str) -> None:
+    """Объяснить менеджеру в карточке, почему ссылки не будет — не чаще раза в
+    шесть часов на сделку."""
+    key = int(lead_id)
+    now = time.time()
+    for k, ts in list(_blocked_noted.items()):
+        if now - ts > _BLOCKED_NOTE_GAP_S:
+            _blocked_noted.pop(k, None)
+    if now - _blocked_noted.get(key, 0.0) < _BLOCKED_NOTE_GAP_S:
+        return
+    _blocked_noted[key] = now
+    await amo_service.add_note(
+        lead_id,
+        f"Ссылка на оплату не создаётся: способ оплаты «{payment_method}».\n"
+        "По криптовалютным способам счёт Ozon Pay не выставляем — оплата идёт мимо "
+        "эквайринга. Нужна ссылка Ozon Pay — поменяйте способ оплаты и заведите "
+        "сделку на этап «Оплата запрошена» заново.",
+    )
+
+
 async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     """Обработчик очереди (LANE_AMO). Возвращает исход строкой (лог/тесты)."""
     key = str(lead_id)
@@ -406,6 +442,19 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     if existing_link:
         logger.info("Lead %s: 577617 уже заполнено (%.40s…) — счёт не создаём", lead_id, existing_link)
         return "skipped-link-present"
+
+    # Способ оплаты (577373) из стоп-списка — крипта, USDT/USTD, TRC, wallet
+    # (Катя 28.09.2026). Такие оплаты идут мимо эквайринга, ссылка Ozon Pay там
+    # не нужна: создать её — значит отправить клиенту счёт, который он оплатит
+    # не туда. Это НЕ ошибка менеджера, поэтому без тега «ошибка счёта» и без
+    # алерта в ТГ: тихо пропускаем и один раз объясняем в карточке.
+    payment_method = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD) or "").strip()
+    blocked_token = blocked_invoice_payment_token(payment_method)
+    if blocked_token:
+        logger.info("Lead %s: способ оплаты «%s» (стоп-слово «%s») — ссылку не создаём",
+                    lead_id, payment_method, blocked_token)
+        await _note_blocked_once(lead_id, payment_method)
+        return "skipped-payment-method"
 
     # «Другая сумма» (578141): заполнено → счёт на неё, а не на сумму заказа.
     # Нечитаемое значение — честная ошибка менеджеру (не молчать и не подменять).
@@ -1004,6 +1053,11 @@ async def _retry_missing_link(lead: dict) -> int:
 
     logger.info("Ozon сверка: сделка %s без ссылки %.0f мин, повтор дал «%s»",
                 lead_id, quiet_min, outcome)
+
+    # Ссылки нет ПО ЗАМЫСЛУ: способ оплаты из стоп-списка (крипта и прочее).
+    # Звать человека тут не за чем — та же логика, что с Академией выше.
+    if outcome == "skipped-payment-method":
+        return 0
 
     # Повтор не помог и сделка висит давно — зовём человека. Порог отдельный от
     # OZON_STALE_ALERT_MIN: там «клиент не платит по выставленному счёту», а
