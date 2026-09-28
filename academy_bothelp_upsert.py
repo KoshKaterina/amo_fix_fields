@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 _UPSERT_LOCK = asyncio.Lock()
 
 FIELD_CUID = 573753
+FIELD_TELEGRAM_ID = 571839
+FIELD_TELEGRAM_USERNAME = 577785
 FIELD_PD_CONSENT = 578239
 FIELD_PD_VERSION = 578241
 FIELD_MARKETING_CONSENT = 578245
@@ -85,6 +87,27 @@ def _phone(value: Any) -> str:
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+def _telegram_id(payload: dict) -> str:
+    """Return a numeric messenger ID from BotHelp's standard webhook fields."""
+    for key in ("user_id", "channel_user_id", "telegram_id"):
+        value = _text(payload.get(key))
+        if value.isdigit():
+            return value
+    return ""
+
+
+def _telegram_username(payload: dict) -> str:
+    """Return a normalized Telegram username when BotHelp provides one."""
+    for key in ("messenger_username", "telegram_username"):
+        value = _text(payload.get(key))
+        if value:
+            return value if value.startswith("@") else f"@{value}"
+    user_id = _text(payload.get("user_id"))
+    if user_id and not user_id.isdigit():
+        return user_id if user_id.startswith("@") else f"@{user_id}"
+    return ""
+
+
 def _field(contact: dict, field_id: int) -> str:
     for item in contact.get("custom_fields_values") or []:
         if int(item.get("field_id") or 0) == field_id:
@@ -118,6 +141,12 @@ def _payload_fields(payload: dict) -> dict[int, str]:
     cuid = _text(payload.get("cuid"))
     if cuid:
         out[FIELD_CUID] = cuid
+    telegram_id = _telegram_id(payload)
+    if telegram_id:
+        out[FIELD_TELEGRAM_ID] = telegram_id
+    telegram_username = _telegram_username(payload)
+    if telegram_username:
+        out[FIELD_TELEGRAM_USERNAME] = telegram_username
     for key, field_id in _CUSTOM_MAP.items():
         value = _text(payload.get(key))
         if value:
@@ -178,7 +207,10 @@ async def _promote_forward_only_practicum(payload: dict, contact_id: int, lead: 
 
 async def _candidate_contacts(payload: dict) -> list[dict] | None:
     queries = []
-    for value in (payload.get("cuid"), _phone(payload.get("phone")), payload.get("email")):
+    for value in (
+        payload.get("cuid"), _phone(payload.get("phone")), payload.get("email"),
+        _telegram_id(payload), _telegram_username(payload),
+    ):
         value = _text(value)
         if value and value not in queries:
             queries.append(value)
@@ -202,7 +234,16 @@ def _matches(contact: dict, payload: dict) -> bool:
     if phone and any(_phone(v.get("value")) == phone for v in _multitext_values(contact, "PHONE")):
         return True
     email = _text(payload.get("email")).lower()
-    return bool(email and any(_text(v.get("value")).lower() == email for v in _multitext_values(contact, "EMAIL")))
+    if email and any(_text(v.get("value")).lower() == email for v in _multitext_values(contact, "EMAIL")):
+        return True
+    telegram_id = _telegram_id(payload)
+    if telegram_id and _field(contact, FIELD_TELEGRAM_ID) == telegram_id:
+        return True
+    telegram_username = _telegram_username(payload).casefold()
+    return bool(
+        telegram_username
+        and _field(contact, FIELD_TELEGRAM_USERNAME).casefold() == telegram_username
+    )
 
 
 async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:

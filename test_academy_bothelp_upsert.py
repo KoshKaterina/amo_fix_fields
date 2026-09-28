@@ -11,6 +11,7 @@ def payload(**overrides):
     base = {
         "cuid": "7hw4.ddv", "name": "Тест Кат", "phone": "+79250833349",
         "email": "test@sunscrypt.ru", "pd_consent": "да", "marketing_consent": "да",
+        "user_id": "477157515", "messenger_username": "test_kat",
         "опыт_в_инвестициях": "хороший опыт", "размер_капитала": "10000000",
         "зачем_капитал": "хочу разобраться", "Регистрация на мероприятие": "Практикум октябрь 2026",
         "действие менеджера": "записаться на практикум",
@@ -34,6 +35,94 @@ def test_payload_fields_maps_answers():
     assert fields[mod.FIELD_EXPERIENCE] == "хороший опыт"
     assert fields[mod.FIELD_CAPITAL] == "10000000"
     assert fields[mod.FIELD_PURPOSE] == "хочу разобраться"
+    assert fields[mod.FIELD_TELEGRAM_ID] == "477157515"
+    assert fields[mod.FIELD_TELEGRAM_USERNAME] == "@test_kat"
+
+
+def test_telegram_identity_queries_and_matches_wazzup_contact(monkeypatch):
+    contact = {
+        "id": 10,
+        "custom_fields_values": [
+            {"field_id": mod.FIELD_TELEGRAM_ID, "values": [{"value": "477157515"}]},
+            {"field_id": mod.FIELD_TELEGRAM_USERNAME, "values": [{"value": "@liverpoolynwa1892"}]},
+        ],
+    }
+    queries = []
+
+    async def find(query, limit=25):
+        queries.append(query)
+        return [contact] if query == "477157515" else []
+
+    monkeypatch.setattr(mod.amo_service, "find_contacts_by_query", find)
+    item = payload(
+        cuid="7hw4.dho", phone="", email="", user_id="477157515",
+        messenger_username="liverpoolynwa1892",
+    )
+    assert run(mod._candidate_contacts(item)) == [contact]
+    assert queries == ["7hw4.dho", "477157515", "@liverpoolynwa1892"]
+    assert mod._matches(contact, item) is True
+
+
+def test_process_reuses_wazzup_lead_found_only_by_telegram_id(monkeypatch):
+    contact = {
+        "id": 10,
+        "custom_fields_values": [
+            {"field_id": mod.FIELD_TELEGRAM_ID, "values": [{"value": "477157515"}]},
+        ],
+        "_embedded": {"leads": [{"id": 20}]},
+    }
+    lead = {
+        "id": 20, "pipeline_id": mod.PIPELINE_ACADEMY,
+        "status_id": mod.STATUS_INBOUND, "created_at": 200,
+    }
+    writes = []
+
+    async def find(query, limit=25):
+        return [contact] if query == "477157515" else []
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("Telegram identity must reuse the existing Wazzup pair")
+
+    monkeypatch.setattr(mod, "configured", lambda: True)
+    monkeypatch.setattr(mod.amo_service, "find_contacts_by_query", find)
+    monkeypatch.setattr(mod.amo_service, "get_contact_by_id", lambda *_a, **_k: _async(contact))
+    monkeypatch.setattr(mod.amo_service, "get_leads_by_ids", lambda *_a: _async([lead]))
+    monkeypatch.setattr(mod.api, "create_contact", forbidden)
+    monkeypatch.setattr(mod.api, "create_lead_direct", forbidden)
+    monkeypatch.setattr(mod.api, "update_contact", lambda *_a, **_k: _async(True))
+    monkeypatch.setattr(
+        mod.amo_service, "patch_lead",
+        lambda lid, **kwargs: writes.append((lid, kwargs)) or _async({"ok": True}),
+    )
+    monkeypatch.setattr(mod.academy_invite_delivery, "schedule", lambda *_a: None)
+
+    item = payload(
+        cuid="7hw4.dho", phone="", email="", user_id="477157515",
+        messenger_username="liverpoolynwa1892",
+        **{"Регистрация на мероприятие": "", "действие менеджера": ""},
+    )
+    result = run(mod.process(item))
+    assert result == {"ok": True, "contact_id": 10, "lead_id": 20, "resolution": "existing"}
+    assert writes == [(20, {
+        "status_id": mod.STATUS_QUESTIONNAIRE_DONE,
+        "pipeline_id": mod.PIPELINE_ACADEMY,
+    })]
+
+
+def test_numeric_bothelp_profile_id_is_not_used_as_telegram_id():
+    item = payload(user_id="", bothelp_user_id="17012")
+    assert mod._telegram_id(item) == ""
+
+
+def test_user_id_username_matches_normalized_telegram_username():
+    contact = {
+        "custom_fields_values": [
+            {"field_id": mod.FIELD_TELEGRAM_USERNAME, "values": [{"value": "@sergey_v29"}]},
+        ],
+    }
+    item = payload(cuid="", phone="", email="", user_id="sergey_v29", messenger_username="")
+    assert mod._telegram_username(item) == "@sergey_v29"
+    assert mod._matches(contact, item) is True
 
 
 def test_process_updates_existing_contact_and_lead(monkeypatch):
