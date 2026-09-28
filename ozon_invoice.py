@@ -6,11 +6,12 @@
 через Ozon Acquiring API (createPayment, payType=SBP — та же «самостоятельная
 интеграция» и те же ключи, что у плагина сайта sunscrypt-sbp), сумма — из
 связанного заказа МойСклад (поле 576689 = UUID заказа; sum МС и amount.value
-Ozon оба в копейках, 1:1) → ОДНИМ атомарным PATCH пишем ссылку в поле 577617 и
+Ozon оба в копейках, 1:1) или из поля «Другая сумма» (578141), и тогда заказ МС
+вообще не нужен (Катя 28.09.2026) → ОДНИМ атомарным PATCH пишем ссылку в поле 577617 и
 переводим сделку в «Ссылка отправлена» (83537866) — там штатные DP-боты (7173)
 шлют клиенту шаблон с уже заполненным полем.
 
-Любая ошибка (нет 576689 / МС недоступен / sum=0 / Ozon отказал / PATCH не
+Любая ошибка (нет 576689 и пуста «Другая сумма» / МС недоступен / sum=0 / Ozon отказал / PATCH не
 прошёл) → сделка ОСТАЁТСЯ на тех-этапе (видно в воронке): тег «ошибка счёта» +
 примечание с причиной + алерт в ТГ ОП с @ответственного менеджера. Клиент в
 этом случае не получает ничего — менеджер выставляет счёт вручную и двигает
@@ -406,12 +407,6 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         logger.info("Lead %s: 577617 уже заполнено (%.40s…) — счёт не создаём", lead_id, existing_link)
         return "skipped-link-present"
 
-    ms_uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
-    if not looks_like_uuid(ms_uuid):
-        await _fail(lead, "Нет заказа в МС - невозможно создать оплату",
-                    detail=f"поле «ID Заказа» (576689) пусто или не UUID: {ms_uuid!r}")
-        return "failed-no-ms-order"
-
     # «Другая сумма» (578141): заполнено → счёт на неё, а не на сумму заказа.
     # Нечитаемое значение — честная ошибка менеджеру (не молчать и не подменять).
     other_kopecks, other_err = _parse_other_amount(
@@ -422,11 +417,25 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
                     detail=f"{other_err}. Исправьте сумму или очистите поле.")
         return "failed-other-amount"
 
-    order = await ms_client.get(f"entity/customerorder/{ms_uuid}")
-    if not order:
-        await _fail(lead, "МойСклад не отдал заказ - счёт не создан",
-                    detail=f"customerorder/{ms_uuid}")
-        return "failed-ms-fetch"
+    # Заказ МС нужен только как ИСТОЧНИК СУММЫ. Заполнена «Другая сумма» — счёт
+    # выставляем и без заказа (Катя 28.09.2026): сумму менеджер назвал сам, ждать
+    # заказ не за чем. Это общий путь всех воронок из _invoice_pipelines().
+    # Заказ при этом всё равно читаем, если он есть: его номер идёт в начало
+    # extId заказа Ozon, по нему офис матчит поступление. Не отдался МС — с
+    # «Другой суммой» не падаем, просто остаёмся без номера в extId.
+    ms_uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
+    order: dict = {}
+    if looks_like_uuid(ms_uuid):
+        order = (await ms_client.get(f"entity/customerorder/{ms_uuid}")) or {}
+        if not order and other_kopecks is None:
+            await _fail(lead, "МойСклад не отдал заказ - счёт не создан",
+                        detail=f"customerorder/{ms_uuid}")
+            return "failed-ms-fetch"
+    elif other_kopecks is None:
+        await _fail(lead, "Нет заказа в МС - невозможно создать оплату",
+                    detail=f"поле «ID Заказа» (576689) пусто или не UUID: {ms_uuid!r}")
+        return "failed-no-ms-order"
+    ms_order_name = str(order.get("name") or "").strip()
 
     if other_kopecks is not None:
         kopecks = other_kopecks
@@ -434,7 +443,7 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         kopecks = int(round(float(order.get("sum") or 0)))
     if kopecks <= 0:
         await _fail(lead, "Сумма заказа МС = 0 - счёт не создан",
-                    detail=f"заказ МС {order.get('name')}. Либо укажите сумму в поле «Другая сумма».")
+                    detail=f"заказ МС {ms_order_name}. Либо укажите сумму в поле «Другая сумма».")
         return "failed-zero-sum"
 
     # «Оплата картой» (578145): галочка → ссылка на checkout.ozon.ru (выбор
@@ -447,7 +456,7 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     # пока мы ждём ответ, создал бы второй платёж на ту же сделку.
     _recent[key] = time.monotonic()
     pay_link, payment_id, err = await _create_payment(
-        ext_id, kopecks, by_card=by_card, ms_order_name=str(order.get("name") or "").strip(),
+        ext_id, kopecks, by_card=by_card, ms_order_name=ms_order_name,
     )
     if not pay_link:
         await _fail(lead, "Ozon не создал счёт - ссылки нет", detail=err)
@@ -471,11 +480,11 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
 
     rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
-    src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {order.get('name')}"
+    src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {ms_order_name}"
     kind = "Счёт (оплата картой, страница выбора Ozon)" if by_card else "Счёт СБП"
     # orderExtId пишем только для карты: по нему сверка ищет оплату, когда Ozon
     # не знает нашего платежа (order-флоу заводит внутри заказа свой).
-    order_ext_id = build_order_ext_id(ext_id, str(order.get("name") or "").strip()) if by_card else ""
+    order_ext_id = build_order_ext_id(ext_id, ms_order_name) if by_card else ""
     await amo_service.add_note(
         lead_id,
         f"{kind} создан автоматически: {rub_str} ₽ ({src}), действителен "

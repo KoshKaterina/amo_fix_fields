@@ -259,6 +259,40 @@ assert not _ozon_calls and not _patches
 assert any("Другая сумма" in a for a in _alerts), _alerts
 print("✓ мусор в «Другой сумме»: счёт не создан, менеджеру понятная ошибка")
 
+# ── 10-1) «Другая сумма» без заказа МС → счёт всё равно создаём ─────────
+# Катя 28.09.2026: заказ МС нужен только как ИСТОЧНИК суммы. Менеджер вписал
+# сумму сам — требовать заказ не за что. Путь один на все воронки.
+_reset()
+_install_mocks(_lead(uuid=None, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000, _ozon_calls
+assert _ozon_calls[0][3] == "", _ozon_calls  # номера заказа нет — extId без префикса
+assert not _tags and not _alerts, (_tags, _alerts)
+assert "Другая сумма" in _notes[0][1], _notes
+print("✓ «Другая сумма» без заказа МС: счёт создан, ошибки менеджеру нет")
+
+# ── 10-2) «Другая сумма» + МС молчит → счёт создаём, просто без номера ──────
+async def _ms_silent(path, params=None, **kw):
+    return None
+
+_reset()
+_install_mocks(_lead(other="2 500"))
+ms_client.get = _ms_silent
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000 and _ozon_calls[0][3] == "", _ozon_calls
+print("✓ «Другая сумма» + молчащий МойСклад: счёт создан, номер заказа пуст")
+
+# ── 10-3) без «Другой суммы» заказ МС по-прежнему обязателен (регресс) ──────
+_reset()
+_install_mocks(_lead())
+ms_client.get = _ms_silent
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "failed-ms-fetch", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+print("✓ без «Другой суммы»: молчащий МойСклад — счёт не создаём")
+
 # ── 10a) _is_checked: форматы amo checkbox ─────────────────────────────────
 for raw in (True, "1", "on", "true", "YES"):
     assert ozon_invoice._is_checked(raw) is True, raw
@@ -843,6 +877,18 @@ assert res == "created", res
 assert _patches[0]["status_id"] == STATUS_LINK_SENT, _patches[0]
 assert _patches[0]["pipeline_id"] == PIPELINE_CLEVER_MAIN, _patches[0]
 print("✓ картотека включена — розница ходит прежним путём")
+
+# ── к3a) картотека: «Другая сумма» без заказа МС тоже создаёт счёт ──────────
+# Требование Кати «во всех воронках»: развилка живёт в общем коде, не в розничной ветке.
+_reset()
+_install_mocks(_lead(status=STATUS_DB_PAYMENT_REQUESTED, pipeline=PIPELINE_DB_WORK,
+                     uuid=None, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000, _ozon_calls
+assert _patches[0]["pipeline_id"] == PIPELINE_DB_WORK, _patches[0]
+assert not _alerts, _alerts
+print("✓ картотека: «Другая сумма» без заказа МС — счёт создан в своей воронке")
 
 # ── к4) перекрёстный негатив: картотека на РОЗНИЧНОМ этапе → скип ───────────
 # Ловит гейт, который сверяет только этап и не смотрит, из какой он воронки.
