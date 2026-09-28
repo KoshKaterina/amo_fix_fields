@@ -2336,3 +2336,171 @@ def test_route_log_names_the_stage_it_passed(monkeypatch):
 
     assert rows[-1]["outcome"] == "skipped_no_bots"
     assert "Оплата запрошена" in rows[-1]["reason"]
+
+
+def test_confirmed_template_does_not_also_say_it_waits(monkeypatch):
+    """Поймано боем 28.09.2026 по заказу 19307: в журнале одна за другой стояли строки
+    «шаблон подтверждён (read), жду ответ клиента» и «жду подтверждения доставки от Wazzup».
+    Робот работал верно, а читалось это как «ждём того, что уже случилось» - ровно та беда,
+    на которую Катя показала словами «лог плохо отражает процессы»."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "mark_launch_ok", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+
+    async def fake_contact(lead):
+        return {"id": 1, "custom_fields_values": [_cf(413385, "79001234567")]}
+
+    async def confirmed(lead, stage, bot, chat_id):
+        # Ровно то, что делает настоящий `confirm_grid_send`, когда доставка подтверждена.
+        A.log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
+                  reason="шаблон уже уходил и подтверждён (read), жду ответ клиента")
+        return True
+
+    monkeypatch.setattr(A, "main_contact", fake_contact)
+    monkeypatch.setattr(A, "confirm_grid_send", confirmed)
+    lead = _lead(id=36565663, name="Заказ №19307", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.run_bot(lead, _stage(83537714, "Новый лид", []),
+                          _bot(7131, launched_by="amo_grid")))
+
+    assert [r["outcome"] for r in rows] == ["waiting_reply"]
+    assert all("жду подтверждения доставки" not in r["reason"] for r in rows)
+
+
+def test_unconfirmed_template_still_says_it_waits(monkeypatch):
+    """Обратный случай: панель про доставку ничего не знает - значит ждём, и в журнале это
+    должно быть сказано, иначе сделка висела бы в журнале без единого следа ожидания."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
+    monkeypatch.setattr(A.store, "mark_launch_ok", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+
+    async def fake_contact(lead):
+        return {"id": 1, "custom_fields_values": [_cf(413385, "79001234567")]}
+
+    async def silent(lead, stage, bot, chat_id):
+        return False
+
+    monkeypatch.setattr(A, "main_contact", fake_contact)
+    monkeypatch.setattr(A, "confirm_grid_send", silent)
+    lead = _lead(id=36565664, name="Заказ №19308", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.run_bot(lead, _stage(83537714, "Новый лид", []),
+                          _bot(7131, launched_by="amo_grid")))
+
+    assert rows[-1]["outcome"] == "waiting_delivery"
+
+
+# ── ответ, пришедший пока робот спал ────────────────────────────────────────────
+
+def test_answer_that_came_while_the_robot_slept_is_picked_up(monkeypatch):
+    """⚠️ Кейс 28.09.2026, заказ 19307. Ночной шаблон ушёл клиенту в 08:52:57, клиент ответил
+    «Да, всё верно» в 08:56:34, а робот в это время спал до начала рабочих часов. Проснувшись в
+    10:00, он подтвердил доставку и встал ЖДАТЬ ответ, который уже лежал в переписке: ответом
+    считалось только то, что придёт после начала ожидания.
+
+    Правильная граница - шаблон, а не наше пробуждение: ответ это то, что пришло ПОСЛЕ шаблона.
+    """
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    rows = _capture(monkeypatch)
+    answers: list[tuple] = []
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
+
+    async def activity(chat_id, since):
+        return {
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
+                      "at": "2026-09-28T05:52:57+00:00"}],
+            "inbound": [{"text": "Да, всё верно", "chat_type": "whatsapp",
+                         "at": "2026-09-28T05:56:34+00:00"}],
+        }
+
+    async def fake_answer(row, text, chat_type=""):
+        answers.append((row["lead_id"], text))
+
+    monkeypatch.setattr(A, "fetch_chat_activity", activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    lead = _lead(id=36565663, name="Заказ №19307", pipeline_id=10593102, status_id=83537714)
+
+    settled = asyncio.run(A.confirm_grid_send(lead, _stage(83537714, "Новый лид", []),
+                                              _bot(7131, launched_by="amo_grid"), "79772777990"))
+
+    assert settled is True
+    assert answers == [(36565663, "Да, всё верно")]
+    assert rows[-1]["outcome"] == "waiting_reply"
+
+
+def test_message_written_before_the_template_is_not_an_answer(monkeypatch):
+    """Обратная сторона той же границы: написанное ДО шаблона ответом на него не является.
+    Принять его за ответ значило бы двинуть сделку по чужим словам."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    _capture(monkeypatch)
+    answers: list[tuple] = []
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
+
+    async def activity(chat_id, since):
+        return {
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
+                      "at": "2026-09-28T05:52:57+00:00"}],
+            "inbound": [{"text": "здравствуйте, а когда доставка?", "chat_type": "whatsapp",
+                         "at": "2026-09-28T05:40:00+00:00"}],
+        }
+
+    async def fake_answer(row, text, chat_type=""):
+        answers.append((row["lead_id"], text))
+
+    monkeypatch.setattr(A, "fetch_chat_activity", activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    lead = _lead(id=36565665, pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.confirm_grid_send(lead, _stage(83537714, "Новый лид", []),
+                                    _bot(7131, launched_by="amo_grid"), "79772777990"))
+
+    assert answers == []
+
+
+def test_catchup_window_starts_from_when_we_took_the_lead(monkeypatch):
+    """Подбор смотрит переписку от момента, когда робот ВЗЯЛ сделку, а не когда начал ждать
+    ответ: между ними помещается ночь, и окно от начала ожидания не покрывало ни шаблон, ни
+    ответ клиента (заказ 19307)."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    A._catchup_at = 0.0
+    asked: list[str] = []
+    answers: list[str] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36565663, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79772777990", "created_at": "2026-09-28T05:52:26+00:00",
+        "launch_ok_at": "2026-09-28T07:00:17+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_activity(chat_id, since):
+        asked.append(since)
+        return {
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
+                      "at": "2026-09-28T05:52:57+00:00"}],
+            "inbound": [{"text": "Да, всё верно", "chat_type": "whatsapp",
+                         "at": "2026-09-28T05:56:34+00:00"}],
+        }
+
+    async def fake_answer(row, text, chat_type=""):
+        answers.append(text)
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    asyncio.run(A.catch_up_on_chats())
+
+    assert asked and asked[0] < "2026-09-28T05:52:26"   # окно покрывает и шаблон, и ответ
+    assert answers == ["Да, всё верно"]

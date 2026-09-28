@@ -1209,8 +1209,9 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
     # мог отстрелять задолго до того, как робот взял сделку: по заказу 19288 шаблон ушёл вечером,
     # статусы прошли до включения робота, и пятнадцать минут ожидания кончились ложным «не
     # дошло». Один запрос к панели снимает весь этот класс: у неё вся переписка уже лежит.
+    settled = False
     if str(bot.get("launched_by") or "engine") != "engine":
-        await confirm_grid_send(lead, stage, bot, chat_id)
+        settled = await confirm_grid_send(lead, stage, bot, chat_id)
 
     if str(bot.get("stop_mode") or "any") == "never":
         # «Ответ не нужен» - информационное сообщение, а не разговор. Ни доставки, ни ответа
@@ -1218,6 +1219,10 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
         log_run(lead, stage, bot=bot, action="launch_bot", outcome="advanced",
                 reason="сообщение информационное, ответа не жду")
         await advance(lead, stage, "информационное сообщение отправлено", from_bot=bot)
+        return
+
+    if settled:
+        # Вопрос доставки уже решён строкой выше - «жду подтверждения» здесь было бы неправдой.
         return
 
     log_run(lead, stage, bot=bot, action="launch_bot", outcome="waiting_delivery",
@@ -2219,6 +2224,13 @@ async def panel_delivery_verdict(chat_id: str, since: str) -> tuple[str, str, st
     data = await fetch_chat_activity(chat_id, since)
     if not data:
         return None
+    return echo_verdict(data)
+
+
+def echo_verdict(data: dict) -> tuple[str, str, str] | None:
+    """Тот же вердикт, что у `panel_delivery_verdict`, но по УЖЕ полученной переписке - чтобы
+    не спрашивать панель дважды. Имя другое: `delivery_verdict` выше судит по статусам нашего
+    ведения и окну ожидания, а это - по тому, что видно в переписке панели."""
     for item in (data.get("echo") or []):
         if not is_robot_echo(item.get("author_name")):
             continue
@@ -2228,6 +2240,31 @@ async def panel_delivery_verdict(chat_id: str, since: str) -> tuple[str, str, st
             return "ok", status, chat_type
         if status == "error":
             return "error", status, chat_type
+    return None
+
+
+def template_sent_at(data: dict) -> str:
+    """Когда автоматика последний раз писала клиенту в этом чате. Пусто - не писала.
+
+    Это и есть честная граница «что считать ответом»: ответ - то, что пришло ПОСЛЕ шаблона.
+    Граница «после того, как робот начал слушать» неверна, и 28.09.2026 это стоило сделки:
+    ночной шаблон ушёл клиенту в 08:52:57, клиент ответил «Да, всё верно» в 08:56:34, а робот
+    в это время спал до начала рабочих часов. Проснувшись в 10:00, он считал ответом только
+    то, что придёт после 10:00, - и ждал ответа, который уже лежал в переписке.
+    """
+    times = [
+        str(item.get("at") or "")
+        for item in (data.get("echo") or [])
+        if is_robot_echo(item.get("author_name")) and item.get("at")
+    ]
+    return max(times) if times else ""
+
+
+def first_answer_after(data: dict, border: str) -> dict | None:
+    """Самое свежее входящее после границы. Панель отдаёт список свежим вперёд."""
+    for item in (data.get("inbound") or []):
+        if _at_or_after(item.get("at"), border):
+            return item
     return None
 
 
@@ -2247,31 +2284,53 @@ def lead_since_iso(lead: dict, fallback_hours: int = 24) -> str:
     return max(moment, floor).isoformat()
 
 
-async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) -> None:
+async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) -> bool:
     """Сразу узнать у панели, что стало с шаблоном грида: дошёл, отбит или пока ничего.
 
     Дошёл - переходим к ожиданию ответа, не тратя окно. Отбит - это доказанная недоставка,
     зовём человека немедленно: ждать ответа от клиента, которого нет в WhatsApp, бессмысленно.
+
+    Возвращает True, если вопрос доставки уже решён (дошло или доказанно не дошло). Вызывающий
+    по этому признаку молчит про ожидание: 28.09.2026 по заказу 19307 в журнале одна за другой
+    стояли строки «шаблон подтверждён (read), жду ответ клиента» и «жду подтверждения доставки
+    от Wazzup» - робот работал правильно, а читалось это как «ждём того, что уже случилось».
     """
     if not chat_id:
-        return
+        return False
     lead_id = int(lead["id"])
-    verdict = await panel_delivery_verdict(chat_id, lead_since_iso(lead))
+    status_id = int(lead.get("status_id") or 0)
+    data = await fetch_chat_activity(chat_id, lead_since_iso(lead))
+    if not data:
+        return False
+    verdict = echo_verdict(data)
     if verdict is None:
-        return
+        return False
     outcome, status, chat_type = verdict
     if outcome == "ok":
         log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
                 reason=f"шаблон уже уходил и подтверждён ({status}), жду ответ клиента",
                 delivery={"statuses": [{"status": status, "chatType": chat_type}]})
         await asyncio.to_thread(
-            store.update, lead_id, int(lead.get("status_id") or 0),
+            store.update, lead_id, status_id,
             phase=store.PHASE_REPLY, note="шаблон подтверждён по переписке панели",
         )
         logger.info("autopilot: по сделке %s шаблон уже подтверждён (%s), жду ответ",
                     lead_id, status)
-        return
+        # ⚠️ Клиент мог ответить, пока робот спал. Смотрим ЗДЕСЬ же, одним и тем же ответом
+        # панели: иначе ответ нашёлся бы только подбором через пять минут, а в кейсе 28.09.2026
+        # (заказ 19307) не нашёлся бы никогда - подбор смотрел переписку от начала ожидания.
+        answer = first_answer_after(data, template_sent_at(data))
+        if answer is not None:
+            logger.info("autopilot: по сделке %s ответ клиента пришёл до нас (%s)",
+                        lead_id, str(answer.get("at") or ""))
+            await on_client_answer(
+                {"lead_id": lead_id, "status_id": status_id,
+                 "bot_id": int(bot.get("bot_id") or 0)},
+                str(answer.get("text") or ""), str(answer.get("chat_type") or ""),
+            )
+        return True
     await report_not_delivered(lead, stage, bot, status, chat_type, "по переписке панели")
+    return True
 
 
 async def catch_up_on_chats() -> None:
@@ -2296,19 +2355,27 @@ async def catch_up_on_chats() -> None:
     rows += list(await asyncio.to_thread(store.list_by_phase, store.PHASE_DELIVERY))
     for row in rows:
         chat_id = str(row.get("chat_id") or "")
+        # ⚠️ Окно считаем от того, когда робот ВЗЯЛ сделку, а не когда начал ждать ответ. Между
+        # этими моментами помещается целая ночь: заказ пришёл в 08:52, робот его взял и уснул до
+        # десяти, шаблон и ответ клиента прошли в те же минуты. Окно от начала ожидания
+        # заканчивалось в 09:00 и не покрывало ни шаблон, ни ответ (заказ 19307, 28.09.2026).
+        started = str(row.get("created_at") or row.get("launch_ok_at") or "")
         since = str(row.get("launch_ok_at") or row.get("created_at") or "")
         if not chat_id or not since:
             continue
-        # ⚠️ Спрашиваем с ЗАПАСОМ назад, а не от начала ожидания. По заказу 19303 отказ канала
-        # пришёл за 21 секунду ДО того, как робот начал слушать (он ждал телефон), и подбор с
-        # точным `since` его не находил - ровно тот же зазор, из-за которого кейс и случился.
-        data = await fetch_chat_activity(chat_id, shift_iso(since, -AUTOPILOT_CATCHUP_LOOKBACK_S))
+        # ⚠️ Спрашиваем с ЗАПАСОМ назад. По заказу 19303 отказ канала пришёл за 21 секунду ДО
+        # того, как робот начал слушать (он ждал телефон), и подбор с точным `since` его не
+        # находил - ровно тот же зазор, из-за которого кейс и случился.
+        window = shift_iso(started or since, -AUTOPILOT_CATCHUP_LOOKBACK_S)
+        data = await fetch_chat_activity(chat_id, window)
         if not data:
             continue
-        # ⚠️ А вот ВХОДЯЩИЕ берём строго после начала ожидания: сообщение, написанное до
-        # запуска бота, ответом на шаблон не является, и принять его за ответ значило бы
-        # двинуть сделку по чужим словам.
-        inbound = [i for i in (data.get("inbound") or []) if _at_or_after(i.get("at"), since)]
+        # ⚠️ Ответом считаем то, что пришло ПОСЛЕ шаблона, а не после начала ожидания.
+        # Сообщение, написанное до шаблона, ответом на него не является - принять его за ответ
+        # значило бы двинуть сделку по чужим словам. А шаблона в переписке не видно - остаётся
+        # прежняя, более осторожная граница.
+        border = template_sent_at(data) or since
+        inbound = [i for i in (data.get("inbound") or []) if _at_or_after(i.get("at"), border)]
         echo = (data.get("echo") or [])
         if not inbound:
             # Доставка могла подтвердиться - или отбиться - статусом, вебхук которого не дошёл.
