@@ -69,6 +69,7 @@ _ORIG_GET_LEAD = O.amo_service.get_lead_full
 _ORIG_BY_STATUS = O.amo_service.get_leads_by_status
 _ORIG_ADD_NOTE = O.amo_service.add_note
 _ORIG_CREATE_TASK = O.api.create_task
+_ORIG_OPEN_TASKS = O.api.get_open_tasks
 _ORIG_CLAIM = O.notices.claim_notice
 _ORIG_PURGE = O.notices.purge_notices_older_than
 
@@ -78,6 +79,7 @@ def setup_function(_=None):
     O.amo_service.get_leads_by_status = _ORIG_BY_STATUS
     O.amo_service.add_note = _ORIG_ADD_NOTE
     O.api.create_task = _ORIG_CREATE_TASK
+    O.api.get_open_tasks = _ORIG_OPEN_TASKS
     O.notices.claim_notice = _ORIG_CLAIM
     O.notices.purge_notices_older_than = _ORIG_PURGE
     O._last_run.clear()
@@ -89,12 +91,24 @@ def setup_function(_=None):
     O.OFFICE_RECORD_WATCH_ENABLED = True
     O.OFFICE_RECORD_WATCH_CREATE_ENABLED = True
     O.OFFICE_RECORD_NOTE_ENABLED = False
+    O.OFFICE_RECORD_SKIP_IF_OPEN_TASK = True
     O.OFFICE_RECORD_ALERT_ENABLED = False
     O.OFFICE_RECORD_TASK_RESPONSIBLE_USER_ID = 0
     O.OFFICE_RECORD_TASK_TYPE_ID = 1
     O.OFFICE_RECORD_TASK_DEADLINE_H = 4
     O.OFFICE_RECORD_WINDOW_START_H = 10
     O.OFFICE_RECORD_WINDOW_END_H = 19
+
+
+def teardown_function(_=None):
+    """⚠️ Убираем подмены ЗА СОБОЙ, а не только перед собой.
+
+    `O.notices` это живой `autopilot_store`, общий на всю сессию pytest. Пока уборки не
+    было, последний мой тест оставлял в нём фальшивый `claim_notice`, и соседний
+    `test_autopilot` падал - но ТОЛЬКО когда мой файл шёл первым. Порядок файлов в
+    команде не должен менять результат (поймано 29.09.2026).
+    """
+    setup_function()
 
 
 def _lead(end_ts=END_TS, *, lead_id=LEAD, status=STATUS_CLEVER_OFFICE_RECORD,
@@ -124,8 +138,11 @@ class _FakeClaims:
         return True
 
 
-def _wire(leads, *, fresh=None, task_ok=True):
-    """Подменяет amo и дедуп. Возвращает (claims, созданные задачи)."""
+def _wire(leads, *, fresh=None, task_ok=True, open_tasks=()):
+    """Подменяет amo и дедуп. Возвращает (claims, созданные задачи).
+
+    open_tasks: что отдаёт api.get_open_tasks. () - задач нет, None - amo молчит.
+    """
     claims = _FakeClaims()
     tasks = []
 
@@ -143,9 +160,13 @@ def _wire(leads, *, fresh=None, task_ok=True):
                       "complete_till": complete_till, "type": task_type_id})
         return task_ok
 
+    async def fake_open_tasks(entity_id, entity_type="leads"):
+        return None if open_tasks is None else list(open_tasks)
+
     O.amo_service.get_leads_by_status = fake_by_status
     O.amo_service.get_lead_full = fake_full
     O.api.create_task = fake_create_task
+    O.api.get_open_tasks = fake_open_tasks
     O.notices.claim_notice = claims
     return claims, tasks
 
@@ -357,6 +378,67 @@ def test_status_молчит_пока_флаг_выключен():
     finally:
         O.OFFICE_RECORD_WATCH_ENABLED = True
     assert O.status()["enabled"] is True
+
+
+def test_открытая_задача_на_сделке_глушит_сторожа():
+    """Решение Кати 29.09.2026, отменяет её же «ставить всегда» от 27.09."""
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(),
+                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
+    assert asyncio.run(O.sweep_once()) == {"has-open-task": 1}
+    assert tasks == []
+    # Ключ НЕ сожжён: закроют чужую задачу и не двинут сделку - напомним.
+    assert claims.taken == set()
+
+
+def test_после_закрытия_чужой_задачи_сторож_срабатывает():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(),
+                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
+    assert asyncio.run(O.sweep_once()) == {"has-open-task": 1}
+    # Задачу закрыли - открытых больше нет.
+    async def no_tasks(entity_id, entity_type="leads"):
+        return []
+
+    O.api.get_open_tasks = no_tasks
+    assert asyncio.run(O.sweep_once()) == {"created": 1}
+    assert len(tasks) == 1
+
+
+def test_amo_молчит_про_задачи_ключ_не_сожжён():
+    """Молчание amo нельзя читать как «задач нет» - иначе на каждом сбое связи
+    мы кладём задачу поверх существующей."""
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=None)
+    assert asyncio.run(O.sweep_once()) == {"tasks-silent": 1}
+    assert tasks == []
+    assert claims.taken == set()
+
+
+def test_гейт_выключен_флагом_ставим_несмотря_на_чужую_задачу():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    O.OFFICE_RECORD_SKIP_IF_OPEN_TASK = False
+    claims, tasks = _wire([_lead()], fresh=_lead(),
+                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
+    assert asyncio.run(O.sweep_once()) == {"created": 1}
+    assert len(tasks) == 1
+
+
+def test_гейт_работает_и_в_режиме_отчёта():
+    """Отчёт должен предсказывать бой, а не врать в оптимистичную сторону."""
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    O.OFFICE_RECORD_WATCH_CREATE_ENABLED = False
+    claims, tasks = _wire([_lead()], fresh=_lead(),
+                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
+    assert asyncio.run(O.sweep_once()) == {"has-open-task": 1}
+    assert tasks == []
+
+
+def test_нет_открытых_задач_ставим_как_раньше():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[])
+    assert asyncio.run(O.sweep_once()) == {"created": 1}
+    assert len(tasks) == 1
 
 
 def _mk_by_status(leads):

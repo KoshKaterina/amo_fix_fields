@@ -678,6 +678,22 @@ async def create_task(
     return data is not None
 
 
+async def get_open_tasks(entity_id: int, entity_type: str = "leads") -> list[dict] | None:
+    """Незакрытые задачи сущности. None - amo НЕ ОТВЕТИЛ, это не то же, что «задач нет».
+
+    Разница принципиальна для сторожей: молчание amo нельзя читать как «путь свободен»,
+    иначе на каждом сбое связи мы ставим задачу поверх существующей.
+    """
+    url = (
+        f"{BASE_URL}/api/v4/tasks?filter[entity_type]={entity_type}"
+        f"&filter[entity_id]={int(entity_id)}&filter[is_completed]=0&limit=250"
+    )
+    data = await _request_json("GET", url, what=f"get_open_tasks[{entity_id}]")
+    if data is None:
+        return None
+    return ((data.get("_embedded") or {}).get("tasks")) or []
+
+
 async def create_unsorted_lead(
     lead_name: Any,
     pipeline_id: int,

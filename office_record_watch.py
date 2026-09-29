@@ -36,9 +36,14 @@ GET, список `/api/v4/leads` отдаёт `custom_fields_values` (пров�
     значит сторож честно взводится заново. Ключ по одной сделке запретил бы это навсегда;
   • в режиме отчёта (`OFFICE_RECORD_WATCH_CREATE_ENABLED=0`) ключи НЕ жжём - иначе сутки
     обкатки выжгли бы их все и фича уехала бы в бой навсегда молчащей.
+  • у сделки есть ЛЮБАЯ незакрытая задача - молчим: сделку уже держит человек,
+    вторая задача об одном только мусорит список (решение Кати 29.09.2026);
 
 Решения Кати 27.09.2026: одна задача на одну запись (без напоминаний по кругу), тип
-задачи «Связаться», открытые задачи на сделке НЕ проверяем - ставим свою всегда.
+задачи «Связаться».
+⚠️ Решение Кати 29.09.2026 ОТМЕНИЛО её же прежнее «ставить всегда»: теперь перед
+созданием смотрим открытые задачи сделки и при любой незакрытой молчим
+(`OFFICE_RECORD_SKIP_IF_OPEN_TASK`). Повод: 13 задач бэклога легли пачкой на двух человек.
 """
 
 import asyncio
@@ -59,6 +64,7 @@ from waybill_config import (
     OFFICE_RECORD_MAX_AGE_DAYS,
     OFFICE_RECORD_MAX_PER_PASS,
     OFFICE_RECORD_NOTE_ENABLED,
+    OFFICE_RECORD_SKIP_IF_OPEN_TASK,
     OFFICE_RECORD_TASK_DEADLINE_H,
     OFFICE_RECORD_TASK_RESPONSIBLE_USER_ID,
     OFFICE_RECORD_TASK_TEXT,
@@ -209,6 +215,22 @@ async def _still_waiting(lead_id: int, end_ts: int) -> tuple[str, dict | None]:
     return "ok", lead
 
 
+async def _has_open_task(lead_id: int) -> bool | None:
+    """Есть ли у сделки хоть одна незакрытая задача. None - amo не ответил.
+
+    Зовётся ТОЛЬКО по сделке, уже решённой на «сработать», а не на каждую сделку
+    этапа: в стоячем режиме это ноль-два запроса в сутки, а не семнадцать на каждый проход.
+    """
+    try:
+        tasks = await api.get_open_tasks(lead_id)
+    except Exception:
+        logger.exception("Сторож записи в офис: не прочитались задачи сделки %s", lead_id)
+        return None
+    if tasks is None:
+        return None
+    return bool(tasks)
+
+
 async def _create(lead: dict, end_ts: int) -> str:
     """Задача менеджеру. "created" · "already" (по этой записи уже просили) · "failed".
 
@@ -286,6 +308,18 @@ async def sweep_once() -> dict:
             if state != "ok":
                 decisions[state] = decisions.get(state, 0) + 1
                 continue
+            if OFFICE_RECORD_SKIP_IF_OPEN_TASK:
+                busy = await _has_open_task(lead_id)
+                if busy is None:
+                    # amo не ответил про задачи - молчание не значит «путь свободен».
+                    # Ключ не жжём, вернёмся следующим проходом.
+                    decisions["tasks-silent"] = decisions.get("tasks-silent", 0) + 1
+                    continue
+                if busy:
+                    # Сделку уже держит человек (решение Кати 29.09.2026).
+                    # Ключ ТОЖЕ не жжём: закроет задачу и не двинет сделку - напомним.
+                    decisions["has-open-task"] = decisions.get("has-open-task", 0) + 1
+                    continue
             if not OFFICE_RECORD_WATCH_CREATE_ENABLED:
                 decisions["would-fire"] = decisions.get("would-fire", 0) + 1
                 created.append({"lead_id": lead_id, "end_ts": end_ts, "created": False,
@@ -413,11 +447,12 @@ async def init() -> None:
         _task = asyncio.create_task(_loop())
         logger.info(
             "Сторож записи в офис: поднят (опрос %ss, запас %s мин, давность до %s дн, "
-            "не больше %s задач за проход, тип задачи %s, создание %s)",
+            "не больше %s задач за проход, тип задачи %s, создание %s, чужая открытая задача - %s)",
             OFFICE_RECORD_WATCH_INTERVAL_S, OFFICE_RECORD_GRACE_MIN,
             OFFICE_RECORD_MAX_AGE_DAYS, OFFICE_RECORD_MAX_PER_PASS,
             OFFICE_RECORD_TASK_TYPE_ID,
             "ВКЛ" if OFFICE_RECORD_WATCH_CREATE_ENABLED else "выкл (режим отчёта)",
+            "молчим" if OFFICE_RECORD_SKIP_IF_OPEN_TASK else "ставим всё равно",
         )
 
 
@@ -442,5 +477,6 @@ def status() -> dict:
         "interval_s": OFFICE_RECORD_WATCH_INTERVAL_S,
         "grace_min": OFFICE_RECORD_GRACE_MIN,
         "max_age_days": OFFICE_RECORD_MAX_AGE_DAYS,
+        "skip_if_open_task": OFFICE_RECORD_SKIP_IF_OPEN_TASK,
         "last_run": dict(_last_run),
     }
