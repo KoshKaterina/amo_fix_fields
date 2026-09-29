@@ -17,6 +17,7 @@ import academy_intent_alert
 import academy_assignment
 import academy_consent_stamp
 import academy_bothelp_upsert
+import academy_chat_join
 import amgroup_shipment
 import amo_service
 import budget_mismatch_watch
@@ -163,6 +164,11 @@ async def lifespan(app):
     # панели, ни фонового цикла.
     await autopilot.init()
     academy_invite_delivery.start()
+    # Вступление в чат практикума двигает сделку на «Вступил в чат». Слушает
+    # Telegram длинным опросом и сам проверяет ACADEMY_CHAT_JOIN_ENABLED: без
+    # флага не поднимает ни опроса, ни состояния. Опрос живёт ТОЛЬКО здесь, в
+    # основном сервисе: у Telegram один читатель на бота, второй получил бы 409.
+    academy_chat_join.start()
     yield
     # Первым — досверка хвостов unmiss (спящие дебаунс-задачи), пока API-пайплайн жив.
     await wazzup_sla.shutdown()
@@ -182,6 +188,7 @@ async def lifespan(app):
     await amgroup_duplicate_watch.shutdown()
     await autopilot.shutdown()
     await academy_invite_delivery.stop()
+    await academy_chat_join.stop()
     await office_transfer.stop_reconcile()
     await lead_distribution.stop_reconcile()
     await alert_settings_client.stop()
@@ -215,7 +222,10 @@ async def health():
     return {"status": "ok", "telegram": telegram_bot.telegram_health(),
             "mail_watch": mail_watch.status(),
             "office_record": office_record_watch.status(),
-            "budget_watch": budget_mismatch_watch.status(), **queue_stats()}
+            "budget_watch": budget_mismatch_watch.status(),
+            # Опрос вступлений: молчащий слушатель внутри живого контейнера
+            # иначе неотличим от тишины по отсутствию вступлений.
+            "academy_chat_join": academy_chat_join.stats(), **queue_stats()}
 
 
 def insert_nested(data, keys, value):

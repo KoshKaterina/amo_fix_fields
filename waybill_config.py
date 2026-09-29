@@ -346,6 +346,27 @@ def is_prepaid_payment(payment_method) -> bool:
     s = str(payment_method or "").lower()
     return any(t in s for t in _PREPAID_TOKENS)
 
+
+# Способы оплаты, по которым счёт Ozon Pay НЕ выставляем (Катя 28.09.2026).
+# Криптовалюту принимают мимо эквайринга: ссылка на СБП там не нужна и сбивает
+# с толку и клиента, и менеджера. Сравнение по вхождению и без учёта регистра,
+# поэтому «Крипта», «криптой», «Оплата криптой», «USDT TRC20», «Trust Wallet»
+# ловятся одинаково. «ustd» — частая опечатка в «usdt», держим оба написания.
+OZON_INVOICE_BLOCKED_PAYMENT_TOKENS = ("крипт", "usdt", "ustd", "trc", "wallet")
+
+
+def blocked_invoice_payment_token(payment_method) -> str:
+    """Стоп-слово из способа оплаты, если ссылку по нему создавать нельзя.
+
+    Возвращает само слово (его показываем менеджеру в примечании) или пустую
+    строку, когда способ обычный."""
+    s = str(payment_method or "").lower()
+    for token in OZON_INVOICE_BLOCKED_PAYMENT_TOKENS:
+        if token in s:
+            return token
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # WooCommerce — простановка статуса заказа 'completed' для рефералки (amo → WC).
 # Передаём ТОЛЬКО статус и ТОЛЬКО когда заказ оплачен (PAID по логике Метрики,
@@ -907,6 +928,19 @@ FIELD_ACADEMY_MARKETING_CONSENT = 578245
 FIELD_ACADEMY_MARKETING_DATE_TEXT = 578277
 FIELD_ACADEMY_PD_DATE_TEXT = 578279
 STATUS_ACADEMY_RECORDED_PRACTICUM = 88835666
+STATUS_ACADEMY_JOINED_CHAT = 88943006
+
+# Перенос сделки на «Вступил в чат» по событию Telegram (29.09.2026). Слушаем
+# длинным опросом от имени бота-админа чата; вебхук Telegram не заводим намеренно -
+# опрос переживает пересборку контейнера бесплатно (разбор в шапке academy_chat_join).
+# OFF по умолчанию: включаем после проверки боем.
+ACADEMY_CHAT_JOIN_ENABLED = os.getenv("ACADEMY_CHAT_JOIN_ENABLED", "0") == "1"
+# Холостой ход: событие разбираем и решение пишем в журнал, но сделку не двигаем.
+ACADEMY_CHAT_JOIN_DRY_RUN = os.getenv("ACADEMY_CHAT_JOIN_DRY_RUN", "0") == "1"
+ACADEMY_CHAT_JOIN_STATE_PATH = os.getenv(
+    "ACADEMY_CHAT_JOIN_STATE_PATH", "/app/var/academy/academy_chat_join.json",
+)
+ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S = int(os.getenv("ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S", "25"))
 
 # Уведомления в топик УВЕДОМЛЕНИЯ отдела продаж по двум полям контакта Академии.
 # OFF до общего переключения сценария; обработчик реагирует только когда amo
