@@ -252,10 +252,16 @@ def test_soobshchenie_soderzhit_ssylku_i_teg(monkeypatch):
     assert "·" not in text
 
 
-def test_uhodit_v_topik_uvedomleniya(monkeypatch):
+def test_uhodit_v_vetku_akademii_toy_zhe_supergruppy(monkeypatch):
+    """Чат тот же, что у отдела продаж, ветка своя.
+
+    ⚠️ Тест переписан 29.09.2026. До этого он держал `thread == 10479` - общий топик
+    УВЕДОМЛЕНИЯ, и это было верно ровно до появления ветки «Уведомления академии».
+    Номер `20518` снят из ссылки Кати `t.me/c/3680811996/20518/20519`.
+    """
     _send(_lead(), monkeypatch)
     assert _sent[0]["chat_id"] == -1003680811996
-    assert _sent[0]["thread"] == 10479
+    assert _sent[0]["thread"] == 20518
 
 
 def test_bez_kontakta_soobshchenie_vse_ravno_uhodit(monkeypatch):
