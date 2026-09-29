@@ -1,13 +1,22 @@
 """Новый лид в Академии → сообщение в топик УВЕДОМЛЕНИЯ с тегом Гладкова (Катя 08.09.2026).
 
-Сделка встала на этап «Входящий лид» воронки «Академия» — Саша (РОП) должен увидеть её
-в тот же момент, а не найти вечером в списке. Уведомление короткое: кто клиент, куда
-звонить, ссылка на сделку.
+Сделка встала на «Входящий лид» ИЛИ на «Бот запущен» воронки «Академия» — Саша (РОП) должен
+увидеть её в тот же момент, а не найти вечером в списке. Уведомление короткое: кто клиент,
+куда звонить, с какого этапа пришёл, ссылка на сделку.
 
 ────────────────────────────── что считается новым лидом ──────────────────────────────
-ЛЮБОЕ попадание сделки на этап «Входящий лид» (выбор Кати 08.09.2026): и сделка, созданная
-сразу там, и переведённая туда с другого этапа. Для Саши это одно и то же событие — лид,
-которого раньше в работе не было, — и различать их в интерфейсе нечем.
+ЛЮБОЕ попадание сделки на один из этапов ACADEMY_LEAD_ALERT_STATUSES (выбор Кати 08.09.2026,
+второй этап добавлен 29.09.2026): и сделка, созданная сразу там, и переведённая туда с
+другого этапа. Для Саши это одно и то же событие — лид, которого раньше в работе не было, —
+и различать их в интерфейсе нечем.
+
+⚠️ Этапов два, потому что вход у Академии раздвоился. Телеграм-бот с 29.09 больше не кладёт
+сделку во «Входящий лид»: блок перехода в BotHelp перенесён на старт, и сделку создаёт наш
+обработчик сразу в «Боте запущен». «Входящий лид» остался живым входом для остальных
+источников — заявка с мероприятия, письмо в телеграм. Слушать надо оба.
+
+⚠️ Дедуп ключуется по СДЕЛКЕ, а не по этапу. Поэтому старый путь «сначала Входящий лид,
+через минуту Бот запущен» даёт ровно одно сообщение, а не два.
 
 Отсюда два следствия, которых нет у соседа showroom_alert:
   • гейта по возрасту сделки НЕТ — он отсекал бы ровно перевод старой сделки;
@@ -49,11 +58,17 @@ from waybill_config import (
     ACADEMY_LEAD_ALERT_DELAY_S,
     ACADEMY_LEAD_ALERT_ENABLED,
     ACADEMY_LEAD_ALERT_HOUR_LIMIT,
+    ACADEMY_LEAD_ALERT_STAGE_NAMES,
+    ACADEMY_LEAD_ALERT_STATUSES,
     ACADEMY_PANEL_FALLBACK_AMO_ID,
     FIELD_PHONE,
     PIPELINE_ACADEMY,
-    STATUS_ACADEMY_INBOUND_LEAD,
+    STATUS_ACADEMY_INBOUND_LEAD,  # noqa: F401 — на атрибут модуля ссылается test_alerts
 )
+
+# Вебхук amo отдаёт значения формой, то есть строками — сравниваем в одном виде.
+_ALERT_STATUSES = {str(s) for s in ACADEMY_LEAD_ALERT_STATUSES}
+_STAGE_NAMES = {str(k): v for k, v in ACADEMY_LEAD_ALERT_STAGE_NAMES.items()}
 
 logger = logging.getLogger("uvicorn")
 
@@ -146,8 +161,8 @@ def _budget_ok() -> bool:
     return False
 
 
-def is_inbound_lead(lead: dict) -> bool:
-    """Сделка ПРЯМО СЕЙЧАС стоит на «Входящем лиде» воронки Академии?
+def is_alert_stage(lead: dict) -> bool:
+    """Сделка ПРЯМО СЕЙЧАС стоит на одном из входных этапов Академии?
 
     Проверяется по сделке, а не по вебхуку: между вебхуком и отправкой проходит пауза,
     и за неё лид могли увести дальше."""
@@ -155,11 +170,20 @@ def is_inbound_lead(lead: dict) -> bool:
         return False
     if str(lead.get("pipeline_id")) != str(PIPELINE_ACADEMY):
         return False
-    return str(lead.get("status_id")) == str(STATUS_ACADEMY_INBOUND_LEAD)
+    return str(lead.get("status_id")) in _ALERT_STATUSES
+
+
+# Имя до 29.09.2026, когда этап был один. Оставлено, чтобы не ломать чужие вызовы.
+is_inbound_lead = is_alert_stage
+
+
+def _stage_name(lead: dict) -> str:
+    """Человекочитаемое имя этапа для сообщения (правило Кати 03.08.2026: без ID)."""
+    return _STAGE_NAMES.get(str((lead or {}).get("status_id")), "")
 
 
 def notify_bg(lead_id, pipeline_id, status_id) -> None:
-    """Разбор вебхука `/lead_change`: сделка Академии встала на «Входящий лид».
+    """Разбор вебхука `/lead_change`: сделка Академии встала на входной этап.
 
     Зовётся на КАЖДОМ изменении любой сделки, поэтому здесь только сравнения и словарь.
     Сеть и чтение amo — в фоне, в `_apply`."""
@@ -169,7 +193,7 @@ def notify_bg(lead_id, pipeline_id, status_id) -> None:
         return
     if str(pipeline_id) != str(PIPELINE_ACADEMY):
         return
-    if str(status_id) != str(STATUS_ACADEMY_INBOUND_LEAD):
+    if str(status_id) not in _ALERT_STATUSES:
         return
     if not _is_new(lead_id):
         return
@@ -191,9 +215,9 @@ async def _apply(lead_id) -> None:
             _unsee(lead_id)
             return
 
-        if not is_inbound_lead(lead):
+        if not is_alert_stage(lead):
             logger.info(
-                "Академия-алерт: сделка %s уже не на «Входящем лиде» — молчим", lead_id,
+                "Академия-алерт: сделка %s уже ушла со входных этапов — молчим", lead_id,
             )
             _unsee(lead_id)
             return
@@ -220,6 +244,7 @@ async def _apply(lead_id) -> None:
                 "телефон": phone or "",
                 "клиент": client or "",
                 "сделка": name if name and name != client else "",
+                "этап": _stage_name(lead),
                 "ссылка_на_сделку": alerts.lead_link(lead_id),
             },
         )
@@ -323,5 +348,10 @@ def _build_message(lead_id, lead: dict, client, phone) -> str:
     name = ((lead or {}).get("name") or "").strip()
     if name and name != client:
         lines.append(f"📝 {_esc(name)}")
+    # Этапа два, и они означают разные входы: «Бот запущен» — телеграм-бот, «Входящий лид» —
+    # заявка с мероприятия или письмо. Саше это нужно ещё до открытия карточки.
+    stage = _stage_name(lead)
+    if stage:
+        lines.append(f"🪜 {_esc(stage)}")
     lines.append(f'🔗 <a href="{BASE_URL}/leads/detail/{lead_id}">Открыть сделку</a>')
     return "\n".join(lines)

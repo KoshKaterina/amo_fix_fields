@@ -49,6 +49,7 @@ import tg_recipients  # noqa: E402
 from waybill_config import (  # noqa: E402
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
+    STATUS_ACADEMY_BOT_STARTED,
     STATUS_ACADEMY_FIRST_CONTACT,
     STATUS_ACADEMY_INBOUND_LEAD,
     STATUS_NEW_LEAD,
@@ -139,6 +140,20 @@ def test_stroki_iz_vebhuka_tozhe_prohodyat(scheduled):
     assert len(scheduled) == 1
 
 
+def test_bot_zapushchen_tozhe_zavodit_fon(scheduled):
+    """С 29.09.2026 бот кладёт сделку сразу сюда, минуя «Входящий лид» (Катя)."""
+    academy_lead_alert.notify_bg(LEAD_ID, PIPELINE_ACADEMY, STATUS_ACADEMY_BOT_STARTED)
+    assert len(scheduled) == 1
+
+
+def test_pereezd_mezhdu_dvumya_vhodami_daet_odno_soobshchenie(scheduled):
+    """Старый путь «Входящий лид → Бот запущен» не должен звонить дважды:
+    дедуп ключуется по сделке, а не по этапу."""
+    academy_lead_alert.notify_bg(LEAD_ID, PIPELINE_ACADEMY, STATUS_ACADEMY_INBOUND_LEAD)
+    academy_lead_alert.notify_bg(LEAD_ID, PIPELINE_ACADEMY, STATUS_ACADEMY_BOT_STARTED)
+    assert len(scheduled) == 1
+
+
 def test_drugoy_etap_akademii_ne_zavodit_fon(scheduled):
     academy_lead_alert.notify_bg(LEAD_ID, PIPELINE_ACADEMY, STATUS_ACADEMY_FIRST_CONTACT)
     assert scheduled == []
@@ -192,19 +207,28 @@ def test_posle_okna_uvedomlyaem_snova(scheduled):
 # ── гейт по сделке: пауза между вебхуком и отправкой ─────────────────────────
 
 def test_lid_na_etape_prohodit():
+    assert academy_lead_alert.is_alert_stage(_lead()) is True
+
+
+def test_bot_zapushchen_prohodit():
+    assert academy_lead_alert.is_alert_stage(_lead(status=STATUS_ACADEMY_BOT_STARTED)) is True
+
+
+def test_staroe_imya_funkcii_zhivo():
+    """`is_inbound_lead` осталось алиасом — на него мог ссылаться чужой код."""
     assert academy_lead_alert.is_inbound_lead(_lead()) is True
 
 
 def test_uehal_dalshe_po_voronke_ne_prohodit():
-    assert academy_lead_alert.is_inbound_lead(_lead(status=STATUS_ACADEMY_COURSE)) is False
+    assert academy_lead_alert.is_alert_stage(_lead(status=STATUS_ACADEMY_COURSE)) is False
 
 
 def test_chuzhaya_voronka_ne_prohodit():
-    assert academy_lead_alert.is_inbound_lead(_lead(pipeline=PIPELINE_CLEVER_MAIN)) is False
+    assert academy_lead_alert.is_alert_stage(_lead(pipeline=PIPELINE_CLEVER_MAIN)) is False
 
 
 def test_net_sdelki_ne_prohodit():
-    assert academy_lead_alert.is_inbound_lead(None) is False
+    assert academy_lead_alert.is_alert_stage(None) is False
 
 
 def test_uveli_za_pauzu_molchim_i_otmetka_snyata(monkeypatch):
@@ -248,8 +272,17 @@ def test_soobshchenie_soderzhit_ssylku_i_teg(monkeypatch):
     assert "+79991234567" in text
     assert "Пётр Иванов" in text
     assert "Заявка на курс DeFi" in text
+    # Этап называется словами, а не номером (правило Кати 03.08.2026).
+    assert "Входящий лид" in text
+    assert str(STATUS_ACADEMY_INBOUND_LEAD) not in text
     # Правило Кати 26.08.2026: точки посередине в текстах для людей не ставим.
     assert "·" not in text
+
+
+def test_v_soobshchenii_vidno_chto_lid_iz_bota(monkeypatch):
+    """Саша должен различать вход ещё до открытия карточки."""
+    _send(_lead(status=STATUS_ACADEMY_BOT_STARTED), monkeypatch)
+    assert "Бот запущен" in _sent[0]["text"]
 
 
 def test_uhodit_v_vetku_akademii_toy_zhe_supergruppy(monkeypatch):
