@@ -38,16 +38,41 @@ import httpx
 
 import amo_service
 from waybill_config import (
-    ACADEMY_CHAT_JOIN_DRY_RUN,
-    ACADEMY_CHAT_JOIN_ENABLED,
-    ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S,
-    ACADEMY_CHAT_JOIN_STATE_PATH,
     ACADEMY_INVITE_BOT_TOKEN,
     ACADEMY_PRACTICUM_CHAT_ID,
     PIPELINE_ACADEMY,
-    STATUS_ACADEMY_JOINED_CHAT,
     TG_PROXY_URL,
 )
+
+# Свои настройки живут в общем waybill_config, как у соседних модулей, НО падать из-за
+# них модуль не имеет права.
+#
+# ⚠️ Цена урока 29.09.2026. Этот модуль требовал из общего конфига четыре новых имени.
+# В то же пятиминутное окно параллельная сессия залила свою копию того же конфига,
+# собранную минутой раньше - без наших имён. Контейнер лёг в цикл перезапуска (девять
+# попыток), 22 запроса получили 502. Затем то же повторилось в обратную сторону: наш
+# откат конфига снёс их флаг, и упал уже их модуль.
+#
+# Отсюда правило: общий конфиг - ЖЕЛАЕМЫЙ источник, окружение - обязательный запасной.
+# Так одновременная правка общего файла двумя сессиями больше не роняет сервис.
+try:
+    from waybill_config import (  # noqa: F401
+        ACADEMY_CHAT_JOIN_DRY_RUN,
+        ACADEMY_CHAT_JOIN_ENABLED,
+        ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S,
+        ACADEMY_CHAT_JOIN_STATE_PATH,
+        STATUS_ACADEMY_JOINED_CHAT,
+    )
+except ImportError:  # чужая заливка общего конфига могла унести наши строки
+    ACADEMY_CHAT_JOIN_ENABLED = os.getenv("ACADEMY_CHAT_JOIN_ENABLED", "0").strip() == "1"
+    ACADEMY_CHAT_JOIN_DRY_RUN = os.getenv("ACADEMY_CHAT_JOIN_DRY_RUN", "0").strip() == "1"
+    ACADEMY_CHAT_JOIN_STATE_PATH = os.getenv(
+        "ACADEMY_CHAT_JOIN_STATE_PATH", "/app/var/academy/academy_chat_join.json")
+    ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S = int(
+        os.getenv("ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S", "25") or "25")
+    STATUS_ACADEMY_JOINED_CHAT = 88943006
+    logging.getLogger("uvicorn").warning(
+        "Академия-вступление: настроек нет в waybill_config - читаю окружение напрямую")
 
 logger = logging.getLogger("uvicorn")
 
