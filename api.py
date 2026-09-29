@@ -678,20 +678,32 @@ async def create_task(
     return data is not None
 
 
-async def get_open_tasks(entity_id: int, entity_type: str = "leads") -> list[dict] | None:
-    """Незакрытые задачи сущности. None - amo НЕ ОТВЕТИЛ, это не то же, что «задач нет».
+async def get_open_tasks_by_responsible(responsible_user_id: int) -> list[dict] | None:
+    """Все незакрытые задачи менеджера (любые сущности). None - amo НЕ ОТВЕТИЛ.
 
-    Разница принципиальна для сторожей: молчание amo нельзя читать как «путь свободен»,
-    иначе на каждом сбое связи мы ставим задачу поверх существующей.
+    Разница между None и пустым списком принципиальна для сторожей: молчание amo нельзя
+    читать как «задач нет», иначе на каждом сбое связи мы ставим задачу поверх живой.
+
+    Отдаём ВСЕ задачи менеджера, а пересечение с клиентом считает вызывающий: фильтра
+    «по клиенту» в amo нет, а у менеджера задач десятки, не тысячи (замер 29.09.2026:
+    44 у самого загруженного), это одна-две страницы.
     """
-    url = (
-        f"{BASE_URL}/api/v4/tasks?filter[entity_type]={entity_type}"
-        f"&filter[entity_id]={int(entity_id)}&filter[is_completed]=0&limit=250"
-    )
-    data = await _request_json("GET", url, what=f"get_open_tasks[{entity_id}]")
-    if data is None:
-        return None
-    return ((data.get("_embedded") or {}).get("tasks")) or []
+    tasks: list[dict] = []
+    page = 1
+    while page <= 20:
+        url = (
+            f"{BASE_URL}/api/v4/tasks?filter[responsible_user_id]={int(responsible_user_id)}"
+            f"&filter[is_completed]=0&limit=250&page={page}"
+        )
+        data = await _request_json("GET", url, what=f"open_tasks_by_resp[{responsible_user_id}]")
+        if data is None:
+            return None
+        batch = ((data.get("_embedded") or {}).get("tasks")) or []
+        tasks.extend(batch)
+        if len(batch) < 250 or "next" not in ((data.get("_links") or {})):
+            break
+        page += 1
+    return tasks
 
 
 async def create_unsorted_lead(

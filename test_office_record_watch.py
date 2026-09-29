@@ -56,6 +56,9 @@ from waybill_config import (  # noqa: E402
 )
 
 LEAD = 36555973
+CONTACT = 48599231
+OTHER_LEAD_SAME_CLIENT = 36500001
+OTHER_CLIENT_LEAD = 36500002
 ZUBALIY = 13963494
 POLESSKIY = 13946318
 
@@ -69,7 +72,8 @@ _ORIG_GET_LEAD = O.amo_service.get_lead_full
 _ORIG_BY_STATUS = O.amo_service.get_leads_by_status
 _ORIG_ADD_NOTE = O.amo_service.add_note
 _ORIG_CREATE_TASK = O.api.create_task
-_ORIG_OPEN_TASKS = O.api.get_open_tasks
+_ORIG_OPEN_TASKS = O.api.get_open_tasks_by_responsible
+_ORIG_CONTACT = O.amo_service.get_contact_by_id
 _ORIG_CLAIM = O.notices.claim_notice
 _ORIG_PURGE = O.notices.purge_notices_older_than
 
@@ -79,7 +83,8 @@ def setup_function(_=None):
     O.amo_service.get_leads_by_status = _ORIG_BY_STATUS
     O.amo_service.add_note = _ORIG_ADD_NOTE
     O.api.create_task = _ORIG_CREATE_TASK
-    O.api.get_open_tasks = _ORIG_OPEN_TASKS
+    O.api.get_open_tasks_by_responsible = _ORIG_OPEN_TASKS
+    O.amo_service.get_contact_by_id = _ORIG_CONTACT
     O.notices.claim_notice = _ORIG_CLAIM
     O.notices.purge_notices_older_than = _ORIG_PURGE
     O._last_run.clear()
@@ -91,7 +96,7 @@ def setup_function(_=None):
     O.OFFICE_RECORD_WATCH_ENABLED = True
     O.OFFICE_RECORD_WATCH_CREATE_ENABLED = True
     O.OFFICE_RECORD_NOTE_ENABLED = False
-    O.OFFICE_RECORD_SKIP_IF_OPEN_TASK = True
+    O.OFFICE_RECORD_SKIP_IF_CLIENT_BUSY = True
     O.OFFICE_RECORD_ALERT_ENABLED = False
     O.OFFICE_RECORD_TASK_RESPONSIBLE_USER_ID = 0
     O.OFFICE_RECORD_TASK_TYPE_ID = 1
@@ -112,7 +117,8 @@ def teardown_function(_=None):
 
 
 def _lead(end_ts=END_TS, *, lead_id=LEAD, status=STATUS_CLEVER_OFFICE_RECORD,
-          pipeline=PIPELINE_CLEVER_MAIN, responsible=ZUBALIY, with_start=True):
+          pipeline=PIPELINE_CLEVER_MAIN, responsible=ZUBALIY, with_start=True,
+          contact_id=CONTACT):
     cfs = []
     if with_start:
         cfs.append({"field_id": FIELD_OFFICE_RECORD_START, "field_type": "date_time",
@@ -120,8 +126,11 @@ def _lead(end_ts=END_TS, *, lead_id=LEAD, status=STATUS_CLEVER_OFFICE_RECORD,
     if end_ts is not None:
         cfs.append({"field_id": FIELD_OFFICE_RECORD_END, "field_type": "date_time",
                     "values": [{"value": end_ts}]})
-    return {"id": lead_id, "status_id": status, "pipeline_id": pipeline,
+    lead = {"id": lead_id, "status_id": status, "pipeline_id": pipeline,
             "responsible_user_id": responsible, "custom_fields_values": cfs}
+    if contact_id:
+        lead["_embedded"] = {"contacts": [{"id": contact_id}]}
+    return lead
 
 
 class _FakeClaims:
@@ -138,10 +147,13 @@ class _FakeClaims:
         return True
 
 
-def _wire(leads, *, fresh=None, task_ok=True, open_tasks=()):
+def _wire(leads, *, fresh=None, task_ok=True, open_tasks=(), client_leads=(),
+          contact_silent=False):
     """Подменяет amo и дедуп. Возвращает (claims, созданные задачи).
 
-    open_tasks: что отдаёт api.get_open_tasks. () - задач нет, None - amo молчит.
+    open_tasks: что отдаёт api.get_open_tasks_by_responsible. () - нет, None - молчит.
+    client_leads: сделки клиента помимо самой сторожимой.
+    contact_silent: контакт не читается (amo молчит).
     """
     claims = _FakeClaims()
     tasks = []
@@ -160,13 +172,20 @@ def _wire(leads, *, fresh=None, task_ok=True, open_tasks=()):
                       "complete_till": complete_till, "type": task_type_id})
         return task_ok
 
-    async def fake_open_tasks(entity_id, entity_type="leads"):
+    async def fake_open_tasks(responsible_user_id):
         return None if open_tasks is None else list(open_tasks)
+
+    async def fake_contact(contact_id, with_=()):
+        if contact_silent:
+            return None
+        return {"id": int(contact_id),
+                "_embedded": {"leads": [{"id": i} for i in client_leads]}}
 
     O.amo_service.get_leads_by_status = fake_by_status
     O.amo_service.get_lead_full = fake_full
     O.api.create_task = fake_create_task
-    O.api.get_open_tasks = fake_open_tasks
+    O.api.get_open_tasks_by_responsible = fake_open_tasks
+    O.amo_service.get_contact_by_id = fake_contact
     O.notices.claim_notice = claims
     return claims, tasks
 
@@ -380,34 +399,66 @@ def test_status_молчит_пока_флаг_выключен():
     assert O.status()["enabled"] is True
 
 
-def test_открытая_задача_на_сделке_глушит_сторожа():
-    """Решение Кати 29.09.2026, отменяет её же «ставить всегда» от 27.09."""
+def _task(entity_type, entity_id, text="Перезвонить"):
+    return {"id": 1, "entity_type": entity_type, "entity_id": entity_id, "text": text}
+
+
+def test_задача_менеджера_по_этому_же_клиенту_глушит():
+    """Формулировка Кати 29.09.2026: задачи ЭТОГО менеджера по ЭТОМУ клиенту."""
     O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
-    claims, tasks = _wire([_lead()], fresh=_lead(),
-                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
-    assert asyncio.run(O.sweep_once()) == {"has-open-task": 1}
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[_task("leads", LEAD)])
+    assert asyncio.run(O.sweep_once()) == {"client-busy": 1}
     assert tasks == []
-    # Ключ НЕ сожжён: закроют чужую задачу и не двинут сделку - напомним.
+    # Ключ НЕ сожжён: закроет задачу и не двинет сделку - напомним.
     assert claims.taken == set()
 
 
-def test_после_закрытия_чужой_задачи_сторож_срабатывает():
+def test_задача_на_соседней_сделке_того_же_клиента_тоже_глушит():
+    """Клиент - это не одна сделка. Для менеджера это одна работа."""
     O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
     claims, tasks = _wire([_lead()], fresh=_lead(),
-                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
-    assert asyncio.run(O.sweep_once()) == {"has-open-task": 1}
-    # Задачу закрыли - открытых больше нет.
-    async def no_tasks(entity_id, entity_type="leads"):
-        return []
+                          client_leads=[OTHER_LEAD_SAME_CLIENT],
+                          open_tasks=[_task("leads", OTHER_LEAD_SAME_CLIENT)])
+    assert asyncio.run(O.sweep_once()) == {"client-busy": 1}
+    assert tasks == []
 
-    O.api.get_open_tasks = no_tasks
+
+def test_задача_на_самом_контакте_тоже_глушит():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[_task("contacts", CONTACT)])
+    assert asyncio.run(O.sweep_once()) == {"client-busy": 1}
+    assert tasks == []
+
+
+def test_чужая_задача_не_глушит():
+    """Ошибка первой версии 29.09: чужая задача нашего ответственного не касается.
+
+    Спрашиваем задачи ИМЕННО нашего менеджера, поэтому задача другого человека
+    в его список не попадает."""
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[])
+    assert asyncio.run(O.sweep_once()) == {"created": 1}
+    assert len(tasks) == 1
+
+
+def test_задача_менеджера_по_другому_клиенту_не_глушит():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(),
+                          open_tasks=[_task("leads", OTHER_CLIENT_LEAD)])
+    assert asyncio.run(O.sweep_once()) == {"created": 1}
+    assert len(tasks) == 1
+
+
+def test_сделка_без_контакта_гейт_не_применяем():
+    """Клиента не знаем - молчать не за что, задача нужна тем более."""
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead(contact_id=None)], fresh=_lead(contact_id=None),
+                          open_tasks=[_task("leads", LEAD)])
     assert asyncio.run(O.sweep_once()) == {"created": 1}
     assert len(tasks) == 1
 
 
 def test_amo_молчит_про_задачи_ключ_не_сожжён():
-    """Молчание amo нельзя читать как «задач нет» - иначе на каждом сбое связи
-    мы кладём задачу поверх существующей."""
     O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
     claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=None)
     assert asyncio.run(O.sweep_once()) == {"tasks-silent": 1}
@@ -415,11 +466,31 @@ def test_amo_молчит_про_задачи_ключ_не_сожжён():
     assert claims.taken == set()
 
 
-def test_гейт_выключен_флагом_ставим_несмотря_на_чужую_задачу():
+def test_amo_молчит_про_контакт_ключ_не_сожжён():
     O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
-    O.OFFICE_RECORD_SKIP_IF_OPEN_TASK = False
-    claims, tasks = _wire([_lead()], fresh=_lead(),
-                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
+    claims, tasks = _wire([_lead()], fresh=_lead(), contact_silent=True)
+    assert asyncio.run(O.sweep_once()) == {"tasks-silent": 1}
+    assert tasks == []
+    assert claims.taken == set()
+
+
+def test_после_закрытия_задачи_сторож_срабатывает():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[_task("leads", LEAD)])
+    assert asyncio.run(O.sweep_once()) == {"client-busy": 1}
+
+    async def no_tasks(responsible_user_id):
+        return []
+
+    O.api.get_open_tasks_by_responsible = no_tasks
+    assert asyncio.run(O.sweep_once()) == {"created": 1}
+    assert len(tasks) == 1
+
+
+def test_гейт_выключен_флагом():
+    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
+    O.OFFICE_RECORD_SKIP_IF_CLIENT_BUSY = False
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[_task("leads", LEAD)])
     assert asyncio.run(O.sweep_once()) == {"created": 1}
     assert len(tasks) == 1
 
@@ -428,17 +499,9 @@ def test_гейт_работает_и_в_режиме_отчёта():
     """Отчёт должен предсказывать бой, а не врать в оптимистичную сторону."""
     O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
     O.OFFICE_RECORD_WATCH_CREATE_ENABLED = False
-    claims, tasks = _wire([_lead()], fresh=_lead(),
-                          open_tasks=[{"id": 1, "text": "Перезвонить клиенту"}])
-    assert asyncio.run(O.sweep_once()) == {"has-open-task": 1}
+    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[_task("leads", LEAD)])
+    assert asyncio.run(O.sweep_once()) == {"client-busy": 1}
     assert tasks == []
-
-
-def test_нет_открытых_задач_ставим_как_раньше():
-    O.OFFICE_RECORD_MAX_AGE_DAYS = 3650
-    claims, tasks = _wire([_lead()], fresh=_lead(), open_tasks=[])
-    assert asyncio.run(O.sweep_once()) == {"created": 1}
-    assert len(tasks) == 1
 
 
 def _mk_by_status(leads):

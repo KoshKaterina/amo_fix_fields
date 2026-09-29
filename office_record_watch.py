@@ -36,14 +36,17 @@ GET, список `/api/v4/leads` отдаёт `custom_fields_values` (пров�
     значит сторож честно взводится заново. Ключ по одной сделке запретил бы это навсегда;
   • в режиме отчёта (`OFFICE_RECORD_WATCH_CREATE_ENABLED=0`) ключи НЕ жжём - иначе сутки
     обкатки выжгли бы их все и фича уехала бы в бой навсегда молчащей.
-  • у сделки есть ЛЮБАЯ незакрытая задача - молчим: сделку уже держит человек,
-    вторая задача об одном только мусорит список (решение Кати 29.09.2026);
+  • у менеджера уже есть открытая задача по ЭТОМУ ЖЕ КЛИЕНТУ - молчим: он уже
+    держит человека в работе, вторая задача про того же клиента ему не нужна;
 
 Решения Кати 27.09.2026: одна задача на одну запись (без напоминаний по кругу), тип
 задачи «Связаться».
-⚠️ Решение Кати 29.09.2026 ОТМЕНИЛО её же прежнее «ставить всегда»: теперь перед
-созданием смотрим открытые задачи сделки и при любой незакрытой молчим
-(`OFFICE_RECORD_SKIP_IF_OPEN_TASK`). Повод: 13 задач бэклога легли пачкой на двух человек.
+⚠️ Решение Кати 29.09.2026 ОТМЕНИЛО её же прежнее «ставить всегда». Повод: 13 задач
+бэклога легли пачкой на двух человек.
+⚠️ ПЕРВАЯ версия гейта была НЕВЕРНОЙ и откачена в тот же день: она смотрела ЛЮБЫЕ
+открытые задачи на сделке. Слова Кати: «при рассмотрении добавления задачи по клиенту
+мы должны смотреть есть ли у менеджера открытые задачи по этому же клиенту, а не в принципе».
+Действует вторая версия: `OFFICE_RECORD_SKIP_IF_CLIENT_BUSY`.
 """
 
 import asyncio
@@ -64,7 +67,7 @@ from waybill_config import (
     OFFICE_RECORD_MAX_AGE_DAYS,
     OFFICE_RECORD_MAX_PER_PASS,
     OFFICE_RECORD_NOTE_ENABLED,
-    OFFICE_RECORD_SKIP_IF_OPEN_TASK,
+    OFFICE_RECORD_SKIP_IF_CLIENT_BUSY,
     OFFICE_RECORD_TASK_DEADLINE_H,
     OFFICE_RECORD_TASK_RESPONSIBLE_USER_ID,
     OFFICE_RECORD_TASK_TEXT,
@@ -197,7 +200,7 @@ async def _still_waiting(lead_id: int, end_ts: int) -> tuple[str, dict | None]:
     Во всех случаях кроме "ok" ключ дедупа НЕ жжём.
     """
     try:
-        lead = await amo_service.get_lead_full(lead_id, with_=())
+        lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
     except Exception:
         logger.exception("Сторож записи в офис: не прочиталась сделка %s", lead_id)
         return "silent", None
@@ -215,20 +218,70 @@ async def _still_waiting(lead_id: int, end_ts: int) -> tuple[str, dict | None]:
     return "ok", lead
 
 
-async def _has_open_task(lead_id: int) -> bool | None:
-    """Есть ли у сделки хоть одна незакрытая задача. None - amo не ответил.
+async def _client_busy(lead: dict, responsible_id) -> bool | None:
+    """Есть ли у ЭТОГО менеджера открытая задача по ЭТОМУ ЖЕ клиенту.
 
-    Зовётся ТОЛЬКО по сделке, уже решённой на «сработать», а не на каждую сделку
-    этапа: в стоячем режиме это ноль-два запроса в сутки, а не семнадцать на каждый проход.
+    None - amo не ответил, решение откладываем до следующего прохода.
+
+    Клиент - это не одна сделка: считаем сам контакт И все его сделки. Менеджер
+    может держать задачу на соседней сделке того же человека или на контакте - для
+    него это одна работа, и вторая задача про того же клиента ему не нужна.
+
+    Контакта у сделки нет или нет ответственного - гейт НЕ применяем (False):
+    молчать тут не за что, а задача нужна тем больше.
     """
     try:
-        tasks = await api.get_open_tasks(lead_id)
+        responsible_id = int(responsible_id or 0)
+    except (TypeError, ValueError):
+        return False
+    if not responsible_id:
+        return False
+
+    contact_ids = []
+    for c in ((lead.get("_embedded") or {}).get("contacts")) or []:
+        try:
+            contact_ids.append(int(c.get("id")))
+        except (TypeError, ValueError):
+            continue
+    if not contact_ids:
+        return False
+
+    # Всё, что считается «этим же клиентом».
+    client: set[tuple[str, int]] = {("contacts", cid) for cid in contact_ids}
+    try:
+        client.add(("leads", int(lead.get("id"))))
+    except (TypeError, ValueError):
+        pass
+    for cid in contact_ids:
+        try:
+            contact = await amo_service.get_contact_by_id(cid, with_=("leads",))
+        except Exception:
+            logger.exception("Сторож записи в офис: не прочитался контакт %s", cid)
+            return None
+        if not contact:
+            return None
+        for l in ((contact.get("_embedded") or {}).get("leads")) or []:
+            try:
+                client.add(("leads", int(l.get("id"))))
+            except (TypeError, ValueError):
+                continue
+
+    try:
+        tasks = await api.get_open_tasks_by_responsible(responsible_id)
     except Exception:
-        logger.exception("Сторож записи в офис: не прочитались задачи сделки %s", lead_id)
+        logger.exception("Сторож записи в офис: не прочитались задачи менеджера %s", responsible_id)
         return None
     if tasks is None:
         return None
-    return bool(tasks)
+
+    for t in tasks:
+        try:
+            key = (str(t.get("entity_type") or ""), int(t.get("entity_id") or 0))
+        except (TypeError, ValueError):
+            continue
+        if key in client:
+            return True
+    return False
 
 
 async def _create(lead: dict, end_ts: int) -> str:
@@ -308,17 +361,17 @@ async def sweep_once() -> dict:
             if state != "ok":
                 decisions[state] = decisions.get(state, 0) + 1
                 continue
-            if OFFICE_RECORD_SKIP_IF_OPEN_TASK:
-                busy = await _has_open_task(lead_id)
+            if OFFICE_RECORD_SKIP_IF_CLIENT_BUSY:
+                busy = await _client_busy(fresh or lead, (fresh or lead).get("responsible_user_id"))
                 if busy is None:
-                    # amo не ответил про задачи - молчание не значит «путь свободен».
+                    # amo не ответил - молчание не значит «путь свободен».
                     # Ключ не жжём, вернёмся следующим проходом.
                     decisions["tasks-silent"] = decisions.get("tasks-silent", 0) + 1
                     continue
                 if busy:
-                    # Сделку уже держит человек (решение Кати 29.09.2026).
+                    # Менеджер уже держит этого клиента (формулировка Кати 29.09.2026).
                     # Ключ ТОЖЕ не жжём: закроет задачу и не двинет сделку - напомним.
-                    decisions["has-open-task"] = decisions.get("has-open-task", 0) + 1
+                    decisions["client-busy"] = decisions.get("client-busy", 0) + 1
                     continue
             if not OFFICE_RECORD_WATCH_CREATE_ENABLED:
                 decisions["would-fire"] = decisions.get("would-fire", 0) + 1
@@ -447,12 +500,12 @@ async def init() -> None:
         _task = asyncio.create_task(_loop())
         logger.info(
             "Сторож записи в офис: поднят (опрос %ss, запас %s мин, давность до %s дн, "
-            "не больше %s задач за проход, тип задачи %s, создание %s, чужая открытая задача - %s)",
+            "не больше %s задач за проход, тип задачи %s, создание %s, занят клиентом - %s)",
             OFFICE_RECORD_WATCH_INTERVAL_S, OFFICE_RECORD_GRACE_MIN,
             OFFICE_RECORD_MAX_AGE_DAYS, OFFICE_RECORD_MAX_PER_PASS,
             OFFICE_RECORD_TASK_TYPE_ID,
             "ВКЛ" if OFFICE_RECORD_WATCH_CREATE_ENABLED else "выкл (режим отчёта)",
-            "молчим" if OFFICE_RECORD_SKIP_IF_OPEN_TASK else "ставим всё равно",
+            "молчим" if OFFICE_RECORD_SKIP_IF_CLIENT_BUSY else "ставим всё равно",
         )
 
 
@@ -477,6 +530,6 @@ def status() -> dict:
         "interval_s": OFFICE_RECORD_WATCH_INTERVAL_S,
         "grace_min": OFFICE_RECORD_GRACE_MIN,
         "max_age_days": OFFICE_RECORD_MAX_AGE_DAYS,
-        "skip_if_open_task": OFFICE_RECORD_SKIP_IF_OPEN_TASK,
+        "skip_if_client_busy": OFFICE_RECORD_SKIP_IF_CLIENT_BUSY,
         "last_run": dict(_last_run),
     }
