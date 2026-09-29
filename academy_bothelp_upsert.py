@@ -3,11 +3,19 @@
 Штатное действие BotHelp ищет сделку только по CUID. После автоматической
 склейки NOVA CUID может исчезнуть с выжившего контакта, и следующие шаги бота
 молча перестают обновлять amo. Этот обработчик принимает полный webhook
-BotHelp, ищет человека по CUID/телефону/email и обновляет одну открытую сделку.
+BotHelp, ищет человека по CUID/телефону/email/Telegram и обновляет одну открытую сделку.
+
+⚠️ 29.09.2026 здесь сведены ДВЕ линии работы, три дня жившие порознь и не включавшие одна
+другую. Боевая дала замок от гонок, сопоставление по Telegram, поля «Откуда…» и СТРОГИЙ путь
+практикума для legacy-сценария; линия `master` - вынесенный ранг этапов, `just_created` и
+МЯГКИЙ путь практикума для обычной записи. Оба пути практикума оставлены намеренно: строгий
+ловит только действие «связаться с клиентом», обычную запись он пропускал. Разбор -
+`projects/amo-cleanup/knowledge/priyomnik-bothelp-dve-linii-koda.md` в рабочей папке.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -15,17 +23,26 @@ from typing import Any
 
 import amo_service
 import api
+import academy_invite_delivery
 from waybill_config import (
     ACADEMY_BOTHELP_UPSERT_ENABLED,
     ACADEMY_BOTHELP_WEBHOOK_SECRET,
     ACADEMY_CUTOVER_TS,
     ACADEMY_RESPONSIBLE_USER_ID,
     PIPELINE_ACADEMY,
+    STATUS_ACADEMY_RECORDED_PRACTICUM,
 )
 
 logger = logging.getLogger(__name__)
 
+# One uvicorn worker serves this isolated webhook. Serializing the complete
+# resolve/create sequence closes the check-then-create race between simultaneous
+# BotHelp deliveries: the second request resolves again after the first commit.
+_UPSERT_LOCK = asyncio.Lock()
+
 FIELD_CUID = 573753
+FIELD_TELEGRAM_ID = 571839
+FIELD_TELEGRAM_USERNAME = 577785
 FIELD_PD_CONSENT = 578239
 FIELD_PD_VERSION = 578241
 FIELD_MARKETING_CONSENT = 578245
@@ -36,13 +53,17 @@ FIELD_EXPERIENCE = 578263
 FIELD_CAPITAL = 578265
 FIELD_PURPOSE = 578267
 FIELD_ACTION = 578269
+FIELD_SOURCE_MANAGER = 578285
+FIELD_SOURCE_PRACTICUM = 578287
 
 STATUS_INBOUND = 87654850
 STATUS_BOT_STARTED = 88838378
 STATUS_QUESTIONNAIRE = 88838382
 STATUS_QUESTIONNAIRE_DONE = 88838386
-STATUS_RECORDED_PRACTICUM = 88835666
+STATUS_RECORDED_PRACTICUM = STATUS_ACADEMY_RECORDED_PRACTICUM
 _BOT_STATUSES = {STATUS_INBOUND, STATUS_BOT_STARTED, STATUS_QUESTIONNAIRE, STATUS_QUESTIONNAIRE_DONE}
+_FORWARD_ONLY_PRACTICUM_ACTION = "связаться с клиентом"
+_LEGACY_PRACTICUM_INTENT_REF = "179005890770899fb909ef"
 
 _CUSTOM_MAP = {
     "pd_consent": FIELD_PD_CONSENT,
@@ -55,6 +76,8 @@ _CUSTOM_MAP = {
     "размер_капитала": FIELD_CAPITAL,
     "зачем_капитал": FIELD_PURPOSE,
     "действие менеджера": FIELD_ACTION,
+    "Откуда вызван менеджер": FIELD_SOURCE_MANAGER,
+    "Откуда записался на практикум": FIELD_SOURCE_PRACTICUM,
 }
 
 
@@ -73,6 +96,27 @@ def _text(value: Any) -> str:
 def _phone(value: Any) -> str:
     digits = re.sub(r"\D", "", _text(value))
     return digits[-10:] if len(digits) >= 10 else digits
+
+
+def _telegram_id(payload: dict) -> str:
+    """Return a numeric messenger ID from BotHelp's standard webhook fields."""
+    for key in ("user_id", "channel_user_id", "telegram_id"):
+        value = _text(payload.get(key))
+        if value.isdigit():
+            return value
+    return ""
+
+
+def _telegram_username(payload: dict) -> str:
+    """Return a normalized Telegram username when BotHelp provides one."""
+    for key in ("messenger_username", "telegram_username"):
+        value = _text(payload.get(key))
+        if value:
+            return value if value.startswith("@") else f"@{value}"
+    user_id = _text(payload.get("user_id"))
+    if user_id and not user_id.isdigit():
+        return user_id if user_id.startswith("@") else f"@{user_id}"
+    return ""
 
 
 def _field(contact: dict, field_id: int) -> str:
@@ -108,6 +152,12 @@ def _payload_fields(payload: dict) -> dict[int, str]:
     cuid = _text(payload.get("cuid"))
     if cuid:
         out[FIELD_CUID] = cuid
+    telegram_id = _telegram_id(payload)
+    if telegram_id:
+        out[FIELD_TELEGRAM_ID] = telegram_id
+    telegram_username = _telegram_username(payload)
+    if telegram_username:
+        out[FIELD_TELEGRAM_USERNAME] = telegram_username
     for key, field_id in _CUSTOM_MAP.items():
         value = _text(payload.get(key))
         if value:
@@ -115,9 +165,63 @@ def _payload_fields(payload: dict) -> dict[int, str]:
     return out
 
 
+def _is_practicum_registration(payload: dict) -> bool:
+    return "практикум" in _text(payload.get("Регистрация на мероприятие")).casefold()
+
+
+def _is_forward_only_practicum(payload: dict) -> bool:
+    action = _text(payload.get("действие менеджера") or payload.get("manager_action"))
+    return _is_practicum_registration(payload) and action.casefold() == _FORWARD_ONLY_PRACTICUM_ACTION
+
+
+def _has_trusted_legacy_practicum_intent(payload: dict) -> bool:
+    """The generic legacy action is delivery intent only with node evidence.
+
+    BotHelp must add this immutable ref to the webhook payload from node 709.
+    A stored contact field or the generic action alone is deliberately rejected.
+    """
+    ref = _text(payload.get("academy_intent_ref") or payload.get("bothelp_step_ref"))
+    return _is_forward_only_practicum(payload) and hmac.compare_digest(
+        ref, _LEGACY_PRACTICUM_INTENT_REF,
+    )
+
+
+async def _promote_forward_only_practicum(payload: dict, contact_id: int, lead: dict) -> str:
+    """Move legacy flow registrations forward without creating or sending a link."""
+    contact = await amo_service.get_contact_by_id(contact_id, with_=())
+    if not contact:
+        return "contact_readback_failed"
+    for field_id in (FIELD_EVENT, FIELD_ACTION):
+        expected = _payload_fields(payload).get(field_id, "")
+        if not expected or _field(contact, field_id).casefold() != expected.casefold():
+            return "contact_readback_mismatch"
+
+    current = await amo_service.get_lead_full(int(lead["id"]), with_=())
+    if not current:
+        return "lead_readback_failed"
+    status = int(current.get("status_id") or 0)
+    if status != STATUS_RECORDED_PRACTICUM:
+        if status not in _BOT_STATUSES:
+            return "stage_guard"
+        patched = await amo_service.patch_lead(
+            int(lead["id"]),
+            status_id=STATUS_RECORDED_PRACTICUM,
+            pipeline_id=PIPELINE_ACADEMY,
+        )
+        if not patched.get("ok"):
+            return "stage_update_failed"
+    confirmed = await amo_service.get_lead_full(int(lead["id"]), with_=())
+    if int((confirmed or {}).get("status_id") or 0) != STATUS_RECORDED_PRACTICUM:
+        return "stage_readback_mismatch"
+    return "recorded_practicum"
+
+
 async def _candidate_contacts(payload: dict) -> list[dict] | None:
     queries = []
-    for value in (payload.get("cuid"), _phone(payload.get("phone")), payload.get("email")):
+    for value in (
+        payload.get("cuid"), _phone(payload.get("phone")), payload.get("email"),
+        _telegram_id(payload), _telegram_username(payload),
+    ):
         value = _text(value)
         if value and value not in queries:
             queries.append(value)
@@ -141,7 +245,16 @@ def _matches(contact: dict, payload: dict) -> bool:
     if phone and any(_phone(v.get("value")) == phone for v in _multitext_values(contact, "PHONE")):
         return True
     email = _text(payload.get("email")).lower()
-    return bool(email and any(_text(v.get("value")).lower() == email for v in _multitext_values(contact, "EMAIL")))
+    if email and any(_text(v.get("value")).lower() == email for v in _multitext_values(contact, "EMAIL")):
+        return True
+    telegram_id = _telegram_id(payload)
+    if telegram_id and _field(contact, FIELD_TELEGRAM_ID) == telegram_id:
+        return True
+    telegram_username = _telegram_username(payload).casefold()
+    return bool(
+        telegram_username
+        and _field(contact, FIELD_TELEGRAM_USERNAME).casefold() == telegram_username
+    )
 
 
 async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
@@ -151,7 +264,10 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
     candidates = []
     for row in rows:
         full = await amo_service.get_contact_by_id(row["id"], with_=("leads",))
-        if full and _matches(full, payload):
+        if not full or int(full.get("id") or 0) != int(row["id"]):
+            # An unread candidate is not evidence that the person is absent.
+            return None, None, "search_failed"
+        if _matches(full, payload):
             candidates.append(full)
 
     best_contact = None
@@ -159,6 +275,10 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
     for contact in candidates:
         lead_ids = [int(x["id"]) for x in (contact.get("_embedded") or {}).get("leads") or [] if x.get("id")]
         leads = await amo_service.get_leads_by_ids(lead_ids)
+        if {int(x.get("id") or 0) for x in leads or []} != set(lead_ids):
+            # The batch helper may return []/a partial batch after a read failure.
+            # Retry resolution later; never create a replacement on that basis.
+            return None, None, "search_failed"
         open_academy = [
             lead for lead in leads
             if int(lead.get("pipeline_id") or 0) == PIPELINE_ACADEMY
@@ -180,6 +300,8 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
 # профиль подписчика целиком, а не «что изменилось», и на повторном заходе приносит те же
 # поля заново. Без ранга частичный профиль («пришёл только один ответ анкеты») утащил бы
 # сделку с «Анкеты пройденной» обратно на «Проходит анкету».
+# Вынесен из тела функции при сведении линий 29.09.2026: поведение то же, но порядок этапов
+# теперь виден снаружи и читается без разбора функции.
 _STAGE_RANK = {
     STATUS_INBOUND: 0,
     STATUS_BOT_STARTED: 1,
@@ -188,9 +310,16 @@ _STAGE_RANK = {
 }
 
 
-def _wants_practicum(event: str, manager_action: str) -> bool:
-    """Просьба записать на практикум - в названии мероприятия или в действии клиента."""
-    return "практикум" in _text(event).lower() or "практикум" in _text(manager_action).lower()
+def _wants_practicum(event: Any, manager_action: Any) -> bool:
+    """Просьба записать на практикум - в названии мероприятия ИЛИ в действии клиента.
+
+    Шире, чем `_is_practicum_registration`: тот смотрит только поле регистрации, а бот просит
+    записать и через «действие менеджера».
+    """
+    return (
+        "практикум" in _text(event).casefold()
+        or "практикум" in _text(manager_action).casefold()
+    )
 
 
 def _target_status(
@@ -209,6 +338,10 @@ def _target_status(
     `practicum_is_new` - флаг практикума ИЗМЕНИЛСЯ в этом запросе. Ложь означает, что то же
     значение уже лежало в карточке с прошлого раза: человек просто нажал `/start`, а не
     записывался заново.
+
+    ⚠️ Это МЯГКИЙ путь для обычной записи. Legacy-сценарий («связаться с клиентом») идёт
+    раньше и строже - через `_promote_forward_only_practicum`, с обратным чтением карточки и
+    доверенным признаком шага бота. Порядок важен: сработавший строгий путь сюда не доходит.
     """
     if just_created:
         return None
@@ -232,7 +365,7 @@ def _target_status(
     return None
 
 
-async def process(payload: dict) -> dict[str, Any]:
+async def _process_unlocked(payload: dict) -> dict[str, Any]:
     if not configured():
         return {"ok": False, "reason": "disabled"}
     contact, lead, resolution = await _resolve(payload)
@@ -281,6 +414,24 @@ async def process(payload: dict) -> dict[str, Any]:
             return {"ok": False, "reason": "lead_create_failed", "contact_id": contact["id"]}
         lead = {"id": lead_id, "status_id": STATUS_BOT_STARTED, "created_at": ACADEMY_CUTOVER_TS}
 
+    if _is_forward_only_practicum(payload):
+        progression = await _promote_forward_only_practicum(payload, int(contact["id"]), lead)
+        if progression != "recorded_practicum":
+            return {
+                "ok": False, "reason": progression,
+                "contact_id": contact["id"], "lead_id": lead["id"],
+            }
+        logger.info(
+            "ACADEMY_BOTHELP_UPSERT forward-only cuid=%s contact=%s lead=%s",
+            _text(payload.get("cuid")), contact["id"], lead["id"],
+        )
+        if _has_trusted_legacy_practicum_intent(payload):
+            academy_invite_delivery.schedule(payload, int(lead["id"]))
+        return {
+            "ok": True, "contact_id": contact["id"], "lead_id": lead["id"],
+            "resolution": resolution, "progression": progression,
+        }
+
     target = _target_status(
         payload, int(lead.get("status_id") or 0),
         practicum_is_new=practicum_now and not practicum_was,
@@ -289,7 +440,6 @@ async def process(payload: dict) -> dict[str, Any]:
     if target:
         result = await amo_service.patch_lead(
             lead["id"], status_id=target, pipeline_id=PIPELINE_ACADEMY,
-            responsible_user_id=ACADEMY_RESPONSIBLE_USER_ID,
         )
         if not result.get("ok"):
             return {"ok": False, "reason": "lead_update_failed", "contact_id": contact["id"], "lead_id": lead["id"]}
@@ -298,4 +448,10 @@ async def process(payload: dict) -> dict[str, Any]:
         "ACADEMY_BOTHELP_UPSERT ok cuid=%s contact=%s lead=%s resolution=%s",
         _text(payload.get("cuid")), contact["id"], lead["id"], resolution,
     )
+    academy_invite_delivery.schedule(payload, int(lead["id"]))
     return {"ok": True, "contact_id": contact["id"], "lead_id": lead["id"], "resolution": resolution}
+
+
+async def process(payload: dict) -> dict[str, Any]:
+    async with _UPSERT_LOCK:
+        return await _process_unlocked(payload)
