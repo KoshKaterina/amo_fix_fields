@@ -79,6 +79,7 @@ def setup_function(_=None):
     lead_distribution_log_client.send = _fake_log_send
     team_panel_client.fetch_for_datetime = _fake_fetch_for_datetime
     _tomorrow_statuses.clear()
+    _live_now_statuses.clear()
 
 
 def teardown_function(_=None):
@@ -232,9 +233,31 @@ async def _fake_log_send(payload):
 
 
 _tomorrow_statuses: dict = {}  # user_id -> bool, наполняется тестами tomorrow-fallback
+# Кто на месте ПРЯМО СЕЙЧАС по данным панели. Отдельно от _tomorrow_statuses
+# намеренно: боевой код спрашивает панель по двум РАЗНЫМ поводам, и отвечать на
+# них одинаково нельзя (см. докстринг подделки ниже). По умолчанию пусто -
+# «живьём никого», как и было до появления живой проверки.
+_live_now_statuses: dict = {}
 
 
 async def _fake_fetch_for_datetime(user_ids, at):
+    """Отвечает ПО МОМЕНТУ, о котором спрашивают, а не одинаково на любой.
+
+    Боевой код зовёт панель дважды и по разным поводам: «кто на месте прямо
+    сейчас» - живая проверка, когда график показал пустой пул, - и «кто будет на
+    ближайшем старте интервала» (_upcoming_pool). Подделка, слепая к `at`,
+    отвечала на оба вопроса из _tomorrow_statuses и тем СКРЫВАЛА живую проверку
+    целиком: пул «на сейчас» всегда оказывался непустым, до `_upcoming_pool`
+    дело не доходило, и признак pool_is_future терялся.
+
+    Поймано 29.09.2026 при сведении боевой версии в master: тест
+    test_profile_before_first_interval_empty_live_pool_uses_upcoming_pool ждал
+    причину tomorrow_shift_fallback, а бой писал load - и бой был ПРАВ, потому
+    что по этой подделке человек действительно «был на месте». Врал тест.
+    """
+    now = datetime.datetime.now(ld._MSK)
+    if abs((at - now).total_seconds()) <= 60:
+        return {uid: _live_now_statuses.get(uid, False) for uid in user_ids}
     return {uid: _tomorrow_statuses.get(uid, False) for uid in user_ids}
 
 
@@ -1473,3 +1496,25 @@ def test_cdek_pvz_pickup_is_distributed_normally():
     outcome = run(ld.process_lead_distribution(316))
     assert outcome == "routed"
     assert _patch_calls and _patch_calls[0]["lead_id"] == 316
+
+
+def test_empty_schedule_pool_but_someone_live_now_goes_by_load():
+    """Обратная сторона теста выше и та самая живая проверка, которую слепая
+    подделка прятала: график говорит «никого», а панель отвечает, что человек
+    на месте ПРЯМО СЕЙЧАС. Тогда лид идёт по загрузке среди живых, а не в
+    будущий пул, и причина load в журнале - правильная подпись, а не промах.
+    Добавлено 29.09.2026: до этого путь живой проверки не был закрыт тестом."""
+    _reset_fakes()
+    now = datetime.datetime.now(ld._MSK)
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now.hour, now.hour)  # по графику никого
+    work_hours = [{"start": _hhmm(now + datetime.timedelta(hours=2)), "end": _hhmm(now + datetime.timedelta(hours=3))}]
+    _seed_profile(name="LiveNowBeatsSchedule", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
+    _live_now_statuses[2] = True  # панель: 2 на месте сейчас
+    lead = _lead(lead_id=221, source_id=1, contacts=[{"id": 501}])
+    _lead_by_id[221] = lead
+    _contact_by_id[501] = _contact(501, other_leads=[])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(221)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 2
+    assert _log_calls[-1]["rule"] == "load"
+    assert _log_calls[-1]["detail"]["pool_is_future"] is False  # признак живёт в detail
