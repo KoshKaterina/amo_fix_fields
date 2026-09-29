@@ -973,20 +973,62 @@ def test_in_flight_covers_patch_not_just_decide_and_record():
     assert len(_patch_calls) == 1
 
 
-# ══════ наш самовывоз (офис/шоурум) — не распределяем (Тиана 19.08.2026, шоурум — Катя 23.09.2026) ══════
+# ══════ наш самовывоз → офис-менеджер (Тиана 19.08.2026, назначение — Катя 23.09.2026) ══════
 
-def test_office_pickup_delivery_is_not_distributed():
+def test_office_pickup_delivery_goes_to_office_manager():
     """Реальное значение поля 577315 на живом аккаунте: 'Самовывоз из офиса
     Sunscrypt, 1 шт, 0.00 рублей' — с ценой/количеством в той же строке,
-    не голое 'офис'. Матч обязан быть по подстроке, не по точному значению."""
+    не голое 'офис'. Матч обязан быть по подстроке, не по точному значению.
+    С 23.09.2026 такая сделка не просто минует пул, а уходит офис-менеджеру."""
     _reset_fakes()
     _seed_profile(name="OfficeGuard", source_ids=[1])
     lead = _lead(lead_id=310, source_id=1, delivery_type="Самовывоз из офиса Sunscrypt, 1 шт, 0.00 рублей")
     _lead_by_id[310] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
     outcome = run(ld.process_lead_distribution(310))
-    assert outcome == "skipped-pickup-delivery"
-    assert not _patch_calls, "сделка с самовывозом из офиса не должна получать ответственного"
+    assert outcome == "pickup-assigned-office"
+    assert _patch_calls and _patch_calls[0]["responsible_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+
+
+def test_showroom_pickup_delivery_goes_to_office_manager():
+    """Ради чего всё затевалось (Катя 23.09.2026): триггер воронки ждёт подстроку
+    «шоурума» в поле, а поле приезжает через очередь и к моменту триггера обычно
+    пустое — сделка оставалась на дефолтном ответственном."""
+    _reset_fakes()
+    _seed_profile(name="ShowroomAssign", source_ids=[1])
+    lead = _lead(lead_id=317, source_id=1,
+                 delivery_type="Самовывоз из шоурума Sunscrypt, 0.00 рублей")
+    _lead_by_id[317] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(317))
+    assert outcome == "pickup-assigned-office"
+    assert _patch_calls[0]["responsible_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+
+
+def test_pickup_already_on_office_manager_is_not_patched_again():
+    """Ответственный уже офис-менеджер — PATCH не шлём вовсе, но сделку
+    помечаем обработанной, чтобы шквал вебхуков не гонял её по кругу."""
+    _reset_fakes()
+    _seed_profile(name="PickupIdempotent", source_ids=[1])
+    lead = _lead(lead_id=318, source_id=1, delivery_type="Самовывоз из шоурума Sunscrypt")
+    lead["responsible_user_id"] = ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+    _lead_by_id[318] = lead
+    outcome = run(ld.process_lead_distribution(318))
+    assert outcome == "pickup-assigned-office"
+    assert not _patch_calls, "ответственный тот же — переназначать нечего"
+
+
+def test_pickup_second_webhook_does_not_reassign():
+    """Второй вебхук по той же сделке ничего не трогает: иначе ручная правка
+    менеджера затиралась бы обратно на офис-менеджера."""
+    _reset_fakes()
+    _seed_profile(name="PickupRepeat", source_ids=[1])
+    lead = _lead(lead_id=319, source_id=1, delivery_type="Самовывоз из шоурума Sunscrypt")
+    _lead_by_id[319] = lead
+    assert run(ld.process_lead_distribution(319)) == "pickup-assigned-office"
+    _patch_calls.clear()
+    assert run(ld.process_lead_distribution(319)) == "skipped-already-routed"
+    assert not _patch_calls
 
 
 def test_office_pickup_delivery_case_insensitive():
@@ -995,43 +1037,7 @@ def test_office_pickup_delivery_case_insensitive():
     lead = _lead(lead_id=311, source_id=1, delivery_type="САМОВЫВОЗ ИЗ ОФИСА")
     _lead_by_id[311] = lead
     outcome = run(ld.process_lead_distribution(311))
-    assert outcome == "skipped-pickup-delivery"
-
-
-def test_showroom_pickup_delivery_is_not_distributed():
-    """Живое значение поля 577315 для шоурума: «Самовывоз из шоурума Sunscrypt,
-    0.00 рублей» (у шоурума с 06.08.2026 свой склад). Слова «офис» в строке нет
-    вовсе — до 23.09.2026 такая сделка уходила в общий пул распределения."""
-    _reset_fakes()
-    _seed_profile(name="ShowroomGuard", source_ids=[1])
-    lead = _lead(lead_id=314, source_id=1, delivery_type="Самовывоз из шоурума Sunscrypt, 0.00 рублей")
-    _lead_by_id[314] = lead
-    _contact_by_id[500] = _contact(500, other_leads=[])
-    outcome = run(ld.process_lead_distribution(314))
-    assert outcome == "skipped-pickup-delivery"
-    assert not _patch_calls, "сделка с самовывозом из шоурума не должна получать ответственного"
-
-
-def test_showroom_pickup_delivery_case_insensitive():
-    _reset_fakes()
-    _seed_profile(name="ShowroomGuardCase", source_ids=[1])
-    lead = _lead(lead_id=315, source_id=1, delivery_type="САМОВЫВОЗ ИЗ ШОУРУМА")
-    _lead_by_id[315] = lead
-    outcome = run(ld.process_lead_distribution(315))
-    assert outcome == "skipped-pickup-delivery"
-
-
-def test_cdek_pvz_pickup_is_distributed_normally():
-    """Контрольный: ПВЗ перевозчика — НЕ наш самовывоз, его ведёт МОП как обычно.
-    Ни «офис», ни «шоурум» в строке нет, под правило попасть не должен."""
-    _reset_fakes()
-    _seed_profile(name="CdekPvzGuard", source_ids=[1])
-    lead = _lead(lead_id=316, source_id=1, delivery_type="CDEK: Самовывоз, 1 шт, 350.00 рублей")
-    _lead_by_id[316] = lead
-    _contact_by_id[500] = _contact(500, other_leads=[])
-    outcome = run(ld.process_lead_distribution(316))
-    assert outcome == "routed"
-    assert _patch_calls and _patch_calls[0]["lead_id"] == 316
+    assert outcome == "pickup-assigned-office"
 
 
 def test_non_office_delivery_is_distributed_normally():
@@ -1250,7 +1256,7 @@ def test_find_repeat_responsible_meta_none_by_default_is_safe():
     assert found is None
 
 
-def test_log_send_includes_pipeline_status_contact_and_no_detail_when_empty():
+def test_log_send_includes_pipeline_status_contact_and_decision_snapshot():
     _reset_fakes()
     _seed_profile(name="LogFields", participant_ids=[1, 2], repeat_contact_mode="random",
                    pipeline_id=111, status_id=222)
@@ -1266,7 +1272,17 @@ def test_log_send_includes_pipeline_status_contact_and_no_detail_when_empty():
     assert call["status_id"] == 222
     assert call["contact_name"] == "Клиент"
     assert call["contact_phone"] == "9991234567"
-    assert call["detail"] is None  # ни repeat, ни prev ответственного - пустой detail не шлём
+    # 30.08.2026: detail больше не бывает пустым - ни repeat, ни prev ответственного
+    # здесь нет, но снимок решения для журнала распределений отправляется всегда.
+    detail = call["detail"]
+    assert detail["v"] == 2
+    assert detail["mode"] == "random"
+    assert detail["participants"] == [1, 2]
+    assert detail["pool"] == [1, 2]
+    assert detail["pool_is_future"] is False
+    assert "repeat_responsible_user_id" not in detail
+    # random-режим счётчики не смотрит - не пишем их и в снимок.
+    assert "counters" not in detail
 
 
 def test_log_send_detail_carries_repeat_and_prev_responsible():
@@ -1283,7 +1299,149 @@ def test_log_send_detail_carries_repeat_and_prev_responsible():
     outcome = run(_call_and_drain(ld.process_lead_distribution(613)))
 
     assert outcome == "routed"
-    assert _log_calls[0]["detail"] == {"repeat_responsible_user_id": 3, "prev_responsible_user_id": 42}
+    detail = _log_calls[0]["detail"]
+    assert detail["repeat_responsible_user_id"] == 3
+    assert detail["prev_responsible_user_id"] == 42
+    # Прежний ответственный (3) НЕ участник профиля [1, 2] - приоритет повторного
+    # клиента к нему неприменим; журнал должен уметь это объяснить, а не молчать.
+    assert detail["repeat_in_profile"] is False
+    assert detail["repeat_available"] is False
+    assert detail["pool"] == []          # весь пул вне окна
+    assert detail["duty_user_id"] == 9
+    assert detail["mode"] == "load"
+    assert detail["counter_kind"] == "daily"
+    assert detail["reason"] == "duty"
+
+
+def test_log_send_detail_carries_load_counters_and_reason():
+    """Снимок «по нагрузке»: числа, на которые смотрел алгоритм, и ветка решения."""
+    _reset_fakes()
+    _seed_profile(name="LogLoad", participant_ids=[1, 2], repeat_contact_mode="load",
+                   pipeline_id=111, status_id=222)
+    # У сотрудника 1 уже есть сделка по источнику 7, у 2 - ни одной.
+    ld._save_counters_state({
+        "date": ld._today_msk(), "counts": {"1": {"7": 1}}, "assignments": {}, "routed_ids": [],
+    })
+    lead = _lead(lead_id=614, pipeline_id=111, status_id=222, source_id=7, contacts=[{"id": 500}])
+    _lead_by_id[614] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(614)))
+
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 2
+    detail = _log_calls[0]["detail"]
+    assert detail["reason"] == "min_source"
+    assert detail["counter_kind"] == "daily"
+    assert detail["fairness_gap"] == 2
+    # Счётчики - СНИМОК ДО этого решения (у 2 ноль, а не уже единица).
+    assert detail["counters"] == {"1": {"source": 1, "total": 1}, "2": {"source": 0, "total": 0}}
+
+
+# ════════════════ журнал: НЕсостоявшиеся распределения (30.08.2026) ════════════════
+
+def test_log_outcome_office_delivery():
+    """Самовывоз уходит офис-менеджеру, и это видно в журнале панели: код исхода
+    прежний (панель валидирует его белым списком), но assigned_user_id теперь
+    заполнен - по нему разбор и понимает, что ответственный появился."""
+    _reset_fakes()
+    _seed_profile(name="OfficeLog", source_ids=[1])
+    lead = _lead(lead_id=710, source_id=1, delivery_type="Самовывоз из офиса Sunscrypt")
+    _lead_by_id[710] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[], name="Клиент Офисный", phone="9031110000")
+
+    result = run(_call_and_drain(ld.process_lead_distribution(710)))
+
+    assert result == "pickup-assigned-office"
+    assert _patch_calls[0]["responsible_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+    call = _log_calls[0]
+    assert call["outcome"] == "office_delivery"
+    assert call["assigned_user_id"] == ld.RESPONSIBLE_OFFICE_MANAGER_USER_ID
+    assert call["rule"] == "pickup_office"
+    # Имя/телефон подтягиваются отдельным GET - иначе строку нельзя было бы
+    # найти поиском по клиенту наравне с остальными.
+    assert call["contact_name"] == "Клиент Офисный"
+    assert call["contact_phone"] == "9031110000"
+
+
+def test_log_outcome_no_candidate_carries_decision_snapshot():
+    """Пул пуст и дежурного нет: сделка висит без ответственного - в журнале
+    отдельный исход со снимком, из которого видно, что пул был пуст."""
+    _reset_fakes()
+    now_h = datetime.datetime.now(ld._MSK).hour
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна
+    _seed_profile(name="NoCandidate", participant_ids=[1, 2], duty_user_id=None, source_ids=[1])
+    lead = _lead(lead_id=712, source_id=1)
+    _lead_by_id[712] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    result = run(_call_and_drain(ld.process_lead_distribution(712)))
+
+    assert result == "no-candidate-waiting"
+    assert not _patch_calls
+    call = _log_calls[0]
+    assert call["outcome"] == "no_candidate"
+    assert call["assigned_user_id"] is None
+    assert call["detail"]["pool"] == []
+    assert call["detail"]["participants"] == [1, 2]
+
+
+def test_log_outcome_patch_failed_names_intended_user():
+    """PATCH не прошёл - ответственный ВЫБРАН, но amoCRM его не принял.
+    В журнале это отдельный исход, и видно, кому сделка должна была уйти."""
+    _reset_fakes()
+    _seed_profile(name="PatchFail", participant_ids=[1], source_ids=[1])
+    lead = _lead(lead_id=713, source_id=1)
+    _lead_by_id[713] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    async def _rejecting_patch_lead(lead_id, **kwargs):
+        _patch_calls.append({"lead_id": lead_id, **kwargs})
+        return {"ok": False, "status_code": 403, "retryable": False}
+
+    ld.amo_service.patch_lead = _rejecting_patch_lead
+    try:
+        result = run(_call_and_drain(ld.process_lead_distribution(713)))
+    finally:
+        ld.amo_service.patch_lead = _fake_patch_lead
+
+    assert result == "failed-patch"
+    call = _log_calls[0]
+    assert call["outcome"] == "patch_failed"
+    assert call["assigned_user_id"] is None
+    assert call["detail"]["intended_user_id"] == 1
+    assert call["detail"]["patch_status_code"] == 403
+
+
+def test_log_outcome_deduped_per_lead_per_day():
+    """Reconciliation ходит по одному и тому же лиду раз в две минуты - без
+    дедупа журнал забился бы одинаковыми «самовывоз» до конца дня."""
+    _reset_fakes()
+    _seed_profile(name="OfficeDedup", source_ids=[1])
+    lead = _lead(lead_id=714, source_id=1, delivery_type="Самовывоз из офиса")
+    _lead_by_id[714] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    run(_call_and_drain(ld.process_lead_distribution(714)))
+    run(_call_and_drain(ld.process_lead_distribution(714)))
+    run(_call_and_drain(ld.process_lead_distribution(714)))
+
+    assert len(_log_calls) == 1, "исход по одной сделке пишется в журнал один раз в сутки"
+
+
+def test_log_outcome_routed_still_marked():
+    """Состоявшееся назначение - то же поле-исход, значение routed."""
+    _reset_fakes()
+    _seed_profile(name="RoutedOutcome", participant_ids=[1], source_ids=[1])
+    lead = _lead(lead_id=715, source_id=1)
+    _lead_by_id[715] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    result = run(_call_and_drain(ld.process_lead_distribution(715)))
+
+    assert result == "routed"
+    assert _log_calls[0]["outcome"] == "routed"
+    assert _log_calls[0]["assigned_user_id"] == 1
 
 
 if __name__ == "__main__":
@@ -1300,3 +1458,18 @@ if __name__ == "__main__":
             print(f"FAIL {fn.__name__}")
             traceback.print_exc()
     print(f"\n{ok}/{len(fns)} прошли")
+
+
+# --- перенесено из версии master 29.09.2026: правило «ПВЗ перевозчика это не наш
+# самовывоз» в ветке самовывоза теста не имело, а проверять его надо ---
+def test_cdek_pvz_pickup_is_distributed_normally():
+    """Контрольный: ПВЗ перевозчика — НЕ наш самовывоз, его ведёт МОП как обычно.
+    Ни «офис», ни «шоурум» в строке нет, под правило попасть не должен."""
+    _reset_fakes()
+    _seed_profile(name="CdekPvzGuard", source_ids=[1])
+    lead = _lead(lead_id=316, source_id=1, delivery_type="CDEK: Самовывоз, 1 шт, 350.00 рублей")
+    _lead_by_id[316] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    outcome = run(ld.process_lead_distribution(316))
+    assert outcome == "routed"
+    assert _patch_calls and _patch_calls[0]["lead_id"] == 316
