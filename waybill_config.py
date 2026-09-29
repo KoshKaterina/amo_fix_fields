@@ -865,6 +865,19 @@ FIELD_ACADEMY_MARKETING_CONSENT = 578245
 FIELD_ACADEMY_MARKETING_DATE_TEXT = 578277
 FIELD_ACADEMY_PD_DATE_TEXT = 578279
 STATUS_ACADEMY_RECORDED_PRACTICUM = 88835666
+STATUS_ACADEMY_JOINED_CHAT = 88943006
+
+# Перенос сделки на «Вступил в чат» по событию Telegram (29.09.2026). Слушаем
+# длинным опросом от имени бота-админа чата; вебхук Telegram не заводим намеренно -
+# опрос переживает пересборку контейнера бесплатно (разбор в шапке academy_chat_join).
+# OFF по умолчанию: включаем после проверки боем.
+ACADEMY_CHAT_JOIN_ENABLED = os.getenv("ACADEMY_CHAT_JOIN_ENABLED", "0") == "1"
+# Холостой ход: событие разбираем и решение пишем в журнал, но сделку не двигаем.
+ACADEMY_CHAT_JOIN_DRY_RUN = os.getenv("ACADEMY_CHAT_JOIN_DRY_RUN", "0") == "1"
+ACADEMY_CHAT_JOIN_STATE_PATH = os.getenv(
+    "ACADEMY_CHAT_JOIN_STATE_PATH", "/app/var/academy/academy_chat_join.json",
+)
+ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S = int(os.getenv("ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S", "25"))
 
 # Уведомления в топик УВЕДОМЛЕНИЯ отдела продаж по двум полям контакта Академии.
 # OFF до общего переключения сценария; обработчик реагирует только когда amo
