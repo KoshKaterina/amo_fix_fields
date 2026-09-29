@@ -62,6 +62,7 @@ from waybill_config import (
     FIELD_MOYSKLAD_ORDER_UUID,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_OFFICE,
+    PIPELINE_TANGEMSHOP,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -74,11 +75,15 @@ logger = logging.getLogger("uvicorn")
 FIELD_ORDER_NUMBER = 576697
 
 # Воронки, где могут появляться сделки по заказам МойСклада (а значит и их
-# дубли): основная воронка отдела продаж и Офис. Список - сшивочный: пока
-# amgroup_lead_builder не определил, в какую воронку кладёт сделки протез,
-# смотрим обе актуальные воронки-получателя заказов; когда определится -
+# дубли): основная воронка отдела продаж, Офис и TangemShop. Список - сшивочный:
+# пока amgroup_lead_builder не определил, в какую воронку кладёт сделки протез,
+# смотрим все актуальные воронки-получателя заказов; когда определится -
 # свести сюда.
-_PIPELINES = (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE)
+# TangemShop добавлен 29.09.2026: мост начинает возить туда заказы магазина
+# tangemshop.ru, и дубль на один заказ МойСклада возможен там ровно так же.
+# Флага у списка нет намеренно - сторож только читает и пишет в чат, лишняя
+# воронка в обзоре не стоит ничего и не может ничего сломать.
+_PIPELINES = (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE, PIPELINE_TANGEMSHOP)
 
 # Тег сделки-протеза (наша) - переиспользуем константу из waybill_config, она
 # уже общая для всего контура amgroup_fallback, заводить свою копию смысла нет.

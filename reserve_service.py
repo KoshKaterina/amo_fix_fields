@@ -67,7 +67,10 @@ from waybill_config import (
     STATUS_SUCCESS,
     STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED,
     STATUS_TANGEM_IN_PROGRESS,
+    STATUS_TANGEM_LINK_SENT,
     STATUS_TANGEM_NEW_ORDER,
+    STATUS_TANGEM_OFFICE_RECORD,
+    STATUS_TANGEM_PAYMENT_REQUESTED,
     STATUS_TANGEM_UPSELL_DONE,
     STATUS_WAYBILL_READY,
 )
@@ -94,10 +97,16 @@ _RESERVE_ON: dict[int, set[int]] = {
         STATUS_PAYMENT_RECEIVED,
         STATUS_SUCCESS,
     },
+    # ⚠️ Три этапа дописаны 29.09.2026 при сведении воронки с розницей: они
+    # стояли в самой воронке, но в этом наборе их не было, и на них резерв
+    # слетал бы по тайм-ауту посреди работы менеджера.
     PIPELINE_TANGEMSHOP: {
         STATUS_TANGEM_NEW_ORDER,
         STATUS_TANGEM_IN_PROGRESS,
+        STATUS_TANGEM_OFFICE_RECORD,
         STATUS_TANGEM_UPSELL_DONE,
+        STATUS_TANGEM_PAYMENT_REQUESTED,
+        STATUS_TANGEM_LINK_SENT,
         STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED,
         STATUS_SUCCESS,
     },

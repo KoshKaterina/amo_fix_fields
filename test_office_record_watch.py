@@ -50,9 +50,11 @@ from waybill_config import (  # noqa: E402
     FIELD_OFFICE_RECORD_END,
     FIELD_OFFICE_RECORD_START,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     STATUS_CLEVER_OFFICE_RECORD,
     STATUS_CLOSED_LOST,
     STATUS_SUCCESS,
+    STATUS_TANGEM_OFFICE_RECORD,
 )
 
 LEAD = 36555973
@@ -235,6 +237,63 @@ def test_ключ_дедупа_взводится_только_перезапи�
     assert O.notice_kind(END_TS) == O.notice_kind(END_TS)
     # Перезаписали клиента - ключ другой, сторож взводится заново.
     assert O.notice_kind(END_TS) != O.notice_kind(END_TS + 86400)
+
+
+# ── TangemShop (29.09.2026): свой этап «Запись в офис», свой выключатель ─────
+
+
+def test_tangemshop_при_выключенном_флаге_не_наша_воронка():
+    assert O.OFFICE_RECORD_WATCH_TANGEMSHOP is False
+    assert O.watched_stages() == {PIPELINE_CLEVER_MAIN: STATUS_CLEVER_OFFICE_RECORD}
+    lead = _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_TANGEM_OFFICE_RECORD)
+    assert O.decide(lead, END_TS + 3600)[0] == "other-pipeline"
+
+
+def test_tangemshop_с_флагом_судится_по_своему_этапу():
+    O.OFFICE_RECORD_WATCH_TANGEMSHOP = True
+    try:
+        assert O.watched_stages() == {
+            PIPELINE_CLEVER_MAIN: STATUS_CLEVER_OFFICE_RECORD,
+            PIPELINE_TANGEMSHOP: STATUS_TANGEM_OFFICE_RECORD,
+        }
+        lead = _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_TANGEM_OFFICE_RECORD)
+        assert O.decide(lead, END_TS + 10 * 60)[0] == "fire"
+        # чужой этап внутри своей воронки - не наш случай
+        assert O.decide(
+            _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_CLEVER_OFFICE_RECORD),
+            END_TS + 3600)[0] == "other-stage"
+        # и наоборот: этап Tangemshop внутри розницы тоже мимо
+        assert O.decide(
+            _lead(pipeline=PIPELINE_CLEVER_MAIN, status=STATUS_TANGEM_OFFICE_RECORD),
+            END_TS + 3600)[0] == "other-stage"
+        # без полей виджета NOVA задач не появится - оговорка плана, проверенная кодом
+        assert O.decide(
+            _lead(end_ts=None, pipeline=PIPELINE_TANGEMSHOP,
+                  status=STATUS_TANGEM_OFFICE_RECORD), END_TS + 86400) == ("no-date", None)
+    finally:
+        O.OFFICE_RECORD_WATCH_TANGEMSHOP = False
+
+
+def test_выключенная_воронка_не_стоит_лишнего_запроса():
+    """Проход по этапам: с опущенным флагом запрос ровно один, розничный."""
+    asked: list = []
+
+    async def fake_by_status(status_id, with_=()):
+        asked.append(status_id)
+        return []
+
+    saved = O.amo_service.get_leads_by_status
+    O.amo_service.get_leads_by_status = fake_by_status
+    try:
+        asyncio.run(O._stage_leads())
+        assert asked == [STATUS_CLEVER_OFFICE_RECORD]
+        asked.clear()
+        O.OFFICE_RECORD_WATCH_TANGEMSHOP = True
+        asyncio.run(O._stage_leads())
+        assert asked == [STATUS_CLEVER_OFFICE_RECORD, STATUS_TANGEM_OFFICE_RECORD]
+    finally:
+        O.OFFICE_RECORD_WATCH_TANGEMSHOP = False
+        O.amo_service.get_leads_by_status = saved
     assert str(END_TS) in O.notice_kind(END_TS)
 
 

@@ -289,6 +289,59 @@ STATUS_TANGEM_NEW_ORDER = 78157066                    # «Новый заказ�
 STATUS_TANGEM_IN_PROGRESS = 78157070                   # «взят в работу»
 STATUS_TANGEM_UPSELL_DONE = 78157074                   # «апсейл / допродажа сделаны»
 STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED = 86477050   # «доплата получена»
+# Этапы, появившиеся при сведении воронки с розницей (29.09.2026). В боевом
+# конфиге их до сих пор не было, хотя в самой воронке они уже стоят - состав
+# снят со справочника этапов панели (app/stats/stage_names.py).
+STATUS_TANGEM_OFFICE_RECORD = 87522374                 # «Запись в офис»
+STATUS_TANGEM_PAYMENT_REQUESTED = 86477046             # «доплата запрошена» (тех-этап входа счёта)
+STATUS_TANGEM_LINK_SENT = 87521846                     # «Ссылка отправлена»
+
+# Признак заказа магазина tangemshop.ru (InSales). Нужен там, где сделка уже
+# УЕХАЛА из воронки TangemShop в Офис и по воронке её от розничной не отличить:
+# Метрика и статусы WooCommerce (см. metrika_sync, woo_status_sync).
+# Два независимых признака, достаточно любого:
+#   1. канал продаж = TangemShop (зеркало канала МойСклада);
+#   2. суффикс в «Номере заказа на сайте» - его ставит woo-sklad ВСЕМ заказам
+#      InSales (woo_moysklad/insales/normalizer.py::_INSALES_ORDER_SUFFIX),
+#      потому что числовые id WooCommerce и InSales пересекаются.
+# ⚠️ Организация «ИП Абовян» признаком быть НЕ может: на неё же садятся заказы Озона.
+FIELD_SALES_CHANNEL = 576725                           # «Канал продаж» (select)
+ENUM_SALES_CHANNEL_TANGEMSHOP = 1041663                # значение «TangemShop»
+TANGEMSHOP_ORDER_SUFFIX = " Tangemshop"
+
+
+def is_tangemshop_order_number(value) -> bool:
+    """«17665 Tangemshop» -> True, «19003» -> False, пусто -> False."""
+    return TANGEMSHOP_ORDER_SUFFIX.strip().casefold() in str(value or "").casefold()
+
+
+def _lead_custom_field(lead: dict, field_id: int) -> dict:
+    """Первое значение доп. поля прямо из тела сделки: {"value": …, "enum_id": …}.
+
+    Свой мини-разбор, а не amo_service: waybill_config — нижний слой, его
+    импортируют все, и тянуть сюда клиент amoCRM значило бы завести круг импортов.
+    Отдаём словарь целиком, потому что у select-полей надёжнее сверяться по
+    enum_id: подпись значения заказчик может переименовать в интерфейсе."""
+    for field in (lead or {}).get("custom_fields_values") or []:
+        if field.get("field_id") == field_id:
+            values = field.get("values") or []
+            return values[0] if values and isinstance(values[0], dict) else {}
+    return {}
+
+
+def is_tangemshop_lead(lead: dict) -> bool:
+    """Сделка по заказу магазина tangemshop.ru — по каналу продаж ИЛИ по
+    суффиксу номера заказа на сайте. Хватает любого из двух: канал ставит мост
+    зеркалом МойСклада и его можно затереть (см. knowledge/
+    zatiranie-zerkalnyh-atributov-ms.md), суффикс живёт в номере с рождения."""
+    channel = _lead_custom_field(lead, FIELD_SALES_CHANNEL)
+    if channel.get("enum_id") == ENUM_SALES_CHANNEL_TANGEMSHOP:
+        return True
+    if str(channel.get("value") or "").strip().casefold() == "tangemshop":
+        return True
+    return is_tangemshop_order_number(
+        _lead_custom_field(lead, FIELD_SITE_ORDER_NUMBER).get("value"))
+
 
 # Офис — отгрузка реально расходует резерв (STATUS_WAYBILL_READY уже определена
 # выше = «Готова накладная»; STATUS_SUCCESS здесь = «Успешно реализовано» в
@@ -686,6 +739,9 @@ NEW_LEAD_ESCALATE_MINUTES = int(os.getenv("NEW_LEAD_ESCALATE_MINUTES", "120"))
 NEW_LEAD_WINDOW_START_H = int(os.getenv("NEW_LEAD_WINDOW_START_H", "12"))
 NEW_LEAD_WINDOW_END_H = int(os.getenv("NEW_LEAD_WINDOW_END_H", "19"))
 NEW_LEAD_POLL_INTERVAL_S = int(os.getenv("NEW_LEAD_POLL_INTERVAL_S", "300"))
+# Тот же сторож по воронке TangemShop (29.09.2026, «да» Кати). Порог, окно и событие
+# каталога общие с розницей — расходиться им незачем, воронку ведут те же менеджеры.
+NEW_LEAD_WATCH_TANGEMSHOP = os.getenv("NEW_LEAD_WATCH_TANGEMSHOP", "").strip() == "1"
 
 MANAGER_NAMES = {
     9291546:  "Игорь Оанча",
@@ -822,6 +878,9 @@ SHOWROOM_ALERT_ENABLED = os.getenv("SHOWROOM_ALERT_ENABLED", "1") == "1"
 SHOWROOM_ALERT_DELAY_S = int(os.getenv("SHOWROOM_ALERT_DELAY_S", "90"))
 # Возраст сделки, старше — не наш случай. Защита от массовых прогонов по старью.
 SHOWROOM_ALERT_MAX_AGE_MIN = int(os.getenv("SHOWROOM_ALERT_MAX_AGE_MIN", "60"))
+# Тот же алерт по входному этапу воронки TangemShop (29.09.2026, «да» Кати).
+# Шоурум и люди те же, топик тот же — отдельный только выключатель.
+SHOWROOM_ALERT_TANGEMSHOP = os.getenv("SHOWROOM_ALERT_TANGEMSHOP", "").strip() == "1"
 
 # Академия-алерт (academy_lead_alert): лид встал на «Входящий лид» воронки Академии →
 # сообщение Гладкову в топик УВЕДОМЛЕНИЯ (Катя 08.09.2026). Мастер-флаг как у соседа:
@@ -1000,6 +1059,8 @@ OZON_PAYMENT_STAGES: dict[int, tuple[int, int, int]] = {
     PIPELINE_DB_WORK: (STATUS_DB_PAYMENT_REQUESTED, STATUS_DB_LINK_SENT, STATUS_DB_PAYMENT_RECEIVED),
     PIPELINE_ACADEMY: (STATUS_ACADEMY_PAYMENT_REQUESTED, STATUS_ACADEMY_LINK_SENT,
                        STATUS_ACADEMY_PAYMENT_RECEIVED),
+    PIPELINE_TANGEMSHOP: (STATUS_TANGEM_PAYMENT_REQUESTED, STATUS_TANGEM_LINK_SENT,
+                          STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED),
 }
 
 # Счёт СБП в картотеке. Отдельный флаг от OZON_INVOICE_ENABLED: розничный контур
@@ -1007,6 +1068,11 @@ OZON_PAYMENT_STAGES: dict[int, tuple[int, int, int]] = {
 OZON_INVOICE_DB_WORK = os.getenv("OZON_INVOICE_DB_WORK", "").strip() == "1"
 # Счёт СБП в Академии — свой флаг по той же причине: включаем и наблюдаем отдельно.
 OZON_INVOICE_ACADEMY = os.getenv("OZON_INVOICE_ACADEMY", "").strip() == "1"
+# Счёт СБП в TangemShop (29.09.2026) — свой флаг по той же причине.
+# ⚠️ Денежная развилка, решается ДО включения: счёт выставляется на организацию
+# из ключей Ozon Pay, а заказы Tangemshop в МойСкладе идут на ИП Абовян. На чьи
+# реквизиты уходит ссылка клиенту — вопрос к Кате, а не к коду.
+OZON_INVOICE_TANGEMSHOP = os.getenv("OZON_INVOICE_TANGEMSHOP", "").strip() == "1"
 
 FIELD_PAYMENT_LINK = 577617           # «Ссылка для оплаты»
 # «Другая сумма» (text, создано Катей 20.07.2026): если заполнено — счёт СБП
@@ -1103,6 +1169,15 @@ OFFICE_TRANSFER_SOURCE_OPT = os.getenv("OFFICE_TRANSFER_SOURCE_OPT", "").strip()
 # ЗНР-правила увезли бы её в Лист ожидания / Академию / ОПТ, и менеджер потерял
 # бы её из своего списка. Разводку держит office_transfer._allowed_branches().
 OFFICE_TRANSFER_SOURCE_DB_WORK = os.getenv("OFFICE_TRANSFER_SOURCE_DB_WORK", "").strip() == "1"
+
+# Воронка TangemShop как ИСТОЧНИК переноса (29.09.2026, ТЗ по запуску заказов
+# Tangemshop через amoCRM). Правила те же, что у розницы - они читают «Тип
+# заявки», «Склад заказа» и «Тип доставки», а не воронку.
+# ⚠️ Только ветка «Успешно реализовано», как у картотеки. Прямое требование Кати:
+# «УР переводит сделку в офис, ЗИН закрывает её без перехода в офис». ЗНР-правила
+# увезли бы сделку в Лист ожидания / Академию / ОПТ по полю «Причина ЗИН».
+# Разводку держит office_transfer._allowed_branches().
+OFFICE_TRANSFER_SOURCE_TANGEMSHOP = os.getenv("OFFICE_TRANSFER_SOURCE_TANGEMSHOP", "").strip() == "1"
 
 # Cutover-граница (unix ts): события ДО неё игнорируются везде (вебхук и
 # reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии
@@ -1408,6 +1483,11 @@ OFFICE_RECORD_WATCH_CREATE_ENABLED = os.getenv("OFFICE_RECORD_WATCH_CREATE_ENABL
 # стоит ОДИН GET: 144 запроса в сутки, 0,02% лимита интеграции. Быстрее незачем -
 # запас после записи и так 10 минут, а медиана просрочки на этапе 17 дней.
 OFFICE_RECORD_WATCH_INTERVAL_S = int(os.getenv("OFFICE_RECORD_WATCH_INTERVAL_S", "600"))
+# Тот же сторож по этапу «Запись в офис» воронки TangemShop (29.09.2026, «да» Кати).
+# ⚠️ Полезен ровно настолько, насколько запись клиента Tangemshop оформляют тем же
+# виджетом NOVA: сторож судит по его полям 578063/578065. Оформляют иначе - полей
+# нет, сторож честно молчит. Проверяется первой живой записью.
+OFFICE_RECORD_WATCH_TANGEMSHOP = os.getenv("OFFICE_RECORD_WATCH_TANGEMSHOP", "").strip() == "1"
 # Запас после конца записи (из постановки Кати): клиент опаздывает, менеджер двигает
 # сделку не в ту же минуту.
 OFFICE_RECORD_GRACE_MIN = int(os.getenv("OFFICE_RECORD_GRACE_MIN", "10"))

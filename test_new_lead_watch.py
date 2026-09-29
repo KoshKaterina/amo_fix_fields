@@ -41,10 +41,13 @@ import tg_recipients  # noqa: E402
 from waybill_config import (  # noqa: E402
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     STATUS_ACADEMY_INBOUND_LEAD,
     STATUS_CLEVER_IN_PROGRESS,
     STATUS_NEW_LEAD,
     STATUS_NEW_LEAD_BUFFERS,
+    STATUS_TANGEM_IN_PROGRESS,
+    STATUS_TANGEM_NEW_ORDER,
 )
 
 ROP_CHAT = -5358037627
@@ -470,3 +473,47 @@ def test_state_file_remembers_the_pipeline():
     N.note_lead(36565218, PIPELINE_ACADEMY, STATUS_ACADEMY_INBOUND_LEAD)
     saved = json.loads(N.STATE_PATH.read_text(encoding="utf-8"))
     assert saved["pending"]["36565218"]["pipeline"] == PIPELINE_ACADEMY
+
+
+# ───────────────────────────── TangemShop (29.09.2026) ─────────────────────────────
+
+
+def test_tangemshop_is_off_by_default():
+    """Выключатель свой, и по умолчанию он опущен: воронку включают отдельным шагом."""
+    assert N.NEW_LEAD_WATCH_TANGEMSHOP is False
+    N.note_lead(LEAD, PIPELINE_TANGEMSHOP, STATUS_TANGEM_NEW_ORDER)
+    assert N._pending == {}
+
+
+def test_tangemshop_counts_like_retail_when_enabled():
+    """Включили - «Новый заказ» заводит счётчик, уход с него снимает. Как у розницы."""
+    N.NEW_LEAD_WATCH_TANGEMSHOP = True
+    try:
+        N.note_lead(LEAD, PIPELINE_TANGEMSHOP, STATUS_TANGEM_NEW_ORDER)
+        assert N._pending[LEAD]["pipeline"] == PIPELINE_TANGEMSHOP
+        N.note_lead(LEAD, PIPELINE_TANGEMSHOP, STATUS_TANGEM_IN_PROGRESS)
+        assert N._pending == {}
+    finally:
+        N.NEW_LEAD_WATCH_TANGEMSHOP = False
+
+
+def test_tangemshop_shares_the_retail_event_key():
+    """Событие каталога одно на два магазина - осознанно: воронку ведут те же люди по
+    тем же правилам, и двум «новым лидам» в панели разойтись нечем. Различаются только
+    подписью в тексте, чтобы руководитель видел, чей это заказ."""
+    tg, retail = N._WATCHED[PIPELINE_TANGEMSHOP], N._WATCHED[PIPELINE_CLEVER_MAIN]
+    assert tg.event == retail.event
+    assert tg.chat == retail.chat
+    assert tg.subject != retail.subject
+
+
+def test_tangemshop_does_not_wake_the_loop_when_off():
+    """Выключенная воронка не должна сама по себе поднимать цикл опроса."""
+    was_rop = N.ROP_CHAT_ID
+    N.ROP_CHAT_ID = None
+    N.ACADEMY_LEAD_UNTAKEN_ENABLED = False
+    try:
+        assert [w for pid, w in N._WATCHED.items() if N._is_on(w, pid)] == []
+    finally:
+        N.ROP_CHAT_ID = was_rop
+        N.ACADEMY_LEAD_UNTAKEN_ENABLED = True

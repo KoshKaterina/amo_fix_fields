@@ -71,6 +71,7 @@ from waybill_config import (
     OZON_STALE_ALERT_MIN,
     OZON_INVOICE_ACADEMY,
     OZON_INVOICE_DB_WORK,
+    OZON_INVOICE_TANGEMSHOP,
     OZON_PAYMENT_STAGES,
     OZON_STALE_ESCALATE_CHAT_ID,
     OZON_STALE_ESCALATE_DAYS,
@@ -78,6 +79,7 @@ from waybill_config import (
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
     PIPELINE_DB_WORK,
+    PIPELINE_TANGEMSHOP,
     PUBLIC_BASE_URL,
     TAG_INVOICE_ERROR,
     blocked_invoice_payment_token,
@@ -110,7 +112,8 @@ def is_enabled() -> bool:
 def _invoice_pipelines() -> tuple[int, ...]:
     """Воронки, где выставляем счёт. Розница всегда, картотека «Работа с базой» —
     за флагом OZON_INVOICE_DB_WORK (07.09.2026), Академия — за OZON_INVOICE_ACADEMY
-    (09.09.2026, обучение продаётся по той же схеме).
+    (09.09.2026, обучение продаётся по той же схеме), TangemShop — за
+    OZON_INVOICE_TANGEMSHOP (29.09.2026, заказы магазина tangemshop.ru).
 
     Флаги читаем на КАЖДОМ вызове, а не собираем кортеж на импорте: иначе флаг,
     подменённый в тестах (и в консоли при разборе инцидента), не подействовал бы.
@@ -120,6 +123,8 @@ def _invoice_pipelines() -> tuple[int, ...]:
         out.append(PIPELINE_DB_WORK)
     if OZON_INVOICE_ACADEMY:
         out.append(PIPELINE_ACADEMY)
+    if OZON_INVOICE_TANGEMSHOP:
+        out.append(PIPELINE_TANGEMSHOP)
     return tuple(out)
 
 

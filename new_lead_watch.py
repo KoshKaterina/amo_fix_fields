@@ -1,14 +1,18 @@
-"""Новый лид не взяли в работу: розница и Академия (Катя 28.08.2026, 29.09.2026).
+"""Новый лид не взяли в работу: розница, Академия и TangemShop (Катя 28.08 и 29.09.2026).
 
 Третий триггер группы «ОП срочные уведомления» и такой же второй контур, как счётчик
 перезвонов: в чат ОП уходит событие, сюда - провал. Лид упал во вход воронки и через два
 РАБОЧИХ часа так и висит нетронутым.
 
-──────────────────────────── две воронки, один сторож ────────────────────────────
-29.09.2026 к рознице добавилась Академия. Сторож ПАРАМЕТРИЗОВАН по воронке, а не
-скопирован: копия означала бы вторую `worktime_minutes`, второе перечитывание сделки и
-второй файл состояния - то самое размножение правила, от которого мы лечимся в
-`knowledge/edinyy-kontur-pravila-i-storozh.md`. Таблица воронок - `_WATCHED`.
+──────────────────────────── три воронки, один сторож ────────────────────────────
+29.09.2026 к рознице добавилась Академия, следом TangemShop. Сторож ПАРАМЕТРИЗОВАН по
+воронке, а не скопирован: копия означала бы вторую `worktime_minutes`, второе
+перечитывание сделки и второй файл состояния - то самое размножение правила, от которого
+мы лечимся в `knowledge/edinyy-kontur-pravila-i-storozh.md`. Таблица воронок - `_WATCHED`.
+
+TangemShop добавлен третьей строкой и ведёт себя как розница во всём, кроме подписи в
+тексте: магазин чужой, менеджеры те же. Событие каталога у него общее с розницей -
+намеренно, чтобы настройка уведомления не разошлась на две.
 
 Различаются воронки тремя вещами, и все три записаны в таблице:
 
@@ -72,10 +76,13 @@ from waybill_config import (
     NEW_LEAD_POLL_INTERVAL_S,
     NEW_LEAD_WINDOW_END_H,
     NEW_LEAD_WINDOW_START_H,
+    NEW_LEAD_WATCH_TANGEMSHOP,
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     STATUS_ACADEMY_INBOUND_LEAD,
     STATUS_NEW_LEAD_ALL,
+    STATUS_TANGEM_NEW_ORDER,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -104,6 +111,17 @@ _WATCHED: dict[int, _Watch] = {
     PIPELINE_ACADEMY: _Watch(
         event="academy_lead_untaken", statuses=frozenset({STATUS_ACADEMY_INBOUND_LEAD}),
         chat="op_notify", subject="Лид Академии", tags=True, route=True, panel=True,
+    ),
+    # TangemShop (29.09.2026, «да» Кати по списку А8 плана запуска воронки).
+    # Событие каталога то же, что у розницы, и это осознанно: воронку ведут ТЕ ЖЕ
+    # менеджеры по тем же правилам, значит и настройка уведомления должна быть одна.
+    # Заводить второй ключ - значит завести вторую строку в панели, которую
+    # кто-то однажды настроит иначе, и два «новых лида» разойдутся молча.
+    # Отличается только подпись в тексте: руководителю важно видеть, чей это заказ.
+    # Входной этап один - «Новый заказ»; «Неразобранное» не берём, как и у розницы.
+    PIPELINE_TANGEMSHOP: _Watch(
+        event="new_lead_untaken", statuses=frozenset({STATUS_TANGEM_NEW_ORDER}),
+        chat="rop", subject="Заказ Tangemshop", tags=False, route=False, panel=False,
     ),
 }
 
@@ -136,14 +154,22 @@ def _destination(w: _Watch) -> tuple[int | None, int | None]:
     return NOTIFY_CHAT_ID, NOTIFY_THREAD_ID
 
 
-def _is_on(w: _Watch) -> bool:
+def _is_on(w: _Watch, pipeline_id=None) -> bool:
     """Сторожим ли эту воронку прямо сейчас: есть куда слать и не погашен мастер-флаг.
 
     Выключатели РАЗДЕЛЬНЫЕ по воронкам намеренно: до 29.09.2026 пустой `ROP_ALERT_CHAT_ID`
     глушил сторож целиком, и Академия, которой этот чат не нужен, замолчала бы вместе с
     розницей.
+
+    ⚠️ Флаг ищем по ВОРОНКЕ, а не по ключу события: у TangemShop ключ события тот же,
+    что у розницы (одна настройка на два магазина, см. `_WATCHED`), и различить их
+    по `w.event` невозможно. Розница своего флага не имеет и не получает: она здесь
+    с 28.08.2026 и включается наличием чата.
     """
     if w.event == "academy_lead_untaken" and not ACADEMY_LEAD_UNTAKEN_ENABLED:
+        return False
+    if pipeline_id is not None and int(pipeline_id) == PIPELINE_TANGEMSHOP \
+            and not NEW_LEAD_WATCH_TANGEMSHOP:
         return False
     return _destination(w)[0] is not None
 
@@ -151,7 +177,7 @@ def _is_on(w: _Watch) -> bool:
 def _watch_for(pipeline_id) -> _Watch | None:
     """Воронка из таблицы наблюдаемых, если она сейчас включена. Иначе None - молчим."""
     w = _WATCHED.get(pipeline_id)
-    return w if (w is not None and _is_on(w)) else None
+    return w if (w is not None and _is_on(w, pipeline_id)) else None
 
 
 def _save() -> None:
@@ -424,7 +450,7 @@ async def init() -> None:
     # Запускаемся, если сторожим ХОТЬ ОДНУ воронку. До 29.09.2026 здесь стояло
     # `if ROP_CHAT_ID is None: return`, и пустой чат руководства погасил бы заодно Академию,
     # которой этот чат не нужен вовсе.
-    live = [w for w in _WATCHED.values() if _is_on(w)]
+    live = [w for pid, w in _WATCHED.items() if _is_on(w, pid)]
     if not live:
         logger.info("Новый лид: ни одной воронки не сторожим (нет чатов) - счётчик выключен")
         return

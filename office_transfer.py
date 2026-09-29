@@ -15,6 +15,17 @@ OFFICE_TRANSFER_SOURCE_DB_WORK (07.09.2026, постановка Кати: «п�
 закрытая в картотеке как «не реализовано», обязана остаться там — это карточка
 обзвона, а не брак заказа. Разводку держит _allowed_branches().
 
+Четвёртый источник — воронка TangemShop за флагом
+OFFICE_TRANSFER_SOURCE_TANGEMSHOP (29.09.2026, ТЗ по запуску заказов магазина
+tangemshop.ru через amoCRM). Правила те же — они читают поля сделки, а не
+воронку. ⚠️ Ей тоже разрешена ТОЛЬКО ветка УР, прямыми словами Кати: «УР
+переводит сделку в офис, ЗИН закрывает её без перехода в офис».
+
+⚠️ Сделка, уехавшая отсюда в Офис, по воронке больше не отличима от розничной —
+об этом знают metrika_sync и woo_status_sync, у них свой отсев по признаку
+магазина (waybill_config.is_tangemshop_order_number, канал продаж 576725).
+Заводите пятый источник — проверьте там же.
+
 Правила (условия читаются по СВЕЖЕЙ дочитанной сделке, не по телу вебхука —
 select-поля сверяются по enum_id, не по тексту, чтобы не зависеть от того, как
 менеджер видит подпись значения):
@@ -135,6 +146,7 @@ from waybill_config import (
     OFFICE_TRANSFER_SINCE_TS,
     OFFICE_TRANSFER_SOURCE_DB_WORK,
     OFFICE_TRANSFER_SOURCE_OPT,
+    OFFICE_TRANSFER_SOURCE_TANGEMSHOP,
     OFFICE_TRANSFER_STALE_ALERT_MIN,
     OFFICE_TRANSFER_WAREHOUSES,
     PIPELINE_ACADEMY,
@@ -142,6 +154,7 @@ from waybill_config import (
     PIPELINE_DB_WORK,
     PIPELINE_OFFICE,
     PIPELINE_OPT,
+    PIPELINE_TANGEMSHOP,
     PIPELINE_WAITLIST,
     REASON_ACADEMY,
     REASON_OPT,
@@ -412,12 +425,15 @@ def _source_pipelines() -> tuple[int, ...]:
     построению. Условия правил читаются с полей сделки («Тип заявки», «Склад
     заказа», «Тип доставки»), а они у опта заполняются так же, поэтому опт-заказ
     едет в тот же этап Офиса, что и розничный с такой же доставкой. С картотекой
-    так же — но ей разрешена только ветка УР, см. _allowed_branches()."""
+    так же — но ей разрешена только ветка УР, см. _allowed_branches(). TangemShop
+    (29.09.2026) — за OFFICE_TRANSFER_SOURCE_TANGEMSHOP, ему тоже только УР."""
     out = [PIPELINE_CLEVER_MAIN]
     if OFFICE_TRANSFER_SOURCE_OPT:
         out.append(PIPELINE_OPT)
     if OFFICE_TRANSFER_SOURCE_DB_WORK:
         out.append(PIPELINE_DB_WORK)
+    if OFFICE_TRANSFER_SOURCE_TANGEMSHOP:
+        out.append(PIPELINE_TANGEMSHOP)
     return tuple(out)
 
 
@@ -433,14 +449,19 @@ def _allowed_branches(pipeline_id) -> frozenset[str]:
     а не брак заказа. ЗНР-правила увезли бы её в Лист ожидания / Академию / ОПТ,
     и человек потерял бы её из своего списка (постановка Кати 07.09.2026).
 
+    TangemShop — ТОЛЬКО УР по той же механике, но по другой причине
+    (29.09.2026, прямое требование Кати): «УР переводит сделку в офис, ЗИН
+    закрывает её без перехода в офис». Заказ чужого магазина, закрытый как не
+    реализованный, не должен уезжать в чужие воронки по полю «Причина ЗИН».
+
     Ограничение бизнесовое, а не переходное, поэтому оно НЕ снимается
     ignore_flags: теневой матчинг в _no_match_ur гасит флаги правил, но ветку
-    ЗНР картотеке не открывает."""
+    ЗНР этим воронкам не открывает."""
     try:
         pid = int(pipeline_id)
     except (TypeError, ValueError):
         return frozenset({_BRANCH_UR, _BRANCH_ZNR})
-    if pid == PIPELINE_DB_WORK:
+    if pid in (PIPELINE_DB_WORK, PIPELINE_TANGEMSHOP):
         return frozenset({_BRANCH_UR})
     return frozenset({_BRANCH_UR, _BRANCH_ZNR})
 

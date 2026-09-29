@@ -49,6 +49,7 @@ from waybill_config import (
     STATUS_CLOSED_LOST,
     STATUS_SUCCESS,
     is_cod_payment,
+    is_tangemshop_lead,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -256,6 +257,19 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     # Работаем только со сквозным потоком заказа: CLEVER → Офис/Фулфилмент.
     # Сделки из прочих воронок (опт, отдел продаж и т.п.) игнорируем.
     if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE):
+        return
+
+    # ⚠️ Заказы магазина tangemshop.ru (29.09.2026). Гейта по воронке выше тут
+    # НЕ хватает: сделка Tangemshop, закрытая как УР, уезжает в Офис (см.
+    # office_transfer, источник за флагом OFFICE_TRANSFER_SOURCE_TANGEMSHOP) и
+    # с этого момента от розничной по воронке неотличима. Дальше _resolve_clever
+    # не находит оригинал в рознице и с 31.07.2026 в этом случае считает
+    # канонической саму сделку, а идентификатор клиента ей не нужен - хватает
+    # id контакта. Без этого отсева выручка чужого магазина ушла бы офлайн-
+    # конверсией в счётчик Метрики Sunscrypt. У tangemshop.ru свой счётчик,
+    # и заводить его здесь никто не просил.
+    if is_tangemshop_lead(lead):
+        logger.info("Metrika: сделка %s — заказ Tangemshop, в счётчик Sunscrypt не шлём", lead_id)
         return
 
     payment = _cf(lead, FIELD_PAYMENT_METHOD)

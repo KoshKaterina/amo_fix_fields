@@ -30,6 +30,9 @@ from waybill_config import (
     STATUS_OFFICE_SHIPPED,
     STATUS_PAYMENT_RECEIVED,
     STATUS_SUCCESS,
+    STATUS_TANGEM_LINK_SENT,
+    STATUS_TANGEM_OFFICE_RECORD,
+    STATUS_TANGEM_PAYMENT_REQUESTED,
     STATUS_WAYBILL_READY,
 )
 
@@ -311,6 +314,22 @@ def test_master_flag_vyklyuchaet_zapis(env, monkeypatch):
 def test_tangemshop_rabotaet_po_svoim_etapam(env):
     puts = _run(env, PIPELINE_TANGEMSHOP, STATUS_CLOSED_LOST)
     assert puts == [] or all(b["reserve"] == 0 for _, b in puts)
+
+
+@pytest.mark.parametrize("status_id", [
+    STATUS_TANGEM_OFFICE_RECORD,
+    STATUS_TANGEM_PAYMENT_REQUESTED,
+    STATUS_TANGEM_LINK_SENT,
+])
+def test_novye_etapy_tangemshop_derzhat_rezerv(env, status_id):
+    """Три этапа, появившиеся при сведении воронки с розницей (29.09.2026).
+
+    До этой правки их не было в наборе: резерв на них слетал бы по тайм-ауту
+    посреди работы менеджера - сделка стоит на «Ссылка отправлена», клиент
+    думает, а товар уже не за ним.
+    """
+    puts = _run(env, PIPELINE_TANGEMSHOP, status_id)
+    assert [b["reserve"] for _, b in puts] == [2, 1], "резерв = количеству в позиции"
 
 
 # --- тайм-аут -----------------------------------------------------------

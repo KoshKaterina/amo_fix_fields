@@ -43,10 +43,13 @@ from waybill_config import (
     FIELD_COMPOSITION,
     FIELD_DELIVERY_TYPE,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     SHOWROOM_ALERT_DELAY_S,
     SHOWROOM_ALERT_ENABLED,
     SHOWROOM_ALERT_MAX_AGE_MIN,
+    SHOWROOM_ALERT_TANGEMSHOP,
     STATUS_NEW_LEAD_ALL,
+    STATUS_TANGEM_NEW_ORDER,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -111,16 +114,31 @@ def is_pickup(delivery_type) -> bool:
     return any(marker in text for marker in DELIVERY_PICKUP_MARKERS)
 
 
+def _entry_stages(pipeline_id) -> frozenset[int] | None:
+    """Входные этапы воронки, откуда алерт уместен. None — воронка не наша.
+
+    TangemShop добавлен 29.09.2026 («да» Кати по списку А8): самовывоз из офиса
+    заказчику Tangemshop записывают те же люди и в тот же шоурум. За своим флагом,
+    чтобы включать и наблюдать отдельно от розницы."""
+    pid = str(pipeline_id)
+    if pid == str(PIPELINE_CLEVER_MAIN):
+        return frozenset(STATUS_NEW_LEAD_ALL)
+    if pid == str(PIPELINE_TANGEMSHOP) and SHOWROOM_ALERT_TANGEMSHOP:
+        return frozenset({STATUS_TANGEM_NEW_ORDER})
+    return None
+
+
 def is_fresh_new_lead(lead: dict) -> bool:
-    """Сделка — свежая заявка в «Новый лид» воронки ОП розница?
+    """Сделка — свежая заявка на входном этапе розницы или TangemShop?
 
     Проверяется по СДЕЛКЕ, а не по вебхуку: массовый прогон по старым сделкам
     шлёт такие же вебхуки, и отличить их можно только этапом и возрастом."""
     if not lead:
         return False
-    if str(lead.get("pipeline_id")) != str(PIPELINE_CLEVER_MAIN):
+    stages = _entry_stages(lead.get("pipeline_id"))
+    if stages is None:
         return False
-    if lead.get("status_id") not in STATUS_NEW_LEAD_ALL:
+    if lead.get("status_id") not in stages:
         return False
     created = lead.get("created_at") or 0
     return (time.time() - created) <= SHOWROOM_ALERT_MAX_AGE_MIN * 60

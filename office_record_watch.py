@@ -75,10 +75,13 @@ from waybill_config import (
     OFFICE_RECORD_WATCH_CREATE_ENABLED,
     OFFICE_RECORD_WATCH_ENABLED,
     OFFICE_RECORD_WATCH_INTERVAL_S,
+    OFFICE_RECORD_WATCH_TANGEMSHOP,
     OFFICE_RECORD_WINDOW_END_H,
     OFFICE_RECORD_WINDOW_START_H,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     STATUS_CLEVER_OFFICE_RECORD,
+    STATUS_TANGEM_OFFICE_RECORD,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -151,6 +154,23 @@ def task_deadline(now_ts: int) -> int:
     return int(dt.timestamp())
 
 
+def watched_stages() -> dict[int, int]:
+    """Воронка -> этап «Запись в офис». Розница всегда, TangemShop за флагом
+    OFFICE_RECORD_WATCH_TANGEMSHOP (29.09.2026, «да» Кати по списку А8 плана).
+
+    ⚠️ Оговорка, названная в плане и НЕ снятая кодом: сторож судит по полям виджета
+    NOVA «Онлайн-запись» (578063, 578065). Если запись клиента Tangemshop оформляют
+    другим способом, полей не будет, и `decide` честно вернёт "no-date" - задач не
+    появится, но и пользы не будет. Проверяется первой живой записью, а не здесь.
+
+    Флаг читаем на КАЖДОМ вызове, тем же приёмом, что в
+    office_transfer._source_pipelines(): иначе подмена в тестах не подействует."""
+    out = {PIPELINE_CLEVER_MAIN: STATUS_CLEVER_OFFICE_RECORD}
+    if OFFICE_RECORD_WATCH_TANGEMSHOP:
+        out[PIPELINE_TANGEMSHOP] = STATUS_TANGEM_OFFICE_RECORD
+    return out
+
+
 def decide(lead: dict, now_ts: int) -> tuple[str, int | None]:
     """Решение по ОДНОЙ сделке из списка этапа. Без сети и без диска.
 
@@ -162,11 +182,12 @@ def decide(lead: dict, now_ts: int) -> tuple[str, int | None]:
         pipeline_id = int(lead.get("pipeline_id") or 0)
     except (TypeError, ValueError):
         return "other-stage", None
-    if pipeline_id != PIPELINE_CLEVER_MAIN:
+    stages = watched_stages()
+    if pipeline_id not in stages:
         return "other-pipeline", None
     # Фильтр запроса этап уже отобрал, но `decide` зовут и тесты, и разбор отчёта -
     # проверяем явно, а не «по построению».
-    if status_id != STATUS_CLEVER_OFFICE_RECORD:
+    if status_id != stages[pipeline_id]:
         return "other-stage", None
 
     end_ts = end_ts_of(lead)
@@ -183,13 +204,20 @@ def decide(lead: dict, now_ts: int) -> tuple[str, int | None]:
 
 
 async def _stage_leads() -> list[dict]:
-    """Сделки этапа «Запись в офис».
+    """Сделки этапов «Запись в офис» всех наблюдаемых воронок.
 
     ⚠️ `get_leads_by_status` возвращает пустой список и когда этап пуст, и когда amo
     молчит - различить нельзя. Для нас это безопасно в нужную сторону: пустой список
     даёт ноль задач, ложных задач молчание amo не создаёт.
+
+    Запрос на КАЖДУЮ воронку свой: этап у них разный, объединить в один вызов нечем.
+    Этапы крошечные (замер розницы 27.09.2026 - 17 сделок), проход стоит по одному
+    GET на воронку.
     """
-    return await amo_service.get_leads_by_status(STATUS_CLEVER_OFFICE_RECORD, with_=())
+    leads: list[dict] = []
+    for status_id in watched_stages().values():
+        leads.extend(await amo_service.get_leads_by_status(status_id, with_=()))
+    return leads
 
 
 async def _still_waiting(lead_id: int, end_ts: int) -> tuple[str, dict | None]:
@@ -211,7 +239,8 @@ async def _still_waiting(lead_id: int, end_ts: int) -> tuple[str, dict | None]:
         pipeline_id = int(lead.get("pipeline_id") or 0)
     except (TypeError, ValueError):
         return "silent", None
-    if status_id != STATUS_CLEVER_OFFICE_RECORD or pipeline_id != PIPELINE_CLEVER_MAIN:
+    stages = watched_stages()
+    if stages.get(pipeline_id) != status_id:
         return "moved", lead
     if end_ts_of(lead) != int(end_ts):
         return "rescheduled", lead

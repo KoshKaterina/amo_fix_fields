@@ -40,6 +40,7 @@ from waybill_config import (
     WOO_STATUS_SINCE_TS,
     WOO_STATUS_SYNC_ENABLED,
     is_cod_payment,
+    is_tangemshop_lead,
 )
 
 logger = logging.getLogger("uvicorn")
@@ -156,6 +157,22 @@ async def resolve_target(payload: dict, lead: dict | None = None) -> dict | None
         logger.info(
             "Woo: заказ %s без номера на сайте (577415) — не с сайта, пропуск",
             canonical.get("id"),
+        )
+        return None
+
+    # ⚠️ Заказы магазина tangemshop.ru (29.09.2026). Номер там идёт с суффиксом
+    # (« Tangemshop»), потому что числовые id WooCommerce и InSales пересекаются.
+    # В WooCommerce такого заказа нет, и до сегодня нас спасало ровно это: Woo
+    # отвечал 400 на «17665 Tangemshop», и модуль писал «не найден». Спасало
+    # СЛУЧАЙНО - поменяется формат номера, и мы поставим completed ЧУЖОМУ заказу
+    # Sunscrypt, а на этом статусе висит начисление реферальной комиссии.
+    # Проверка та же, что у соседа order_note.py: номер не из WooCommerce - не
+    # ходим туда вовсе. Гейта по воронке тут не хватает: сделка Tangemshop,
+    # закрытая как УР, живёт в Офисе наравне с розничной.
+    if is_tangemshop_lead(canonical) or not site.isdigit():
+        logger.info(
+            "Woo: сделка %s — номер «%s» не из WooCommerce, в Woo не идём",
+            canonical.get("id"), site,
         )
         return None
 

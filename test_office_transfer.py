@@ -1165,4 +1165,164 @@ metrika_sync._contact_info = _saved_contact_info
 metrika_sync._enabled = _saved_enabled
 print("✓ Метрика картотеку не видит, а розницу отправляет — гейт воронок работает")
 
+# ══════════ TangemShop: перенос только на УР ══════════
+# ТЗ 29.09.2026 по запуску заказов магазина tangemshop.ru через amoCRM. Прямые слова
+# Кати: «УР переводит сделку в офис, ЗИН закрывает её без перехода в офис».
+from waybill_config import (  # noqa: E402
+    ENUM_SALES_CHANNEL_TANGEMSHOP,
+    FIELD_SALES_CHANNEL,
+    FIELD_SITE_ORDER_NUMBER,
+    PIPELINE_TANGEMSHOP,
+    is_tangemshop_lead,
+)
+
+_TG_FLAG_WAS = office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP
+assert _TG_FLAG_WAS is False, "OFFICE_TRANSFER_SOURCE_TANGEMSHOP должен быть выключен по умолчанию"
+
+# флаг выключен → сделку не трогаем и НЕ алертим
+_reset()
+lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ",
+             responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "skipped-not-applicable", res
+assert not _patches and not _tags, (_patches, _tags)
+assert office_transfer.is_source_pipeline(PIPELINE_TANGEMSHOP) is False
+print("✓ Tangemshop: флаг выключен → сделка не трогается и не алертит")
+
+office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP = True
+assert office_transfer.is_source_pipeline(PIPELINE_TANGEMSHOP) is True
+
+# УР со СДЭКом: тот же этап Офиса, что у розницы с такой же доставкой
+_reset()
+lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN, delivery_text="СДЭК до ПВЗ",
+             responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
+assert _patches[0]["status_id"] == STATUS_CREATE_WAYBILL, (
+    "заказ Tangemshop обязан ехать в тот же этап, что розничный с той же доставкой")
+assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
+assert _patches[0]["custom_fields"][FIELD_FORMER_RESPONSIBLE] == "Иван Иванов"
+print("✓ Tangemshop/142 СДЭК → Офис/«Сделать накладную», как из розницы")
+
+# УР с самовывозом: в УР Офиса, тоже как розница
+_reset()
+lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, application_type=APPLICATION_TYPE_ORDER,
+             warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+             delivery_text="Самовывоз из офиса Sunscrypt", responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "moved", res
+assert (_patches[0]["pipeline_id"], _patches[0]["status_id"]) == (PIPELINE_OFFICE, STATUS_SUCCESS), _patches[0]
+print("✓ Tangemshop/142 самовывоз → Офис/УР, как у розницы")
+
+# ⚠️ ГЛАВНЫЙ тест задачи: ЗИН закрывает сделку НА МЕСТЕ
+_reset()
+lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, status_id=STATUS_CLOSED_LOST,
+             reason=REASON_WAITLIST, responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match", res
+assert not _patches, ("ЗИН обязан оставить сделку в воронке Tangemshop", _patches)
+print("✓ Tangemshop/143 → остаётся в своей воронке, ЗНР-правила ей не даны")
+
+# та же причина ЗИН, но «Академия»: тоже никуда
+_reset()
+lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, status_id=STATUS_CLOSED_LOST,
+             reason=REASON_ACADEMY, responsible_user_id=999)
+_install_dispatcher_mocks(lead)
+res = run(office_transfer.process_office_transfer(42))
+assert res == "no-match", res
+assert not _patches, _patches
+print("✓ Tangemshop/143 «Академия» → тоже на месте, ветка ЗНР закрыта целиком")
+
+office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP = _TG_FLAG_WAS
+
+# ── признак магазина: два независимых источника ──────────────────────────────
+assert is_tangemshop_lead(
+    {"custom_fields_values": [_cf(FIELD_SALES_CHANNEL, value="TangemShop")]}) is True
+# по enum_id тоже: подпись значения в интерфейсе заказчик может переименовать
+assert is_tangemshop_lead({"custom_fields_values": [
+    {"field_id": FIELD_SALES_CHANNEL,
+     "values": [{"value": "как угодно", "enum_id": ENUM_SALES_CHANNEL_TANGEMSHOP}]}]}) is True
+assert is_tangemshop_lead(
+    {"custom_fields_values": [_cf(FIELD_SITE_ORDER_NUMBER, value="17665 Tangemshop")]}) is True
+assert is_tangemshop_lead(
+    {"custom_fields_values": [_cf(FIELD_SITE_ORDER_NUMBER, value="19003")]}) is False
+assert is_tangemshop_lead({"custom_fields_values": []}) is False
+assert is_tangemshop_lead({}) is False
+print("✓ признак магазина: канал продаж ИЛИ суффикс номера, розничный номер не задет")
+
+# ── мина 1: выручка Tangemshop не уезжает в счётчик Метрики Sunscrypt ────────
+# Сделка, закрытая как УР, живёт в ОФИСЕ и по воронке от розничной неотличима.
+metrika_sync.metrika_client.upload_simple_order = _catch_upload
+metrika_sync._contact_info = _fake_contact_info
+metrika_sync._enabled = True
+
+
+async def _find_no_sibling(query, with_=()):
+    """Оригинала в рознице нет — штатный случай после перехода на ПЕРЕНОС.
+    Ровно тут _resolve_clever и возвращает саму сделку, из-за чего заказ чужого
+    магазина доезжал бы до отправки."""
+    return []
+
+
+_saved_find = metrika_sync.amo_service.find_leads_by_query
+metrika_sync.amo_service.find_leads_by_query = _find_no_sibling
+
+
+def _office_lead(lead_id: int, site_number: str) -> dict:
+    """Заказ, закрытый как УР и уехавший в Офис.
+
+    ⚠️ Две обязательные мелочи, на каждой из которых сторож молча становится
+    ложно-зелёным:
+      • UUID заказа МойСклада - без него `_resolve_clever` выходит РАНЬШЕ признака
+        магазина, и пустой результат означал бы совсем другую причину;
+      • свой id у каждой сделки - у Метрики есть дедуп по состоянию заказа, и
+        вторая отправка того же id не уходит вовсе.
+    """
+    lead = _ym_lead(PIPELINE_OFFICE)
+    lead["id"] = lead_id
+    lead["custom_fields_values"].append(
+        _cf(metrika_sync.FIELD_MOYSKLAD_ORDER_UUID, value=f"0e5aa71e-c413-11ee-0a80-{lead_id:012d}"))
+    lead["custom_fields_values"].append(_cf(FIELD_SITE_ORDER_NUMBER, value=site_number))
+    return lead
+
+
+_ym_rows.clear()
+run(metrika_sync.process_sync({"lead_id": 8101}, lead=_office_lead(8101, "17665 Tangemshop")))
+assert not _ym_rows, ("выручка чужого магазина не должна уезжать в счётчик Sunscrypt", _ym_rows)
+
+# Контроль, чтобы сторож не был ложно-зелёным: та же сделка БЕЗ признака магазина
+# доходит до отправки.
+_ym_rows.clear()
+run(metrika_sync.process_sync({"lead_id": 8102}, lead=_office_lead(8102, "19003")))
+assert _ym_rows, "розничный заказ в Офисе обязан уезжать в Метрику — иначе сторож ничего не проверяет"
+
+metrika_sync.metrika_client.upload_simple_order = _saved_upload
+metrika_sync._contact_info = _saved_contact_info
+metrika_sync._enabled = _saved_enabled
+print("✓ Метрика: заказ Tangemshop отсеян, розничный в Офисе уезжает как раньше")
+
+# ── мина 2: заказ Tangemshop не стучится в WooCommerce ──────────────────────
+# На статусе completed висит начисление реферальной комиссии Easy Affiliate.
+import woo_status_sync  # noqa: E402
+
+metrika_sync.amo_service.find_leads_by_query = _find_no_sibling
+
+assert run(woo_status_sync.resolve_target(
+    {"lead_id": 8201}, lead=_office_lead(8201, "17665 Tangemshop"))) is None, (
+    "номер с суффиксом магазина в WooCommerce искать нечего")
+
+# Контроль: розничный заказ по-прежнему доходит до Woo.
+_target = run(woo_status_sync.resolve_target({"lead_id": 8202}, lead=_office_lead(8202, "19003")))
+assert _target is not None and _target["site"] == "19003", _target
+
+metrika_sync.amo_service.find_leads_by_query = _saved_find
+print("✓ WooCommerce: заказ Tangemshop не ищется, розничный находится как раньше")
+
 print("\noffice_transfer: все тесты прошли")

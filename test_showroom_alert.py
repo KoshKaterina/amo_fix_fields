@@ -51,8 +51,10 @@ import showroom_alert  # noqa: E402
 import tg_recipients  # noqa: E402
 from waybill_config import (  # noqa: E402
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     STATUS_NEW_LEAD,
     STATUS_NEW_LEAD_BUFFERS,
+    STATUS_TANGEM_NEW_ORDER,
 )
 
 LEAD_ID = 36600001
@@ -190,6 +192,39 @@ def test_staraya_sdelka_ne_prohodit():
 
 def test_net_sdelki_ne_prohodit():
     assert showroom_alert.is_fresh_new_lead(None) is False
+
+
+# ── TangemShop (29.09.2026): тот же шоурум, те же люди, свой выключатель ─────
+
+def test_tangemshop_pri_vyklyuchennom_flage_ne_prohodit():
+    assert showroom_alert.SHOWROOM_ALERT_TANGEMSHOP is False
+    lead = _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_TANGEM_NEW_ORDER)
+    assert showroom_alert.is_fresh_new_lead(lead) is False
+
+
+def test_tangemshop_s_flagom_prohodit():
+    showroom_alert.SHOWROOM_ALERT_TANGEMSHOP = True
+    try:
+        assert showroom_alert.is_fresh_new_lead(
+            _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_TANGEM_NEW_ORDER)) is True
+        # розничные буферные этапы в чужой воронке не в счёт: вход у неё один
+        assert showroom_alert.is_fresh_new_lead(
+            _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_NEW_LEAD)) is False
+        # возраст сделки общий на все воронки
+        assert showroom_alert.is_fresh_new_lead(
+            _lead(pipeline=PIPELINE_TANGEMSHOP, status=STATUS_TANGEM_NEW_ORDER,
+                  age_min=60 * 24 * 28)) is False
+    finally:
+        showroom_alert.SHOWROOM_ALERT_TANGEMSHOP = False
+
+
+def test_roznica_ne_zavisit_ot_flaga_tangemshop():
+    """Контроль: включение чужой воронки ничего не меняет в розничной."""
+    showroom_alert.SHOWROOM_ALERT_TANGEMSHOP = True
+    try:
+        assert showroom_alert.is_fresh_new_lead(_lead()) is True
+    finally:
+        showroom_alert.SHOWROOM_ALERT_TANGEMSHOP = False
 
 
 # ── гейт notify_bg ───────────────────────────────────────────────────────────

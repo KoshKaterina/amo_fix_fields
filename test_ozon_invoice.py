@@ -1147,4 +1147,74 @@ print("✓ оплаченная сделка Академии доезжает �
 ozon_invoice.OZON_INVOICE_DB_WORK = _FLAG_WAS
 ozon_invoice.OZON_INVOICE_ACADEMY = _ACADEMY_FLAG_WAS
 
+# ══════════════════════ TangemShop: четвёртая воронка ══════════════════════
+# ТЗ 29.09.2026: оплата заказов магазина tangemshop.ru идёт по той же схеме,
+# что розничная. Этапы у воронки свои, механика общая.
+from waybill_config import (  # noqa: E402
+    PIPELINE_TANGEMSHOP,
+    STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED,
+    STATUS_TANGEM_LINK_SENT,
+    STATUS_TANGEM_PAYMENT_REQUESTED,
+)
+
+_TG_FLAG_WAS = ozon_invoice.OZON_INVOICE_TANGEMSHOP
+assert _TG_FLAG_WAS is False, "OZON_INVOICE_TANGEMSHOP должен быть выключен по умолчанию"
+assert PIPELINE_TANGEMSHOP not in ozon_invoice._invoice_pipelines()
+print("✓ Tangemshop: флаг выключен по умолчанию, воронки счёта её не включают")
+
+# флаг выключен + сделка на тех-этапе Tangemshop → полный скип
+_reset()
+_install_mocks(_lead(status=STATUS_TANGEM_PAYMENT_REQUESTED, pipeline=PIPELINE_TANGEMSHOP))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-moved", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+print("✓ Tangemshop: при выключенном флаге счёт не создаётся")
+
+# флаг включён: счёт создан, PATCH несёт этапы и воронку Tangemshop
+ozon_invoice.OZON_INVOICE_TANGEMSHOP = True
+_reset()
+_install_mocks(_lead(status=STATUS_TANGEM_PAYMENT_REQUESTED, pipeline=PIPELINE_TANGEMSHOP))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert len(_patches) == 1, _patches
+assert _patches[0]["status_id"] == STATUS_TANGEM_LINK_SENT, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_TANGEMSHOP, _patches[0]
+print("✓ Tangemshop: сделка остаётся в своей воронке, этап — «Ссылка отправлена»")
+
+# перекрёстный негатив: розничный тех-этап внутри воронки Tangemshop → скип
+_reset()
+_install_mocks(_lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_TANGEMSHOP))
+assert run(ozon_invoice.process_invoice_lead(LEAD_ID)) == "skipped-moved"
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+print("✓ Tangemshop: розничный тех-этап в чужой воронке — скип, воронки не путаются")
+
+# оплата доводится до конца и с опущенным флагом: деньги клиента уже списаны
+ozon_invoice.OZON_INVOICE_TANGEMSHOP = False
+_reset()
+_install_mocks(_lead(status=STATUS_TANGEM_LINK_SENT, pipeline=PIPELINE_TANGEMSHOP))
+res = run(ozon_invoice._mark_paid(
+    _lead(status=STATUS_TANGEM_LINK_SENT, pipeline=PIPELINE_TANGEMSHOP),
+    "1000", "extId tg", "вебхук"))
+assert res == "moved", res
+assert _patches[0]["status_id"] == STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED, _patches[0]
+assert _patches[0]["pipeline_id"] == PIPELINE_TANGEMSHOP, _patches[0]
+print("✓ оплаченная сделка Tangemshop доезжает до «доплата получена» и с опущенным флагом")
+
+# сверка: выключенный флаг не стоит ни одного лишнего запроса
+_asked_tg: list = []
+
+
+async def _fake_by_status_tg(status_id, with_=()):
+    _asked_tg.append(status_id)
+    return []
+
+amo_service.get_leads_by_status = _fake_by_status_tg
+run(ozon_invoice._reconcile_once())
+assert STATUS_TANGEM_LINK_SENT not in _asked_tg, _asked_tg
+assert STATUS_TANGEM_PAYMENT_REQUESTED not in _asked_tg, _asked_tg
+amo_service.get_leads_by_status = _real_by_status
+print("✓ сверка: выключенная воронка Tangemshop не опрашивается вовсе")
+
+ozon_invoice.OZON_INVOICE_TANGEMSHOP = _TG_FLAG_WAS
+
 print("\nozon_invoice: все тесты прошли")
