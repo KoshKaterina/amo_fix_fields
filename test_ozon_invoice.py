@@ -51,9 +51,13 @@ _notes: list = []
 _tags: list = []
 _alerts: list = []
 _ozon_calls: list = []
+_reads: list = []          # сколько раз модуль читал сделку — это и есть «попытка»
 
 
-def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None, other=None, by_card=None):
+# Способ оплаты и бюджет у фабрики ЗАПОЛНЕНЫ по умолчанию: с 28.09.2026 незаполненная
+# сделка счёт не создаёт вовсе, а большинству тестов нужна именно нормальная сделка.
+def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=UU, link=None,
+          other=None, by_card=None, method="Онлайн-оплата", price=12345):
     cf = []
     if uuid is not None:
         cf.append({"field_id": FIELD_MOYSKLAD_ORDER_UUID, "values": [{"value": uuid}]})
@@ -63,9 +67,12 @@ def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=U
         cf.append({"field_id": ozon_invoice.FIELD_INVOICE_OTHER_AMOUNT, "values": [{"value": other}]})
     if by_card is not None:
         cf.append({"field_id": ozon_invoice.FIELD_INVOICE_BY_CARD, "values": [{"value": by_card}]})
+    if method is not None:
+        cf.append({"field_id": ozon_invoice.FIELD_PAYMENT_METHOD, "values": [{"value": method}]})
     return {
         "id": LEAD_ID,
         "name": "Заказ №4242",
+        "price": price,
         "status_id": status,
         "pipeline_id": pipeline,
         "responsible_user_id": 11513202,
@@ -75,6 +82,7 @@ def _lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_CLEVER_MAIN, uuid=U
 
 def _install_mocks(lead, *, order_sum=1234500, ozon_ok=True, patch_ok=True):
     async def fake_get_lead_full(lead_id, with_=()):
+        _reads.append(lead_id)
         return lead
 
     async def fake_patch_lead(lead_id, **kw):
@@ -115,9 +123,11 @@ def _install_mocks(lead, *, order_sum=1234500, ozon_ok=True, patch_ok=True):
 
 
 def _reset():
-    for coll in (_patches, _notes, _tags, _alerts, _ozon_calls):
+    for coll in (_patches, _notes, _tags, _alerts, _ozon_calls, _reads):
         coll.clear()
     ozon_invoice._recent.clear()
+    ozon_invoice._blocked_noted.clear()
+    ozon_invoice._failed_recent.clear()
 
 
 def run(coro):
@@ -259,6 +269,125 @@ assert not _ozon_calls and not _patches
 assert any("Другая сумма" in a for a in _alerts), _alerts
 print("✓ мусор в «Другой сумме»: счёт не создан, менеджеру понятная ошибка")
 
+# ── 10-1) «Другая сумма» без заказа МС → счёт всё равно создаём ─────────
+# Катя 28.09.2026: заказ МС нужен только как ИСТОЧНИК суммы. Менеджер вписал
+# сумму сам — требовать заказ не за что. Путь один на все воронки.
+_reset()
+_install_mocks(_lead(uuid=None, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000, _ozon_calls
+assert _ozon_calls[0][3] == "", _ozon_calls  # номера заказа нет — extId без префикса
+assert not _tags and not _alerts, (_tags, _alerts)
+assert "Другая сумма" in _notes[0][1], _notes
+print("✓ «Другая сумма» без заказа МС: счёт создан, ошибки менеджеру нет")
+
+# ── 10-2) «Другая сумма» + МС молчит → счёт создаём, просто без номера ──────
+async def _ms_silent(path, params=None, **kw):
+    return None
+
+_reset()
+_install_mocks(_lead(other="2 500"))
+ms_client.get = _ms_silent
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000 and _ozon_calls[0][3] == "", _ozon_calls
+print("✓ «Другая сумма» + молчащий МойСклад: счёт создан, номер заказа пуст")
+
+# ── 10-3) без «Другой суммы» заказ МС по-прежнему обязателен (регресс) ──────
+_reset()
+_install_mocks(_lead())
+ms_client.get = _ms_silent
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "failed-ms-fetch", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+print("✓ без «Другой суммы»: молчащий МойСклад — счёт не создаём")
+
+# ── 11) стоп-список способов оплаты: крипта и прочее ───────────────────
+# Катя 28.09.2026: по таким способам оплата идёт мимо эквайринга, ссылка Ozon Pay
+# там не нужна. Сначала чистая функция — все написания разом.
+for raw in ("Крипта", "криптой", "ОПЛАТА КРИПТОЙ", "Crypto USDT", "usdt", "USDT TRC20",
+            "ustd", "Trust Wallet", "wallet", "TRC-20"):
+    assert ozon_invoice.blocked_invoice_payment_token(raw), raw
+for raw in ("Онлайн-оплата", "Картой на сайте", "При получении", "Безналичный перевод",
+            "Наличные", "СберПей", "", None):
+    assert ozon_invoice.blocked_invoice_payment_token(raw) == "", raw
+print("✓ стоп-список: крипта/USDT/USTD/TRC/wallet в любом регистре, обычные способы живы")
+
+# ── 11a) способ оплаты «Крипта» → ссылку не создаём, Ozon не дёргаем ────────
+_reset()
+_install_mocks(_lead(method="Крипта"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-payment-method", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+assert not _tags and not _alerts, "это не ошибка менеджера: ни тега, ни алерта в ТГ"
+assert len(_notes) == 1 and "Крипта" in _notes[0][1], _notes
+print("✓ «Крипта»: ссылки нет, Ozon не дёрнут, в карточке объяснение без тега и алерта")
+
+# ── 11b) «Другая сумма» стоп-список не отменяет ─────────────────────────
+# Запрет стоит ВЫШЕ развилки про сумму: крипта не пускает счёт ни при какой сумме.
+_reset()
+_install_mocks(_lead(method="криптой", uuid=None, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-payment-method", res
+assert not _ozon_calls, _ozon_calls
+print("✓ стоп-список сильнее «Другой суммы»: счёт не создаётся вообще")
+
+# ── 11c) повторные вебхуки той же сделки не сыплют примечаниями ─────────
+_reset()
+_install_mocks(_lead(method="USDT TRC20"))
+run(ozon_invoice.process_invoice_lead(LEAD_ID))
+ozon_invoice._recent.clear()          # следующий вебхук вне дедуп-окна
+run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert len(_notes) == 1, _notes
+print("✓ стоп-список: объяснение в карточке одно, сколько бы вебхуков ни пришло")
+
+# ── 12) незаполненная сделка: выставлять нечего, молчим ────────────────────
+# Разбор сделки 36389097 (Катя 28.09.2026): способ оплаты пуст, бюджет 0, заказа
+# МС нет. Раньше это был _fail с тегом и алертом, а наша же запись двигала
+# updated_at → сторож пробовал снова → восемь одинаковых примечаний за два часа.
+_reset()
+_install_mocks(_lead(method=None, uuid=None, price=0))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-not-ready", res
+assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+assert not _tags and not _alerts and not _notes, "незаполненная сделка — не повод шуметь"
+print("✓ способ оплаты пуст: счёт не создаём и НЕ шумим (ни тега, ни примечания, ни алерта)")
+
+_reset()
+_install_mocks(_lead(uuid=None, price=0))         # способ есть, а суммы взять неоткуда
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "skipped-not-ready", res
+assert not _ozon_calls and not _notes and not _tags, (_ozon_calls, _notes, _tags)
+print("✓ бюджет 0, «Другая сумма» пуста, заказа МС нет: молча пропускаем")
+
+# ── 12a) но бюджет 0 при живом заказе МС счёт НЕ блокирует ─────────────────
+# Сумма берётся из заказа, а не из бюджета: блокировать такую сделку нельзя.
+_reset()
+_install_mocks(_lead(price=0))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 1234500, _ozon_calls
+print("✓ бюджет 0, но заказ МС есть — счёт создаётся по сумме заказа")
+
+_reset()
+_install_mocks(_lead(uuid=None, price=0, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created" and _ozon_calls[0][1] == 250000, (res, _ozon_calls)
+print("✓ бюджет 0, но «Другая сумма» заполнена — счёт создаётся")
+
+# ── 12b) одна и та же причина отказа не дублируется в течение часа ─────────
+_reset()
+_install_mocks(_lead(uuid=""))                    # заказа МС нет, но сделка заполнена
+res1 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+ozon_invoice._recent.clear()
+res2 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res1 == res2 == "failed-no-ms-order", (res1, res2)
+assert len(_notes) == 1, _notes
+assert len(_alerts) == 1, _alerts
+assert len(_tags) == 1, _tags
+print("✓ повтор той же причины: одно примечание, один алерт, один тег — без спама")
+
 # ── 10a) _is_checked: форматы amo checkbox ─────────────────────────────────
 for raw in (True, "1", "on", "true", "YES"):
     assert ozon_invoice._is_checked(raw) is True, raw
@@ -293,6 +422,100 @@ res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
 assert res == "skipped-link-present", res
 assert not _ozon_calls and not _patches and not _alerts and not _tags
 print("✓ ссылка уже в поле: второй платёж не создаём, ручную ссылку уважаем")
+
+# ── отказной заход НЕ занимает дедуп-окно (23.09.2026, сделка 36553383) ─────
+# Раньше окно занимал любой проход, включая отказной. Менеджер очищал поле,
+# чтобы получить новую ссылку, дёргал этап — и попадал в окно, занятое
+# предыдущим отказом. Чем настойчивее дёргал, тем дольше не создавалось.
+_reset()
+_install_mocks(_lead(link="https://qr.nspk.ru/OLD"))
+res1 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res1 == "skipped-link-present", res1
+assert not _ozon_calls, "при заполненном поле в Ozon не ходим"
+_install_mocks(_lead())          # менеджер очистил поле и дёрнул сделку снова
+res2 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res2 == "created", res2
+assert len(_ozon_calls) == 1, _ozon_calls
+print("✓ отказ «ссылка уже есть» не блокирует следующую попытку")
+
+_reset()
+_install_mocks(_lead(status=STATUS_LINK_SENT))
+res1 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res1 == "skipped-moved", res1
+_install_mocks(_lead())
+res2 = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res2 == "created", res2
+print("✓ отказ «уехала с этапа» тоже не блокирует следующую попытку")
+
+# ── сторож: сделка висит на «Оплата запрошена» без ссылки ───────────────────
+_reset()
+_install_mocks(_lead())
+fresh = _lead()
+fresh["updated_at"] = int(time.time())            # только что трогали
+assert run(ozon_invoice._retry_missing_link(fresh)) == 0
+assert not _ozon_calls, "свежую сделку не трогаем — её вебхук ещё в очереди"
+print("✓ сторож не наступает на пятки: свежую сделку не пересоздаёт")
+
+_reset()
+_install_mocks(_lead())
+stale = _lead()
+stale["updated_at"] = int(time.time() - 10 * 60)  # тишина десять минут
+assert run(ozon_invoice._retry_missing_link(stale)) == 1
+assert len(_ozon_calls) == 1, _ozon_calls
+assert _patches and _patches[0]["status_id"] == STATUS_LINK_SENT
+print("✓ сторож: зависшая без ссылки сделка получает счёт повторной попыткой")
+
+# ── сторож не долбит одну и ту же сделку (Катя 23.09.2026: «плохо для сервера») ──
+# Проход сверки идёт каждые три минуты. Без этой защиты сторож ходил в amo и
+# МойСклад по одним и тем же сделкам бесконечно: за сорок минут 18 заходов по
+# двум сделкам, у которых счёт в принципе не мог создаться (нет заказа МС).
+_reset()
+_install_mocks(_lead(uuid=""))                    # заказа МС нет — счёт невозможен
+broken = _lead(uuid="")
+broken["updated_at"] = int(time.time() - 10 * 60)
+assert run(ozon_invoice._retry_missing_link(broken)) == 0
+first_calls = len(_reads)
+assert run(ozon_invoice._retry_missing_link(broken)) == 0
+assert len(_reads) == first_calls, "вторая попытка на той же версии сделки не нужна"
+# сделку тронули — версия сменилась, пробуем снова. Считаем именно чтения сделки,
+# а не примечания: с 28.09.2026 одна и та же причина отказа пишется раз в час.
+broken["updated_at"] = int(time.time() - 9 * 60)
+assert run(ozon_invoice._retry_missing_link(broken)) == 0
+assert len(_reads) > first_calls, "после изменения сделки попытка обязана повториться"
+print("✓ сторож: одна попытка на версию сделки, повтор только после изменения")
+
+_reset()
+_install_mocks(_lead())
+old = _lead()
+old["updated_at"] = int(time.time() - 8 * 3600)    # висит восемь часов
+assert run(ozon_invoice._retry_missing_link(old)) == 0
+assert not _ozon_calls, "давно стоящая сделка — это работа менеджера, не наш сбой"
+print("✓ сторож молчит о сделках, которые просто долго стоят на этапе оплаты")
+
+# Константы Академии импортируются ниже по файлу — здесь берём их из модуля.
+_reset()
+_install_mocks(_lead())
+academy = _lead(status=ozon_invoice.OZON_PAYMENT_STAGES[ozon_invoice.PIPELINE_ACADEMY][0],
+                pipeline=ozon_invoice.PIPELINE_ACADEMY, uuid="")
+academy["updated_at"] = int(time.time() - 10 * 60)
+assert run(ozon_invoice._retry_missing_link(academy)) == 0
+assert not _ozon_calls and not _notes and not _tags, "Академию сторож не трогает вовсе"
+print("✓ сторож не лезет в Академию: там счёт выставляют иначе")
+
+# ── сторож молчит о сделках со стоп-способом оплаты ─────────────────────────
+# Ссылки нет ПО ЗАМЫСЛУ. Без этого гейта сторож звал бы человека каждые сутки
+# по каждой сделке, где клиент платит криптой.
+_reset()
+_REAL_IN_WINDOW_CRYPTO = ozon_invoice._in_alert_window
+ozon_invoice._in_alert_window = lambda now=None: True
+_install_mocks(_lead(method="Оплата криптой"))
+crypto = _lead(method="Оплата криптой")
+crypto["updated_at"] = int(time.time() - 30 * 60)     # висит полчаса, порог алерта 15 мин
+assert run(ozon_invoice._retry_missing_link(crypto)) == 0
+assert not _alerts and not _tags, (_alerts, _tags)
+assert not _ozon_calls, _ozon_calls
+ozon_invoice._in_alert_window = _REAL_IN_WINDOW_CRYPTO
+print("✓ сторож: у сделки со стоп-способом ссылки нет законно — человека не зовём")
 
 # ═══ Этап 2: вебхук факта оплаты ════════════════════════════════════════════
 
@@ -765,6 +988,18 @@ assert res == "created", res
 assert _patches[0]["status_id"] == STATUS_LINK_SENT, _patches[0]
 assert _patches[0]["pipeline_id"] == PIPELINE_CLEVER_MAIN, _patches[0]
 print("✓ картотека включена — розница ходит прежним путём")
+
+# ── к3a) картотека: «Другая сумма» без заказа МС тоже создаёт счёт ──────────
+# Требование Кати «во всех воронках»: развилка живёт в общем коде, не в розничной ветке.
+_reset()
+_install_mocks(_lead(status=STATUS_DB_PAYMENT_REQUESTED, pipeline=PIPELINE_DB_WORK,
+                     uuid=None, other="2 500"))
+res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+assert res == "created", res
+assert _ozon_calls[0][1] == 250000, _ozon_calls
+assert _patches[0]["pipeline_id"] == PIPELINE_DB_WORK, _patches[0]
+assert not _alerts, _alerts
+print("✓ картотека: «Другая сумма» без заказа МС — счёт создан в своей воронке")
 
 # ── к4) перекрёстный негатив: картотека на РОЗНИЧНОМ этапе → скип ───────────
 # Ловит гейт, который сверяет только этап и не смотрит, из какой он воронки.

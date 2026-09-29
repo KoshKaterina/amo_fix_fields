@@ -6,11 +6,23 @@
 через Ozon Acquiring API (createPayment, payType=SBP — та же «самостоятельная
 интеграция» и те же ключи, что у плагина сайта sunscrypt-sbp), сумма — из
 связанного заказа МойСклад (поле 576689 = UUID заказа; sum МС и amount.value
-Ozon оба в копейках, 1:1) → ОДНИМ атомарным PATCH пишем ссылку в поле 577617 и
+Ozon оба в копейках, 1:1) или из поля «Другая сумма» (578141), и тогда заказ МС
+вообще не нужен (Катя 28.09.2026) → ОДНИМ атомарным PATCH пишем ссылку в поле 577617 и
 переводим сделку в «Ссылка отправлена» (83537866) — там штатные DP-боты (7173)
 шлют клиенту шаблон с уже заполненным полем.
 
-Любая ошибка (нет 576689 / МС недоступен / sum=0 / Ozon отказал / PATCH не
+Способ оплаты (577373) со словом «крипт», «usdt»/«ustd», «trc» или «wallet» —
+ссылку НЕ создаём вовсе (Катя 28.09.2026): такие оплаты идут мимо эквайринга.
+Это не ошибка, поэтому без тега и алерта — только примечание в карточке, и
+сторож зависших счетов такие сделки тоже пропускает.
+
+Сделка не заполнена — счёт не выставляем и МОЛЧИМ (Катя 28.09.2026): пуст способ
+оплаты, либо разом пусты бюджет, «Другая сумма» и заказ МС. Это не сбой, а работа
+менеджера, которая ещё не сделана. Раньше такие сделки падали в ошибку, а наша же
+запись двигала updated_at, сторож видел «новую версию» и пробовал снова — петля
+на восемь одинаковых примечаний за два часа (сделка 36389097).
+
+Любая ошибка (нет 576689 и пуста «Другая сумма» / МС недоступен / sum=0 / Ozon отказал / PATCH не
 прошёл) → сделка ОСТАЁТСЯ на тех-этапе (видно в воронке): тег «ошибка счёта» +
 примечание с причиной + алерт в ТГ ОП с @ответственного менеджера. Клиент в
 этом случае не получает ничего — менеджер выставляет счёт вручную и двигает
@@ -42,6 +54,7 @@ from waybill_config import (
     FIELD_INVOICE_OTHER_AMOUNT,
     FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_PAYMENT_LINK,
+    FIELD_PAYMENT_METHOD,
     OZON_INVOICE_ENABLED,
     OZON_INVOICE_REDIRECT_URL,
     OZON_INVOICE_TTL_S,
@@ -52,6 +65,9 @@ from waybill_config import (
     OZON_RECONCILE_INTERVAL_S,
     OZON_ALERT_WINDOW_END_H,
     OZON_ALERT_WINDOW_START_H,
+    OZON_NO_LINK_ALERT_MIN,
+    OZON_NO_LINK_MAX_QUIET_MIN,
+    OZON_NO_LINK_RETRY_MIN,
     OZON_STALE_ALERT_MIN,
     OZON_INVOICE_ACADEMY,
     OZON_INVOICE_DB_WORK,
@@ -64,6 +80,7 @@ from waybill_config import (
     PIPELINE_DB_WORK,
     PUBLIC_BASE_URL,
     TAG_INVOICE_ERROR,
+    blocked_invoice_payment_token,
     looks_like_uuid,
 )
 
@@ -315,12 +332,33 @@ async def _create_payment(
     return pay_link, payment_id, ""
 
 
+# Одна и та же причина отказа по одной сделке — не чаще раза в час. Страховка от
+# петли «наш же _fail меняет сделку → сторож видит новую версию → новая попытка →
+# новый _fail» (сделка 36389097, 28.09.2026: восемь одинаковых примечаний за два
+# часа). Память процесса: после пересборки контейнера отсчёт начинается заново.
+_failed_recent: dict[tuple, float] = {}
+_FAIL_REPEAT_GAP_S = 3600.0
+
+
 async def _fail(lead: dict, reason: str, detail: str = "") -> None:
     """Счёт не создан/не доставлен: тег + примечание + алерт в ТГ ОП с
-    @ответственного (формат и текст «Нет заказа в МС…» — требование Кати)."""
+    @ответственного (формат и текст «Нет заказа в МС…» — требование Кати).
+
+    Повтор той же причины по той же сделке в течение часа — только строка в лог:
+    менеджеру от десятого одинакового примечания пользы нет, а карточку оно
+    забивает так, что живую переписку в ней не найти."""
     lead_id = lead.get("id")
     name = lead.get("name") or f"сделка {lead_id}"
     logger.warning("Lead %s: СБП-счёт: %s (%s)", lead_id, reason, detail)
+    now = time.time()
+    for k, ts in list(_failed_recent.items()):
+        if now - ts > _FAIL_REPEAT_GAP_S:
+            _failed_recent.pop(k, None)
+    key = (int(lead_id or 0), reason)
+    if now - _failed_recent.get(key, 0.0) < _FAIL_REPEAT_GAP_S:
+        logger.info("Lead %s: та же причина отказа в течение часа — примечание и алерт не дублируем", lead_id)
+        return
+    _failed_recent[key] = now
     note = f"⚠️ Счёт СБП: {reason}"
     if detail:
         note += f"\n{detail}"
@@ -343,6 +381,35 @@ async def _fail(lead: dict, reason: str, detail: str = "") -> None:
         await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
+# Кому уже объяснили, что по этому способу оплаты ссылки не будет. Вебхук
+# update_lead прилетает на ЛЮБУЮ правку сделки, а сделка с криптой может стоять
+# на этапе долго — без этого окна в карточку насыпалась бы пачка одинаковых
+# примечаний. Память процесса: после пересборки контейнера объясним ещё раз, и
+# это дешевле, чем лишний запрос примечаний на каждый вебхук.
+_blocked_noted: dict[int, float] = {}
+_BLOCKED_NOTE_GAP_S = 6 * 3600
+
+
+async def _note_blocked_once(lead_id, payment_method: str) -> None:
+    """Объяснить менеджеру в карточке, почему ссылки не будет — не чаще раза в
+    шесть часов на сделку."""
+    key = int(lead_id)
+    now = time.time()
+    for k, ts in list(_blocked_noted.items()):
+        if now - ts > _BLOCKED_NOTE_GAP_S:
+            _blocked_noted.pop(k, None)
+    if now - _blocked_noted.get(key, 0.0) < _BLOCKED_NOTE_GAP_S:
+        return
+    _blocked_noted[key] = now
+    await amo_service.add_note(
+        lead_id,
+        f"Ссылка на оплату не создаётся: способ оплаты «{payment_method}».\n"
+        "По криптовалютным способам счёт Ozon Pay не выставляем — оплата идёт мимо "
+        "эквайринга. Нужна ссылка Ozon Pay — поменяйте способ оплаты и заведите "
+        "сделку на этап «Оплата запрошена» заново.",
+    )
+
+
 async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     """Обработчик очереди (LANE_AMO). Возвращает исход строкой (лог/тесты)."""
     key = str(lead_id)
@@ -353,7 +420,12 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     if key in _recent:
         logger.info("Lead %s: счёт уже создавался в последние %.0fс — скип (дедуп)", lead_id, RECENT_TTL_S)
         return "skipped-recent"
-    _recent[key] = now
+    # ⚠️ Ключ дедупа НЕ ставим здесь (23.09.2026, разбор сделки 36553383).
+    # Раньше окно занимал любой заход, включая отказной: «поле уже заполнено»,
+    # «уехала с этапа», «сделку не прочитать». Выходило хуже всего для того, кто
+    # старается: менеджер дёргал этап раз в полминуты, каждый заход занимал окно
+    # заново, и ссылка не создавалась восемь минут подряд. Теперь окно занимает
+    # только настоящая попытка создания - см. _recent[key] перед _create_payment.
 
     lead = await amo_service.get_lead_full(lead_id, with_=())
     if not lead:
@@ -398,11 +470,40 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         logger.info("Lead %s: 577617 уже заполнено (%.40s…) — счёт не создаём", lead_id, existing_link)
         return "skipped-link-present"
 
-    ms_uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
-    if not looks_like_uuid(ms_uuid):
-        await _fail(lead, "Нет заказа в МС - невозможно создать оплату",
-                    detail=f"поле «ID Заказа» (576689) пусто или не UUID: {ms_uuid!r}")
-        return "failed-no-ms-order"
+    # Способ оплаты (577373) из стоп-списка — крипта, USDT/USTD, TRC, wallet
+    # (Катя 28.09.2026). Такие оплаты идут мимо эквайринга, ссылка Ozon Pay там
+    # не нужна: создать её — значит отправить клиенту счёт, который он оплатит
+    # не туда. Это НЕ ошибка менеджера, поэтому без тега «ошибка счёта» и без
+    # алерта в ТГ: тихо пропускаем и один раз объясняем в карточке.
+    payment_method = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD) or "").strip()
+    blocked_token = blocked_invoice_payment_token(payment_method)
+    if blocked_token:
+        logger.info("Lead %s: способ оплаты «%s» (стоп-слово «%s») — ссылку не создаём",
+                    lead_id, payment_method, blocked_token)
+        await _note_blocked_once(lead_id, payment_method)
+        return "skipped-payment-method"
+
+    # Сделка ещё не заполнена — выставлять нечего (Катя 28.09.2026). Два случая:
+    #   • способ оплаты пуст: чем платит человек, неизвестно;
+    #   • пусты И бюджет, И «Другая сумма», И заказа МС нет: суммы счёта взять
+    #     неоткуда. Если заказ МС есть — сумму возьмём из него, это не наш случай.
+    # Раньше такие сделки падали в _fail «Нет заказа в МС»: тег, примечание, алерт.
+    # А наша же запись двигала updated_at, сторож видел «новую версию» сделки и
+    # пробовал снова — петля. По сделке 36389097 вышло восемь одинаковых
+    # примечаний за два часа. Теперь молча пропускаем: это не сбой, а незаполненная
+    # сделка, и чинить её менеджеру, а не нам.
+    other_raw = str(amo_service.get_custom_field_value(lead, FIELD_INVOICE_OTHER_AMOUNT) or "").strip()
+    ms_uuid_raw = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
+    try:
+        budget = float(lead.get("price") or 0)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if not payment_method:
+        logger.info("Lead %s: способ оплаты не заполнен — ссылку не создаём", lead_id)
+        return "skipped-not-ready"
+    if budget <= 0 and not other_raw and not looks_like_uuid(ms_uuid_raw):
+        logger.info("Lead %s: бюджет 0, «Другая сумма» пуста, заказа МС нет — ссылку не создаём", lead_id)
+        return "skipped-not-ready"
 
     # «Другая сумма» (578141): заполнено → счёт на неё, а не на сумму заказа.
     # Нечитаемое значение — честная ошибка менеджеру (не молчать и не подменять).
@@ -414,11 +515,25 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
                     detail=f"{other_err}. Исправьте сумму или очистите поле.")
         return "failed-other-amount"
 
-    order = await ms_client.get(f"entity/customerorder/{ms_uuid}")
-    if not order:
-        await _fail(lead, "МойСклад не отдал заказ - счёт не создан",
-                    detail=f"customerorder/{ms_uuid}")
-        return "failed-ms-fetch"
+    # Заказ МС нужен только как ИСТОЧНИК СУММЫ. Заполнена «Другая сумма» — счёт
+    # выставляем и без заказа (Катя 28.09.2026): сумму менеджер назвал сам, ждать
+    # заказ не за чем. Это общий путь всех воронок из _invoice_pipelines().
+    # Заказ при этом всё равно читаем, если он есть: его номер идёт в начало
+    # extId заказа Ozon, по нему офис матчит поступление. Не отдался МС — с
+    # «Другой суммой» не падаем, просто остаёмся без номера в extId.
+    ms_uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
+    order: dict = {}
+    if looks_like_uuid(ms_uuid):
+        order = (await ms_client.get(f"entity/customerorder/{ms_uuid}")) or {}
+        if not order and other_kopecks is None:
+            await _fail(lead, "МойСклад не отдал заказ - счёт не создан",
+                        detail=f"customerorder/{ms_uuid}")
+            return "failed-ms-fetch"
+    elif other_kopecks is None:
+        await _fail(lead, "Нет заказа в МС - невозможно создать оплату",
+                    detail=f"поле «ID Заказа» (576689) пусто или не UUID: {ms_uuid!r}")
+        return "failed-no-ms-order"
+    ms_order_name = str(order.get("name") or "").strip()
 
     if other_kopecks is not None:
         kopecks = other_kopecks
@@ -426,7 +541,7 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         kopecks = int(round(float(order.get("sum") or 0)))
     if kopecks <= 0:
         await _fail(lead, "Сумма заказа МС = 0 - счёт не создан",
-                    detail=f"заказ МС {order.get('name')}. Либо укажите сумму в поле «Другая сумма».")
+                    detail=f"заказ МС {ms_order_name}. Либо укажите сумму в поле «Другая сумма».")
         return "failed-zero-sum"
 
     # «Оплата картой» (578145): галочка → ссылка на checkout.ozon.ru (выбор
@@ -434,8 +549,12 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     by_card = _is_checked(amo_service.get_custom_field_value(lead, FIELD_INVOICE_BY_CARD))
 
     ext_id = f"amo-{lead_id}-{int(time.time())}"
+    # Вот она, «настоящая попытка»: дальше идём в Ozon за платежом. Окно дедупа
+    # занимаем ЗДЕСЬ, до сетевого вызова - иначе повторный вебхук, пришедший
+    # пока мы ждём ответ, создал бы второй платёж на ту же сделку.
+    _recent[key] = time.monotonic()
     pay_link, payment_id, err = await _create_payment(
-        ext_id, kopecks, by_card=by_card, ms_order_name=str(order.get("name") or "").strip(),
+        ext_id, kopecks, by_card=by_card, ms_order_name=ms_order_name,
     )
     if not pay_link:
         await _fail(lead, "Ozon не создал счёт - ссылки нет", detail=err)
@@ -459,11 +578,11 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
 
     rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
-    src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {order.get('name')}"
+    src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {ms_order_name}"
     kind = "Счёт (оплата картой, страница выбора Ozon)" if by_card else "Счёт СБП"
     # orderExtId пишем только для карты: по нему сверка ищет оплату, когда Ozon
     # не знает нашего платежа (order-флоу заводит внутри заказа свой).
-    order_ext_id = build_order_ext_id(ext_id, str(order.get("name") or "").strip()) if by_card else ""
+    order_ext_id = build_order_ext_id(ext_id, ms_order_name) if by_card else ""
     await amo_service.add_note(
         lead_id,
         f"{kind} создан автоматически: {rub_str} ₽ ({src}), действителен "
@@ -922,10 +1041,97 @@ async def _stale_alert(lead: dict, created_at: int | None, status: str,
             await telegram_bot.send_alert(d.text, **d.send_kwargs())
 
 
+# Сделки, по которым уже звали человека из-за отсутствующей ссылки: второй раз
+# в тот же день не зовём. Живёт в процессе - после пересборки контейнера
+# напоминание может повториться, и это дешевле, чем тащить ради него примечание.
+_no_link_alerted: dict[int, float] = {}
+_NO_LINK_ALERT_GAP_S = 6 * 3600
+# На каком updated_at сделки мы уже пробовали создать счёт. Пока сделка не
+# изменилась, повторять бессмысленно: входные данные те же, ответ будет тот же.
+# Без этого сторож ходил в amo и МойСклад по одним и тем же сделкам каждые
+# три минуты (Катя 23.09.2026: «это плохо для сервера»).
+_no_link_tried_at: dict[int, int] = {}
+
+
+async def _retry_missing_link(lead: dict) -> int:
+    """Сделка стоит на «Оплата запрошена», ссылки нет — пробуем создать заново.
+
+    Зачем это вообще нужно (23.09.2026, разбор сделки 36553383). Счёт создаётся
+    ТОЛЬКО по вебхуку об изменении сделки. Значит достаточно один раз промахнуться
+    - потерялся вебхук, попытка попала в дедуп-окно, менеджер очистил поле и
+    больше сделку не трогал, - и сделка стоит без ссылки, пока кто-нибудь её не
+    тронет руками. Клиент в этот момент ждёт оплату и ничего не получает.
+
+    Ждём OZON_NO_LINK_RETRY_MIN минут покоя, чтобы не наступать на пятки живой
+    работе менеджера: сделку могли только что перевести, и вебхук ещё в очереди.
+    Отсчёт - от updated_at: пока сделку крутят, счётчик сбрасывается сам.
+
+    Возвращает 1, если ссылка создалась, иначе 0.
+    """
+    if OZON_NO_LINK_RETRY_MIN <= 0:
+        return 0
+    # Академия под сторож не идёт (решение Кати 23.09.2026): счёт там выставляют
+    # иначе, заказа МС у таких сделок нет и не будет, и сделка месяцами стоит на
+    # «Оплата запрошена», пока клиент решается. Повтор заведомо холостой, а тег
+    # «ошибка счёта» и алерт менеджеру - ложные. Сверку оплат по Академии это не
+    # трогает: она ходит по выставленным счетам и работает как раньше.
+    if int(lead.get("pipeline_id") or 0) == PIPELINE_ACADEMY:
+        return 0
+    lead_id = lead.get("id")
+    updated_at = int(lead.get("updated_at") or 0)
+    quiet_min = (time.time() - float(updated_at)) / 60
+    if quiet_min < OZON_NO_LINK_RETRY_MIN:
+        return 0
+    # Слишком давно не трогали — это не застрявший счёт, а живая работа: клиент
+    # думает, менеджер переписывается, сделка стоит на этапе оплаты неделями.
+    if 0 < OZON_NO_LINK_MAX_QUIET_MIN < quiet_min:
+        return 0
+    # Уже пробовали на этой же версии сделки — входные данные не изменились,
+    # ответ будет тот же. Ждём, пока сделку тронут: тогда updated_at сдвинется.
+    if _no_link_tried_at.get(lead_id) == updated_at:
+        return 0
+    _no_link_tried_at[lead_id] = updated_at
+
+    outcome = await process_invoice_lead(lead_id, source="reconcile")
+    if outcome == "created":
+        logger.info("Ozon сверка: сделка %s висела без ссылки %.0f мин — счёт создан заново",
+                    lead_id, quiet_min)
+        _no_link_alerted.pop(lead_id, None)
+        _no_link_tried_at.pop(lead_id, None)
+        return 1
+
+    logger.info("Ozon сверка: сделка %s без ссылки %.0f мин, повтор дал «%s»",
+                lead_id, quiet_min, outcome)
+
+    # Ссылки нет ПО ЗАМЫСЛУ, а не из-за сбоя: способ оплаты из стоп-списка
+    # (крипта и прочее), сделка не заполнена, уехала с этапа, попытка была только
+    # что. Любой наш «скип» — не повод звать человека: та же логика, что с
+    # Академией выше. Именно на этом месте раньше начиналась петля примечаний.
+    if outcome.startswith("skipped-"):
+        return 0
+
+    # Повтор не помог и сделка висит давно — зовём человека. Порог отдельный от
+    # OZON_STALE_ALERT_MIN: там «клиент не платит по выставленному счёту», а
+    # здесь счёта нет вовсе, и это чинить нам, а не клиенту.
+    if OZON_NO_LINK_ALERT_MIN <= 0 or quiet_min < OZON_NO_LINK_ALERT_MIN:
+        return 0
+    if time.time() - _no_link_alerted.get(lead_id, 0.0) < _NO_LINK_ALERT_GAP_S:
+        return 0
+    if not _in_alert_window():
+        return 0
+    _no_link_alerted[lead_id] = time.time()
+    await _fail(
+        lead,
+        f"Сделка {int(quiet_min)} мин на «Оплата запрошена», а ссылки нет - выставьте счёт вручную",
+        detail=f"автоповтор вернул «{outcome}»",
+    )
+    return 0
+
+
 async def _reconcile_once() -> str:
     """Один проход: сделки с выставленным счётом на этапах оплаты → спросить
     Ozon → Completed двигаем, зависшие подсвечиваем алертом."""
-    checked = moved = 0
+    checked = moved = retried = 0
     # Пары «воронка + этап»: сверка ходит только по включённым воронкам, иначе
     # выключенный флаг всё равно стоил бы двух лишних запросов на проход.
     for pipeline_id in _invoice_pipelines():
@@ -941,7 +1147,13 @@ async def _reconcile_once() -> str:
                     continue
                 link = str(amo_service.get_custom_field_value(lead, FIELD_PAYMENT_LINK) or "").strip()
                 if not link:
-                    continue  # счёта нет — сверять нечего (менеджер ещё не запросил оплату)
+                    # Ссылки нет. На «Ссылка отправлена» это и правда нечего
+                    # сверять, а вот на тех-этапе «Оплата запрошена» — застрявшая
+                    # сделка: счёт не создался, и сам он уже не создастся, потому
+                    # что повторных попыток по расписанию у модуля не было.
+                    if status_id == stages[0]:
+                        retried += await _retry_missing_link(lead)
+                    continue
 
                 lead_id = lead.get("id")
                 payment_id, ext_id, order_ext_id, created_at, last_alert_at = await _payment_ref(lead_id)
@@ -969,8 +1181,9 @@ async def _reconcile_once() -> str:
                     moved += 1
                     _stale_alerted.pop(lead_id, None)
 
-    logger.info("Ozon сверка: проверено счетов %s, переведено сделок %s", checked, moved)
-    return f"checked={checked} moved={moved}"
+    logger.info("Ozon сверка: проверено счетов %s, переведено сделок %s, пересозданных ссылок %s",
+                checked, moved, retried)
+    return f"checked={checked} moved={moved} retried={retried}"
 
 
 async def _reconcile_loop() -> None:

@@ -99,6 +99,22 @@ class WooClient:
             f"Woo GET orders/{order_id}: {resp.status_code}", resp.status_code, resp.text[:300]
         )
 
+    async def get_order(self, order_id) -> dict | None:
+        """Полный заказ WooCommerce. None → заказа нет в WC (удалён/неверный id).
+        Нужен order_note: контакты покупателя берём из первоисточника, а не из
+        МойСклада — там email к этому моменту уже может быть затёрт."""
+        resp = await self._request("GET", f"/orders/{order_id}")
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                raise WooError(f"Woo GET orders/{order_id}: невалидный JSON", resp.status_code)
+        if resp.status_code in (400, 404):
+            return None
+        raise WooError(
+            f"Woo GET orders/{order_id}: {resp.status_code}", resp.status_code, resp.text[:300]
+        )
+
     async def complete_order(self, order_id) -> str:
         """Ставит заказу статус 'completed'. Возвращает:
           'completed'  — статус успешно изменён;
@@ -178,6 +194,10 @@ def _ensure() -> WooClient:
 
 async def get_order_status(order_id) -> str | None:
     return await _ensure().get_order_status(order_id)
+
+
+async def get_order(order_id) -> dict | None:
+    return await _ensure().get_order(order_id)
 
 
 async def complete_order(order_id) -> str:
