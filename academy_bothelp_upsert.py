@@ -176,19 +176,60 @@ async def _resolve(payload: dict) -> tuple[dict | None, dict | None, str]:
     return None, None, "new"
 
 
-def _target_status(payload: dict, current_status: int | None) -> int | None:
+# Порядок бот-этапов. Нужен, чтобы двигать сделку ТОЛЬКО вперёд: webhook BotHelp несёт
+# профиль подписчика целиком, а не «что изменилось», и на повторном заходе приносит те же
+# поля заново. Без ранга частичный профиль («пришёл только один ответ анкеты») утащил бы
+# сделку с «Анкеты пройденной» обратно на «Проходит анкету».
+_STAGE_RANK = {
+    STATUS_INBOUND: 0,
+    STATUS_BOT_STARTED: 1,
+    STATUS_QUESTIONNAIRE: 2,
+    STATUS_QUESTIONNAIRE_DONE: 3,
+}
+
+
+def _wants_practicum(event: str, manager_action: str) -> bool:
+    """Просьба записать на практикум - в названии мероприятия или в действии клиента."""
+    return "практикум" in _text(event).lower() or "практикум" in _text(manager_action).lower()
+
+
+def _target_status(
+    payload: dict,
+    current_status: int | None,
+    *,
+    practicum_is_new: bool = True,
+    just_created: bool = False,
+) -> int | None:
+    """Куда двигать сделку, или None - не трогать.
+
+    `just_created` - сделку создали этим же запросом. Она родилась на «Боте запущен», и
+    двигать её тем же профилем нельзя: старые поля из карточки подписчика утащили бы новую
+    карточку сразу в середину воронки. Следующий шаг сценария пришлёт свой webhook.
+
+    `practicum_is_new` - флаг практикума ИЗМЕНИЛСЯ в этом запросе. Ложь означает, что то же
+    значение уже лежало в карточке с прошлого раза: человек просто нажал `/start`, а не
+    записывался заново.
+    """
+    if just_created:
+        return None
     if current_status is not None and current_status not in _BOT_STATUSES:
         return None
-    event = _text(payload.get("Регистрация на мероприятие")).lower()
-    manager_action = _text(payload.get("действие менеджера")).lower()
-    if "практикум" in event or "практикум" in manager_action:
+    if practicum_is_new and _wants_practicum(
+        payload.get("Регистрация на мероприятие"), payload.get("действие менеджера"),
+    ):
         return STATUS_RECORDED_PRACTICUM
     answers = [_text(payload.get(k)) for k in ("опыт_в_инвестициях", "размер_капитала", "зачем_капитал")]
     if all(answers):
-        return STATUS_QUESTIONNAIRE_DONE
-    if any(answers):
-        return STATUS_QUESTIONNAIRE
-    return STATUS_BOT_STARTED if current_status in (None, STATUS_INBOUND) else None
+        candidate = STATUS_QUESTIONNAIRE_DONE
+    elif any(answers):
+        candidate = STATUS_QUESTIONNAIRE
+    else:
+        candidate = STATUS_BOT_STARTED
+    if current_status is None:
+        return candidate
+    if _STAGE_RANK.get(candidate, -1) > _STAGE_RANK.get(current_status, -1):
+        return candidate
+    return None
 
 
 async def process(payload: dict) -> dict[str, Any]:
@@ -207,6 +248,14 @@ async def process(payload: dict) -> dict[str, Any]:
             return {"ok": False, "reason": "contact_create_failed"}
         contact = await amo_service.get_contact_by_id(cid, with_=("leads",)) or {"id": cid}
 
+    # Снимаем флаг практикума ДО обновления контакта. После `update_contact` карточка уже
+    # содержит то, что пришло, и «изменилось ли значение» стало бы не отличить от «лежало
+    # с прошлого раза».
+    practicum_was = _wants_practicum(_field(contact, FIELD_EVENT), _field(contact, FIELD_ACTION))
+    practicum_now = _wants_practicum(
+        payload.get("Регистрация на мероприятие"), payload.get("действие менеджера"),
+    )
+
     fields = [
         {"field_id": fid, "values": [{"value": value}]}
         for fid, value in _payload_fields(payload).items()
@@ -219,6 +268,7 @@ async def process(payload: dict) -> dict[str, Any]:
     if not updated:
         return {"ok": False, "reason": "contact_update_failed", "contact_id": contact["id"]}
 
+    just_created = lead is None
     if lead is None:
         lead_id = await api.create_lead_direct(
             f"Лид Академии — {name or phone or email or payload.get('cuid')}",
@@ -231,7 +281,11 @@ async def process(payload: dict) -> dict[str, Any]:
             return {"ok": False, "reason": "lead_create_failed", "contact_id": contact["id"]}
         lead = {"id": lead_id, "status_id": STATUS_BOT_STARTED, "created_at": ACADEMY_CUTOVER_TS}
 
-    target = _target_status(payload, int(lead.get("status_id") or 0))
+    target = _target_status(
+        payload, int(lead.get("status_id") or 0),
+        practicum_is_new=practicum_now and not practicum_was,
+        just_created=just_created,
+    )
     if target:
         result = await amo_service.patch_lead(
             lead["id"], status_id=target, pipeline_id=PIPELINE_ACADEMY,
