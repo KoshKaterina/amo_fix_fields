@@ -11,12 +11,18 @@ tg_diagnostic.py
 # shipment, duplicate_watch): 03.09.2026 выяснилось, что ни один из них ни разу
 # не уехал в git. Поимённо - значит новый файл по умолчанию виден, а спрятать
 # его можно только осознанно, дописав строку сюда.
+# ⚠️ 29.09.2026: тогда поимённо расписали ТОЛЬКО семейство amgroup, а две маски
+# (`ms_demand_*.py`, `query_ur_egor*.py`) так и остались и продолжали прятать четыре
+# боевых файла. Заменены на имена. **Маску здесь не заводить НИКОГДА** - урок один
+# и тот же, но пришлось учить дважды.
 amgroup_ff.py
 amgroup_probe.py
 amgroup_timeline.py
 dp_probe.py
-ms_demand_*.py
-query_ur_egor*.py
+ms_demand_channel_probe.py
+ms_demand_set_channel.py
+query_ur_egor.py
+query_ur_egor_door.py
 
 # logs & build artifacts
 *.log
