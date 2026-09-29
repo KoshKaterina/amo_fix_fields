@@ -42,7 +42,9 @@ _stub("httpx", AsyncClient=object)
 # чтобы тесты тега работали против настоящей логики.
 
 import tg_recipients as T  # noqa: E402
-import wazzup_sla as W  # noqa: E402
+import tg_recipients as TG
+import wazzup_sla as W
+from waybill_config import PIPELINE_ACADEMY, PIPELINE_CLEVER_MAIN  # noqa: E402
 
 
 def _msg(chat_id="79990000000", is_echo=False, status=None, text="привет",
@@ -65,7 +67,7 @@ _ORIG_ROP_CHAT = W.ROP_CHAT_ID
 async def _resolve_nothing(chat_id):
     """Дефолт для тестов, где сделка не важна: не найдена → общий порог, тег смены.
     Без него _fill_lead_info полез бы в застабленный amo_service."""
-    return None, None, False
+    return None, None, False, None
 
 
 def setup_function(_=None):
@@ -158,7 +160,8 @@ def test_sweep_marks_alerted_and_dedups(monkeypatch=None):
         return True
 
     async def fake_resolve(chat_id):
-        return 12345, 13929334, False  # сделка + ответственный Егор, доставка не самовывоз
+        # Четвёртое значение - воронка: РОЗНИЦА, то есть событие и слова прежние.
+        return 12345, 13929334, False, PIPELINE_CLEVER_MAIN
 
     W.telegram_bot.send_alert = fake_send
     W._resolve_lead_safe = fake_resolve
@@ -240,7 +243,8 @@ def test_mentions_unknown_falls_back_to_shift():
 
 # --- самовывоз: порог 3 минуты и один адресат (Катя 13.08.2026) ---------------
 
-def _sweep_stubs(pickup=False, lead=12345, responsible=13929334):
+def _sweep_stubs(pickup=False, lead=12345, responsible=13929334,
+                 pipeline=PIPELINE_CLEVER_MAIN):
     """Общие подмены: окно открыто, беседа в amo не закрыта, сделка нашлась.
     Возвращает список отправленных текстов."""
     sent = []
@@ -250,7 +254,7 @@ def _sweep_stubs(pickup=False, lead=12345, responsible=13929334):
         return True
 
     async def fake_resolve(chat_id):
-        return lead, responsible, pickup
+        return lead, responsible, pickup, pipeline
 
     async def fake_talk_open(st):
         return False
@@ -333,7 +337,7 @@ def test_fill_lead_info_retries_when_lead_not_found():
 
     async def resolve_empty(chat_id):
         calls.append(chat_id)
-        return None, None, False
+        return None, None, False, None
 
     W._resolve_lead_safe = resolve_empty
     st = {"chat_id": "79990000000"}
@@ -345,9 +349,12 @@ def test_fill_lead_info_retries_when_lead_not_found():
     assert len(calls) == 2, "после паузы попытка повторяется"
 
 
-def _lead(status_id=83537718, delivery=None, updated_at=100, lead_id=1, responsible=13929334):
+def _lead(status_id=83537718, delivery=None, updated_at=100, lead_id=1, responsible=13929334,
+          pipeline=PIPELINE_CLEVER_MAIN):
+    # Воронка есть у любой живой сделки amo, и с 29.09.2026 сторож её читает - держим
+    # её в фикстуре, иначе тесты проверяют сделку, которой в бою не бывает.
     ld = {"id": lead_id, "status_id": status_id, "updated_at": updated_at,
-          "responsible_user_id": responsible}
+          "responsible_user_id": responsible, "pipeline_id": pipeline}
     if delivery is not None:
         ld["custom_fields_values"] = [
             {"field_id": W.FIELD_DELIVERY_TYPE, "values": [{"value": delivery}]}]
@@ -376,8 +383,10 @@ def test_resolve_lead_prefers_pickup_over_fresher():
         ]
 
     W.amo_service.find_leads_by_query = fake_find
-    lead_id, responsible, pickup = asyncio.run(W._resolve_lead("79990000000"))
+    lead_id, responsible, pickup, pipeline = asyncio.run(W._resolve_lead("79990000000"))
     assert (lead_id, responsible, pickup) == (20, 9291546, True)
+    # Воронку отдаём наружу с 29.09.2026: по ней сторож понимает, чей это клиент.
+    assert pipeline == PIPELINE_CLEVER_MAIN
 
 
 def test_resolve_lead_ignores_closed_pickup():
@@ -389,7 +398,7 @@ def test_resolve_lead_ignores_closed_pickup():
         ]
 
     W.amo_service.find_leads_by_query = fake_find
-    lead_id, _, pickup = asyncio.run(W._resolve_lead("79990000000"))
+    lead_id, _, pickup, _pipe = asyncio.run(W._resolve_lead("79990000000"))
     assert (lead_id, pickup) == (40, False)
 
 # --- «Ответ не требуется»: беседа закрыта в amo → алерт не нужен -------------
@@ -592,6 +601,97 @@ def test_unknown_manager_is_named_in_words_not_by_id():
     text = sent[0][0]
     assert "менеджер не определён" in text
     assert "999999" not in text
+
+
+# ─────────── клиент из Академии: своё событие и свои слова (Катя 29.09.2026) ───────────
+#
+# Одним топиком с розницей иначе не понять, чей клиент ждёт: заголовок это говорит словами,
+# а тег уходит ответственному, а не розничной смене.
+
+
+def _academy_sweep(responsible=13929334, pickup=False, pipeline=None):
+    """Ожидание, дожившее до порога, со сделкой в нужной воронке. Возвращает (отправленные,
+    запрошенные события)."""
+    if pipeline is None:
+        pipeline = PIPELINE_ACADEMY
+    sent = _sweep_stubs(pickup=pickup, responsible=responsible, pipeline=pipeline)
+    seen = []
+    real = W.alerts.decide
+
+    def spy(event_key, **kw):
+        seen.append((event_key, kw))
+        return real(event_key, **kw)
+
+    W.alerts.decide = spy
+    W.handle_webhook({"messages": [_msg(is_echo=False)]})
+    st = next(iter(W._pending.values()))
+    st["waiting_since"] -= 60 * 60
+    asyncio.run(W._sweep(threshold_s=15 * 60))
+    W.alerts.decide = real
+    return sent, seen
+
+
+def test_academy_client_gets_its_own_event():
+    sent, seen = _academy_sweep(responsible=99000001)
+    assert [e for e, _ in seen] == ["academy_no_reply"]
+    assert len(sent) == 1
+    assert "Клиент академии ждёт ответа" in sent[0]
+    # Фолбэк - Гладков, а НЕ вся смена розницы: это клиент Академии.
+    assert TG.ACADEMY_ALERT_TAG in sent[0]
+    assert TG.MANAGERS_ON_SHIFT not in sent[0]
+    # Маршрут в чат команды у этого события не просим: по ТЗ адрес - топик УВЕДОМЛЕНИЯ.
+    assert seen[0][1]["route_by_responsible"] is False
+
+
+def test_academy_client_tags_the_responsible_when_known():
+    sent, _ = _academy_sweep(responsible=13929334)
+    assert "@egorkonsss" in sent[0]
+
+
+def test_retail_client_unchanged():
+    """Розница как была: прежнее событие, прежние слова."""
+    sent, seen = _academy_sweep(pipeline=PIPELINE_CLEVER_MAIN)
+    assert [e for e, _ in seen] == ["wazzup_no_reply"]
+    assert "Клиент ждёт ответа" in sent[0] and "академии" not in sent[0]
+
+
+def test_unknown_pipeline_behaves_like_retail():
+    """Воронку не определили - шлём розничным событием, то есть как до правки.
+    Деградируем к прежнему поведению, а не к молчанию."""
+    sent, seen = _academy_sweep(pipeline=0)   # 0 - «воронки нет», не Академия
+    assert [e for e, _ in seen] == ["wazzup_no_reply"]
+    assert len(sent) == 1
+
+
+def test_pickup_beats_academy():
+    """Самовывозного клиента ведёт шоурум - тег Катя-офис, про академию молчим."""
+    sent, seen = _academy_sweep(pickup=True)
+    assert [e for e, _ in seen] == ["wazzup_no_reply"]
+    assert TG.SLA_PICKUP_TAG in sent[0]
+    assert "академии" not in sent[0]
+
+
+_ORIG_PANEL_NOTIFY = W.alerts.panel_notify_bg
+
+
+def test_academy_alert_also_lands_in_panel_feed():
+    """Лента панели вторым каналом, лично ответственному. Розница в ленту не дублируется:
+    её эскалация адресована чату руководителей, а не человеку со сделкой."""
+    posted = []
+    W.alerts.panel_notify_bg = lambda **kw: posted.append(kw)
+    try:
+        _academy_sweep(responsible=13929334)
+        assert len(posted) == 1
+        assert posted[0]["kind"] == "academy_no_reply"
+        assert posted[0]["amo_user_id"] == 13929334
+        assert posted[0]["fallback_amo_user_id"] == W.ACADEMY_PANEL_FALLBACK_AMO_ID
+        assert "<a href=" not in posted[0]["body"], "разметка в ленту не едет"
+
+        posted.clear()
+        _academy_sweep(pipeline=PIPELINE_CLEVER_MAIN)
+        assert posted == []
+    finally:
+        W.alerts.panel_notify_bg = _ORIG_PANEL_NOTIFY
 
 
 if __name__ == "__main__":

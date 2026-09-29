@@ -67,6 +67,7 @@ from tg_recipients import (
 )
 from waybill_config import (
     ACADEMY_LEAD_UNTAKEN_ENABLED,
+    ACADEMY_PANEL_FALLBACK_AMO_ID,
     NEW_LEAD_ESCALATE_MINUTES,
     NEW_LEAD_POLL_INTERVAL_S,
     NEW_LEAD_WINDOW_END_H,
@@ -92,16 +93,17 @@ class _Watch:
     subject: str                # как зовём лид в тексте: «Новый лид», «Лид Академии»
     tags: bool                  # чат менеджеров - нужен @тег; руководству - имя словами
     route: bool                 # адрес уточняется по ответственному
+    panel: bool                 # копия в ленту панели, лично ответственному
 
 
 _WATCHED: dict[int, _Watch] = {
     PIPELINE_CLEVER_MAIN: _Watch(
         event="new_lead_untaken", statuses=frozenset(STATUS_NEW_LEAD_ALL),
-        chat="rop", subject="Новый лид", tags=False, route=False,
+        chat="rop", subject="Новый лид", tags=False, route=False, panel=False,
     ),
     PIPELINE_ACADEMY: _Watch(
         event="academy_lead_untaken", statuses=frozenset({STATUS_ACADEMY_INBOUND_LEAD}),
-        chat="op_notify", subject="Лид Академии", tags=True, route=True,
+        chat="op_notify", subject="Лид Академии", tags=True, route=True, panel=True,
     ),
 }
 
@@ -384,6 +386,19 @@ async def _sweep() -> None:
                 "%s: эскалация %s (сделка %s, %s рабочих минут на входе)",
                 w.subject, "отправлена" if ok else "НЕ отправлена", lead_id, int(waited),
             )
+            if ok and w.panel:
+                # Лента панели вторым каналом - только у Академии (ТЗ Кати 29.09.2026).
+                # Розничная эскалация идёт руководству и в ленту не дублируется: там
+                # адресат не человек со сделкой, а чат руководителей.
+                plain, link = alerts.strip_link(d.text)
+                alerts.panel_notify_bg(
+                    kind=w.event, level="warn",
+                    title=f"{w.subject} не взяли в работу {_waited_words(waited)}",
+                    body=plain, url=link,
+                    dedupe_key=f"{w.event}:{lead_id}",
+                    amo_user_id=responsible,
+                    fallback_amo_user_id=ACADEMY_PANEL_FALLBACK_AMO_ID,
+                )
         except Exception:
             logger.exception("Новый лид: ошибка проверки сделки %s", lead_id)
 

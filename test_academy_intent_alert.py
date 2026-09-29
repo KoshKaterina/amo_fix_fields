@@ -33,6 +33,7 @@ sys.modules.setdefault("telegram_bot", tg)
 
 import academy_intent_alert as alert  # noqa: E402
 import alert_settings_client as settings_client  # noqa: E402
+import alerts as alerts_mod  # noqa: E402
 import tg_recipients  # noqa: E402
 import waybill_config  # noqa: E402
 from waybill_config import (  # noqa: E402
@@ -50,17 +51,28 @@ def run(coro):
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
-    """Дедуп - во временный файл, состояние - с нуля на каждый тест."""
+    """Дедуп - во временный файл, состояние - с нуля на каждый тест.
+
+    ⚠️ Окно склейки по умолчанию в тестах НУЛЕВОЕ: тогда `process` шлёт сразу и его ответ
+    можно проверять в одну строку. Саму склейку проверяют тесты, которые окно включают.
+    """
     monkeypatch.setattr(alert, "_SEEN_PATH", str(tmp_path / "seen.json"), raising=False)
     monkeypatch.setattr(alert, "_seen_loaded", False, raising=False)
     alert._seen.clear()
+    alert._pending.clear()
+    alert._flush_tasks.clear()
     monkeypatch.setattr(alert, "ACADEMY_CUTOVER_TS", 100, raising=False)
     monkeypatch.setattr(alert, "ACADEMY_INTENT_ALERT_ENABLED", True, raising=False)
-    # По умолчанию панель не опрашиваем: сендер шлёт свой текст и свой адрес.
+    monkeypatch.setattr(alert, "ACADEMY_INTENT_ALERT_COALESCE_S", 0, raising=False)
+    # Лента панели в тестах выключена: её проверяют отдельные тесты своей заглушкой.
+    monkeypatch.setattr(alerts_mod, "ACADEMY_PANEL_NOTIFY_ENABLED", False, raising=False)
+    # По умолчанию панель настроек не опрашиваем: сендер шлёт свой текст и свой адрес.
     monkeypatch.setattr(waybill_config, "ALERT_SETTINGS_FROM_PANEL", "off")
     monkeypatch.setattr(settings_client, "ALERT_SETTINGS_FROM_PANEL", "off")
     yield
     alert._seen.clear()
+    alert._pending.clear()
+    alert._flush_tasks.clear()
     settings_client.set_settings_for_tests(None)
 
 
@@ -216,3 +228,133 @@ def test_tekst_i_adres_iz_paneli(monkeypatch):
     # Строка про запись на мероприятие выпала: поле не менялось, значение пустое.
     assert "Запись:" not in text
     assert "@egorkonsss" in text
+
+
+# ── склейка касаний в одно сообщение (Катя 29.09.2026) ──────────────────────
+#
+# Повод живой: 29.09 в 15:06 бот заполнил два поля двумя вебхуками, и пришло два сообщения
+# с разницей в две секунды. Утренний дедуп такое не склеивает - он гасит ПОВТОР одной пары
+# «поле, значение», а тут пары разные.
+
+def test_dva_vebhuka_sklejivayutsya_v_odno(monkeypatch):
+    """Два касания подряд по одной сделке - одно сообщение с двумя строками."""
+    monkeypatch.setattr(alert, "ACADEMY_INTENT_ALERT_COALESCE_S", 60, raising=False)
+    sent = _wire(monkeypatch, _contact(field_id=FIELD_ACADEMY_MANAGER_ACTION), _lead())
+
+    # Первый вебхук: поле «Действие клиента». Уходит в копилку, не в чат.
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "buffered"
+    assert sent == []
+
+    # Второй вебхук: другое поле, «Запись на мероприятие». Тоже в копилку.
+    contact2 = {
+        "id": 10, "name": "Анна",
+        "custom_fields_values": [
+            {"field_id": FIELD_ACADEMY_MANAGER_ACTION, "values": [{"value": "написать менеджеру"}]},
+            {"field_id": FIELD_ACADEMY_EVENT_REGISTRATION, "values": [{"value": "Практикум"}]},
+        ],
+        "_embedded": {"leads": [{"id": 20}]},
+    }
+    sent = _wire(monkeypatch, contact2, _lead())
+    assert run(alert.process(10, {FIELD_ACADEMY_EVENT_REGISTRATION})) == "buffered"
+    assert sent == []
+
+    # Окно вышло - одно сообщение с обеими строками.
+    assert run(alert.flush(20)) == "sent"
+    assert len(sent) == 1
+    text = sent[0][0]
+    assert "написать менеджеру" in text and "Практикум" in text
+
+
+def test_sklejka_ne_lomaet_dedup(monkeypatch):
+    """Дедуп применяется В МОМЕНТ ОТПРАВКИ, а не при накоплении. Иначе повтор внутри окна
+    отметил бы пару отправленной, а сообщение ещё не ушло - и оно пропало бы совсем."""
+    monkeypatch.setattr(alert, "ACADEMY_INTENT_ALERT_COALESCE_S", 60, raising=False)
+    sent = _wire(monkeypatch, _contact(), _lead())
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "buffered"
+    # Тот же вебхук ещё раз, пока окно открыто.
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "buffered"
+    assert run(alert.flush(20)) == "sent"
+    assert len(sent) == 1, "два одинаковых касания в окне должны дать одно сообщение"
+    # А вот повтор ПОСЛЕ отправки уже гасится дедупом.
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "buffered"
+    assert run(alert.flush(20)) == "duplicate"
+    assert len(sent) == 1
+
+
+def test_sklejka_kopit_po_sdelke_a_ne_po_kontaktu(monkeypatch):
+    """У склеенного человека контактов два. Копилка по СДЕЛКЕ, поэтому касания с разных
+    контактов одного человека дают одно сообщение, а не два."""
+    monkeypatch.setattr(alert, "ACADEMY_INTENT_ALERT_COALESCE_S", 60, raising=False)
+    c1 = _contact(name="Руслан")
+    c1["id"] = 111
+    sent = _wire(monkeypatch, c1, _lead())
+    assert run(alert.process(111, {FIELD_ACADEMY_MANAGER_ACTION})) == "buffered"
+
+    c2 = {
+        "id": 222, "name": "Ruslan",
+        "custom_fields_values": [
+            {"field_id": FIELD_ACADEMY_EVENT_REGISTRATION, "values": [{"value": "Практикум"}]},
+        ],
+        "_embedded": {"leads": [{"id": 20}]},
+    }
+    sent = _wire(monkeypatch, c2, _lead())
+    assert run(alert.process(222, {FIELD_ACADEMY_EVENT_REGISTRATION})) == "buffered"
+    assert list(alert._pending) == [20], "копилка должна быть одна, по сделке"
+    assert run(alert.flush(20)) == "sent"
+    assert len(sent) == 1
+
+
+def test_nulevoe_okno_shlet_srazu(monkeypatch):
+    """Склейку можно выключить нулём - тогда поведение как до 29.09.2026."""
+    monkeypatch.setattr(alert, "ACADEMY_INTENT_ALERT_COALESCE_S", 0, raising=False)
+    sent = _wire(monkeypatch, _contact(), _lead())
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "sent"
+    assert len(sent) == 1
+
+
+# ── лента панели вторым каналом ─────────────────────────────────────────────
+
+def test_uvedomlenie_lozhitsya_v_lentu_paneli(monkeypatch):
+    """Кладём лично ответственному, ссылку выносим из текста в url: лента рендерит
+    плоский текст, и тег <a> приехал бы разметкой."""
+    monkeypatch.setattr(alerts_mod, "ACADEMY_PANEL_NOTIFY_ENABLED", True, raising=False)
+    posted = []
+
+    def fake_panel(**kw):
+        posted.append(kw)
+
+    monkeypatch.setattr(alerts_mod, "panel_notify_bg", fake_panel)
+    _wire(monkeypatch, _contact(), _lead(responsible=EGOR))
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "sent"
+
+    assert len(posted) == 1
+    p = posted[0]
+    assert p["kind"] == "academy_intent"
+    assert p["amo_user_id"] == EGOR
+    assert p["fallback_amo_user_id"] == alert.ACADEMY_PANEL_FALLBACK_AMO_ID
+    assert "написать менеджеру" in p["body"]
+    assert "<a href=" not in p["body"], "разметка в ленту не едет"
+    assert p["url"] and p["url"].startswith("http")
+
+
+def test_v_lentu_ne_kladem_esli_soobshchenie_ne_ushlo(monkeypatch):
+    """Не дошло в чат - в ленту тоже не кладём: иначе в панели будет событие, которого
+    менеджер в чате не видел."""
+    monkeypatch.setattr(alerts_mod, "ACADEMY_PANEL_NOTIFY_ENABLED", True, raising=False)
+    posted = []
+    monkeypatch.setattr(alerts_mod, "panel_notify_bg", lambda **kw: posted.append(kw))
+
+    async def get_contact(*a, **k):
+        return _contact()
+
+    async def get_lead(*a, **k):
+        return _lead()
+
+    async def send_fail(text, **kwargs):
+        return False
+
+    monkeypatch.setattr(alert.amo_service, "get_contact_by_id", get_contact)
+    monkeypatch.setattr(alert.amo_service, "get_lead_full", get_lead)
+    monkeypatch.setattr(alert.telegram_bot, "send_alert", send_fail)
+    assert run(alert.process(10, {FIELD_ACADEMY_MANAGER_ACTION})) == "empty_or_failed"
+    assert posted == []

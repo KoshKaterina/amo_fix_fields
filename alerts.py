@@ -46,18 +46,27 @@
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
 import os
 import pathlib
+import re
 from dataclasses import dataclass, replace
 from typing import Any
+
+import httpx
 
 import alert_settings_client as settings_client
 import alert_templates
 import tg_recipients
-from waybill_config import OZON_STALE_ESCALATE_CHAT_ID
+from waybill_config import (
+    ACADEMY_PANEL_NOTIFY_ENABLED,
+    OZON_STALE_ESCALATE_CHAT_ID,
+    TEAM_PANEL_BASE_URL,
+    TEAM_PANEL_INGEST_TOKEN,
+)
 
 logger = logging.getLogger("uvicorn")
 
@@ -294,6 +303,110 @@ def _decision_record(mode: str, event_key: str, panel: Decision | None, legacy: 
         })
     except Exception:
         logger.exception("alerts: не записался файл решений %s", SHADOW_LOG_PATH)
+
+
+# ── лента панели: второй канал рядом с Телеграмом (Катя 29.09.2026) ────────────────
+#
+# Почему лента, а не только чат: Телеграм у нас глушился на сутки одним сетевым сбоем
+# (28-29.08.2026), а панель - рабочий инструмент, в который человек и так смотрит.
+# Отправка фоновая и никогда не роняет сендер: не доехало уведомление - сообщение в чат
+# всё равно ушло.
+#
+# ⚠️ Ссылку из текста вынимаем в поле `url`: лента рендерит ПЛОСКИЙ текст, и тег `<a>`
+# приехал бы разметкой. Тот же приём уже стоит в `autopilot.py`.
+_LINK_RE = re.compile(r'<a href="([^"]+)">([^<]*)</a>')
+
+_panel_tasks: set = set()
+
+
+def strip_link(text: str) -> tuple[str, str | None]:
+    """Текст без html-ссылки плюс сам адрес. Ссылки нет - адрес None."""
+    url = None
+    m = _LINK_RE.search(text or "")
+    if m:
+        url = m.group(1)
+    plain = _LINK_RE.sub(lambda mm: mm.group(2) or "", text or "")
+    # Пустая строка на месте вынутой ссылки читается как обрыв - убираем.
+    plain = "\n".join(line for line in plain.splitlines() if line.strip())
+    return plain, url
+
+
+def panel_notify_bg(
+    *, kind: str, title: str, body: str = "", url: str | None = None,
+    level: str = "info", dedupe_key: str | None = None,
+    amo_user_id=None, fallback_amo_user_id=None,
+) -> None:
+    """Положить уведомление в ленту панели. Фоном, ошибки только в лог.
+
+    Адресуем ЛИЧНО: `user_amo_id` - ответственный по сделке. Это и есть «пинг
+    ответственного» из ТЗ Кати, а не рассылка по праву доступа.
+
+    ⚠️ Приём панели отвечает 404, если такой amo id ни к кому не привязан - а новых
+    менеджеров Академии в панели ещё нет. Поэтому на 404 пробуем `fallback_amo_user_id`
+    (Гладков). Не вышло и с ним - пишем строку в лог и молчим: копия в ленте дешевле
+    сообщения в чате, которое уже ушло.
+    """
+    if not ACADEMY_PANEL_NOTIFY_ENABLED:
+        return
+    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN:
+        logger.info("alerts: панель не настроена, уведомление «%s» в ленту не кладу", title[:60])
+        return
+    task = asyncio.create_task(_panel_notify(
+        kind=kind, title=title, body=body, url=url, level=level,
+        dedupe_key=dedupe_key, amo_user_id=amo_user_id,
+        fallback_amo_user_id=fallback_amo_user_id,
+    ))
+    _panel_tasks.add(task)
+    task.add_done_callback(_panel_tasks.discard)
+
+
+async def _panel_post(payload: dict) -> int:
+    """Один POST. Возвращает http-код, 0 - до панели не дошли вовсе."""
+    url = f"{TEAM_PANEL_BASE_URL.rstrip('/')}/api/ingest/notification"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                url, json=payload, headers={"X-Ingest-Token": TEAM_PANEL_INGEST_TOKEN},
+            )
+        return resp.status_code
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("alerts: панель не ответила на уведомление «%s»", str(payload.get("title"))[:60])
+        return 0
+
+
+async def _panel_notify(*, kind, title, body, url, level, dedupe_key,
+                        amo_user_id, fallback_amo_user_id) -> None:
+    base = {"kind": kind, "title": title[:300], "body": (body or "")[:2000], "level": level}
+    if url:
+        base["url"] = url
+    if dedupe_key:
+        base["dedupe_key"] = dedupe_key[:160]
+
+    tried = []
+    for candidate in (amo_user_id, fallback_amo_user_id):
+        try:
+            candidate = int(candidate) if candidate is not None else None
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate is None or candidate in tried:
+            continue
+        tried.append(candidate)
+        code = await _panel_post({**base, "user_amo_id": candidate})
+        if code < 400:
+            logger.info("alerts: уведомление «%s» в ленте панели, адресат amo %s", title[:60], candidate)
+            return
+        if code != 404:
+            logger.warning("alerts: панель не приняла уведомление «%s», HTTP %s", title[:60], code)
+            return
+        logger.info(
+            "alerts: amo %s не привязан к сотруднику панели, пробую следующего адресата", candidate,
+        )
+    logger.warning(
+        "alerts: уведомление «%s» в ленту НЕ легло - ни один адресат не привязан (пробовали %s)",
+        title[:60], tried or "никого",
+    )
 
 
 def record_sent(*, chat_id, thread_id, message_id, sent_at, text: str) -> None:

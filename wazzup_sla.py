@@ -46,8 +46,10 @@ import telegram_bot
 import alerts
 from api import BASE_URL
 from waybill_config import (
+    ACADEMY_PANEL_FALLBACK_AMO_ID,
     DELIVERY_PICKUP_MARKERS,
     FIELD_DELIVERY_TYPE,
+    PIPELINE_ACADEMY,
     WAZZUP_API_KEY,
     WAZZUP_API_URL,
     WAZZUP_ENSURE_WEBHOOK,
@@ -374,18 +376,21 @@ async def _sweep(threshold_s: int) -> None:
                 continue
             lead_id = st.get("lead_id")
             pickup = bool(st.get("pickup"))
+            academy = _is_academy(st) and not pickup
             # Самовывоз ведёт шоурум — тегаем только Катю-офис, смену не будим.
-            mentions = SLA_PICKUP_TAG if pickup else _mentions(st.get("responsible_id"))
-            text = _build_message(st, lead_id, mentions, int(wait_s // 60), pickup)
+            mentions = SLA_PICKUP_TAG if pickup else _mentions(st.get("responsible_id"), academy)
+            text = _build_message(st, lead_id, mentions, int(wait_s // 60), pickup, academy)
             d = alerts.decide(
-                "wazzup_no_reply", legacy_text=text, parse_mode="HTML",
+                "academy_no_reply" if academy else "wazzup_no_reply",
+                legacy_text=text, parse_mode="HTML",
                 chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
                 # Самовывоз ведёт шоурум: ответственного не передаём, остаётся тег Кати-офис.
                 responsible_id=None if pickup else st.get("responsible_id"),
-                # Клиента ведёт менеджер Академии → алерт уходит в группу его команды, а не
-                # в топик розницы (Катя 29.09.2026). При самовывозе маршрут не считается:
-                # ответственного мы намеренно не передаём, такого клиента ведёт шоурум.
-                route_by_responsible=not pickup,
+                # Маршрут по ответственному просим только у РОЗНИЧНОГО события: клиент
+                # Академии по ТЗ Кати 29.09.2026 идёт в «Уведомления» с пингом
+                # ответственного, а не в чат команды. При самовывозе маршрут тоже не
+                # считается: ответственного мы намеренно не передаём, клиента ведёт шоурум.
+                route_by_responsible=not pickup and not academy,
                 values={
                     "сколько_ждали": int(wait_s // 60),
                     "теги": mentions,
@@ -406,10 +411,24 @@ async def _sweep(threshold_s: int) -> None:
             ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
             st["alerted"] = True
             logger.info(
-                "Wazzup SLA: алерт %s (беседа %s lead=%s, порог %s мин%s)",
+                "Wazzup SLA: алерт %s (беседа %s lead=%s, порог %s мин%s%s)",
                 "отправлен" if ok else "НЕ отправлен", st["chat_id"], lead_id or "—",
                 int(wait_s // 60), ", самовывоз" if pickup else "",
+                ", Академия" if academy else "",
             )
+            if ok and academy:
+                # Лента панели вторым каналом, лично ответственному (ТЗ Кати 29.09.2026).
+                plain, link = alerts.strip_link(d.text)
+                alerts.panel_notify_bg(
+                    kind="academy_no_reply", level="warn",
+                    title=f"Клиент академии ждёт ответа {int(wait_s // 60)}+ мин",
+                    body=plain, url=link,
+                    # Ключ по беседе и минуте порога: повтор того же ожидания не всплывёт,
+                    # а новое ожидание по тому же клиенту - всплывёт.
+                    dedupe_key=f"academy_no_reply:{st.get('chat_id')}:{int(st['wall_since'].timestamp())}",
+                    amo_user_id=st.get("responsible_id"),
+                    fallback_amo_user_id=ACADEMY_PANEL_FALLBACK_AMO_ID,
+                )
         except Exception:
             logger.exception("Wazzup SLA: ошибка отправки алерта (беседа %s)", st.get("chat_id"))
 
@@ -479,19 +498,24 @@ async def _fill_lead_info(st: dict, now_mono: float) -> None:
     last = st.get("resolved_at")
     if last is not None and (now_mono - last) < _RESOLVE_RETRY_S:
         return
-    lead_id, responsible_id, pickup = await _resolve_lead_safe(st["chat_id"])
+    lead_id, responsible_id, pickup, pipeline_id = await _resolve_lead_safe(st["chat_id"])
     st["resolved_at"] = now_mono
     st["lead_id"] = lead_id
     st["responsible_id"] = responsible_id
     st["pickup"] = pickup
+    st["pipeline_id"] = pipeline_id
     st["lead_resolved"] = lead_id is not None
 
 
 async def _resolve_lead_safe(chat_id: str):
-    """(lead_id, responsible_user_id, pickup) открытой сделки по chat_id (для WhatsApp
-    это телефон). Best-effort с таймаутом WAZZUP_RESPONSIBLE_TIMEOUT_S (10с): не нашли/
-    не успели → (None, None, False) → тегаем всю смену и ждём общий порог. Открытая =
-    не 142/143, самая свежая по работе (как в uis_missed_call)."""
+    """(lead_id, responsible_user_id, pickup, pipeline_id) открытой сделки по chat_id (для
+    WhatsApp это телефон). Best-effort с таймаутом WAZZUP_RESPONSIBLE_TIMEOUT_S (10с): не
+    нашли/не успели → (None, None, False, None) → тегаем всю смену и ждём общий порог.
+    Открытая = не 142/143, самая свежая по работе (как в uis_missed_call).
+
+    ⚠️ `pipeline_id` добавлен 29.09.2026: по нему сторож понимает, что клиент из Академии, и
+    шлёт своё событие своими словами. Не нашли воронку - остаёмся на розничном событии, то
+    есть ведём себя как до правки."""
     try:
         return await asyncio.wait_for(_resolve_lead(chat_id), timeout=WAZZUP_RESPONSIBLE_TIMEOUT_S)
     except asyncio.TimeoutError:
@@ -499,10 +523,10 @@ async def _resolve_lead_safe(chat_id: str):
             "Wazzup SLA: сделка/ответственный не определены за %sс — тегаем смену (беседа %s)",
             WAZZUP_RESPONSIBLE_TIMEOUT_S, chat_id,
         )
-        return None, None, False
+        return None, None, False, None
     except Exception:
         logger.exception("Wazzup SLA: поиск сделки не удался (беседа %s)", chat_id)
-        return None, None, False
+        return None, None, False, None
 
 
 def is_pickup_lead(lead: dict) -> bool:
@@ -519,22 +543,23 @@ def is_pickup_lead(lead: dict) -> bool:
 
 async def _resolve_lead(chat_id: str):
     if not chat_id:
-        return None, None, False
+        return None, None, False, None
     leads = await amo_service.find_leads_by_query(chat_id)
     if leads is None:
         # Молчание amoCRM - не «сделок нет». Тревогу по SLA не поднимаем.
         logger.warning("wazzup_sla: amoCRM не ответила на поиск сделки по чату")
-        return None, None, False
+        return None, None, False, None
     open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
     if not open_leads:
-        return None, None, False
+        return None, None, False, None
     # Самовывоз важнее свежести: у клиента может висеть несколько открытых сделок,
     # и если хоть одна — «приеду сам», реагируем по её правилам и на неё же даём
     # ссылку. Иначе как раньше — самая свежая по работе.
     pickup_leads = [ld for ld in open_leads if is_pickup_lead(ld)]
     best = max(pickup_leads or open_leads,
                key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
-    return best.get("id"), best.get("responsible_user_id"), bool(pickup_leads)
+    return (best.get("id"), best.get("responsible_user_id"),
+            bool(pickup_leads), best.get("pipeline_id"))
 
 
 _WZ_TALK_ORIGIN_PREFIX = "com.wazzup24"
@@ -592,16 +617,31 @@ async def _talk_closed(st: dict) -> bool:
     return False
 
 
-def _mentions(responsible_id) -> str:
+def _is_academy(st: dict) -> bool:
+    """Сделка этого ожидания лежит в воронке Академия?
+
+    Воронку не нашли (amo молчал, сделки нет) - отвечаем «нет»: тогда уведомление уйдёт
+    розничным событием, то есть ровно как до 29.09.2026. Деградируем к прежнему поведению,
+    а не к молчанию.
+    """
+    pipeline = st.get("pipeline_id")
+    if pipeline is None:
+        return False
+    try:
+        return int(pipeline) == int(PIPELINE_ACADEMY)
+    except (TypeError, ValueError):
+        return False
+
+
+def _mentions(responsible_id, academy: bool = False) -> str:
     """Кого тегаем в алерте «клиент ждёт ответа».
 
-    Разводка по команде появилась 29.09.2026 вместе с маршрутом по ответственному, и она
-    обязательна, а не украшение: у `mentions_for` фолбэк - вся смена РОЗНИЦЫ, а алерт по
-    клиенту Академии уходит в группу её команды. Розничные менеджеры в той группе не
-    состоят, и Телеграм нарисовал бы их серым текстом при `ok=true` в журнале - ровно та
-    поломка, которая девять дней была невидимой у Кати-офис.
+    Клиент Академии - тег ответственного, а нет его в карте - Гладков (ТЗ Кати 29.09.2026).
+    Это обязательно, а не украшение: у `mentions_for` фолбэк - вся смена РОЗНИЦЫ, и на
+    клиента Академии будили бы розничных менеджеров. Тот же фолбэк применяем и когда
+    ответственный сам из команды Академии - он может быть не в розничной карте.
     """
-    if is_academy_manager(responsible_id):
+    if academy or is_academy_manager(responsible_id):
         return academy_mentions_for(responsible_id)
     return mentions_for(responsible_id)
 
@@ -611,11 +651,16 @@ def _esc(s: str) -> str:
 
 
 def _build_message(st: dict, lead_id, mentions: str,
-                   wait_min: int = WAZZUP_SLA_MINUTES, pickup: bool = False) -> str:
+                   wait_min: int = WAZZUP_SLA_MINUTES, pickup: bool = False,
+                   academy: bool = False) -> str:
     """wait_min — порог, который реально сработал: у самовывоза он свой, и в тексте
-    должно стоять именно оно, иначе алерт врёт про время ожидания."""
+    должно стоять именно оно, иначе алерт врёт про время ожидания.
+
+    `academy` — клиент из воронки Академия: в заголовке это сказано словами (ТЗ Кати
+    29.09.2026). Одним топиком с розницей иначе не понять, чей клиент ждёт."""
     lines = [
-        f"⏳ Клиент ждёт ответа {wait_min}+ мин — ответьте",
+        f"⏳ Клиент академии ждёт ответа {wait_min}+ мин — ответьте" if academy
+        else f"⏳ Клиент ждёт ответа {wait_min}+ мин — ответьте",
     ]
     if pickup:
         # Объясняем, почему разбудили через три минуты, а не через пятнадцать.

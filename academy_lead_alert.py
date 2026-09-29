@@ -49,6 +49,7 @@ from waybill_config import (
     ACADEMY_LEAD_ALERT_DELAY_S,
     ACADEMY_LEAD_ALERT_ENABLED,
     ACADEMY_LEAD_ALERT_HOUR_LIMIT,
+    ACADEMY_PANEL_FALLBACK_AMO_ID,
     FIELD_PHONE,
     PIPELINE_ACADEMY,
     STATUS_ACADEMY_INBOUND_LEAD,
@@ -228,6 +229,16 @@ async def _apply(lead_id) -> None:
         ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
         if ok:
             _sent_times.append(time.time())
+            # Вторым каналом - лента панели, лично ответственному (ТЗ Кати 29.09.2026).
+            plain, link = alerts.strip_link(d.text)
+            alerts.panel_notify_bg(
+                kind="academy_lead", level="info",
+                title="Новый лид в Академии",
+                body=plain, url=link,
+                dedupe_key=f"academy_lead:{lead_id}",
+                amo_user_id=responsible,
+                fallback_amo_user_id=ACADEMY_PANEL_FALLBACK_AMO_ID,
+            )
         else:
             # Не дошло — пусть следующий вебхук по этой сделке попробует снова.
             _unsee(lead_id)

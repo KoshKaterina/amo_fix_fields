@@ -31,7 +31,9 @@ from tg_recipients import (
 )
 from waybill_config import (
     ACADEMY_CUTOVER_TS,
+    ACADEMY_INTENT_ALERT_COALESCE_S,
     ACADEMY_INTENT_ALERT_ENABLED,
+    ACADEMY_PANEL_FALLBACK_AMO_ID,
     FIELD_ACADEMY_EVENT_REGISTRATION,
     FIELD_ACADEMY_MANAGER_ACTION,
     PIPELINE_ACADEMY,
@@ -43,6 +45,12 @@ _relevant = {FIELD_ACADEMY_EVENT_REGISTRATION, FIELD_ACADEMY_MANAGER_ACTION}
 
 # «сделка:поле:значение» → время отправки. Ключ по СДЕЛКЕ, а не по контакту:
 # у склеенного человека контактов два, и по contact_id повторы не схлопнулись бы.
+# Копилка склейки: сделка → {rows: {поле: значение}, lead, contact}. Живёт только в памяти
+# и только на время окна - терять тут нечего, а рестарт посреди окна отдаст одно сообщение
+# со следующего касания.
+_pending: dict = {}
+_flush_tasks: dict = {}
+
 _seen: dict[str, float] = {}
 _SEEN_CAP = 5000
 _SEEN_PATH = os.getenv(
@@ -206,17 +214,24 @@ def _message(lead: dict, contact: dict, rows: list[tuple[int, str]]) -> str:
 
 
 async def process(contact_id, changed_field_ids: set[int]) -> str:
+    """Разбор одного вебхука: прочитать контакт, найти сделку, положить строки в копилку.
+
+    Само сообщение уходит из `flush` - через окно склейки. Причина: бот заполняет поля по
+    одному, каждое своим вебхуком, и 29.09.2026 в 15:06 два поля дали два сообщения с
+    разницей в две секунды. Утренний дедуп такое не склеивает - он гасит ПОВТОР одной и той
+    же пары «поле, значение», а тут пары разные.
+    """
     contact = await amo_service.get_contact_by_id(contact_id, with_=("leads",))
     if not contact:
         return "no_contact"
     lead = await _academy_lead(contact)
     if not lead:
         return "no_academy_lead"
-    rows: list[tuple[int, str]] = []
+    rows: dict[int, str] = {}
     for field_id in sorted(_relevant.intersection(changed_field_ids)):
         value = str(amo_service.get_custom_field_value(contact, field_id) or "").strip()
         if value:
-            rows.append((field_id, value))
+            rows[field_id] = value
     if not rows:
         logger.info(
             "Академия-действие: контакт %s, сделка %s, нечего слать",
@@ -225,6 +240,48 @@ async def process(contact_id, changed_field_ids: set[int]) -> str:
         return "empty"
 
     lead_id = lead.get("id")
+    # Копилка по СДЕЛКЕ, а не по контакту: у склеенного человека контактов два, и по
+    # contact_id касания одного и того же человека в одну копилку не попали бы.
+    box = _pending.setdefault(lead_id, {"rows": {}, "lead": lead, "contact": contact})
+    box["rows"].update(rows)
+    box["lead"] = lead
+    box["contact"] = contact          # имя берём из последнего увиденного контакта
+
+    if ACADEMY_INTENT_ALERT_COALESCE_S <= 0:
+        return await flush(lead_id)
+    if lead_id not in _flush_tasks:
+        task = asyncio.create_task(_flush_later(lead_id))
+        _flush_tasks[lead_id] = task
+        task.add_done_callback(lambda _t, lid=lead_id: _flush_tasks.pop(lid, None))
+    logger.info(
+        "Академия-действие: контакт %s, сделка %s, строк в копилке %s, ждём склейку %.0f с",
+        contact_id, lead_id, len(box["rows"]), ACADEMY_INTENT_ALERT_COALESCE_S,
+    )
+    return "buffered"
+
+
+async def _flush_later(lead_id) -> None:
+    try:
+        await asyncio.sleep(ACADEMY_INTENT_ALERT_COALESCE_S)
+        await flush(lead_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Академия-действие: склейка по сделке %s упала", lead_id)
+
+
+async def flush(lead_id) -> str:
+    """Отправить накопленное по сделке одним сообщением.
+
+    ⚠️ Дедуп применяется ЗДЕСЬ, а не при накоплении. Проверь его раньше - повтор внутри
+    окна отметил бы пару отправленной, а само сообщение ещё не ушло.
+    """
+    box = _pending.pop(lead_id, None)
+    if not box or not box["rows"]:
+        return "empty"
+    lead, contact = box["lead"], box["contact"]
+    contact_id = contact.get("id")
+    rows = sorted(box["rows"].items())
     fresh = [(fid, val) for fid, val in rows if _is_new(lead_id, fid, val)]
     if not fresh:
         logger.info(
@@ -271,4 +328,17 @@ async def process(contact_id, changed_field_ids: set[int]) -> str:
         "Академия-действие: контакт %s, сделка %s, строк %s из %s, отправлено %s",
         contact_id, lead_id, len(fresh), len(rows), int(bool(ok)),
     )
+
+    if ok:
+        # Вторым каналом - лента панели, лично ответственному (ТЗ Кати 29.09.2026).
+        plain, url = alerts.strip_link(d.text)
+        alerts.panel_notify_bg(
+            kind="academy_intent", level="info",
+            title="Действие клиента в Академии",
+            body=plain, url=url,
+            # Ключ тот же, по чему дедупим в чате: повторная доставка не всплывёт второй раз.
+            dedupe_key=f"academy_intent:{lead_id}:" + ";".join(f"{f}={v}" for f, v in fresh),
+            amo_user_id=lead.get("responsible_user_id"),
+            fallback_amo_user_id=ACADEMY_PANEL_FALLBACK_AMO_ID,
+        )
     return "sent" if ok else "empty_or_failed"
