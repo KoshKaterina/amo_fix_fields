@@ -334,7 +334,14 @@ def test_state_survives_restart(monkeypatch, tmp_path):
 def test_stats_reports_disabled(monkeypatch, tmp_path):
     enable(monkeypatch, tmp_path=tmp_path)
     monkeypatch.setattr(join, "ACADEMY_CHAT_JOIN_ENABLED", False)
-    assert join.stats() == {"enabled": False}
+    assert join.stats() == {"enabled": False, "config_fallback": False}
+
+
+def test_stats_shows_config_fallback(monkeypatch, tmp_path):
+    """Тихая деградация видна снаружи: строки ушли из общего конфига."""
+    enable(monkeypatch, tmp_path=tmp_path)
+    monkeypatch.setattr(join, "CONFIG_FALLBACK", True)
+    assert join.stats()["config_fallback"] is True
 
 
 def test_stats_reports_running(monkeypatch, tmp_path):

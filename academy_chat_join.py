@@ -55,6 +55,11 @@ from waybill_config import (
 #
 # Отсюда правило: общий конфиг - ЖЕЛАЕМЫЙ источник, окружение - обязательный запасной.
 # Так одновременная правка общего файла двумя сессиями больше не роняет сервис.
+# ⚠️ Запасной путь не имеет права быть ТИХИМ. Он снимает падение, но само событие -
+# «из общего конфига пропали наши строки» - остаётся аварией: тихо работающий модуль
+# выглядит здоровым, и затирание никто не заметит. Поэтому здесь ERROR в журнал плюс
+# отдельное поле `config_fallback` в ручке здоровья.
+CONFIG_FALLBACK = False
 try:
     from waybill_config import (  # noqa: F401
         ACADEMY_CHAT_JOIN_DRY_RUN,
@@ -63,7 +68,8 @@ try:
         ACADEMY_CHAT_JOIN_STATE_PATH,
         STATUS_ACADEMY_JOINED_CHAT,
     )
-except ImportError:  # чужая заливка общего конфига могла унести наши строки
+except ImportError as exc:  # чужая заливка общего конфига могла унести наши строки
+    CONFIG_FALLBACK = True
     ACADEMY_CHAT_JOIN_ENABLED = os.getenv("ACADEMY_CHAT_JOIN_ENABLED", "0").strip() == "1"
     ACADEMY_CHAT_JOIN_DRY_RUN = os.getenv("ACADEMY_CHAT_JOIN_DRY_RUN", "0").strip() == "1"
     ACADEMY_CHAT_JOIN_STATE_PATH = os.getenv(
@@ -71,8 +77,10 @@ except ImportError:  # чужая заливка общего конфига м�
     ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S = int(
         os.getenv("ACADEMY_CHAT_JOIN_POLL_TIMEOUT_S", "25") or "25")
     STATUS_ACADEMY_JOINED_CHAT = 88943006
-    logging.getLogger("uvicorn").warning(
-        "Академия-вступление: настроек нет в waybill_config - читаю окружение напрямую")
+    logging.getLogger("uvicorn").error(
+        "Академия-вступление: в waybill_config НЕТ наших настроек (%s) - читаю окружение "
+        "напрямую. Это значит, что общий конфиг залили без наших строк: проверьте и верните",
+        exc)
 
 logger = logging.getLogger("uvicorn")
 
@@ -497,11 +505,14 @@ def stats() -> dict:
     """Срез для ручки здоровья: молчащий опрос внутри живого контейнера иначе
     неотличим от тишины по отсутствию вступлений."""
     if not configured():
-        return {"enabled": False}
+        return {"enabled": False, "config_fallback": CONFIG_FALLBACK}
     _load_state()
     return {
         "enabled": True,
         "dry_run": bool(ACADEMY_CHAT_JOIN_DRY_RUN),
+        # true значит «наших строк в общем конфиге нет, работаю от окружения» - тихая
+        # деградация, которую иначе снаружи не видно.
+        "config_fallback": CONFIG_FALLBACK,
         "offset": int(_state.get("offset") or 0),
         "moved_since_start": _moved_count,
         "known_joins": len(_state.get("seen") or {}),
