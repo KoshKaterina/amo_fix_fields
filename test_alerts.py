@@ -554,3 +554,22 @@ def test_academy_manager_is_tagged_by_handle_then_gladkov(monkeypatch):
     assert tg_recipients.academy_mentions_for(ACADEMY_MOP) == tg_recipients.ACADEMY_ALERT_TAG
     assert tg_recipients.academy_mentions_for(None) == tg_recipients.ACADEMY_ALERT_TAG
     assert tg_recipients.academy_mentions_for("мусор") == tg_recipients.ACADEMY_ALERT_TAG
+
+
+def test_shipped_default_leaves_the_route_off():
+    """Главное обещание выкатки 29.09.2026: код на проде, а маршрут ВЫКЛЮЧЕН.
+
+    Решение Кати - «никого пока, выкатить выключенным»: в amo есть Менеджер1 (14289086) и
+    Менеджер2 (14289446), но состав команды ещё не согласован. Пустой список = ни одно
+    уведомление не меняет адреса.
+
+    ⚠️ Тест держит именно ПОСТАВЛЯЕМОЕ значение, без подмен: впишет кто-нибудь номера прямо
+    в код - здесь станет красно. Включать маршрут положено переменной окружения, а не правкой
+    исходника, иначе включение не видно ни в одной выкатке.
+    """
+    assert waybill_config.ACADEMY_TEAM_AMO_IDS == frozenset(), (
+        "маршрут по ответственному включён в коде; включают его через ACADEMY_TEAM_AMO_IDS"
+    )
+    # Адреса при этом известны и зашиты - их правка .env не требует.
+    assert waybill_config.ACADEMY_NOTIFY_THREAD_ID == 20518
+    assert waybill_config.ACADEMY_TEAM_CHAT_ID == -5435861195
