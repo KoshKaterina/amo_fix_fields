@@ -15,6 +15,9 @@
 """
 
 from waybill_config import (
+    ACADEMY_NOTIFY_THREAD_ID,
+    ACADEMY_TEAM_AMO_IDS,
+    ACADEMY_TEAM_CHAT_ID,
     MANAGER_NAMES,
     ROP_ALERT_CHAT_ID,
     WAZZUP_ALWAYS_TAG,
@@ -58,6 +61,53 @@ SLA_PICKUP_TAG = "@kathrina_bistraya"
 # ⚠️ Саша убран из уведомлений розницы 13.08.2026 (отпуск, его просьба) — здесь он стоит
 # по отдельной просьбе Кати и с отпуском не связан.
 ACADEMY_ALERT_TAG = "@gladkov_369"
+
+# ── Академия: своя ветка и своя команда (Катя 29.09.2026) ──
+# Ветка «Уведомления академии» в ТОЙ ЖЕ супергруппе ОП: новый лид Академии переехал из
+# общего топика УВЕДОМЛЕНИЯ сюда, чтобы не мешаться с розничным потоком. Номер снимается
+# из адреса веб-телеграма, как в своё время 4083 для ШОУРУМА:
+# web.telegram.org/a/#-1003680811996_<номер>.
+# None → остаётся общий топик УВЕДОМЛЕНИЯ, то есть поведение до 29.09. Не молчим, как
+# SHOWROOM_ALERT_THREAD_ID: там своя ветка — смысл алерта, а здесь только место.
+ACADEMY_NOTIFY_THREAD = ACADEMY_NOTIFY_THREAD_ID
+# Группа команды Академии. Отдельный чат, а не топик: новые менеджеры в супергруппе ОП не
+# состоят, и тег там нарисовался бы серым текстом при ok=true в логе.
+ACADEMY_TEAM_CHAT = ACADEMY_TEAM_CHAT_ID
+
+
+def is_academy_manager(responsible_id) -> bool:
+    """Ответственный — из команды Академии? От этого зависит АДРЕС уведомления.
+
+    Список приходит из окружения (ACADEMY_TEAM_AMO_IDS). Пустой список — маршрута нет,
+    и это штатное состояние, пока людей не завели в amoCRM: код на проде уже лежит, но
+    ни одно уведомление адреса не меняет.
+    """
+    if not ACADEMY_TEAM_AMO_IDS or responsible_id is None:
+        return False
+    try:
+        return int(responsible_id) in ACADEMY_TEAM_AMO_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+def academy_mentions_for(responsible_id) -> str:
+    """Тег для уведомлений Академии: ник ответственного, а нет его в карте — Гладков.
+
+    Отличается от `mentions_for` намеренно: там фолбэк — вся смена РОЗНИЦЫ, и для лида
+    Академии это неверный адресат. Ответ Кати 29.09.2026 про новый лид: «ответственного,
+    если он уже есть, иначе Гладкова».
+
+    ⚠️ Это фолбэк кода. Когда событие настроено в панели на «ответственному», ник берётся
+    из карточки сотрудника, а сюда управление вернётся только если человека там нет.
+    """
+    handle = None
+    try:
+        if responsible_id is not None:
+            handle = WAZZUP_TG_HANDLES.get(int(responsible_id))
+    except (TypeError, ValueError):
+        handle = None
+    return handle or ACADEMY_ALERT_TAG
+
 
 # ── чат руководства: «ОП срочные уведомления» ──
 # Второй адресат, живущий по своим правилам (выбор Кати 28.08.2026). Разница с чатом ОП

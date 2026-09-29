@@ -28,6 +28,13 @@
 - Номер чата панель не знает: она отдаёт ключ канала, соответствие «ключ → чат и топик»
   живёт только здесь, в `_destination`.
 
+Маршрут по ответственному (Катя 29.09.2026). До этого адресата выбирало ТОЛЬКО событие: один
+ключ канала на событие, второго измерения не было. Теперь сендер может попросить
+`route_by_responsible=True`, и тогда адрес переопределяется по человеку: сделку ведёт менеджер
+Академии - уведомление уходит в группу команды Академии, а не в топик розницы. Переопределение
+ложится и на панельное решение, и на легаси, иначе маршрут молча отвалился бы при смене режима
+флага. Список менеджеров Академии - в окружении, пустой список выключает маршрут целиком.
+
 Получатели. Панель отдаёт режим: `responsible` - ник ответственного из карточки сотрудника
 в панели (сендер передаёт `responsible_id=`), нет его там - сегодняшние теги сендера из
 `values["теги"]` со всем их фолбэком «не нашёлся → вся смена»; `listed` - ники из панели
@@ -95,6 +102,17 @@ def _destination(channel_key: str | None) -> tuple[int | str | None, int | None]
         if tg_recipients.SHOWROOM_ALERT_THREAD_ID is None:
             return None
         return tg_recipients.NOTIFY_CHAT_ID, tg_recipients.SHOWROOM_ALERT_THREAD_ID
+    if channel_key == "op_academy":
+        # Ветка «Уведомления академии» в той же супергруппе ОП. Номер не задан - НЕ молчим,
+        # а остаёмся в общем топике УВЕДОМЛЕНИЯ: до 29.09.2026 лид Академии жил именно там,
+        # и потерять уведомление из-за незаполненной переменной хуже, чем показать его
+        # соседям. У op_showroom наоборот, и это не рассогласование: там своя ветка - смысл
+        # события (визит в шоурум), а здесь - только место в чате.
+        return tg_recipients.NOTIFY_CHAT_ID, (
+            tg_recipients.ACADEMY_NOTIFY_THREAD or tg_recipients.NOTIFY_THREAD_ID
+        )
+    if channel_key == "academy_team":
+        return (tg_recipients.ACADEMY_TEAM_CHAT, None) if tg_recipients.ACADEMY_TEAM_CHAT else None
     if channel_key == "rop":
         return (tg_recipients.ROP_CHAT_ID, None) if tg_recipients.ROP_CHAT_ID else None
     if channel_key == "ozon_escalation":
@@ -102,6 +120,42 @@ def _destination(channel_key: str | None) -> tuple[int | str | None, int | None]
     if channel_key == "tech":
         return None, None
     return None
+
+
+def channel_for_responsible(responsible_id) -> str | None:
+    """Канал по ОТВЕТСТВЕННОМУ: менеджер Академии читает свою группу (Катя 29.09.2026).
+
+    None - маршрут не меняем, адресат остаётся тем, что решило событие. Так было всегда до
+    29.09: один ключ канала на событие, и другого измерения не существовало. Здесь оно
+    появляется, потому что одно и то же событие («клиент ждёт ответа») должно приходить в
+    разные чаты в зависимости от того, чей это клиент.
+    """
+    return "academy_team" if tg_recipients.is_academy_manager(responsible_id) else None
+
+
+def _routed(d: Decision, event_key: str, responsible_id) -> Decision:
+    """Переопределить адрес решения маршрутом по ответственному.
+
+    Применяется и к панельному решению, и к легаси, и это несущая деталь. Только к
+    легаси - маршрут не сработал бы вовсе: прод живёт в режиме `on` с 13.09.2026. Только
+    к панельному - маршрут молча отвалился бы, если флаг когда-нибудь вернут в `off`.
+    """
+    key = channel_for_responsible(responsible_id)
+    if key is None:
+        return d
+    dest = _destination(key)
+    if dest is None:
+        # Группа Академии ещё не настроена - оставляем сегодняшний адрес, а не молчим:
+        # это ровно состояние «код выкачен, chat_id не прописан».
+        logger.info("alerts: %s - чат команды Академии не настроен, адрес не меняю", event_key)
+        return d
+    if (d.chat_id, d.thread_id) == (dest[0], dest[1]):
+        return d
+    logger.info(
+        "alerts: %s - ответственный из команды Академии, адрес chat=%s thread=%s вместо chat=%s thread=%s",
+        event_key, dest[0], dest[1], d.chat_id, d.thread_id,
+    )
+    return replace(d, chat_id=dest[0], thread_id=dest[1])
 
 
 def _tags(event_key: str, cfg: dict[str, Any], values: dict[str, Any], responsible_id) -> str:
@@ -165,6 +219,7 @@ def decide(
     event_key: str, *, legacy_text: str, values: dict[str, Any],
     chat_id: int | str | None = None, thread_id: int | None = None, parse_mode: str | None = None,
     lead: dict | None = None, keep_text: bool = False, responsible_id=None,
+    route_by_responsible: bool = False,
 ) -> Decision | None:
     """Что и куда слать. None - не слать (выключено в панели или её чат не настроен).
 
@@ -173,8 +228,13 @@ def decide(
     `responsible_id` - ответственный по сделке в amoCRM: в режиме «ответственному» его ник
     берётся из карточки сотрудника в панели, нет там - остаются теги сендера.
     `keep_text=True` - текст остаётся кодовым, панель решает только выключатель и чат.
+    `route_by_responsible=True` - адрес выбирается по ответственному, а не только по событию:
+    его сделку ведёт менеджер Академии - уведомление уходит в группу команды Академии.
+    Список пуст или чат не настроен - адрес не меняется (см. `_routed`).
     """
     legacy = Decision(legacy_text, chat_id, thread_id, parse_mode, "legacy")
+    if route_by_responsible:
+        legacy = _routed(legacy, event_key, responsible_id)
     mode = settings_client.mode()
     if mode == "off":
         return legacy
@@ -182,6 +242,8 @@ def decide(
     if cfg is None:
         return legacy
     panel = _from_panel(event_key, cfg, values, lead, keep_text, legacy, responsible_id)
+    if panel is not None and route_by_responsible:
+        panel = _routed(panel, event_key, responsible_id)
     if mode == "shadow":
         if panel is None:
             logger.info("alerts[shadow] %s: панель велела бы НЕ слать; шлём как раньше", event_key)

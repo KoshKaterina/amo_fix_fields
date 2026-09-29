@@ -38,7 +38,12 @@ import amo_service
 import telegram_bot
 import alerts
 from api import BASE_URL
-from tg_recipients import ACADEMY_ALERT_TAG, NOTIFY_CHAT_ID, NOTIFY_THREAD_ID
+from tg_recipients import (
+    ACADEMY_NOTIFY_THREAD,
+    NOTIFY_CHAT_ID,
+    NOTIFY_THREAD_ID,
+    academy_mentions_for,
+)
 from waybill_config import (
     ACADEMY_LEAD_ALERT_DEDUP_H,
     ACADEMY_LEAD_ALERT_DELAY_S,
@@ -200,11 +205,17 @@ async def _apply(lead_id) -> None:
         client, phone = await _client_card(lead)
         text = _build_message(lead_id, lead, client, phone)
         name = ((lead or {}).get("name") or "").strip()
+        responsible = (lead or {}).get("responsible_user_id")
         d = alerts.decide(
             "academy_lead", legacy_text=text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID, lead=lead,
+            chat_id=NOTIFY_CHAT_ID, thread_id=_thread(), lead=lead,
+            # Тег - ответственному, а нет его в картах - Гладкову (ответ Кати 29.09.2026).
+            # Маршрут по ответственному здесь НЕ включаем: лид всегда идёт в ветку
+            # «Уведомления академии». На «Входящем лиде» ответственного часто ещё нет, и
+            # развилка по человеку работала бы через раз.
+            responsible_id=responsible,
             values={
-                "теги": ACADEMY_ALERT_TAG,
+                "теги": academy_mentions_for(responsible),
                 "телефон": phone or "",
                 "клиент": client or "",
                 "сделка": name if name and name != client else "",
@@ -247,7 +258,7 @@ async def _report_burst() -> None:
             "дальше уведомления приглушены до конца часа. Похоже на массовый перенос сделок, "
             "стоит заглянуть в воронку."
         ),
-        chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+        chat_id=NOTIFY_CHAT_ID, thread_id=_thread(),
         values={"лимит": ACADEMY_LEAD_ALERT_HOUR_LIMIT},
     )
     if d is None:
@@ -279,11 +290,20 @@ def _esc(s) -> str:
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _thread() -> int | None:
+    """Ветка «Уведомления академии», а нет её номера - общий топик УВЕДОМЛЕНИЯ.
+
+    Читается функцией, а не константой: номер приходит из окружения, и до его появления
+    уведомление обязано ходить туда, куда ходило до 29.09.2026, а не пропасть.
+    """
+    return ACADEMY_NOTIFY_THREAD or NOTIFY_THREAD_ID
+
+
 def _build_message(lead_id, lead: dict, client, phone) -> str:
     """Без ID в тексте (правило Кати 03.08.2026) и без точек посередине (26.08.2026)."""
     lines = [
         "🎓 Новый лид в Академии",
-        ACADEMY_ALERT_TAG,
+        academy_mentions_for((lead or {}).get("responsible_user_id")),
     ]
     if phone:
         lines.append(f"📞 {_esc(phone)}")

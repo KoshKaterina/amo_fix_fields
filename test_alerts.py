@@ -53,6 +53,9 @@ VALUES_BY_EVENT = {
     "office_transfer_bad_fill": {"причина", "сделка", "ссылка_на_сделку", "теги"},
     "lead_not_distributed": {"сколько_ждали", "сделка", "ссылка_на_сделку", "теги"},
     "new_lead_untaken": {"сколько_ждали", "ответственный", "сделка", "ссылка_на_сделку"},
+    # Близнец предыдущего для Академии (29.09.2026): тот же сторож, но чат менеджеров -
+    # значит в наборе есть «теги», которых у розничного события нет и быть не должно.
+    "academy_lead_untaken": {"сколько_ждали", "ответственный", "теги", "сделка", "ссылка_на_сделку"},
     "autopilot_event": {"текст_события", "теги"},
     "autopilot_failure": {"текст_поломки"},
     "wazzup_undelivered": {"канал", "клиент", "телефон", "отправитель", "тип_сообщения", "ошибка", "сообщение", "ссылка_на_сделку"},
@@ -440,3 +443,114 @@ def test_on_mode_records_decision_and_sent_response(mode, panel_doc, monkeypatch
     assert srow["text_head"].startswith("🎓 Новый лид в Академии") and srow["tg_date"] == "2026-09-13T20:00:00+00:00"
     # record_sent никогда не бросает - даже с мусором вместо даты.
     alerts.record_sent(chat_id=None, thread_id=None, message_id=None, sent_at="?", text="")
+
+
+# ── маршрут по ответственному (Катя 29.09.2026) ──────────────────────────────────
+#
+# До 29.09 адресата выбирало ТОЛЬКО событие. Здесь появляется второе измерение: одно и то
+# же событие уходит в разные чаты в зависимости от того, чей это клиент. Держим то, на чём
+# маршрут стоит:
+#   • пустой список менеджеров = маршрута нет (состояние свежей выкатки);
+#   • переопределение ложится и на панельное решение, и на легаси - иначе маршрут молча
+#     отвалился бы при смене режима флага;
+#   • чат группы не настроен - остаётся прежний адрес, а НЕ молчание.
+
+ACADEMY_MOP = 99000001
+ACADEMY_TEAM_CHAT = -4777000111
+
+
+@pytest.fixture
+def academy_team(monkeypatch):
+    """Команда Академии заведена: список менеджеров и чат группы на месте."""
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_AMO_IDS", frozenset({ACADEMY_MOP}))
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_CHAT", ACADEMY_TEAM_CHAT)
+
+
+def test_route_is_off_while_the_list_is_empty(mode, panel_doc, monkeypatch):
+    """Штатное состояние выкатки: код на проде, аккаунтов в amo ещё нет. Ни одно
+    уведомление не меняет адреса."""
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_AMO_IDS", frozenset())
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_CHAT", ACADEMY_TEAM_CHAT)
+    assert alerts.channel_for_responsible(ACADEMY_MOP) is None
+    mode("off")
+    d = alerts.decide("wazzup_no_reply", legacy_text="x", values={}, chat_id=1, thread_id=2,
+                      responsible_id=ACADEMY_MOP, route_by_responsible=True)
+    assert (d.chat_id, d.thread_id) == (1, 2)
+
+
+def test_route_sends_academy_manager_to_the_team_chat(mode, academy_team):
+    mode("off")
+    d = alerts.decide("wazzup_no_reply", legacy_text="x", values={}, chat_id=1, thread_id=2,
+                      responsible_id=ACADEMY_MOP, route_by_responsible=True)
+    assert (d.chat_id, d.thread_id) == (ACADEMY_TEAM_CHAT, None)
+    assert d.source == "legacy"      # маршрут не подменяет источник решения
+
+
+def test_route_leaves_other_managers_alone(mode, academy_team):
+    mode("off")
+    d = alerts.decide("wazzup_no_reply", legacy_text="x", values={}, chat_id=1, thread_id=2,
+                      responsible_id=13929334, route_by_responsible=True)
+    assert (d.chat_id, d.thread_id) == (1, 2)
+
+
+def test_route_applies_to_the_panel_decision_too(mode, panel_doc, academy_team):
+    """Прод живёт в режиме `on` с 13.09.2026: маршрут, наложенный только на легаси, не
+    сработал бы там вовсе."""
+    mode("on")
+    settings_client.set_settings_for_tests(panel_doc)
+    d = alerts.decide("wazzup_no_reply", legacy_text="старый", chat_id=1, thread_id=2,
+                      responsible_id=ACADEMY_MOP, route_by_responsible=True,
+                      values={"сколько_ждали": 30, "теги": "@x", "канал": "Telegram",
+                              "клиент": "Аня", "телефон": "+7", "сообщение": "«?»",
+                              "ссылка_на_сделку": LINK})
+    assert d.source == "panel"
+    assert (d.chat_id, d.thread_id) == (ACADEMY_TEAM_CHAT, None)
+
+
+def test_route_without_a_team_chat_keeps_the_old_address(mode, monkeypatch, caplog):
+    """Список заполнили, chat_id группы ещё нет - шлём по старому адресу. Молчать тут
+    нельзя: уведомление о ждущем клиенте дороже аккуратности адреса."""
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_AMO_IDS", frozenset({ACADEMY_MOP}))
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_CHAT", None)
+    mode("off")
+    with caplog.at_level("INFO", logger="uvicorn"):
+        d = alerts.decide("wazzup_no_reply", legacy_text="x", values={}, chat_id=1, thread_id=2,
+                          responsible_id=ACADEMY_MOP, route_by_responsible=True)
+    assert (d.chat_id, d.thread_id) == (1, 2)
+    assert any("не настроен" in r.getMessage() for r in caplog.records)
+
+
+def test_route_is_not_asked_for_by_default(mode, academy_team):
+    """Сендер обязан попросить маршрут явно: остальные события адреса не меняют."""
+    mode("off")
+    d = alerts.decide("missed_call", legacy_text="x", values={}, chat_id=1, thread_id=2,
+                      responsible_id=ACADEMY_MOP)
+    assert (d.chat_id, d.thread_id) == (1, 2)
+
+
+def test_academy_thread_channel(monkeypatch):
+    """Ветка «Уведомления академии». Номера нет - остаёмся в общем топике УВЕДОМЛЕНИЯ, а не
+    молчим: до 29.09.2026 лид Академии жил именно там."""
+    monkeypatch.setattr(tg_recipients, "ACADEMY_NOTIFY_THREAD", 12345)
+    assert alerts._destination("op_academy") == (tg_recipients.NOTIFY_CHAT_ID, 12345)
+    monkeypatch.setattr(tg_recipients, "ACADEMY_NOTIFY_THREAD", None)
+    assert alerts._destination("op_academy") == (tg_recipients.NOTIFY_CHAT_ID,
+                                                tg_recipients.NOTIFY_THREAD_ID)
+
+
+def test_academy_team_channel_is_silent_without_a_chat(monkeypatch):
+    """А вот отдельная ГРУППА без номера - это молчание по ключу канала: подставлять вместо
+    неё топик розницы нельзя, туда эти сообщения не адресованы."""
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_CHAT", None)
+    assert alerts._destination("academy_team") is None
+    monkeypatch.setattr(tg_recipients, "ACADEMY_TEAM_CHAT", ACADEMY_TEAM_CHAT)
+    assert alerts._destination("academy_team") == (ACADEMY_TEAM_CHAT, None)
+
+
+def test_academy_manager_is_tagged_by_handle_then_gladkov(monkeypatch):
+    """Тег уведомлений Академии: ник ответственного, а нет его в карте - Гладков. Фолбэк
+    «вся смена розницы» здесь неверен - в группе Академии этих людей нет."""
+    assert tg_recipients.academy_mentions_for(13929334) == "@egorkonsss"
+    assert tg_recipients.academy_mentions_for(ACADEMY_MOP) == tg_recipients.ACADEMY_ALERT_TAG
+    assert tg_recipients.academy_mentions_for(None) == tg_recipients.ACADEMY_ALERT_TAG
+    assert tg_recipients.academy_mentions_for("мусор") == tg_recipients.ACADEMY_ALERT_TAG

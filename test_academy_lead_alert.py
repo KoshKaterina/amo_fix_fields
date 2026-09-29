@@ -45,6 +45,7 @@ def _install_stubs():
 _install_stubs()
 
 import academy_lead_alert  # noqa: E402
+import tg_recipients  # noqa: E402
 from waybill_config import (  # noqa: E402
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
@@ -292,3 +293,56 @@ def test_massovyy_prognoz_glushitsya_posle_limita(monkeypatch):
     assert "приглушены" in _sent[-1]["text"]
     # Приглушённые лиды не помечены отправленными — вернутся следующим вебхуком.
     assert str(LEAD_ID + 4) not in academy_lead_alert._seen
+
+
+# ── своя ветка и тег ответственного (Катя 29.09.2026) ────────────────────────
+#
+# До 29.09 лид Академии шёл в ОБЩИЙ топик УВЕДОМЛЕНИЯ и всегда тегал Гладкова. Теперь у
+# направления своя ветка, а тег достаётся ответственному, если он уже назначен.
+
+EGOR = 13929334          # есть в карте хендлов: @egorkonsss
+ACADEMY_MOP = 99000001   # «Менеджер1»: в карте хендлов его пока нет
+
+
+def test_teg_uhodit_otvetstvennomu(monkeypatch):
+    _send(_lead() | {"responsible_user_id": EGOR}, monkeypatch)
+    assert "@egorkonsss" in _sent[0]["text"]
+
+
+def test_bez_otvetstvennogo_tegaem_gladkova(monkeypatch):
+    """На «Входящем лиде» ответственного часто ещё нет — тогда зовём Гладкова, он ведёт
+    Академию. Фолбэк «вся смена розницы» тут неверен: эти лиды не их."""
+    _send(_lead(), monkeypatch)
+    assert tg_recipients.ACADEMY_ALERT_TAG in _sent[0]["text"]
+
+
+def test_neizvestnyy_otvetstvennyy_tozhe_daet_gladkova(monkeypatch):
+    """Менеджер назначен, но его ника мы не знаем — молчать нельзя, зовём Гладкова."""
+    _send(_lead() | {"responsible_user_id": ACADEMY_MOP}, monkeypatch)
+    assert tg_recipients.ACADEMY_ALERT_TAG in _sent[0]["text"]
+
+
+def test_uvedomlenie_uhodit_v_vetku_akademii(monkeypatch):
+    monkeypatch.setattr(academy_lead_alert, "ACADEMY_NOTIFY_THREAD", 12345)
+    _send(_lead(), monkeypatch)
+    assert _sent[0]["thread"] == 12345
+    assert _sent[0]["chat_id"] == academy_lead_alert.NOTIFY_CHAT_ID
+
+
+def test_bez_nomera_vetki_ostaemsya_v_obshchem_topike(monkeypatch):
+    """Номер ветки ещё не прописан — уведомление идёт туда, куда ходило до 29.09.2026,
+    а не пропадает."""
+    monkeypatch.setattr(academy_lead_alert, "ACADEMY_NOTIFY_THREAD", None)
+    _send(_lead(), monkeypatch)
+    assert _sent[0]["thread"] == academy_lead_alert.NOTIFY_THREAD_ID
+
+
+def test_predupregdenie_o_perebore_idet_v_tu_zhe_vetku(monkeypatch):
+    """Иначе приглушённые сообщения в одной ветке, а объяснение почему — в другой."""
+    monkeypatch.setattr(academy_lead_alert, "ACADEMY_NOTIFY_THREAD", 12345)
+    monkeypatch.setattr(academy_lead_alert, "ACADEMY_LEAD_ALERT_HOUR_LIMIT", 1)
+    for i in range(3):
+        academy_lead_alert._seen[str(LEAD_ID + i)] = 1.0
+        _send(_lead(lead_id=LEAD_ID + i), monkeypatch, lead_id=LEAD_ID + i)
+    assert "приглушены" in _sent[-1]["text"]
+    assert _sent[-1]["thread"] == 12345

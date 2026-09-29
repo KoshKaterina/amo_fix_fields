@@ -68,6 +68,8 @@ from tg_recipients import (
     NOTIFY_THREAD_ID,
     ROP_CHAT_ID,
     SLA_PICKUP_TAG,
+    academy_mentions_for,
+    is_academy_manager,
     manager_name,
     mentions_for,
 )
@@ -373,13 +375,17 @@ async def _sweep(threshold_s: int) -> None:
             lead_id = st.get("lead_id")
             pickup = bool(st.get("pickup"))
             # Самовывоз ведёт шоурум — тегаем только Катю-офис, смену не будим.
-            mentions = SLA_PICKUP_TAG if pickup else mentions_for(st.get("responsible_id"))
+            mentions = SLA_PICKUP_TAG if pickup else _mentions(st.get("responsible_id"))
             text = _build_message(st, lead_id, mentions, int(wait_s // 60), pickup)
             d = alerts.decide(
                 "wazzup_no_reply", legacy_text=text, parse_mode="HTML",
                 chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
                 # Самовывоз ведёт шоурум: ответственного не передаём, остаётся тег Кати-офис.
                 responsible_id=None if pickup else st.get("responsible_id"),
+                # Клиента ведёт менеджер Академии → алерт уходит в группу его команды, а не
+                # в топик розницы (Катя 29.09.2026). При самовывозе маршрут не считается:
+                # ответственного мы намеренно не передаём, такого клиента ведёт шоурум.
+                route_by_responsible=not pickup,
                 values={
                     "сколько_ждали": int(wait_s // 60),
                     "теги": mentions,
@@ -584,6 +590,20 @@ async def _talk_closed(st: dict) -> bool:
             return False
         return True
     return False
+
+
+def _mentions(responsible_id) -> str:
+    """Кого тегаем в алерте «клиент ждёт ответа».
+
+    Разводка по команде появилась 29.09.2026 вместе с маршрутом по ответственному, и она
+    обязательна, а не украшение: у `mentions_for` фолбэк - вся смена РОЗНИЦЫ, а алерт по
+    клиенту Академии уходит в группу её команды. Розничные менеджеры в той группе не
+    состоят, и Телеграм нарисовал бы их серым текстом при `ok=true` в журнале - ровно та
+    поломка, которая девять дней была невидимой у Кати-офис.
+    """
+    if is_academy_manager(responsible_id):
+        return academy_mentions_for(responsible_id)
+    return mentions_for(responsible_id)
 
 
 def _esc(s: str) -> str:
