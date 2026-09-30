@@ -33,6 +33,9 @@ from waybill_config import (
     STATUS_TANGEM_LINK_SENT,
     STATUS_TANGEM_OFFICE_RECORD,
     STATUS_TANGEM_PAYMENT_REQUESTED,
+    STATUS_TANGEM_QUALIFIED,
+    STATUS_TANGEM_TECH_NEW_LEAD,
+    STATUS_TANGEM_TERMS_AGREED,
     STATUS_WAYBILL_READY,
 )
 
@@ -320,16 +323,44 @@ def test_tangemshop_rabotaet_po_svoim_etapam(env):
     STATUS_TANGEM_OFFICE_RECORD,
     STATUS_TANGEM_PAYMENT_REQUESTED,
     STATUS_TANGEM_LINK_SENT,
+    STATUS_TANGEM_TECH_NEW_LEAD,
+    STATUS_TANGEM_QUALIFIED,
+    STATUS_TANGEM_TERMS_AGREED,
 ])
 def test_novye_etapy_tangemshop_derzhat_rezerv(env, status_id):
-    """Три этапа, появившиеся при сведении воронки с розницей (29.09.2026).
+    """Этапы, появившиеся при сведении воронки с розницей: три 29.09.2026 и ещё
+    три 30.09.2026.
 
-    До этой правки их не было в наборе: резерв на них слетал бы по тайм-ауту
-    посреди работы менеджера - сделка стоит на «Ссылка отправлена», клиент
-    думает, а товар уже не за ним.
+    Без них резерв слетает по тайм-ауту посреди работы менеджера - сделка стоит
+    на «Ссылка отправлена» или «Условия согласованы», клиент думает, а товар уже
+    не за ним.
     """
     puts = _run(env, PIPELINE_TANGEMSHOP, status_id)
     assert [b["reserve"] for _, b in puts] == [2, 1], "резерв = количеству в позиции"
+
+
+def test_nabor_etapov_tangemshop_sovpadaet_s_voronkoy():
+    """Сторож против третьего захода: набор резерва должен покрывать ВСЕ рабочие
+    этапы воронки. Состав снят живым запросом GET /leads/pipelines/9822330 30.09.2026.
+
+    Воронку достраивают на ходу; заведут новый рабочий этап - этот тест упадёт и
+    напомнит дописать его в набор, а не ловить потом слетевший резерв.
+    """
+    live_working = {
+        88973458,  # Новый лид тех
+        78157066,  # Новый лид
+        78157070,  # взят в работу
+        87522374,  # Запись в офис
+        88979338,  # Квалификация проведена
+        78157074,  # апсейл / допродажа сделаны
+        88981214,  # Условия согласованы
+        86477046,  # Оплата запрошена
+        87521846,  # Ссылка отправлена
+        86477050,  # Оплата получена
+    }
+    known = reserve_service._RESERVE_ON[PIPELINE_TANGEMSHOP]
+    missing = live_working - known
+    assert not missing, f"этапы воронки без резерва: {sorted(missing)}"
 
 
 # --- тайм-аут -----------------------------------------------------------
