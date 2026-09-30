@@ -286,6 +286,32 @@ def test_chasovoy_limit_gasit_potok():
     assert "приглушены" in _sent[0]["text"]
 
 
+def test_suhoy_progon_pishet_kazhduyu_proverku():
+    """Иначе по журналу не отличить «молчит, потому что порядок» от «не работает»."""
+    _reset(leads=[_lead(17, PIPELINE_CLEVER_MAIN)], dry_run=True)
+    lines = []
+    real = G.logger.info
+    G.logger.info = lambda msg, *a: lines.append(msg % a if a else msg)
+    try:
+        _apply()
+    finally:
+        G.logger.info = real
+        G.RETAIL_GUARD_DRY_RUN = False
+    assert any("своя открытая сделка есть" in l for l in lines)
+
+
+def test_boevoy_rezhim_zhurnal_ne_zasoryaet():
+    _reset(leads=[_lead(18, PIPELINE_CLEVER_MAIN)])
+    lines = []
+    real = G.logger.info
+    G.logger.info = lambda msg, *a: lines.append(msg % a if a else msg)
+    try:
+        _apply()
+    finally:
+        G.logger.info = real
+    assert not any("сухой прогон" in l for l in lines)
+
+
 # --- текст ----------------------------------------------------------------------
 
 def test_telegram_pokazyvaet_nik_a_ne_nomer_chata():

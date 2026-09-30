@@ -232,6 +232,18 @@ def _snippet(text, limit: int = 160) -> str:
 # проверка и алерт
 # ---------------------------------------------------------------------------
 
+def _dry_log(st: dict, verdict: str, leads: int = 0, open_leads: int = 0) -> None:
+    """В сухом прогоне пишем КАЖДОЕ решение, а не только найденные случаи: иначе по
+    журналу не отличить «сторож молчит, потому что всё в порядке» от «сторож не
+    работает». В боевом режиме молчание остаётся молчанием - журнал не засоряем."""
+    if not RETAIL_GUARD_DRY_RUN:
+        return
+    logger.info(
+        "Сторож розничных лидов[сухой прогон]: беседа %s, канал %s — %s (сделок %s, открытых %s)",
+        st.get("chat_id"), _channel_label(st), verdict, leads, open_leads,
+    )
+
+
 async def _apply(st: dict) -> None:
     chat_id = st["chat_id"]
     try:
@@ -242,15 +254,21 @@ async def _apply(st: dict) -> None:
         if leads is None:
             # Молчание amoCRM — не «сделок нет». Тревогу не поднимаем.
             logger.warning("Сторож розничных лидов: amoCRM не ответила на поиск сделок по чату")
+            _dry_log(st, "amoCRM не ответила, молчим")
             return
 
         open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
         if not open_leads:
             # Открытых сделок нет — amo создаст новую сам, это штатный путь.
+            _dry_log(st, "открытых сделок нет, amo создаст сам", len(leads), 0)
             return
 
         own = [ld for ld in open_leads if str(ld.get("pipeline_id")) in RETAIL_GUARD_OWN_PIPELINES]
         if own:
+            _dry_log(
+                st, f"своя открытая сделка есть — воронка «{_pipeline_name(own[0].get('pipeline_id'))}»",
+                len(leads), len(open_leads),
+            )
             return
 
         foreign = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
@@ -259,8 +277,11 @@ async def _apply(st: dict) -> None:
                 "Сторож розничных лидов: вне окна %s-%s МСК — молчим (беседа %s)",
                 RETAIL_GUARD_WINDOW_START_H, RETAIL_GUARD_WINDOW_END_H, chat_id,
             )
+            _dry_log(st, "случай есть, но вне окна отправки", len(leads), len(open_leads))
             return
         if not _alert_is_new(chat_id):
+            _dry_log(st, "случай есть, но про этот чат уже писали в окне дедупа",
+                     len(leads), len(open_leads))
             return
         if not _budget_ok():
             _unalert(chat_id)
