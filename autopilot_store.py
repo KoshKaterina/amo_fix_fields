@@ -92,7 +92,7 @@ def _now() -> str:
 
 _COLS = (
     "lead_id, status_id, pipeline_id, bot_id, phase, launch_attempted_at, launch_ok_at, "
-    "chat_id, wake_at, created_at, updated_at, note, delivery"
+    "chat_id, wake_at, created_at, updated_at, note, delivery, contact_name"
 )
 
 
@@ -111,6 +111,10 @@ def _row(r) -> dict:
         "updated_at": r[10],
         "note": r[11],
         "delivery": _loads(r[12]),
+        # Имя контакта - второй ключ поиска переписки: телеграмный чат по телефону не
+        # находится (правка Кати 01.10.2026). Держим здесь, чтобы подбор не ходил за именем
+        # в amoCRM каждые пять минут.
+        "contact_name": r[13] if len(r) > 13 else "",
     }
 
 
@@ -190,6 +194,20 @@ def _create_schema(conn) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS ix_autopilot_notified_at ON autopilot_notified (created_at)"
     )
+    _add_missing_columns(conn)
+
+
+def _add_missing_columns(conn) -> None:
+    """Догнать схему на базах, созданных прежними версиями.
+
+    `CREATE TABLE IF NOT EXISTS` существующую таблицу не меняет, а боевая база живёт на диске
+    с сентября - без этого шага новая колонка появилась бы только у тех, кто начинает с нуля.
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(autopilot_state)")}
+    if "contact_name" not in have:
+        conn.execute(
+            "ALTER TABLE autopilot_state ADD COLUMN contact_name TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def get(lead_id: int, status_id: int) -> dict | None:
@@ -229,6 +247,7 @@ def update(lead_id: int, status_id: int, **fields) -> None:
     ничего не сделает, а мы будем искать её в логике движка."""
     allowed = {
         "bot_id", "phase", "launch_attempted_at", "launch_ok_at", "chat_id", "wake_at", "note",
+        "contact_name",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -250,12 +269,15 @@ def mark_launch_attempted(lead_id: int, status_id: int, bot_id: int) -> None:
     update(lead_id, status_id, bot_id=bot_id, launch_attempted_at=_now())
 
 
-def mark_launch_ok(lead_id: int, status_id: int, chat_id: str | None = None) -> None:
+def mark_launch_ok(lead_id: int, status_id: int, chat_id: str | None = None,
+                   contact_name: str | None = None) -> None:
     """Отметка ПОСЛЕ ответа amoCRM. Между этой и предыдущей - окно, в котором рестарт
     оставляет запись «попытка была, результат неизвестен»."""
     fields: dict = {"launch_ok_at": _now(), "phase": PHASE_DELIVERY}
     if chat_id:
         fields["chat_id"] = str(chat_id)
+    if contact_name:
+        fields["contact_name"] = str(contact_name)[:255]
     update(lead_id, status_id, **fields)
 
 

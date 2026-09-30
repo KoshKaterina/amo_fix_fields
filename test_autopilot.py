@@ -1700,7 +1700,7 @@ def test_catchup_picks_up_the_answer_a_webhook_lost(monkeypatch):
                             "launch_ok_at": "2026-09-27T08:13:00+00:00", "delivery": [],
                         }] if phase == S.PHASE_REPLY else [])
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         assert chat_id == "79998993959"
         return {"inbound": [{"text": "Да, всё верно", "chat_type": "whatsapp",
                              "at": "2026-09-27T11:00:00+00:00"}], "echo": []}
@@ -1746,7 +1746,7 @@ def test_catchup_records_delivery_when_only_echo_is_there(monkeypatch):
                             "launch_ok_at": "2026-09-27T09:29:17+00:00", "delivery": [],
                         }] if phase == S.PHASE_DELIVERY else [])
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         return {"inbound": [], "echo": [{"status": "delivered", "chat_type": "whatsapp"}]}
 
     async def fake_record(row, status, chat_type):
@@ -1936,7 +1936,7 @@ def test_grid_send_is_confirmed_right_away_not_after_the_window(monkeypatch):
     updates: list[dict] = []
     monkeypatch.setattr(A.store, "update", lambda *a, **kw: updates.append(kw))
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         return {"inbound": [], "echo": [{"status": "delivered", "chat_type": "whatsapp",
                                          "author_name": "Admin"}]}
 
@@ -1969,7 +1969,7 @@ def test_grid_send_error_from_panel_calls_a_human_right_away(monkeypatch):
     monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
     monkeypatch.setattr(A.store, "update", lambda *a, **kw: None)
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
                                          "author_name": "Admin"}]}
 
@@ -2005,7 +2005,7 @@ def test_delivery_window_asks_the_panel_before_saying_it_cannot_judge(monkeypatc
         "chat_id": "79609323338", "launch_ok_at": "2020-01-01T00:00:00+00:00", "delivery": [],
     }] if phase == S.PHASE_DELIVERY else [])
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
                                          "author_name": "Admin"}]}
 
@@ -2026,7 +2026,7 @@ def test_delivery_window_asks_the_panel_before_saying_it_cannot_judge(monkeypatc
 
 def test_panel_verdict_ignores_human_echo(monkeypatch):
     """Отказ по сообщению МЕНЕДЖЕРА - не наш случай: робот судит только о своём шаблоне."""
-    async def only_human(chat_id, since):
+    async def only_human(chat_id, since, name=''):
         return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
                                          "author_name": "Александер Гладков"}]}
 
@@ -2053,7 +2053,7 @@ def test_catchup_reports_error_even_when_waiting_for_reply(monkeypatch):
         "chat_id": "79609323338", "launch_ok_at": "2026-09-27T13:58:57+00:00", "delivery": [],
     }] if phase == S.PHASE_REPLY else [])
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         return {"inbound": [], "echo": [{"status": "error", "chat_type": "whatsapp",
                                          "author_name": "Admin"}]}
 
@@ -2090,7 +2090,7 @@ def test_catchup_looks_back_but_takes_only_fresh_inbound(monkeypatch):
         "chat_id": "79935370419", "launch_ok_at": "2026-09-27T12:00:00+00:00", "delivery": [],
     }] if phase == S.PHASE_REPLY else [])
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         asked.append(since)
         return {"inbound": [{"text": "старое сообщение", "chat_type": "whatsapp",
                              "at": "2026-09-27T11:30:00+00:00"}], "echo": []}
@@ -2354,7 +2354,7 @@ def test_confirmed_template_does_not_also_say_it_waits(monkeypatch):
     async def fake_contact(lead):
         return {"id": 1, "custom_fields_values": [_cf(413385, "79001234567")]}
 
-    async def confirmed(lead, stage, bot, chat_id):
+    async def confirmed(lead, stage, bot, chat_id, name=''):
         # Ровно то, что делает настоящий `confirm_grid_send`, когда доставка подтверждена.
         A.log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
                   reason="шаблон уже уходил и подтверждён (read), жду ответ клиента")
@@ -2385,7 +2385,7 @@ def test_unconfirmed_template_still_says_it_waits(monkeypatch):
     async def fake_contact(lead):
         return {"id": 1, "custom_fields_values": [_cf(413385, "79001234567")]}
 
-    async def silent(lead, stage, bot, chat_id):
+    async def silent(lead, stage, bot, chat_id, name=''):
         return False
 
     monkeypatch.setattr(A, "main_contact", fake_contact)
@@ -2415,7 +2415,7 @@ def test_answer_that_came_while_the_robot_slept_is_picked_up(monkeypatch):
     answers: list[tuple] = []
     monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
 
-    async def activity(chat_id, since):
+    async def activity(chat_id, since, name=''):
         return {
             "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
                       "at": "2026-09-28T05:52:57+00:00"}],
@@ -2447,7 +2447,7 @@ def test_message_written_before_the_template_is_not_an_answer(monkeypatch):
     answers: list[tuple] = []
     monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
 
-    async def activity(chat_id, since):
+    async def activity(chat_id, since, name=''):
         return {
             "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
                       "at": "2026-09-28T05:52:57+00:00"}],
@@ -2486,7 +2486,7 @@ def test_catchup_window_starts_from_when_we_took_the_lead(monkeypatch):
         "launch_ok_at": "2026-09-28T07:00:17+00:00", "delivery": [],
     }] if phase == S.PHASE_REPLY else [])
 
-    async def fake_activity(chat_id, since):
+    async def fake_activity(chat_id, since, name=''):
         asked.append(since)
         return {
             "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
@@ -2630,3 +2630,74 @@ def test_silent_client_still_gets_the_alert(monkeypatch):
 
     assert rows[-1]["outcome"] == "stop_no_reply"
     assert _SENT and "не подтвердил заказ" in _SENT[-1]["text"]
+
+
+# ── телеграмная склейка ─────────────────────────────────────────────────────────
+
+def test_catchup_finds_telegram_answer_by_contact_name(monkeypatch):
+    """⚠️ Главная потеря, найденная 01.10.2026: у Telegram `chat_id` анонимный, телефона в теле
+    вебхука нет у 85% сообщений, а робот держит в состоянии телефон - и телеграмные ответы не
+    видел вовсе. По сделкам призрака 12 ответов из 15 телеграмных остались неразобранными,
+    среди них «Да» и «Здравствуйте! Да, все верно».
+
+    Теперь вторым ключом идёт имя контакта, и найденный чат робот ЗАПОМИНАЕТ: со следующего
+    сообщения он узнает его прямо по вебхуку, без подбора.
+    """
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    A._catchup_at = 0.0
+    asked: list[tuple] = []
+    answers: list[str] = []
+    learned: list[tuple] = []
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36568537, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79841500355", "contact_name": "Кристина Ковалева",
+        "created_at": "2026-09-30T10:46:00+00:00",
+        "launch_ok_at": "2026-09-30T10:59:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+    monkeypatch.setattr(A.store, "update",
+                        lambda lead_id, status_id, **kw: learned.append((lead_id, kw)))
+
+    async def fake_activity(chat_id, since, name=""):
+        asked.append((chat_id, name))
+        # Панель нашла переписку по ИМЕНИ: чат телеграмный, телефону не равен.
+        return {
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "telegram",
+                      "chat_id": "5536716433", "at": "2026-09-30T10:59:02+00:00"}],
+            "inbound": [{"text": "Здравствуйте! Да, все верно", "chat_type": "telegram",
+                         "chat_id": "5536716433", "at": "2026-09-30T11:04:37+00:00"}],
+        }
+
+    async def fake_answer(row, text, chat_type=""):
+        answers.append(text)
+
+    monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    asyncio.run(A.catch_up_on_chats())
+
+    assert asked and asked[0][1] == "Кристина Ковалева"      # имя ушло вторым ключом
+    assert answers == ["Здравствуйте! Да, все верно"]        # ответ разобран
+    assert learned and learned[-1][1] == {"chat_id": "5536716433"}   # чат запомнен
+
+
+def test_namesakes_do_not_teach_the_robot_a_wrong_chat():
+    """Предохранитель: нашлись сообщения из РАЗНЫХ чатов - значит имя в этом окне адресует не
+    одного человека, и привязывать сделку к одному из чатов наугад нельзя."""
+    learned: list[tuple] = []
+    original = A.store.update
+    A.store.update = lambda lead_id, status_id, **kw: learned.append((lead_id, kw))
+    try:
+        A.learn_chat_id(1, 2, "79990000000", {
+            "inbound": [{"chat_id": "111"}, {"chat_id": "222"}], "echo": [],
+        })
+        assert learned == []
+        A.learn_chat_id(1, 2, "79990000000", {
+            "inbound": [{"chat_id": "333"}], "echo": [{"chat_id": "333"}],
+        })
+        assert learned == [(1, {"chat_id": "333"})]
+    finally:
+        A.store.update = original

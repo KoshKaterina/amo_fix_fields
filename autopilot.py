@@ -1255,7 +1255,12 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
         # два одинаковых сообщения. Отметка времени всё равно нужна: от неё считается окно
         # ожидания доставки.
         await asyncio.to_thread(store.update, lead_id, status_id, bot_id=bot_id)
-    await asyncio.to_thread(store.mark_launch_ok, lead_id, status_id, chat_id)
+    # Имя контакта кладём в состояние рядом с чатом: по нему подбор находит телеграмную
+    # переписку, которую по телефону не найти (правка Кати 01.10.2026).
+    contact_name = str((contact or {}).get("name") or "").strip()
+    await asyncio.to_thread(
+        store.mark_launch_ok, lead_id, status_id, chat_id, contact_name,
+    )
     refresh_watched_chats()
 
     # ⚠️ Факт отправки спрашиваем СРАЗУ, а не ждём вебхуков (правка Кати 27.09.2026). Бот грида
@@ -1264,7 +1269,7 @@ async def run_bot(lead: dict, stage: dict, bot: dict) -> None:
     # дошло». Один запрос к панели снимает весь этот класс: у неё вся переписка уже лежит.
     settled = False
     if str(bot.get("launched_by") or "engine") != "engine":
-        settled = await confirm_grid_send(lead, stage, bot, chat_id)
+        settled = await confirm_grid_send(lead, stage, bot, chat_id, contact_name)
 
     if str(bot.get("stop_mode") or "any") == "never":
         # «Ответ не нужен» - информационное сообщение, а не разговор. Ни доставки, ни ответа
@@ -2221,16 +2226,54 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
     )
 
 
-async def fetch_chat_activity(chat_id: str, since: str) -> dict[str, Any] | None:
-    """Что было в чате после `since` - спрашиваем панель. None - спросить не удалось."""
-    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN or not chat_id:
+def learn_chat_id(lead_id: int, status_id: int, known: str, data: dict) -> None:
+    """Запомнить чат, в котором на самом деле идёт переписка.
+
+    Нашли сообщения по ИМЕНИ - значит у сделки телеграмный чат, а в состоянии лежит телефон.
+    Записываем настоящий `chat_id`: со следующего сообщения робот узнает чат прямо по вебхуку,
+    без подбора, и ответ клиента разберётся сразу, а не через пять минут.
+
+    ⚠️ Берём чат только если он ОДИН: несколько разных чатов в ответе означают тёзок, и
+    привязывать сделку к одному из них наугад нельзя.
+    """
+    chats = {
+        str(item.get("chat_id") or "")
+        for group in ("inbound", "echo")
+        for item in (data.get(group) or [])
+        if item.get("chat_id")
+    }
+    if len(chats) != 1:
+        return
+    found = chats.pop()
+    if not found or found == str(known or ""):
+        return
+    try:
+        store.update(lead_id, status_id, chat_id=found)
+        refresh_watched_chats()
+        logger.info("autopilot: запомнил чат %s по сделке %s (был %s)", found, lead_id, known)
+    except Exception:  # noqa: BLE001 - не смогли запомнить, значит просто подберём снова
+        logger.exception("autopilot: не смог запомнить чат сделки %s", lead_id)
+
+
+async def fetch_chat_activity(chat_id: str, since: str,
+                              name: str = "") -> dict[str, Any] | None:
+    """Что было в чате после `since` - спрашиваем панель. None - спросить не удалось.
+
+    `name` - имя контакта, второй ключ поиска (правка Кати 01.10.2026). Без него телеграмная
+    переписка не находится: у Telegram `chat_id` анонимный, телефона в теле вебхука нет у 85%
+    сообщений, а робот держит в состоянии телефон. Из-за этого 12 ответов из 15 телеграмных
+    сделок призрака остались неразобранными - среди них «Да» и «Здравствуйте! Да, все верно».
+    """
+    if not TEAM_PANEL_BASE_URL or not TEAM_PANEL_INGEST_TOKEN:
+        return None
+    if not chat_id and not str(name or "").strip():
         return None
     base = TEAM_PANEL_BASE_URL.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
                 base + "/api/ingest/autopilot/chat-activity",
-                params={"chat": chat_id, "since": since},
+                params={"chat": chat_id, "since": since, "name": name},
                 headers={"X-Ingest-Token": TEAM_PANEL_INGEST_TOKEN},
             )
         if resp.status_code >= 400:
@@ -2262,7 +2305,8 @@ async def report_not_delivered(lead: dict, stage: dict | None, bot: dict | None,
     )
 
 
-async def panel_delivery_verdict(chat_id: str, since: str) -> tuple[str, str, str] | None:
+async def panel_delivery_verdict(chat_id: str, since: str,
+                                 name: str = "") -> tuple[str, str, str] | None:
     """Что панель знает о судьбе НАШЕГО сообщения в этом чате после `since`.
 
     Возвращает `(исход, статус, канал)`: `ok` - дошло, `error` - Wazzup отбил явной ошибкой.
@@ -2274,7 +2318,7 @@ async def panel_delivery_verdict(chat_id: str, since: str) -> tuple[str, str, st
     подтвердить нечем, жду ответ клиента», тогда как сторож доставки в том же контейнере уже
     знал, что клиент сообщения не получил, и написал об этом примечание в сделку.
     """
-    data = await fetch_chat_activity(chat_id, since)
+    data = await fetch_chat_activity(chat_id, since, name)
     if not data:
         return None
     return echo_verdict(data)
@@ -2337,7 +2381,8 @@ def lead_since_iso(lead: dict, fallback_hours: int = 24) -> str:
     return max(moment, floor).isoformat()
 
 
-async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) -> bool:
+async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str,
+                            name: str = "") -> bool:
     """Сразу узнать у панели, что стало с шаблоном грида: дошёл, отбит или пока ничего.
 
     Дошёл - переходим к ожиданию ответа, не тратя окно. Отбит - это доказанная недоставка,
@@ -2348,13 +2393,14 @@ async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str) ->
     стояли строки «шаблон подтверждён (read), жду ответ клиента» и «жду подтверждения доставки
     от Wazzup» - робот работал правильно, а читалось это как «ждём того, что уже случилось».
     """
-    if not chat_id:
-        return False
     lead_id = int(lead["id"])
     status_id = int(lead.get("status_id") or 0)
-    data = await fetch_chat_activity(chat_id, lead_since_iso(lead))
+    if not chat_id and not name:
+        return False
+    data = await fetch_chat_activity(chat_id, lead_since_iso(lead), name)
     if not data:
         return False
+    learn_chat_id(lead_id, status_id, chat_id, data)
     verdict = echo_verdict(data)
     if verdict is None:
         return False
@@ -2414,15 +2460,20 @@ async def catch_up_on_chats() -> None:
         # заканчивалось в 09:00 и не покрывало ни шаблон, ни ответ (заказ 19307, 28.09.2026).
         started = str(row.get("created_at") or row.get("launch_ok_at") or "")
         since = str(row.get("launch_ok_at") or row.get("created_at") or "")
-        if not chat_id or not since:
+        if not since:
             continue
         # ⚠️ Спрашиваем с ЗАПАСОМ назад. По заказу 19303 отказ канала пришёл за 21 секунду ДО
         # того, как робот начал слушать (он ждал телефон), и подбор с точным `since` его не
         # находил - ровно тот же зазор, из-за которого кейс и случился.
         window = shift_iso(started or since, -AUTOPILOT_CATCHUP_LOOKBACK_S)
-        data = await fetch_chat_activity(chat_id, window)
+        # Имя контакта - второй ключ поиска, без него телеграмная переписка не находится. Берём
+        # его из СОСТОЯНИЯ, а не из amoCRM: подбор идёт каждые пять минут по всем ждущим
+        # сделкам, и два лишних запроса на каждую - это дорого и незачем.
+        name = str(row.get("contact_name") or "")
+        data = await fetch_chat_activity(chat_id, window, name)
         if not data:
             continue
+        learn_chat_id(row["lead_id"], row["status_id"], chat_id, data)
         # ⚠️ Ответом считаем то, что пришло ПОСЛЕ шаблона, а не после начала ожидания.
         # Сообщение, написанное до шаблона, ответом на него не является - принять его за ответ
         # значило бы двинуть сделку по чужим словам. А шаблона в переписке не видно - остаётся
