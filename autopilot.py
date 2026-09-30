@@ -624,7 +624,8 @@ def answer_decision(bot: dict, answer: str) -> str:
       never  - «Ответ не нужен»: информационное сообщение, ответа не ждём вовсе;
       any    - «Как только клиент ответит»: дальше ведёт ЛЮБОЙ ответ;
       listed - «Только на эти ответы»: перечисленное ведёт дальше, прочее останавливает;
-      except - «На любой ответ, кроме этих»: перечисленное останавливает.
+      except - «На любой ответ, кроме этих»: перечисленное останавливает;
+      word   - «Если в ответе есть это слово»: слово целиком, см. `answer_has_word`.
 
     ⚠️ Остановка живёт в `listed` и `except`, а не в `any`. Правка Кати 09.09.2026: экран
     обещает «идём дальше», и движок обязан обещанию соответствовать, а не читать его наоборот.
@@ -641,7 +642,45 @@ def answer_decision(bot: dict, answer: str) -> str:
         return "advance" if got in listed else "stop"
     if mode == "except":
         return "stop" if got in listed else "advance"
+    if mode == "word":
+        return "advance" if answer_has_word(got, listed) else "stop"
     return "stop"
+
+
+# Клиент спрашивает - значит ждёт человека, а не хода робота.
+_QUESTION_MARKS = ("?", "？")
+
+# Отказ в любом виде. Ищем отдельными словами: «нет» перебивает найденное согласие, а «нетто»
+# или «интернет» - не отказ, поэтому границы слова обязательны.
+_REFUSAL_WORDS = ("нет", "не")
+
+
+def answer_has_word(answer_norm: str, words: list[str]) -> bool:
+    """Есть ли в ответе одно из слов ЦЕЛИКОМ - с двумя предохранителями.
+
+    Правило просила Катя 30.09.2026: «любой ответ с да в тексте поведет сделку вперед». Повод -
+    замер живых ответов за 30 дней: 183 совпали со списком дословно, а ещё 12 содержали «да» и
+    НЕ совпали («Да верно», «Да,верно», «Да все верно», «Здравствуйте! Да, все верно») - робот
+    звал человека к подтверждённому заказу.
+
+    ⚠️ Предохранитель первый - ВОПРОС. Среди тех же двенадцати было «Здравствуйте да / Могу через
+    беп20 оплатить?»: человек согласился и тут же спросил. Увести такую сделку в успех значит
+    оставить клиента без ответа, поэтому вопрос всегда зовёт менеджера.
+
+    ⚠️ Предохранитель второй - ОТКАЗ. «Да, но нет», «да, не надо» согласием не являются: слово
+    «не» или «нет» перебивает найденное слово согласия.
+
+    ⚠️ Границы слова обязательны: без них «да» нашлось бы в «давайте подумаю» и «дайте скидку».
+    """
+    if not answer_norm or not words:
+        return False
+    if any(mark in answer_norm for mark in _QUESTION_MARKS):
+        return False
+    if any(re.search(rf"(?<!\w){re.escape(bad)}(?!\w)", answer_norm) for bad in _REFUSAL_WORDS):
+        return False
+    return any(
+        re.search(rf"(?<!\w){re.escape(w)}(?!\w)", answer_norm) for w in words if w
+    )
 
 
 # Правила движения вперёд - словами экрана. Заголовок там «Когда идём дальше», и в журнале
@@ -651,6 +690,7 @@ STOP_MODE_TITLES = {
     "any": "как только клиент ответит",
     "listed": "только на эти ответы",
     "except": "на любой ответ, кроме этих",
+    "word": "если в ответе есть это слово",
     "never": "ответ не нужен",
 }
 
@@ -680,6 +720,19 @@ def answer_verdict_note(bot: dict, answer: str, decision: str) -> str:
         return f"{head}. Правило бота - «{rule}»: {shown or 'список пуст'}. {hit}, {tail}"
     if mode == "except":
         hit = "ответ в списке-исключении" if decision == "stop" else "в списке-исключении его нет"
+        return f"{head}. Правило бота - «{rule}»: {shown or 'список пуст'}. {hit}, {tail}"
+    if mode == "word":
+        # Причина остановки у этого правила бывает троякой, и человеку важно знать, какая:
+        # слова нет вовсе, слово есть но клиент спросил, слово есть но клиент отказался.
+        if decision == "advance":
+            hit = "слово найдено целиком"
+        elif any(mark in normalize_answer(said) for mark in _QUESTION_MARKS):
+            hit = "клиент о чём-то спрашивает - это к менеджеру"
+        elif any(re.search(rf"(?<!\w){re.escape(bad)}(?!\w)", normalize_answer(said))
+                 for bad in _REFUSAL_WORDS):
+            hit = "в ответе есть отказ"
+        else:
+            hit = "ни одного слова из списка в ответе нет"
         return f"{head}. Правило бота - «{rule}»: {shown or 'список пуст'}. {hit}, {tail}"
     return f"{head}. Правило бота - «{rule}», сравнивать не с чем, {tail}"
 
@@ -2434,6 +2487,19 @@ async def check_reply_windows() -> None:
                 "сделку увели с этапа, пока ждали ответа",
             )
             continue
+        # ⚠️ Прежде чем сказать «клиент молчит», смотрим НЕ ТОЛЬКО мессенджер (просьба Кати
+        # 30.09.2026). По заказу 19377 клиент подтвердил заказ письмом через две минуты и семь
+        # минут говорил с менеджером по телефону - для робота этого не существовало, и он
+        # честно собирался написать «клиент не подтвердил заказ».
+        touch = await human_touch_after(lead, row)
+        if touch:
+            await asyncio.to_thread(
+                store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED, touch,
+            )
+            refresh_watched_chats()
+            log_run(lead, stage, bot=bot, action="reply", outcome="stop_off_channel",
+                    reason=f"в мессенджере тишина {hours} ч, но {touch} - дальше человек")
+            continue
         await stop_here(
             lead, stage, "stop_no_reply", f"клиент не ответил за {hours} ч", bot=bot,
             op_text=f"клиент не подтвердил заказ за {hours} ч - напишите или позвоните сами. "
@@ -2443,6 +2509,57 @@ async def check_reply_windows() -> None:
                     "этап": str((stage or {}).get("status_name") or "")},
             panel_title="Авто-режим: клиент не отвечает",
         )
+
+
+async def human_touch_after(lead: dict, row: dict) -> str:
+    """Общались ли с клиентом ВНЕ мессенджера после того, как робот начал ждать ответ.
+
+    Просьба Кати 30.09.2026: «лучше смотреть не только wazzup, если это возможно». Возможно:
+    письма и звонки лежат в примечаниях КОНТАКТА (не сделки, это проверено живьём), и оттуда
+    видно факт и время - входящее письмо (`amomail_message` с `income`) и состоявшийся звонок
+    (`call_in`/`call_out` с длительностью).
+
+    ⚠️ Возвращаем ОПИСАНИЕ касания, а не «да/нет», и вперёд по нему сделку НЕ ведём. Тела письма
+    amoCRM в примечании не отдаёт - «Подтверждаю» и «отмените заказ» выглядят для нас одинаково,
+    и решать за клиента мы не вправе. Наше дело скромнее: не говорить «клиент молчит», когда он
+    не молчал, и отдать сделку человеку без ложного алерта.
+    """
+    started = str(row.get("launch_ok_at") or row.get("created_at") or "")
+    if not started:
+        return ""
+    for contact in (((lead.get("_embedded") or {}).get("contacts")) or [])[:2]:
+        contact_id = contact.get("id")
+        if not contact_id:
+            continue
+        try:
+            data = await amo_service._do_get(
+                f"/api/v4/contacts/{contact_id}/notes",
+                [("order[created_at]", "desc"), ("limit", "20")],
+            )
+        except Exception:  # noqa: BLE001 - молчание amo не повод соврать про клиента
+            logger.exception("autopilot: не смог прочитать примечания контакта %s", contact_id)
+            return ""
+        for note in ((data or {}).get("_embedded") or {}).get("notes") or []:
+            stamp = note.get("created_at")
+            if not stamp:
+                continue
+            at = datetime.datetime.fromtimestamp(int(stamp), _UTC)
+            if not _at_or_after(at.isoformat(), started):
+                continue
+            kind = str(note.get("note_type") or "")
+            params = note.get("params") or {}
+            when = at.astimezone(_MSK).strftime("%d.%m в %H:%M")
+            if kind == "amomail_message" and str(params.get("income")).lower() == "true":
+                return f"клиент ответил письмом {when}"
+            if kind in ("call_in", "call_out"):
+                try:
+                    seconds = int(params.get("duration") or 0)
+                except (TypeError, ValueError):
+                    seconds = 0
+                if seconds > 0:
+                    side = "клиент звонил" if kind == "call_in" else "с клиентом говорили"
+                    return f"{side} по телефону {when}, {max(seconds // 60, 1)} мин"
+    return ""
 
 
 async def check_delivery_windows() -> None:

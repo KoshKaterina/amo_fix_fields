@@ -2504,3 +2504,129 @@ def test_catchup_window_starts_from_when_we_took_the_lead(monkeypatch):
 
     assert asked and asked[0] < "2026-09-28T05:52:26"   # окно покрывает и шаблон, и ответ
     assert answers == ["Да, всё верно"]
+
+
+# ── правило «в ответе есть слово» ───────────────────────────────────────────────
+
+def test_word_rule_takes_live_confirmations_that_did_not_match_literally():
+    """Замер живых ответов за 30 дней (30.09.2026): 183 совпали со списком дословно, а ещё 12
+    содержали «да» и НЕ совпали - робот звал человека к подтверждённому заказу. Просьба Кати:
+    «любой ответ с да в тексте поведет сделку вперед»."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да"])
+    for said in ("Да верно", "Да,верно", "Да все верно", "Да. Все верно. Спасибо большое",
+                 "Здравствуйте! Да, все верно", "Да все верно, сейчас оплачу", "ДА"):
+        assert A.answer_decision(bot, said) == "advance", said
+
+
+def test_word_rule_stops_on_a_question_even_with_the_word():
+    """Предохранитель первый. Живой ответ 18.09: «Здравствуйте да / Могу через беп20 оплатить?».
+    Человек согласился и тут же спросил - увести сделку в успех значит бросить его без ответа."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да"])
+    assert A.answer_decision(bot, "Здравствуйте да\nМогу через беп20 оплатить?") == "stop"
+    assert A.answer_decision(bot, "да, а когда доставка?") == "stop"
+
+
+def test_word_rule_stops_on_refusal_even_with_the_word():
+    """Предохранитель второй: «да, но нет» и «да, не надо» согласием не являются."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да"])
+    assert A.answer_decision(bot, "да, но нет") == "stop"
+    assert A.answer_decision(bot, "Да, не надо доставку") == "stop"
+    assert A.answer_decision(bot, "Нет, нужно исправить") == "stop"
+
+
+def test_word_rule_needs_the_whole_word():
+    """Без границ слова «да» нашлось бы в «давайте» и «дайте» - и робот повёл бы вперёд сделку,
+    где клиент просит подождать."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да"])
+    assert A.answer_decision(bot, "давайте подумаю до завтра") == "stop"
+    assert A.answer_decision(bot, "дайте скидку") == "stop"
+    assert A.answer_decision(bot, "Да") == "advance"
+
+
+def test_word_rule_explains_itself_in_the_journal():
+    """Журнал должен называть правило и причину, а не просто «ответ не подошёл»."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да"])
+    ok = A.answer_verdict_note(bot, "Да все верно", "advance")
+    assert "если в ответе есть это слово" in ok
+    assert "слово найдено целиком" in ok
+
+    asked = A.answer_verdict_note(bot, "да, а когда доставка?", "stop")
+    assert "спрашивает" in asked
+    refused = A.answer_verdict_note(bot, "да, но нет", "stop")
+    assert "отказ" in refused
+    missing = A.answer_verdict_note(bot, "подумаю", "stop")
+    assert "ни одного слова" in missing
+
+
+# ── смотрим не только мессенджер ────────────────────────────────────────────────
+
+def test_reply_window_checks_email_and_calls_before_blaming_the_client(monkeypatch):
+    """⚠️ Кейс 19377 (30.09.2026): клиент подтвердил заказ ПИСЬМОМ через две минуты и семь минут
+    говорил с менеджером по телефону, а робот видел только мессенджер и собирался сказать «клиент
+    не подтвердил заказ». Просьба Кати: «лучше смотреть не только wazzup, если это возможно»."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36568687, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79225622524", "launch_ok_at": "2026-09-30T12:31:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19377", pipeline_id=10593102,
+                     status_id=83537714, _embedded={"contacts": [{"id": 55}]})
+
+    async def fake_get(path, params=None):
+        assert "/contacts/55/notes" in path
+        return {"_embedded": {"notes": [{
+            "note_type": "amomail_message",
+            "created_at": 1790000000,
+            "params": {"income": "True", "from": "client@example.com"},
+        }]}}
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    monkeypatch.setattr(A.amo_service, "_do_get", fake_get)
+    monkeypatch.setattr(A, "waiting_for_reply_s", lambda row: 25 * 3600)
+    monkeypatch.setattr(A, "_at_or_after", lambda at, border: True)
+    asyncio.run(A.check_reply_windows())
+
+    assert rows[-1]["outcome"] == "stop_off_channel"
+    assert "письмом" in rows[-1]["reason"]
+    assert _SENT == []            # менеджера не дёргаем: он и так в деле
+
+
+def test_silent_client_still_gets_the_alert(monkeypatch):
+    """Обратный случай: ни письма, ни звонка - значит клиент правда молчит, и менеджер должен
+    об этом узнать. Иначе новая проверка проглотила бы весь смысл срока ожидания."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131, launched_by="amo_grid")])])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+    monkeypatch.setattr(A.store, "list_by_phase", lambda phase: [{
+        "lead_id": 36568688, "status_id": 83537714, "bot_id": 7131, "phase": S.PHASE_REPLY,
+        "chat_id": "79225622525", "launch_ok_at": "2026-09-30T12:31:00+00:00", "delivery": [],
+    }] if phase == S.PHASE_REPLY else [])
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19378", pipeline_id=10593102,
+                     status_id=83537714, _embedded={"contacts": [{"id": 56}]})
+
+    async def empty_notes(path, params=None):
+        return {"_embedded": {"notes": []}}
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    monkeypatch.setattr(A.amo_service, "_do_get", empty_notes)
+    monkeypatch.setattr(A, "waiting_for_reply_s", lambda row: 25 * 3600)
+    asyncio.run(A.check_reply_windows())
+
+    assert rows[-1]["outcome"] == "stop_no_reply"
+    assert _SENT and "не подтвердил заказ" in _SENT[-1]["text"]
