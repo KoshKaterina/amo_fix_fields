@@ -840,6 +840,72 @@ WAZZUP_DELIVERY_MUTE_CONTENT = [
 ]
 
 # ---------------------------------------------------------------------------
+# Сторож розничных лидов (retail_lead_guard, Катя 30.09.2026): клиент написал в
+# канал розницы, а сделки в рознице нет - алерт в чат ОП. Причина в настройке amo
+# «Беседы»: любая открытая сделка человека запрещает создать новую, и обращение
+# падает в чужую сделку. Замер и разбор - заметка папки
+# projects/amo-cleanup/knowledge/vhodyashchee-bez-novoy-sdelki-gard.md
+# ---------------------------------------------------------------------------
+RETAIL_GUARD_ENABLED = os.getenv("RETAIL_GUARD_ENABLED", "1").strip() == "1"
+# Сухой прогон: считаем и пишем в журнал, в Телеграм не шлём. Для обкатки частоты
+# на бою без единого сообщения в чат.
+RETAIL_GUARD_DRY_RUN = os.getenv("RETAIL_GUARD_DRY_RUN", "").strip() == "1"
+# Каналы Wazzup, которые сторожим. Клиентские каналы Sunscrypt: WhatsApp и телеграм
+# 7 926 082-36-03 плюс телеграм 7 925 083-33-49 (живёт с 07.09.2026, именно оттуда
+# пришёл случай Кати). НЕ сторожим партнёрский телеграм Саши 7 901 960-80-28
+# (обменники и боты, тот же, что в WAZZUP_SLA_SKIP_CHANNELS), ботов техподдержки и
+# Академии и каналы Tangemshop - у Tangemshop своя воронка.
+RETAIL_GUARD_CHANNELS = {
+    c.strip() for c in os.getenv(
+        "RETAIL_GUARD_CHANNELS",
+        "46dc9244-d8af-4529-9b01-7650c6ba07da,"
+        "12d3ccf1-8f15-4144-8b6e-5fffe3a2f647,"
+        "782075b4-137e-43b2-839e-8ff21232d7df",
+    ).split(",") if c.strip()
+}
+# Имена каналов для текста алерта: человек читает название, а не идентификатор.
+RETAIL_GUARD_CHANNEL_NAMES = {
+    "46dc9244-d8af-4529-9b01-7650c6ba07da": "WhatsApp 7 926 082-36-03",
+    "12d3ccf1-8f15-4144-8b6e-5fffe3a2f647": "Телеграм 7 926 082-36-03",
+    "782075b4-137e-43b2-839e-8ff21232d7df": "Телеграм 7 925 083-33-49",
+}
+# «Свои» воронки для этих каналов: открытая сделка в любой из них - повода нет.
+# Решение Кати 30.09.2026: Офис свой (человек пишет по заказу, который уехал на
+# отгрузку), Лист ожидания чужой (сделка живая, а покупки в ней нет).
+RETAIL_GUARD_OWN_PIPELINES = {
+    p.strip() for p in os.getenv(
+        "RETAIL_GUARD_OWN_PIPELINES", f"{PIPELINE_CLEVER_MAIN},{PIPELINE_OFFICE}",
+    ).split(",") if p.strip()
+}
+# Воронки словами - для текста алерта.
+RETAIL_GUARD_PIPELINE_NAMES = {
+    str(PIPELINE_CLEVER_MAIN): "ОП розница",
+    str(PIPELINE_OFFICE): "Офис",
+    str(PIPELINE_ACADEMY): "Академия",
+    str(PIPELINE_WAITLIST): "Лист ожидания",
+    str(PIPELINE_DB_WORK): "Работа с базой",
+    str(PIPELINE_OPT): "ОПТ",
+    str(PIPELINE_TANGEMSHOP): "TangemShop",
+    "11075670": "ОПТ под реализацию",
+    "10787898": "Техническая поддержка",
+    "8642414": "Тест",
+}
+# Пауза перед вопросом в amo: сделка и беседа появляются не мгновенно (08.09.2026
+# беседа родилась через семь минут после первого сообщения клиента).
+RETAIL_GUARD_DELAY_S = int(os.getenv("RETAIL_GUARD_DELAY_S", "300"))
+# Не спрашиваем amo про один и тот же чат чаще, чем раз в столько минут.
+RETAIL_GUARD_CHECK_EVERY_MIN = int(os.getenv("RETAIL_GUARD_CHECK_EVERY_MIN", "15"))
+# Один алерт на чат в это окно, часы.
+RETAIL_GUARD_ALERT_DEDUP_H = int(os.getenv("RETAIL_GUARD_ALERT_DEDUP_H", "24"))
+# Предохранитель от массового прогона по базе.
+RETAIL_GUARD_HOUR_LIMIT = int(os.getenv("RETAIL_GUARD_HOUR_LIMIT", "12"))
+# Окно отправки, МСК: начало включительно, конец нет. Ночной алерт никто не
+# прочитает, а чат разбудит; утреннее молчание не теряется - то же обращение
+# поднимет SLA-таймер «клиент ждёт ответа».
+RETAIL_GUARD_WINDOW_START_H = int(os.getenv("RETAIL_GUARD_WINDOW_START_H", "9"))
+RETAIL_GUARD_WINDOW_END_H = int(os.getenv("RETAIL_GUARD_WINDOW_END_H", "21"))
+
+# ---------------------------------------------------------------------------
 # Ozon Pay: счёт СБП из amo — замена виджета int2_ozonpay (MAG-285).
 # createPayment (payType=SBP), режим «самостоятельная интеграция» — тот же,
 # что у плагина сайта sunscrypt-sbp, и ключи ТЕ ЖЕ (ЛК Ozon Pay → Магазины →

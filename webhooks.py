@@ -40,6 +40,7 @@ import order_note
 import preorder_lead_name
 import order_watchdog
 import ozon_invoice
+import retail_lead_guard
 import reserve_service
 import showroom_alert
 import showroom_store
@@ -397,6 +398,13 @@ async def wazzup_webhook(secret: str, request: Request):
         autopilot.on_wazzup(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка авто-режима")
+    # Пятый потребитель — сторож розничных лидов: клиент написал в канал розницы, а
+    # открытой сделки в рознице у него нет (обращение легло в чужую воронку, и отдел
+    # продаж его не видит). Ему нужны только канал, чат и направление сообщения.
+    try:
+        retail_lead_guard.on_wazzup(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка сторожа розничных лидов")
     return {"ok": True}
 
 
