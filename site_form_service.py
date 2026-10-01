@@ -40,6 +40,12 @@ Env:
         воронки pipeline_id. Формы не из карты: схема 1 - пропуск, схема 2 - ответ 422.
         Для «Нет в наличии» запись обязана иметь "form_type": "unavailable" и свой
         slug/source. Без неё новый тип не принимается; схему 1 для этого slug не используем.
+    SITE_FORM_ENTRY_MAP='{"cooperation-wholesale": {"pipeline_id": 10131762,
+                          "status_id": 80276162, "source": "Форма: оптовая закупка",
+                          "responsible_user_id": 13822630, "tags": ["опт"]}}'
+        пометка кнопки (context.entry) → куда класть ВМЕСТО воронки формы. Нужна там, где одна
+        форма стоит на разных страницах и должна уезжать в разные воронки: slug формы это
+        «префикс + тип», опт от розницы по нему не отличить. Пусто - маршрут как был, по slug.
     SITE_FORM_UNAVAILABLE_ENABLED=1 - отдельный включатель «Нет в наличии», по умолчанию ВЫКЛЮЧЕН
     SITE_FORM_RATE_PER_MINUTE=30        - схема 1: заявок с одного адреса в минуту
     SITE_FORM_CLIENT_RATE_PER_MINUTE=5  - схема 2: заявок от одного посетителя в минуту
@@ -154,7 +160,94 @@ def _load_map() -> dict:
     return out
 
 
+def _load_entry_map() -> dict:
+    """SITE_FORM_ENTRY_MAP: пометка кнопки (`context.entry`) → куда класть вместо воронки формы.
+
+    Зачем. slug формы плагин собирает как «префикс + ТИП» (`sun-contact-forms.php`:
+    `$cfg['slug_prefix'] . $type`), поэтому по нему нельзя отличить оптовую заявку с
+    «Сотрудничества» от розничной с карточки товара - тип у них один, «обратный звонок или
+    вопрос». Пометка кнопки их различает и до нас доезжает в `context.entry`.
+
+    Значение - те же поля, что в SITE_FORM_MAP, но обязателен только pipeline_id:
+
+        {"cooperation-wholesale": {"pipeline_id": 10131762, "status_id": 80276162,
+                                   "source": "Форма: оптовая закупка",
+                                   "responsible_user_id": 13822630, "tags": ["опт"]}}
+
+    ⚠️ status_id НЕ наследуется от формы: этап принадлежит своей воронке, и чужой id amo не
+    примет. Не задан - заявка остаётся в «Неразобранном» той воронки, куда её положили.
+
+    ⚠️ responsible_user_id для воронок, которых не слушает распределение лидов (а оно слушает
+    только розничный хаб), задавать обязательно: иначе сделка останется на пользователе токена
+    интеграции и до менеджера не дойдёт. Для ОПТ это Артём Коннов - то же решение, что в
+    правиле ЗНР «Причина = Опт» в office_transfer.
+
+    Битая запись выбрасывается с логом, битый JSON не роняет импорт.
+    """
+    raw = os.getenv("SITE_FORM_ENTRY_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.error("SITE_FORM_ENTRY_MAP: битый JSON — карта пуста, маршрут по пометке не работает")
+        return {}
+    if not isinstance(data, dict):
+        logger.error("SITE_FORM_ENTRY_MAP: ожидался объект entry->настройки — карта пуста")
+        return {}
+    out = {}
+    for name, cfg in data.items():
+        if not isinstance(cfg, dict):
+            logger.error("SITE_FORM_ENTRY_MAP[%s]: не объект — пропуск", name)
+            continue
+        pipeline_id = cfg.get("pipeline_id")
+        if not isinstance(pipeline_id, int):
+            logger.error("SITE_FORM_ENTRY_MAP[%s]: нужен pipeline_id (int) — пропуск", name)
+            continue
+        status_id = cfg.get("status_id")
+        if status_id is not None and not isinstance(status_id, int):
+            logger.error("SITE_FORM_ENTRY_MAP[%s]: status_id должен быть int — пропуск", name)
+            continue
+        responsible = cfg.get("responsible_user_id")
+        if responsible is not None and not isinstance(responsible, int):
+            logger.error("SITE_FORM_ENTRY_MAP[%s]: responsible_user_id должен быть int — пропуск", name)
+            continue
+        out[str(name).strip()] = {
+            "pipeline_id": pipeline_id,
+            "status_id": status_id if isinstance(status_id, int) else None,
+            "responsible_user_id": responsible if isinstance(responsible, int) else None,
+            "source": str(cfg.get("source") or "").strip(),
+            "tags": [str(t) for t in (cfg.get("tags") or []) if str(t).strip()],
+        }
+    return out
+
+
+def apply_entry_override(cfg: dict, payload: dict) -> dict:
+    """Настройки формы плюс переопределение по пометке кнопки. Пометки нет в карте - как было.
+
+    Возвращает НОВЫЙ словарь: исходный cfg принадлежит FORM_MAP и переживает все заявки.
+    """
+    name = str(((payload.get("context") or {}).get("entry") or "")).strip()
+    if not name:
+        return cfg
+    override = ENTRY_MAP.get(name)
+    if not override:
+        return cfg
+    merged = dict(cfg)
+    merged["pipeline_id"] = override["pipeline_id"]
+    # Этап и ответственного берём ТОЛЬКО из переопределения: этап чужой воронки amo не примет,
+    # а ответственного у формы для оптовой воронки нет.
+    merged["status_id"] = override["status_id"]
+    merged["responsible_user_id"] = override["responsible_user_id"]
+    if override["source"]:
+        merged["source"] = override["source"]
+    if override["tags"]:
+        merged["tags"] = override["tags"]
+    return merged
+
+
 FORM_MAP = _load_map()
+ENTRY_MAP = _load_entry_map()
 
 _rate: dict[str, list] = {}
 _client_rate: dict[str, list] = {}
@@ -646,7 +739,11 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
     lead_id = int(row["lead_id"])
     source = cfg["source"]
     if cfg["status_id"] and row.get("unsorted_uid"):
-        accepted = await api.accept_unsorted(row["unsorted_uid"], cfg["status_id"])
+        # Ответственного ставим тем же accept: воронки вне розничного хаба распределение
+        # лидов не слушает, и без этого сделка осталась бы на пользователе токена.
+        accepted = await api.accept_unsorted(
+            row["unsorted_uid"], cfg["status_id"], cfg.get("responsible_user_id")
+        )
         if accepted:
             lead_id = int(accepted)
         else:
@@ -764,6 +861,15 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
             return False
         await _retry_or_fail(row, "form-type-mismatch")
         return
+    # Переопределение по пометке кнопки - уже после всех проверок карты форм: приём заявки
+    # по-прежнему требует, чтобы slug был в SITE_FORM_MAP, меняется только адрес назначения.
+    # Считаем здесь, а не на приёме: карту можно поправить, пока заявка ждёт в очереди.
+    routed = apply_entry_override(cfg, payload)
+    if routed is not cfg:
+        logger.info("site_form[%s]: пометка %s → воронка %s, этап %s, ответственный %s",
+                    row["form"], (payload.get("context") or {}).get("entry"),
+                    routed["pipeline_id"], routed["status_id"], routed.get("responsible_user_id"))
+    cfg = routed
     try:
         if row["status"] == "pending":
             lead_id, uid = await _create_lead_v2(payload, cfg, attempt)

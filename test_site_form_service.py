@@ -1589,3 +1589,102 @@ def test_store_purge_keeps_fresh_rows(v2):
     store.insert_pending(SID, "test-callback", "{}")
     assert store.purge(7, now=1000.0 + 8 * 86400) == 1
     assert store.get(SID) is not None
+
+
+# --- маршрут по пометке кнопки (SITE_FORM_ENTRY_MAP) ----------------------
+
+
+def _entry(name):
+    return {"context": {"entry": name}}
+
+
+def test_load_entry_map_valid(monkeypatch):
+    monkeypatch.setenv(
+        "SITE_FORM_ENTRY_MAP",
+        '{"cooperation-wholesale": {"pipeline_id": 10131762, "status_id": 80276162,'
+        ' "source": "Форма: оптовая закупка", "responsible_user_id": 13822630,'
+        ' "tags": ["опт"]}}',
+    )
+    m = sf._load_entry_map()
+    assert set(m) == {"cooperation-wholesale"}
+    cfg = m["cooperation-wholesale"]
+    assert cfg["pipeline_id"] == 10131762
+    assert cfg["status_id"] == 80276162
+    assert cfg["responsible_user_id"] == 13822630
+    assert cfg["source"] == "Форма: оптовая закупка"
+    assert cfg["tags"] == ["опт"]
+
+
+def test_load_entry_map_empty_without_env(monkeypatch):
+    monkeypatch.delenv("SITE_FORM_ENTRY_MAP", raising=False)
+    assert sf._load_entry_map() == {}
+
+
+def test_load_entry_map_broken_json(monkeypatch):
+    monkeypatch.setenv("SITE_FORM_ENTRY_MAP", "{оборвано")
+    assert sf._load_entry_map() == {}
+
+
+def test_load_entry_map_skips_bad_entries(monkeypatch):
+    monkeypatch.setenv(
+        "SITE_FORM_ENTRY_MAP",
+        '{"no-pipeline": {"status_id": 5}, "bad-status": {"pipeline_id": 7, "status_id": "x"},'
+        ' "bad-resp": {"pipeline_id": 7, "responsible_user_id": "x"},'
+        ' "not-object": 1, "ok": {"pipeline_id": 9}}',
+    )
+    m = sf._load_entry_map()
+    assert set(m) == {"ok"}
+    assert m["ok"]["status_id"] is None
+    assert m["ok"]["responsible_user_id"] is None
+
+
+def test_entry_override_unknown_entry_keeps_form_route(monkeypatch):
+    monkeypatch.setattr(sf, "ENTRY_MAP", {"cooperation-wholesale": {
+        "pipeline_id": 999, "status_id": None, "responsible_user_id": None,
+        "source": "", "tags": []}})
+    base = sf.FORM_MAP["svyazatsya"]
+    assert sf.apply_entry_override(base, _entry("product-card")) is base
+
+
+def test_entry_override_no_entry_keeps_form_route(monkeypatch):
+    monkeypatch.setattr(sf, "ENTRY_MAP", {"x": {
+        "pipeline_id": 999, "status_id": None, "responsible_user_id": None,
+        "source": "", "tags": []}})
+    base = sf.FORM_MAP["svyazatsya"]
+    assert sf.apply_entry_override(base, {"context": {}}) is base
+    assert sf.apply_entry_override(base, {}) is base
+
+
+def test_entry_override_replaces_pipeline_stage_and_responsible(monkeypatch):
+    monkeypatch.setattr(sf, "ENTRY_MAP", {"cooperation-wholesale": {
+        "pipeline_id": 10131762,
+        "status_id": 80276162,
+        "responsible_user_id": 13822630,
+        "source": "SRC_OPT",
+        "tags": ["T_OPT"],
+    }})
+    base = sf.FORM_MAP["svyazatsya"]
+    out = sf.apply_entry_override(base, _entry("cooperation-wholesale"))
+    assert out["pipeline_id"] == 10131762
+    assert out["status_id"] == 80276162
+    assert out["responsible_user_id"] == 13822630
+    assert out["source"] == "SRC_OPT"
+    assert out["tags"] == ["T_OPT"]
+    # Запись карты форм не тронута: она переживает все заявки.
+    assert base["pipeline_id"] == 111
+    assert base["status_id"] == 222
+    assert "responsible_user_id" not in base
+
+
+def test_entry_override_without_stage_drops_foreign_stage(monkeypatch):
+    """Этап формы принадлежит её воронке: в чужую воронку его тащить нельзя."""
+    monkeypatch.setattr(sf, "ENTRY_MAP", {"cooperation-media": {
+        "pipeline_id": 10131762, "status_id": None, "responsible_user_id": None,
+        "source": "", "tags": [],
+    }})
+    out = sf.apply_entry_override(sf.FORM_MAP["svyazatsya"], _entry("cooperation-media"))
+    assert out["pipeline_id"] == 10131762
+    assert out["status_id"] is None
+    # source и теги формы остаются, если переопределение их не задало
+    assert out["source"] == "ContactForm_Связаться"
+    assert out["tags"] == ["Форма сайта"]
