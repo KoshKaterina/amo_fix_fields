@@ -51,6 +51,7 @@ _UTC = datetime.timezone.utc
 PHASE_LAUNCHING = "launching"    # бот вызван, ответа amoCRM ещё нет
 PHASE_DELIVERY = "delivery"      # ждём статус доставки от Wazzup
 PHASE_REPLY = "reply"            # ждём ответ клиента
+PHASE_PAYMENT = "payment"        # платёжка сказала «оплачено», ждём платёж в МойСкладе
 PHASE_SLEEPING = "sleeping"      # вне рабочих часов, продолжим в wake_at
 PHASE_DONE = "done"              # этап пройден, бот больше не нужен
 PHASE_STOPPED = "stopped"        # остановились и позвали человека

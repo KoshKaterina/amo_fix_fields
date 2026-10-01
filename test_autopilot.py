@@ -803,8 +803,11 @@ def test_payment_received_is_checked_against_the_warehouse(monkeypatch):
         await asyncio.sleep(0)
 
     asyncio.run(run())
-    assert moves == [], "источники разошлись - решать человеку"
-    assert rows[-1]["outcome"] == "failed"
+    assert moves == [], "денег в складе не видно - в успех пока не ведём"
+    # ⚠️ Раньше здесь стоял исход `failed` и алерт человеку. С 01.10.2026 ноль в складе значит
+    # «платёж ещё не завели»: замер показал задержку 9 мин 51 с и 24 мин 34 с после вебхука.
+    assert rows[-1]["outcome"] == "waiting_payment"
+    assert S.get(666, A.STATUS_PAYMENT_RECEIVED)["phase"] == S.PHASE_PAYMENT
 
 
 def test_payment_received_still_goes_through_when_warehouse_is_silent(monkeypatch):
@@ -1710,9 +1713,176 @@ def test_payment_mismatch_alert_does_not_repeat(monkeypatch):
         await asyncio.sleep(0)
 
     asyncio.run(run())
-    said = [m for m in _SENT if "МойСкладе оплаты нет" in m["text"]]
-    assert len(said) == 1
-    assert len([r for r in rows if r["outcome"] == "failed"]) == 1
+    said = [m for m in _SENT if "МойСкладе платежа нет" in m["text"]]
+    assert not said, "пока ждём платёж, менеджера не дёргаем вовсе"
+    assert len([r for r in rows if r["outcome"] == "waiting_payment"]) == 1, (
+        "взять сделку в ожидание надо один раз, а вебхуков по ней десятки")
+
+
+def _only(phase: str, lead_id: int) -> None:
+    """Оставить в фазе ровно одну сделку.
+
+    ⚠️ Проверки тика (`check_payment_windows`, `check_delivery_windows`) разбирают ВСЕ строки
+    своей фазы, а строки состояния переживают тест: автофикстура чистит только отметки
+    уведомлений. Без этого соседний тест подкладывает свою сделку, и счётчик переводов врёт.
+    """
+    for row in S.list_by_phase(phase):
+        if int(row["lead_id"]) != int(lead_id):
+            S.finish(row["lead_id"], row["status_id"], S.PHASE_STOPPED, "строка чужого теста")
+
+
+# ── ожидание платежа в МойСкладе (решение Кати 01.10.2026) ─────────────────────
+
+def test_payment_appears_later_and_deal_goes_to_success(monkeypatch):
+    """⚠️ Замер 01.10.2026: платёж в МойСкладе появляется отдельным шагом, через 9 мин 51 с и
+    24 мин 34 с после вебхука платёжной системы. Раньше робот спрашивал склад один раз и звал
+    человека; теперь ждёт и ведёт в успех сам, как только деньги видно."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    S.claim(36569599, A.STATUS_PAYMENT_RECEIVED, 10593102)
+    S.update(36569599, A.STATUS_PAYMENT_RECEIVED, phase=S.PHASE_PAYMENT)
+    moves: list[int] = []
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19399", pipeline_id=10593102,
+                     status_id=A.STATUS_PAYMENT_RECEIVED,
+                     custom_fields_values=[_cf(576689, "uuid-1"),
+                                           _cf(577373, "Онлайн-оплата")])
+
+    async def paid_now(path, params=None, retries=3):
+        return {"payedSum": 784200}
+
+    monkeypatch.setattr(A, "move_to", fake_move)
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    monkeypatch.setattr(A.ms_client, "get", paid_now)
+
+    _only(S.PHASE_PAYMENT, 36569599)
+    asyncio.run(A.check_payment_windows())
+
+    assert moves == [A.STATUS_SUCCESS], "деньги видно - сделка обязана уйти в успех"
+    assert rows[-1]["outcome"] == "advanced"
+    assert "7 842" in rows[-1]["reason"] or "7842" in rows[-1]["reason"]
+    assert S.get(36569599, A.STATUS_PAYMENT_RECEIVED)["phase"] == S.PHASE_DONE
+
+
+def test_payment_never_appears_and_human_is_called(monkeypatch):
+    """Час прошёл, денег в складе нет - это уже расхождение. По «Заказу №19302» так и было:
+    Ozon подтвердил 8 533 ₽, товар уехал клиенту, а платежа в МойСкладе нет до сих пор."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    S.claim(36565319, A.STATUS_PAYMENT_RECEIVED, 10593102)
+    S.update(36565319, A.STATUS_PAYMENT_RECEIVED, phase=S.PHASE_PAYMENT)
+    # Отодвигаем отметку создания строки на два часа назад - срок ожидания вышел.
+    with S._connect() as conn:
+        conn.execute("UPDATE autopilot_state SET created_at = ? WHERE lead_id = ?",
+                     (A.shift_iso(A.datetime.datetime.now(A._UTC).isoformat(), -7200),
+                      36565319))
+    moves: list[int] = []
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19302", pipeline_id=10593102,
+                     status_id=A.STATUS_PAYMENT_RECEIVED,
+                     custom_fields_values=[_cf(576689, "uuid-2"),
+                                           _cf(577373, "Онлайн-оплата")])
+
+    async def never_paid(path, params=None, retries=3):
+        return {"payedSum": 0}
+
+    monkeypatch.setattr(A, "move_to", fake_move)
+    monkeypatch.setattr(A, "load_lead", fake_load)
+    monkeypatch.setattr(A.ms_client, "get", never_paid)
+
+    _only(S.PHASE_PAYMENT, 36565319)
+    asyncio.run(A.check_payment_windows())
+
+    assert moves == [], "денег нет - в успех не ведём"
+    assert rows[-1]["outcome"] == "failed"
+    assert [m for m in _SENT if "МойСкладе платежа нет" in m["text"]], "человека позвать обязаны"
+
+
+def test_payment_wait_stops_when_a_human_moves_the_deal(monkeypatch):
+    """Сделку увели с этапа, пока ждали платёж - это право менеджера, и шуметь не о чем."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False}, pipeline_id=10593102)
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    S.claim(36569677, A.STATUS_PAYMENT_RECEIVED, 10593102)
+    S.update(36569677, A.STATUS_PAYMENT_RECEIVED, phase=S.PHASE_PAYMENT)
+    moves: list[int] = []
+
+    async def fake_move(lead, stage_, status_id, status_name, reason):
+        moves.append(status_id)
+
+    async def moved_away(lead_id):
+        return _lead(id=lead_id, name="Заказ №19401", pipeline_id=10593102, status_id=142)
+
+    monkeypatch.setattr(A, "move_to", fake_move)
+    monkeypatch.setattr(A, "load_lead", moved_away)
+
+    _only(S.PHASE_PAYMENT, 36569677)
+    asyncio.run(A.check_payment_windows())
+
+    assert moves == []
+    assert rows[-1]["outcome"] == "stop_left_stage"
+    assert not [m for m in _SENT if "платежа нет" in m["text"]]
+
+
+# ── «отправлено» без подтверждения - не «не дошло» (решение Кати 01.10.2026) ───
+
+def test_sent_without_confirmation_is_not_a_failure():
+    """⚠️ По «Заказу №19402» лежали четыре статуса «отправлено» подряд, ни одного отказа, и
+    робот сказал менеджеру «сообщение до клиента не дошло». Такого утверждения у нас нет:
+    признака доставки не было ни в панели, ни в amoCRM."""
+    only_sent = [{"status": "sent", "chatType": "whatsapp"}] * 4
+    assert A.delivery_verdict(only_sent, 1000, 900) == A.VERDICT_UNCONFIRMED
+    refused = only_sent + [{"status": "error", "chatType": "whatsapp"}]
+    assert A.delivery_verdict(refused, 1000, 900) == A.VERDICT_FAILED
+    assert A.delivery_verdict([], 1000, 900) == A.VERDICT_SILENT
+    # До конца окна ждём при любых статусах - это правило 08.09.2026, его не меняли.
+    assert A.delivery_verdict(only_sent, 10, 900) == A.VERDICT_WAIT
+
+
+def test_unconfirmed_delivery_keeps_the_deal_and_waits_for_the_answer(monkeypatch):
+    """Сделку не бросаем: ответ клиента сам по себе доказательство доставки. Менеджеру молчим,
+    технарям говорим один раз."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714,
+              route=[_stage(83537714, "Новый лид", [_bot(7131)])])
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A, "panel_notify_bg", lambda **kw: None)
+    S.claim(36569679, 83537714, 10593102)
+    S.mark_launch_ok(36569679, 83537714, chat_id="79122130601", contact_name="Глеб Зырянов")
+    S.update(36569679, 83537714, phase=S.PHASE_DELIVERY)
+    for _ in range(4):
+        S.add_delivery_status(36569679, 83537714, {"status": "sent", "chatType": "whatsapp"})
+    with S._connect() as conn:
+        conn.execute("UPDATE autopilot_state SET launch_ok_at = ? WHERE lead_id = ?",
+                     (A.shift_iso(A.datetime.datetime.now(A._UTC).isoformat(), -3600),
+                      36569679))
+
+    async def fake_load(lead_id):
+        return _lead(id=lead_id, name="Заказ №19402", pipeline_id=10593102,
+                     status_id=83537714)
+
+    monkeypatch.setattr(A, "load_lead", fake_load)
+
+    _only(S.PHASE_DELIVERY, 36569679)
+    asyncio.run(A.check_delivery_windows())
+
+    assert S.get(36569679, 83537714)["phase"] == S.PHASE_REPLY, "сделку бросать нельзя"
+    assert rows[-1]["outcome"] == "waiting_reply"
+    assert not [m for m in _SENT if "не дошло" in m["text"]], "менеджеру про недоставку молчим"
 
 
 # ── подбор пропущенного из переписки панели (27.09.2026) ────────────────────────

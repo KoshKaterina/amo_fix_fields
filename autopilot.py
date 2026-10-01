@@ -810,11 +810,27 @@ def answer_verdict_note(bot: dict, answer: str, decision: str) -> str:
     return f"{head}. Правило бота - «{rule}», сравнивать не с чем, {tail}"
 
 
+# Сколько ждём, пока платёж появится в МойСкладе. Час - запас в два с половиной раза над
+# наблюдённым максимумом (24 мин 34 с по «Заказу №19286»). Константа живёт здесь, а не в общем
+# конфиге: общий файл правят несколько сессий разом, и ради одного числа рисковать чужой
+# работой не стоит.
+PAY_WAIT_MIN = 60
+
+
 # Вердикт доставки. Ровно четыре исхода, и «провал» среди них - самый дорогой.
 VERDICT_OK = "ok"          # дошло хотя бы одним каналом
 VERDICT_WAIT = "wait"      # ещё ждём: попытки могут продолжаться
-VERDICT_FAILED = "failed"  # окно вышло, все известные попытки отбиты
+VERDICT_FAILED = "failed"  # окно вышло, и канал ОТБИЛ отправку - это настоящий отказ
 VERDICT_SILENT = "silent"  # окно вышло, а статусов не пришло ни одного
+# Окно вышло, статусы есть, но среди них ни отказа, ни подтверждения - только «отправлено».
+# ⚠️ Отдельный исход, потому что «подтверждения нет» и «не дошло» - разные утверждения, и
+# второе сильнее факта (замер 01.10.2026: из 441 шаблона за 30 дней 34 застряли в «отправлено»
+# навсегда, а отказов за те же дни 49). Сделку по нему не бросаем.
+VERDICT_UNCONFIRMED = "unconfirmed"
+
+
+# Статусы, которыми канал говорит «не взял»: только они дают право на слова «не дошло».
+CHANNEL_REFUSED_STATUSES = ("error", "failed", "rejected", "undelivered")
 
 
 def delivery_ok(statuses: list[dict]) -> bool:
@@ -858,7 +874,17 @@ def delivery_verdict(statuses: list[dict], waited_s: float, wait_limit_s: float)
         return VERDICT_OK
     if waited_s < wait_limit_s:
         return VERDICT_WAIT
-    return VERDICT_FAILED if statuses else VERDICT_SILENT
+    if not statuses:
+        return VERDICT_SILENT
+    # ⚠️ «Отбито» - это ОТКАЗ канала, а не отсутствие подтверждения (правка Кати 01.10.2026).
+    # По «Заказу №19402» лежали четыре статуса «отправлено» подряд, ни одного отказа, и робот
+    # сказал менеджеру «сообщение до клиента не дошло» - утверждение, которого у нас нет.
+    # Признака доставки там не было ни в панели (статус так и остался «отправлено», обновления
+    # не приходило вовсе), ни в amoCRM: два примечания в 13:58 - это запись бота грида об
+    # ОТПРАВКЕ, и читать её как «получено» нельзя.
+    if any(str(st.get("status") or "").lower() in CHANNEL_REFUSED_STATUSES for st in statuses):
+        return VERDICT_FAILED
+    return VERDICT_UNCONFIRMED
 
 
 def delivery_note(statuses: list[dict]) -> str:
@@ -1938,17 +1964,20 @@ async def on_payment_received(lead: dict) -> None:
     order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
     paid = await order_is_paid(order_uuid)
     if paid is False:
-        # ⚠️ Один раз на сделку. Эта ветка живёт ДО `store.claim`, поэтому её не защищает гейт
-        # от повторного вебхука: 27.09.2026 по одному заказу такой алерт ушёл дважды за минуту с
-        # половиной, а вебхуков по сделке, стоящей на этапе, приходят десятки.
-        if not await asyncio.to_thread(store.claim_notice, lead_id, "pay-mismatch"):
-            logger.info("autopilot: о расхождении оплаты по сделке %s уже говорили", lead_id)
-            return
-        await stop_here(
-            lead, None, "failed",
-            "платёжная система сообщила об оплате, а в МойСкладе заказ не оплачен",
-            op_text="платёжная система говорит «оплачено», а в МойСкладе оплаты нет. "
-                    "В успех не веду, посмотрите заказ.",
+        # ⚠️ Ноль в складе прямо сейчас - это НЕ расхождение, а «платёж ещё не завели»
+        # (решение Кати 01.10.2026). Замер по четырём сделкам: платёж в МойСкладе появляется
+        # отдельным шагом, через 9 мин 51 с и 24 мин 34 с после вебхука платёжной системы, а
+        # иногда не появляется вовсе. Поэтому ждём час, проверяя каждую минуту, и ведём в успех
+        # сами, как только деньги видно. Алерт не убран, а отложен на тот же час: именно он
+        # нашёл «Заказ №19302» - 8 533 ₽, товар отгружён, в складе ноль пятые сутки.
+        if await asyncio.to_thread(store.claim, lead_id, STATUS_PAYMENT_RECEIVED,
+                                   int(lead.get("pipeline_id") or 0)):
+            log_run(lead, None, action="payment_fork", outcome="waiting_payment",
+                    reason="платёжная система сообщила об оплате, в МойСкладе платежа пока нет - "
+                           f"жду до {PAY_WAIT_MIN} минут, проверяю каждую минуту")
+        await asyncio.to_thread(
+            store.update, lead_id, STATUS_PAYMENT_RECEIVED, phase=store.PHASE_PAYMENT,
+            note="жду платёж в МойСкладе",
         )
         return
 
@@ -2776,6 +2805,72 @@ async def human_touch_after(lead: dict, row: dict) -> str:
     return ""
 
 
+async def check_payment_windows() -> None:
+    """Платёжка сказала «оплачено», склад пока молчит - ждём платёж и ведём в успех сами.
+
+    ⚠️ Зачем фаза, а не пауза в обработчике: ждать приходится десятки минут, а контейнер за это
+    время может пересобраться. Фаза живёт на диске, и ожидание переживает рестарт.
+
+    ⚠️ Алерт не убран, а отложен. По «Заказу №19302» платежа нет пятые сутки при отгруженном
+    товаре, по «Заказу №19401» - с сегодняшнего дня. Это настоящая дыра, молчать о ней нельзя.
+    """
+    limit = PAY_WAIT_MIN * 60
+    for row in await asyncio.to_thread(store.list_by_phase, store.PHASE_PAYMENT):
+        lead = await load_lead(row["lead_id"])
+        if lead is None:
+            continue
+        if int(lead.get("status_id") or 0) != int(row["status_id"]):
+            # Сделку увели с этапа - право человека, и шуметь не о чем.
+            await asyncio.to_thread(
+                store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+                "сделку увели с этапа, пока ждали платёж",
+            )
+            log_run(lead, None, action="payment_fork", outcome="stop_left_stage",
+                    reason="сделку увели с этапа, пока ждали платёж в МойСкладе")
+            continue
+        order_uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+        paid, payed = await order_payment(order_uuid)
+        if paid:
+            note = payment_note(
+                amo_service.get_custom_field_value(lead, FIELD_PAYMENT_METHOD), paid, payed)
+            await asyncio.to_thread(
+                store.finish, row["lead_id"], row["status_id"], store.PHASE_DONE,
+                "платёж в МойСкладе появился",
+            )
+            log_run(lead, None, action="payment_fork", outcome="advanced", reason=note,
+                    alert_target="op")
+            alert_op(
+                f"{lead_link(row['lead_id'], lead.get('name'))}: оплата получена, "
+                "перевожу в успешную реализацию.",
+                lead.get("responsible_user_id"), lead=lead,
+            )
+            await move_to(lead, None, STATUS_SUCCESS, "Успешно реализовано", note)
+            continue
+        waited = _seconds_since(row.get("created_at"))
+        if waited < limit:
+            continue
+        # Час прошёл, денег в складе так и нет - это уже расхождение, и оно для человека.
+        minutes = int(waited // 60)
+        await asyncio.to_thread(
+            store.finish, row["lead_id"], row["status_id"], store.PHASE_STOPPED,
+            "платёж в МойСкладе так и не появился",
+        )
+        if not await asyncio.to_thread(store.claim_notice, row["lead_id"], "pay-mismatch"):
+            logger.info("autopilot: о расхождении оплаты по сделке %s уже говорили",
+                        row["lead_id"])
+            continue
+        log_run(lead, None, action="payment_fork", outcome="failed",
+                reason=f"платёжная система сообщила об оплате, а в МойСкладе платежа нет "
+                       f"уже {minutes} минут - в успех не веду",
+                alert_target="op")
+        alert_op(
+            f"{lead_link(row['lead_id'], lead.get('name'))}: платёжная система говорит "
+            f"«оплачено», а в МойСкладе платежа нет уже {minutes} минут. В успех не веду, "
+            "посмотрите заказ.",
+            lead.get("responsible_user_id"), lead=lead,
+        )
+
+
 async def check_delivery_windows() -> None:
     """Окно ожидания доставки истекает молча - никакого события об этом не приходит.
 
@@ -2809,6 +2904,29 @@ async def check_delivery_windows() -> None:
         #
         # Поэтому переходим к ожиданию ОТВЕТА и продолжаем слушать чат: ответ клиента сам по
         # себе доказательство доставки. Менеджера не дёргаем, технарям говорим один раз.
+        # ⚠️ «Подтверждения нет» - не повод бросать сделку (решение Кати 01.10.2026). Ответ
+        # клиента сам по себе доказательство доставки, а ждать подтверждения дольше нечего:
+        # у кого оно приходит, приходит в первые минуты (медиана восемь секунд у «доставлено»).
+        # Поэтому слушаем чат дальше, менеджеру молчим, технарям говорим один раз.
+        if verdict == VERDICT_UNCONFIRMED:
+            await asyncio.to_thread(
+                store.update, row["lead_id"], row["status_id"], phase=store.PHASE_REPLY,
+                note="подтверждения доставки нет, слушаю ответ клиента",
+                **({"reply_since": row["launch_ok_at"]} if row.get("launch_ok_at") else {}),
+            )
+            log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
+                    reason=f"{delivery_note(items)}; отказа канала не было, подтверждения тоже - "
+                           "жду ответ клиента, с ведения не снимаю",
+                    delivery={"statuses": items})
+            if await asyncio.to_thread(store.claim_notice, row["lead_id"],
+                                       f"unconfirmed-{row['status_id']}"):
+                alert_tech(
+                    f"{lead_link(row['lead_id'], lead.get('name'))}: канал принял сообщение, но "
+                    "подтверждения доставки так и не прислал. Сделку не бросаю, жду ответ "
+                    "клиента; менеджеру не писал."
+                )
+            continue
+
         if verdict == VERDICT_SILENT and str((bot or {}).get("launched_by") or "engine") != "engine":
             # ⚠️ Прежде чем сказать «подтвердить нечем», спрашиваем панель. По заказу 19303
             # Wazzup отбил шаблон за 21 секунду ДО того, как робот начал слушать чат: связать
@@ -2946,6 +3064,7 @@ async def tick_once() -> None:
     await asyncio.to_thread(store.purge_notices_older_than, 60)
     await check_delivery_windows()
     await check_reply_windows()
+    await check_payment_windows()
     await catch_up_on_chats()
     if not in_work_hours():
         return
