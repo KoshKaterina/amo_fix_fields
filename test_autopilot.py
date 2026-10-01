@@ -71,6 +71,9 @@ def _settings(**over):
     return base
 
 
+_PAY_PAUSE_REAL = A.PAY_RECHECK_PAUSE_S
+
+
 @pytest.fixture(autouse=True)
 def _clean():
     _SENT.clear()
@@ -82,7 +85,11 @@ def _clean():
     S.init()
     with S._connect() as conn:
         conn.execute("DELETE FROM autopilot_notified")
+    # Перепроверка оплаты в бою ждёт между попытками почти минуту. Тестам это ни к чему:
+    # без обнуления прогон всего файла растягивается с девяти секунд до пяти минут.
+    A.PAY_RECHECK_PAUSE_S = 0
     yield
+    A.PAY_RECHECK_PAUSE_S = _PAY_PAUSE_REAL
 
 
 # ── хранилище: гейт от повторного вебхука ───────────────────────────────────────
@@ -2873,3 +2880,64 @@ def test_without_the_template_time_the_stamp_is_left_to_the_store(monkeypatch):
 
     assert saved, "состояние не правилось вовсе"
     assert "reply_since" not in saved[0]
+
+
+# ── расхождение оплаты: гонка молчит, настоящее расхождение говорит ────────────
+
+def test_payment_mismatch_is_rechecked_before_shouting(monkeypatch):
+    """⚠️ Дефект дежурства 01.10.2026: платёж в МойСкладе создаёт наша же автоматика по тому
+    же вебхуку, что переводит сделку на «Оплата получена». Робот спрашивал склад раньше, чем
+    платёж там появлялся, и звал человека зря: по заказу 19399 алерт ушёл в 13:37, а к 13:45
+    заказ был оплачен и отгружен; по заказу 19286 так ушло четыре алерта подряд."""
+    answers = [False, True]          # первый раз ноль, со второй попытки оплата видна
+    asked: list[str] = []
+
+    async def fake_paid(uuid):
+        asked.append(uuid)
+        return answers[min(len(asked), len(answers)) - 1]
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(A, "order_is_paid", fake_paid)
+    monkeypatch.setattr(A.asyncio, "sleep", no_sleep)
+
+    got = asyncio.run(A.order_paid_confirmed("uuid-1", tries=3, pause_s=0))
+    assert got is True, "гонка принята за расхождение"
+    assert len(asked) == 2, "переспросили не один раз"
+
+
+def test_real_mismatch_still_shouts_after_rechecks(monkeypatch):
+    """⚠️ Замолчать совсем нельзя, и это проверено фактом: по заказу 19302 то же сообщение
+    было ВЕРНЫМ - Ozon подтвердил 8 533 ₽, товар уехал клиенту, а в МойСкладе оплата нулевая
+    до сих пор. После всех попыток «не оплачен» обязан остаться «не оплачен»."""
+    asked: list[str] = []
+
+    async def always_unpaid(uuid):
+        asked.append(uuid)
+        return False
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(A, "order_is_paid", always_unpaid)
+    monkeypatch.setattr(A.asyncio, "sleep", no_sleep)
+
+    got = asyncio.run(A.order_paid_confirmed("uuid-2", tries=3, pause_s=0))
+    assert got is False, "настоящее расхождение замолчали"
+    assert len(asked) == 3, "сделали не все попытки"
+
+
+def test_silent_warehouse_is_not_rechecked(monkeypatch):
+    """Молчание склада - не «не оплачен», и переспрашивать его незачем: событие об оплате уже
+    пришло, а держать клиента из-за неотвечающего отчёта мы не будем."""
+    asked: list[str] = []
+
+    async def silent(uuid):
+        asked.append(uuid)
+        return None
+
+    monkeypatch.setattr(A, "order_is_paid", silent)
+    got = asyncio.run(A.order_paid_confirmed("uuid-3", tries=3, pause_s=0))
+    assert got is None
+    assert len(asked) == 1, "молчание склада переспрашивать не надо"
