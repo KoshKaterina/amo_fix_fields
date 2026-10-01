@@ -232,6 +232,44 @@ def test_any_and_never_both_go_forward():
     assert A.answer_decision({"stop_mode": "never"}, "что угодно") == "advance"
 
 
+# ── чистое приветствие ──────────────────────────────────────────────────────────
+
+def test_bare_greeting_is_recognized_with_punctuation_and_emoji():
+    """Приветствие остаётся приветствием под любым знаком и смайликом: чистим всё, что не буква."""
+    for said in ("Здравствуйте", "здравствуйте!", "Здравствуйте.", "ЗДРАВСТВУЙТЕ",
+                 "  Привет  ", "Добрый день", "Доброе утро!", "Добрый вечер,",
+                 "Доброго времени суток", "Здрасьте", "Hi", "Hello!"):
+        assert A.bare_greeting(said) is True, said
+
+
+def test_greeting_plus_anything_else_is_NOT_bare():
+    """⚠️ Главный предохранитель правила. «Содержит приветствие» проглотило бы живой отказ
+    28.09.2026 по заказу 19309 - он здесь последним в списке."""
+    for said in ("Здравствуйте, да", "Здравствуйте, нет", "Привет, а можно завтра?",
+                 "Добрый день! Заказ подтверждаю", "Здравствуйте, Екатерина",
+                 "Здравствуйте, 2 шт",
+                 "Здравствуйте. С учётом того, что в составе вы ничего не написали, "
+                 "пока подтвердить не могу"):
+        assert A.bare_greeting(said) is False, said
+
+
+def test_empty_message_is_not_a_greeting():
+    """Пустое сообщение - не приветствие: иначе пустышка уводила бы сделку в ожидание молча."""
+    assert A.bare_greeting("") is False
+    assert A.bare_greeting(None) is False
+    assert A.bare_greeting("   ") is False
+
+
+def test_greeting_does_not_decide_but_greeting_with_yes_does():
+    """Разбор по окну не меняется: приветствие само решения не несёт, а «Здравствуйте, да» -
+    несёт, и это работало и до правила (предохранители «вопрос» и «нет» на месте)."""
+    bot = {"stop_mode": "word", "stop_answers_norm": ["да", "верно"]}
+    assert A.decide_on_answers(bot, ["Здравствуйте"]) == "stop"
+    assert A.decide_on_answers(bot, ["Здравствуйте, да"]) == "advance"
+    assert A.decide_on_answers(bot, ["Здравствуйте", "Да"]) == "advance"
+    assert A.decide_on_answers(bot, ["Здравствуйте", "Да", "а когда привезёте?"]) == "stop"
+
+
 # ── условия ─────────────────────────────────────────────────────────────────────
 
 _LEAD = {
