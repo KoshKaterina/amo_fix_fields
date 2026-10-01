@@ -66,6 +66,7 @@ import httpx
 import amo_service
 import autopilot_settings_client as settings_client
 import autopilot_store as store
+import sales_sheet_feed
 import ms_client
 import telegram_bot
 import alerts
@@ -1482,6 +1483,25 @@ async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: s
     if len(_moved_by_us) > 2000:
         _moved_by_us.clear()
     _moved_by_us.add((lead_id, int(status_id)))
+
+    # ⚠️ ЗАГЛУШКА записи продажи в рабочую таблицу отдела (постановка Кати 01.10.2026).
+    # НИЧЕГО НЕ ОТПРАВЛЯЕТ: собирает строку и пишет в журнал, в какой лист она ушла бы -
+    # «Продажи» или «Наложка», - и каких полей мы не знаем. Разбор в `sales_sheet_feed.py`.
+    #
+    # Место выбрано здесь, а не в развилке оплаты, намеренно: сюда сходятся ВСЕ четыре пути,
+    # которыми робот уводит сделку в успех (наложка, оплаченный онлайн, принудительный перевод,
+    # вход по «Оплата получена»), и сюда мы попадаем только когда перевод СОСТОЯЛСЯ - призрак
+    # вернулся выше, потолок действий и отказ amoCRM тоже.
+    if int(status_id) == STATUS_SUCCESS:
+        try:
+            sale_contact = await main_contact(lead)
+            sales_sheet_feed.report(lead, sale_contact, status_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Заглушка не имеет права ронять перевод сделки: этап и деньги важнее журнала.
+            logger.exception("sales_sheet: заглушка не отработала по сделке %s", lead_id)
+
     await handle_lead_change(lead_id)
 
 

@@ -3081,3 +3081,86 @@ def test_without_the_template_time_the_stamp_is_left_to_the_store(monkeypatch):
 
     assert saved, "состояние не правилось вовсе"
     assert "reply_since" not in saved[0]
+
+# ── заглушка строки продажи ─────────────────────────────────────────────────────
+
+def _success_move(monkeypatch, *, status_id=None, payment="При получении"):
+    """Прогнать настоящий `move_to` в БОЕВОМ режиме и вернуть, что поймала заглушка."""
+    rows = _capture(monkeypatch)
+    seen: list[tuple] = []
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+    monkeypatch.setattr(A, "handle_lead_change", lambda *a, **k: _noop())
+    monkeypatch.setattr(A, "main_contact", lambda *a, **k: _noop({"id": 1, "name": "Марат"}))
+
+    async def fake_patch(*a, **k):
+        return {"ok": True}
+
+    monkeypatch.setattr(A.amo_service, "patch_lead", fake_patch)
+    monkeypatch.setattr(A.sales_sheet_feed, "report",
+                        lambda lead, contact, stage_name="": seen.append(
+                            (A.sales_sheet_feed.pick_sheet(payment), int(lead["id"]), stage_name)))
+
+    lead = _lead(id=36569679, name="Заказ №19402", pipeline_id=10593102, status_id=83537714)
+    lead["custom_fields_values"] = [
+        {"field_id": 577373, "values": [{"value": payment}]},
+    ]
+    target = A.STATUS_SUCCESS if status_id is None else status_id
+    asyncio.run(A.move_to(lead, _stage(83537714, "Новый лид", []),
+                          target, "Успешно реализовано", "заказ оплачен"))
+    return seen, rows
+
+
+def test_stub_fires_when_we_move_the_lead_to_success(monkeypatch):
+    """Постановка Кати 01.10.2026: продажу записываем в таблицу отдела, когда в успех сделку
+    увели МЫ. Врезка стоит в `move_to`, потому что туда сходятся все четыре наших пути в успех."""
+    seen, _ = _success_move(monkeypatch)
+    assert len(seen) == 1
+    sheet, lead_id, stage_name = seen[0]
+    assert sheet == A.sales_sheet_feed.SHEET_COD
+    assert lead_id == 36569679
+    assert stage_name == "Успешно реализовано"
+
+
+def test_stub_routes_online_sale_to_the_other_sheet(monkeypatch):
+    seen, _ = _success_move(monkeypatch, payment="Онлайн-оплата")
+    assert seen[0][0] == A.sales_sheet_feed.SHEET_SALES
+
+
+def test_stub_is_silent_on_any_other_stage(monkeypatch):
+    """Перевод на обычный этап продажей не является - в таблицу о нём писать нечего."""
+    seen, _ = _success_move(monkeypatch, status_id=83537714)
+    assert seen == []
+
+
+def test_stub_failure_does_not_break_the_move(monkeypatch):
+    """⚠️ Заглушка не имеет права ронять перевод сделки: этап и деньги важнее журнала."""
+    rows = _capture(monkeypatch)
+    monkeypatch.setattr(A.store, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(A, "refresh_watched_chats", lambda: None)
+    monkeypatch.setattr(A, "handle_lead_change", lambda *a, **k: _noop())
+    monkeypatch.setattr(A, "main_contact", lambda *a, **k: _noop(None))
+
+    async def fake_patch(*a, **k):
+        return {"ok": True}
+
+    def boom(*a, **k):
+        raise RuntimeError("таблица недоступна")
+
+    monkeypatch.setattr(A.amo_service, "patch_lead", fake_patch)
+    monkeypatch.setattr(A.sales_sheet_feed, "report", boom)
+    lead = _lead(id=36569680, name="Заказ №19403", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.move_to(lead, _stage(83537714, "Новый лид", []),
+                          A.STATUS_SUCCESS, "Успешно реализовано", "заказ оплачен"))
+
+    # Перевод состоялся и записан в журнал, несмотря на упавшую заглушку.
+    assert rows[-1]["outcome"] == "advanced"
+    assert rows[-1]["moved_to_status_name"] == "Успешно реализовано"
+
+
+def test_shadow_does_not_feed_the_sales_sheet(monkeypatch):
+    """Призрак сделку не двигает - значит и продажи не было, и писать о ней некуда."""
+    _shadow_settings()
+    seen, _ = _success_move(monkeypatch)
+    assert seen == []
