@@ -3097,9 +3097,10 @@ def _success_move(monkeypatch, *, status_id=None, payment="При получен
         return {"ok": True}
 
     monkeypatch.setattr(A.amo_service, "patch_lead", fake_patch)
-    monkeypatch.setattr(A.sales_sheet_feed, "report",
-                        lambda lead, contact, stage_name="": seen.append(
-                            (A.sales_sheet_feed.pick_sheet(payment), int(lead["id"]), stage_name)))
+    async def fake_report(lead, contact):
+        seen.append((A.sales_sheet_feed.pick_sheet(payment), int(lead["id"])))
+
+    monkeypatch.setattr(A.sales_sheet_feed, "report", fake_report)
 
     lead = _lead(id=36569679, name="Заказ №19402", pipeline_id=10593102, status_id=83537714)
     lead["custom_fields_values"] = [
@@ -3116,10 +3117,9 @@ def test_stub_fires_when_we_move_the_lead_to_success(monkeypatch):
     увели МЫ. Врезка стоит в `move_to`, потому что туда сходятся все четыре наших пути в успех."""
     seen, _ = _success_move(monkeypatch)
     assert len(seen) == 1
-    sheet, lead_id, stage_name = seen[0]
+    sheet, lead_id = seen[0]
     assert sheet == A.sales_sheet_feed.SHEET_COD
     assert lead_id == 36569679
-    assert stage_name == "Успешно реализовано"
 
 
 def test_stub_routes_online_sale_to_the_other_sheet(monkeypatch):

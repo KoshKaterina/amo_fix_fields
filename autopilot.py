@@ -1495,7 +1495,7 @@ async def move_to(lead: dict, stage: dict | None, status_id: int, status_name: s
     if int(status_id) == STATUS_SUCCESS:
         try:
             sale_contact = await main_contact(lead)
-            sales_sheet_feed.report(lead, sale_contact, status_name)
+            await sales_sheet_feed.report(lead, sale_contact)
         except asyncio.CancelledError:
             raise
         except Exception:
