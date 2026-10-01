@@ -92,7 +92,7 @@ def _now() -> str:
 
 _COLS = (
     "lead_id, status_id, pipeline_id, bot_id, phase, launch_attempted_at, launch_ok_at, "
-    "chat_id, wake_at, created_at, updated_at, note, delivery, contact_name"
+    "chat_id, wake_at, created_at, updated_at, note, delivery, contact_name, reply_since"
 )
 
 
@@ -115,6 +115,10 @@ def _row(r) -> dict:
         # находится (правка Кати 01.10.2026). Держим здесь, чтобы подбор не ходил за именем
         # в amoCRM каждые пять минут.
         "contact_name": r[13] if len(r) > 13 else "",
+        # Когда начали ждать ОТВЕТ клиента. Отдельно от `updated_at`, потому что
+        # `updated_at` двигает любая правка строки - и срок ожидания не истекал никогда
+        # (разбор 01.10.2026: сделки висели 39 и 94 часа без единого алерта).
+        "reply_since": r[14] if len(r) > 14 else "",
     }
 
 
@@ -208,6 +212,10 @@ def _add_missing_columns(conn) -> None:
         conn.execute(
             "ALTER TABLE autopilot_state ADD COLUMN contact_name TEXT NOT NULL DEFAULT ''"
         )
+    if "reply_since" not in have:
+        conn.execute(
+            "ALTER TABLE autopilot_state ADD COLUMN reply_since TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def get(lead_id: int, status_id: int) -> dict | None:
@@ -247,13 +255,27 @@ def update(lead_id: int, status_id: int, **fields) -> None:
     ничего не сделает, а мы будем искать её в логике движка."""
     allowed = {
         "bot_id", "phase", "launch_attempted_at", "launch_ok_at", "chat_id", "wake_at", "note",
-        "contact_name",
+        "contact_name", "reply_since",
     }
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"autopilot_store.update: неизвестные поля {sorted(unknown)}")
     if not fields:
         return
+    # ⚠️ Вход в фазу ожидания ответа отмечаем ОДИН раз и больше не трогаем (правка Кати
+    # 01.10.2026). До этого срок ожидания считался от `updated_at`, а его двигает любая правка
+    # строки - подбор из переписки, статус доставки, запоминание чата. Робот сам обнулял свой
+    # счётчик, и сделки висели в ожидании 39 и 94 часа, не получив ни одного алерта.
+    if fields.get("phase") == PHASE_REPLY and "reply_since" not in fields:
+        with _connect() as conn:
+            cur = conn.execute(
+                "SELECT reply_since FROM autopilot_state WHERE lead_id = ? AND status_id = ?",
+                (lead_id, status_id),
+            )
+            got = cur.fetchone()
+        if not (got and got[0]):
+            fields["reply_since"] = _now()
+
     sets = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [_now(), lead_id, status_id]
     with _connect() as conn:

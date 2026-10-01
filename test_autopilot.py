@@ -579,7 +579,7 @@ def test_client_reply_is_proof_of_delivery(monkeypatch):
     A.refresh_watched_chats()
     seen: list[str] = []
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         seen.append(text)
 
     monkeypatch.setattr(A, "on_client_answer", fake_answer)
@@ -911,7 +911,7 @@ def test_telegram_reply_is_matched_by_contact_phone(monkeypatch):
     A.refresh_watched_chats()
     seen: list[str] = []
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         seen.append((row["lead_id"], text))
 
     monkeypatch.setattr(A, "on_client_answer", fake_answer)
@@ -1705,7 +1705,7 @@ def test_catchup_picks_up_the_answer_a_webhook_lost(monkeypatch):
         return {"inbound": [{"text": "Да, всё верно", "chat_type": "whatsapp",
                              "at": "2026-09-27T11:00:00+00:00"}], "echo": []}
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         answers.append((row["lead_id"], text, chat_type))
 
     monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
@@ -2095,7 +2095,7 @@ def test_catchup_looks_back_but_takes_only_fresh_inbound(monkeypatch):
         return {"inbound": [{"text": "старое сообщение", "chat_type": "whatsapp",
                              "at": "2026-09-27T11:30:00+00:00"}], "echo": []}
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         answers.append(text)
 
     monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
@@ -2423,7 +2423,7 @@ def test_answer_that_came_while_the_robot_slept_is_picked_up(monkeypatch):
                          "at": "2026-09-28T05:56:34+00:00"}],
         }
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         answers.append((row["lead_id"], text))
 
     monkeypatch.setattr(A, "fetch_chat_activity", activity)
@@ -2455,7 +2455,7 @@ def test_message_written_before_the_template_is_not_an_answer(monkeypatch):
                          "at": "2026-09-28T05:40:00+00:00"}],
         }
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         answers.append((row["lead_id"], text))
 
     monkeypatch.setattr(A, "fetch_chat_activity", activity)
@@ -2495,7 +2495,7 @@ def test_catchup_window_starts_from_when_we_took_the_lead(monkeypatch):
                          "at": "2026-09-28T05:56:34+00:00"}],
         }
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         answers.append(text)
 
     monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
@@ -2672,7 +2672,7 @@ def test_catchup_finds_telegram_answer_by_contact_name(monkeypatch):
                          "chat_id": "5536716433", "at": "2026-09-30T11:04:37+00:00"}],
         }
 
-    async def fake_answer(row, text, chat_type=""):
+    async def fake_answer(row, text, chat_type="", **kw):
         answers.append(text)
 
     monkeypatch.setattr(A, "fetch_chat_activity", fake_activity)
@@ -2701,3 +2701,79 @@ def test_namesakes_do_not_teach_the_robot_a_wrong_chat():
         assert learned == [(1, {"chat_id": "333"})]
     finally:
         A.store.update = original
+
+
+# ── решение по всем ответам окна ────────────────────────────────────────────────
+
+def test_confirmation_in_the_first_of_three_messages_wins():
+    """⚠️ Дефект, найденный дежурством 01.10.2026 по заказу 19388. Клиент написал подряд
+    «Да, всё верно», «Заказ оплачен», «Заказ подтверждаю» - подбор взял ПОСЛЕДНЕЕ и позвал
+    человека к подтверждённому заказу. За сутки клиенты писали на один шаблон по 3-26 сообщений,
+    так что «один шаблон - один ответ» в жизни почти не встречается."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да", "верно"])
+    assert A.decide_on_answers(
+        bot, ["Да, всё верно", "Заказ оплачен", "Заказ подтверждаю"]) == "advance"
+
+
+def test_refusal_or_question_anywhere_in_the_window_calls_a_human():
+    """Обратная сторона: подтверждение в одном сообщении не отменяет вопроса в другом. Живые
+    примеры того же дня - «Да» … «Нет» у одного клиента и «Да, всё верно» … «Нет, благодарю»
+    у другого."""
+    bot = _bot(7131, stop_mode="word", stop_answers=["да", "верно"])
+    assert A.decide_on_answers(bot, ["Да", "Нет"]) == "stop"
+    assert A.decide_on_answers(bot, ["Да, всё верно", "а когда доставка?"]) == "stop"
+    assert A.decide_on_answers(bot, []) == "stop"
+
+
+def test_except_mode_stops_on_a_single_hit_in_the_window():
+    """Режим «на любой ответ, кроме этих» считается иначе: одного попадания в список
+    достаточно, чтобы остановиться, даже если рядом лежит безобидное сообщение."""
+    bot = _bot(7131, stop_mode="except", stop_answers=["Нет, нужно исправить"])
+    assert A.decide_on_answers(bot, ["Нет, нужно исправить", "спасибо"]) == "stop"
+    assert A.decide_on_answers(bot, ["ок", "спасибо"]) == "advance"
+
+
+def test_answer_window_cuts_off_the_conversation_with_a_manager():
+    """Окно ответа - полчаса от первого входящего. Три сообщения подряд это один ответ,
+    разбитый на части; разговор, который клиент ведёт с менеджером через час, ответом на шаблон
+    не является (за сутки один клиент написал 26 сообщений за несколько часов)."""
+    inbound = [   # панель отдаёт свежее первым
+        {"text": "а ещё вопрос", "at": "2026-10-01T09:00:00+00:00"},
+        {"text": "Заказ подтверждаю", "at": "2026-10-01T06:05:00+00:00"},
+        {"text": "Да, всё верно", "at": "2026-10-01T06:00:00+00:00"},
+    ]
+    window = A.answer_window(inbound)
+    texts = [i["text"] for i in window]
+    assert texts == ["Заказ подтверждаю", "Да, всё верно"]
+    assert "а ещё вопрос" not in texts
+
+
+# ── срок ожидания ответа считается от своей отметки ─────────────────────────────
+
+def test_reply_deadline_is_counted_from_its_own_stamp():
+    """⚠️ Дефект, найденный дежурством 01.10.2026: три сделки висели в ожидании 39, 94 и 94 часа
+    без единого алерта. Срок считался от `updated_at`, а его двигает любая правка строки -
+    подбор, статус доставки, запоминание чата. Робот сам обнулял свой счётчик."""
+    S.init()
+    S.claim(40101, 83537714, 10593102)
+    S.mark_launch_ok(40101, 83537714, chat_id="79000000001", contact_name="Пробный")
+    S.update(40101, 83537714, phase=S.PHASE_REPLY)
+    first = S.get(40101, 83537714)
+    assert first["reply_since"], "отметка входа в ожидание не поставилась"
+
+    # Любая последующая правка строки отметку НЕ двигает - именно в этом был дефект.
+    S.update(40101, 83537714, chat_id="5536716433")
+    S.add_delivery_status(40101, 83537714, {"status": "read", "chatType": "telegram"})
+    again = S.get(40101, 83537714)
+    assert again["reply_since"] == first["reply_since"]
+    assert again["updated_at"] >= first["updated_at"]
+
+
+def test_old_rows_without_the_stamp_still_use_the_old_count():
+    """Строки, заведённые до правки, отметки не имеют. Для них остаётся прежний отсчёт: это
+    хуже, но лучше, чем счесть их ждущими с начала времён и высыпать алерты пачкой."""
+    row = {"updated_at": A.shift_iso(A.datetime.datetime.now(A._UTC).isoformat(), -7200)}
+    assert 7100 < A.waiting_for_reply_s(row) < 7300
+    fresh = {"reply_since": A.shift_iso(A.datetime.datetime.now(A._UTC).isoformat(), -3600),
+             "updated_at": A.datetime.datetime.now(A._UTC).isoformat()}
+    assert 3500 < A.waiting_for_reply_s(fresh) < 3700

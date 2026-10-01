@@ -74,6 +74,7 @@ from waybill_config import (
     AUTOPILOT_ENABLED,
     AUTOPILOT_ERROR_DEDUPE_S,
     AUTOPILOT_HOURLY_CAP,
+    AUTOPILOT_ANSWER_WINDOW_MIN,
     AUTOPILOT_CATCHUP_INTERVAL_S,
     AUTOPILOT_CATCHUP_LOOKBACK_S,
     AUTOPILOT_CONTACT_RETRY_S,
@@ -681,6 +682,39 @@ def answer_has_word(answer_norm: str, words: list[str]) -> bool:
     return any(
         re.search(rf"(?<!\w){re.escape(w)}(?!\w)", answer_norm) for w in words if w
     )
+
+
+def has_question_or_refusal(answer: str) -> bool:
+    """Клиент о чём-то спрашивает или отказывается - значит ждёт человека, а не хода робота."""
+    norm = normalize_answer(answer)
+    if any(mark in norm for mark in _QUESTION_MARKS):
+        return True
+    return any(re.search(rf"(?<!\w){re.escape(bad)}(?!\w)", norm) for bad in _REFUSAL_WORDS)
+
+
+def decide_on_answers(bot: dict, answers: list[str]) -> str:
+    """Решение по ВСЕМ ответам окна, а не по одному сообщению (правка Кати 01.10.2026).
+
+    Разбор заказа 19388: клиент написал «Да, всё верно», через секунды «Заказ оплачен», потом
+    «Заказ подтверждаю». Подбор брал последнее сообщение и звал человека - при том что
+    подтверждение лежало в первом. За сутки клиенты писали на один шаблон по 3-26 сообщений:
+    «один шаблон - один ответ» в жизни почти не встречается.
+
+    Правило: подтверждение ищем в ЛЮБОМ сообщении окна, но вопрос или отказ в любом из них
+    перебивает - человек дороже скорости. Режим «на любой ответ, кроме этих» считается иначе:
+    там достаточно ОДНОГО попадания в список, чтобы остановиться.
+    """
+    texts = [str(a) for a in answers if str(a or "").strip()]
+    if not texts:
+        return "stop"
+    mode = str(bot.get("stop_mode") or "any")
+    if mode in ("never", "any"):
+        return "advance"
+    if mode == "except":
+        return "stop" if any(answer_decision(bot, t) == "stop" for t in texts) else "advance"
+    if any(has_question_or_refusal(t) for t in texts):
+        return "stop"
+    return "advance" if any(answer_decision(bot, t) == "advance" for t in texts) else "stop"
 
 
 # Правила движения вперёд - словами экрана. Заголовок там «Когда идём дальше», и в журнале
@@ -2102,8 +2136,18 @@ def waiting_for_reply_s(row: dict, now: datetime.datetime | None = None) -> floa
 
     Отдельно от `waited_s`, потому что это другие часы: сообщение могло уйти вечером, доставка
     подтвердиться ночью, а ожидание ответа начаться только с этого момента.
+
+    ⚠️ Считаем от `reply_since` - отметки, которая ставится один раз при входе в фазу (правка
+    Кати 01.10.2026). Раньше счёт шёл от `updated_at`, а его двигает ЛЮБАЯ правка строки:
+    подбор из переписки, статус доставки, запоминание чата. Робот сам обнулял свой счётчик, и
+    срок ожидания не истекал никогда - сделки висели 39 и 94 часа без единого алерта.
+
+    Старые строки отметки не имеют, для них остаётся прежний отсчёт: это хуже, но лучше, чем
+    считать их ждущими с начала времён и высыпать алерты пачкой на первом же тике.
     """
-    return _seconds_since(row.get("updated_at") or row.get("launch_ok_at"), now)
+    return _seconds_since(
+        row.get("reply_since") or row.get("updated_at") or row.get("launch_ok_at"), now,
+    )
 
 
 def shift_iso(stamp: str, seconds: int) -> str:
@@ -2182,8 +2226,14 @@ async def on_delivered(row: dict, items: list[dict]) -> None:
             reason=delivery_note(items), delivery={"statuses": items})
 
 
-async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
-    """Ответ клиента. Решение принимает режим остановки бота, настроенный на экране."""
+async def on_client_answer(row: dict, text: str, chat_type: str = "",
+                           answers: list[str] | None = None) -> None:
+    """Ответ клиента. Решение принимает режим остановки бота, настроенный на экране.
+
+    `answers` - все сообщения окна ответа, когда их несколько (подбор из переписки). Решение
+    считается по ним целиком: подтверждение ищется в любом, а вопрос или отказ перебивает.
+    Вебхук приносит по одному сообщению, и там список из одного элемента - это тот же случай.
+    """
     lead = await load_lead(row["lead_id"])
     stage = settings_client.get_stage(row["status_id"])
     if lead is None or stage is None:
@@ -2198,27 +2248,30 @@ async def on_client_answer(row: dict, text: str, chat_type: str = "") -> None:
                 reason="сделку увели с этапа, пока ждали ответа", client_answer=text)
         return
 
-    if answer_decision(bot, text) == "advance":
+    said = list(answers) if answers else [text]
+    # В журнал кладём то, по чему решение и принято: при нескольких сообщениях - все, через « / ».
+    shown = " / ".join(s.strip() for s in said if s.strip()) or text
+    if decide_on_answers(bot, said) == "advance":
         log_run(lead, stage, bot=bot, action="reply", outcome="advanced",
-                reason=answer_verdict_note(bot, text, "advance"), client_answer=text)
+                reason=answer_verdict_note(bot, shown, "advance"), client_answer=shown)
         await advance(lead, stage, "клиент ответил так, как ждали", from_bot=bot)
         return
 
     listed = [normalize_answer(a) for a in (bot.get("stop_answers_norm")
                                             or bot.get("stop_answers") or [])]
-    known = normalize_answer(text) in listed
+    known = any(normalize_answer(s) in listed for s in said)
     outcome = "stop_fix_requested" if known else "stop_free_text"
     # Состоянию сделки нужна короткая причина, журналу - разбор целиком: в состоянии эта
     # строка живёт как пометка «почему стоим», её читают в отладке, а не человек на экране.
     note = ("клиент выбрал ответ, на котором робот останавливается" if known
             else "клиент ответил не кнопкой, а своими словами")
-    reason = f"{answer_verdict_note(bot, text, 'stop')}. {note}"
+    reason = f"{answer_verdict_note(bot, shown, 'stop')}. {note}"
     await asyncio.to_thread(
         store.update, row["lead_id"], row["status_id"], phase=store.PHASE_STOPPED, note=note,
     )
     log_run(lead, stage, bot=bot, action="reply", outcome=outcome, reason=reason,
-            client_answer=text, alert_target="op")
-    answer = text.strip()
+            client_answer=shown, alert_target="op")
+    answer = shown.strip()
     alert_op(
         f"{lead_link(int(lead['id']), lead.get('name'))}: клиент ответил «{answer[:200]}». "
         "Дальше не веду, посмотрите переписку.",
@@ -2355,6 +2408,24 @@ def template_sent_at(data: dict) -> str:
         if is_robot_echo(item.get("author_name")) and item.get("at")
     ]
     return max(times) if times else ""
+
+
+def answer_window(inbound: list[dict]) -> list[dict]:
+    """Сообщения, которые считаем ОТВЕТОМ на шаблон: первое входящее и всё, что пришло в
+    пределах `AUTOPILOT_ANSWER_WINDOW_MIN` минут после него. Список приходит свежим вперёд,
+    таким же и отдаём.
+
+    Окно нужно, чтобы не принять за ответ на шаблон разговор с менеджером: за сутки один
+    клиент писал 26 сообщений за несколько часов, и решать по ним о подтверждении заказа
+    нельзя. А вот три сообщения подряд в пределах минуты - это один ответ, разбитый на части.
+    """
+    items = [i for i in inbound if i.get("at")]
+    if not items:
+        return list(inbound[:1])
+    first = min(items, key=lambda i: str(i.get("at")))
+    edge = shift_iso(str(first.get("at")), AUTOPILOT_ANSWER_WINDOW_MIN * 60)
+    inside = [i for i in items if str(i.get("at")) <= edge]
+    return inside or [first]
 
 
 def first_answer_after(data: dict, border: str) -> dict | None:
@@ -2503,11 +2574,19 @@ async def catch_up_on_chats() -> None:
                     await record_delivery(row, status, chat_type)
                     break
             continue
-        newest = inbound[0]
-        logger.info("autopilot: подобрал ответ клиента по сделке %s из переписки панели (%s)",
-                    row["lead_id"], str(newest.get("at") or ""))
-        await on_client_answer(row, str(newest.get("text") or ""),
-                              str(newest.get("chat_type") or ""))
+        # ⚠️ Берём ВСЕ сообщения окна ответа, а не одно (правка Кати 01.10.2026). Панель отдаёт
+        # свежее первым, и `inbound[0]` означало «последнее слово клиента»: по заказу 19388 это
+        # оказалось «Заказ подтверждаю», а подтверждение «Да, всё верно» лежало двумя сообщениями
+        # раньше - робот позвал человека к подтверждённому заказу.
+        window = answer_window(inbound)
+        texts = [str(item.get("text") or "") for item in window]
+        first = window[-1]
+        logger.info(
+            "autopilot: подобрал ответ клиента по сделке %s из переписки панели (%s, сообщений %s)",
+            row["lead_id"], str(first.get("at") or ""), len(texts),
+        )
+        await on_client_answer(row, str(first.get("text") or ""),
+                               str(first.get("chat_type") or ""), answers=texts)
 
 
 async def check_reply_windows() -> None:
