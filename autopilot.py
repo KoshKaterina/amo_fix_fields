@@ -2476,13 +2476,20 @@ async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str,
     if verdict is None:
         return False
     outcome, status, chat_type = verdict
+    border = template_sent_at(data)
     if outcome == "ok":
         log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
                 reason=f"шаблон уже уходил и подтверждён ({status}), жду ответ клиента",
                 delivery={"statuses": [{"status": status, "chatType": chat_type}]})
+        # ⚠️ Ждать начинаем с момента ШАБЛОНА, а не с момента, когда робот это заметил
+        # (дежурство 01.10.2026). Шаблон по заказу 19383 ушёл в 19:37, а робот подхватил
+        # сделку утром в 10:23 - и срок «клиент молчит сутки» поехал бы с утра: менеджер
+        # узнал бы о молчании через 39 часов вместо 24. Так же бывает после пересборки и
+        # после потерянного вебхука - подхват всегда позже отправки.
         await asyncio.to_thread(
             store.update, lead_id, status_id,
             phase=store.PHASE_REPLY, note="шаблон подтверждён по переписке панели",
+            **({"reply_since": border} if border else {}),
         )
         logger.info("autopilot: по сделке %s шаблон уже подтверждён (%s), жду ответ",
                     lead_id, status)
@@ -2493,7 +2500,6 @@ async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str,
         # сделок поймал это сразу: по заказу 19388 здесь брался один ответ - и им оказывалось
         # последнее сообщение «Заказ подтверждаю», хотя подтверждение «Да, всё верно» пришло
         # двумя сообщениями раньше. Та же беда, что в подборе, но другим путём.
-        border = template_sent_at(data)
         after = [i for i in (data.get("inbound") or []) if _at_or_after(i.get("at"), border)]
         window = answer_window(after) if after else []
         if window:
@@ -2750,9 +2756,12 @@ async def check_delivery_windows() -> None:
                     continue
                 await record_delivery(row, status, chat_type)
                 continue
+            # Ждать начинаем от отметки запуска бота: подтверждения доставки нет вовсе,
+            # и ближайшее честное «когда клиенту написали» - это она. См. разбор выше.
             await asyncio.to_thread(
                 store.update, row["lead_id"], row["status_id"], phase=store.PHASE_REPLY,
                 note="подтверждения доставки не было, слушаю ответ клиента",
+                **({"reply_since": row["launch_ok_at"]} if row.get("launch_ok_at") else {}),
             )
             log_run(lead, stage, bot=bot, action="delivery", outcome="waiting_reply",
                     reason="статусов от Wazzup нет, бота запускает грид - жду ответ клиента, "

@@ -2817,3 +2817,59 @@ def test_confirm_path_also_reads_the_whole_window(monkeypatch):
     assert seen, "разбор ответа не вызван вовсе"
     assert "Да, всё верно" in seen[-1]
     assert len(seen[-1]) == 3        # все три сообщения окна, а не последнее
+
+
+def test_waiting_starts_from_the_template_not_from_the_pickup(monkeypatch):
+    """⚠️ Дефект дежурства 01.10.2026: срок «клиент молчит сутки» шёл от момента, когда робот
+    ЗАМЕТИЛ отправку, а не от самой отправки. Шаблон по заказу 19383 ушёл в 19:37, робот
+    подхватил сделку в 10:23 - менеджер узнал бы о молчании через 39 часов вместо 24."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    _capture(monkeypatch)
+    saved: list[dict] = []
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: saved.append(dict(k)))
+
+    async def activity(chat_id, since, name=""):
+        return {   # шаблон ушёл вечером, клиент молчит - ответов нет вовсе
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "telegram",
+                      "at": "2026-09-30T16:37:00+00:00"}],
+            "inbound": [],
+        }
+
+    monkeypatch.setattr(A, "fetch_chat_activity", activity)
+    lead = _lead(id=36569065, name="Заказ №19383", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.confirm_grid_send(lead, _stage(83537714, "Новый лид", []),
+                                    _bot(7131, launched_by="amo_grid"), "453512304"))
+
+    assert saved, "состояние не правилось вовсе"
+    assert saved[0].get("phase") == A.store.PHASE_REPLY
+    assert saved[0].get("reply_since") == "2026-09-30T16:37:00+00:00", (
+        "ждать начали не от шаблона")
+
+
+def test_without_the_template_time_the_stamp_is_left_to_the_store(monkeypatch):
+    """Времени шаблона в переписке нет - отметку не навязываем, её поставит хранилище (сейчас).
+    Пустая строка в поле хуже «сейчас»: срок ожидания тогда не истёк бы никогда."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    _capture(monkeypatch)
+    saved: list[dict] = []
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: saved.append(dict(k)))
+
+    async def activity(chat_id, since, name=""):
+        return {   # статус есть, а времени нет - так бывает у битых вебхуков
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "telegram"}],
+            "inbound": [],
+        }
+
+    monkeypatch.setattr(A, "fetch_chat_activity", activity)
+    lead = _lead(id=36569065, name="Заказ №19383", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.confirm_grid_send(lead, _stage(83537714, "Новый лид", []),
+                                    _bot(7131, launched_by="amo_grid"), "453512304"))
+
+    assert saved, "состояние не правилось вовсе"
+    assert "reply_since" not in saved[0]
