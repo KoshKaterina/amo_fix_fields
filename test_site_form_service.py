@@ -1676,6 +1676,20 @@ def test_entry_override_replaces_pipeline_stage_and_responsible(monkeypatch):
     assert "responsible_user_id" not in base
 
 
+def test_entry_override_skips_test_forms(monkeypatch):
+    """Пометка кнопки у стенда и боя одна: тестовую заявку в живую воронку пускать нельзя."""
+    monkeypatch.setattr(sf, "ENTRY_MAP", {"cooperation-wholesale": {
+        "pipeline_id": 10131762, "status_id": 80276162, "responsible_user_id": 13822630,
+        "source": "SRC_OPT", "tags": ["T_OPT"],
+    }})
+    base = sf.FORM_MAP["svyazatsya"]
+    payload = {"form": "test-callback", "context": {"entry": "cooperation-wholesale"}}
+    assert sf.apply_entry_override(base, payload) is base
+    # а боевая та же заявка - переопределяется
+    payload["form"] = "callback"
+    assert sf.apply_entry_override(base, payload)["pipeline_id"] == 10131762
+
+
 def test_entry_override_without_stage_drops_foreign_stage(monkeypatch):
     """Этап формы принадлежит её воронке: в чужую воронку его тащить нельзя."""
     monkeypatch.setattr(sf, "ENTRY_MAP", {"cooperation-media": {
