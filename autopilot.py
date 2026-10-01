@@ -2489,14 +2489,24 @@ async def confirm_grid_send(lead: dict, stage: dict, bot: dict, chat_id: str,
         # ⚠️ Клиент мог ответить, пока робот спал. Смотрим ЗДЕСЬ же, одним и тем же ответом
         # панели: иначе ответ нашёлся бы только подбором через пять минут, а в кейсе 28.09.2026
         # (заказ 19307) не нашёлся бы никогда - подбор смотрел переписку от начала ожидания.
-        answer = first_answer_after(data, template_sent_at(data))
-        if answer is not None:
-            logger.info("autopilot: по сделке %s ответ клиента пришёл до нас (%s)",
-                        lead_id, str(answer.get("at") or ""))
+        # ⚠️ Берём ВСЕ сообщения окна, а не одно (правка Кати 01.10.2026). Ретро-прогон ночных
+        # сделок поймал это сразу: по заказу 19388 здесь брался один ответ - и им оказывалось
+        # последнее сообщение «Заказ подтверждаю», хотя подтверждение «Да, всё верно» пришло
+        # двумя сообщениями раньше. Та же беда, что в подборе, но другим путём.
+        border = template_sent_at(data)
+        after = [i for i in (data.get("inbound") or []) if _at_or_after(i.get("at"), border)]
+        window = answer_window(after) if after else []
+        if window:
+            first = window[-1]
+            logger.info(
+                "autopilot: по сделке %s ответ клиента пришёл до нас (%s, сообщений %s)",
+                lead_id, str(first.get("at") or ""), len(window),
+            )
             await on_client_answer(
                 {"lead_id": lead_id, "status_id": status_id,
                  "bot_id": int(bot.get("bot_id") or 0)},
-                str(answer.get("text") or ""), str(answer.get("chat_type") or ""),
+                str(first.get("text") or ""), str(first.get("chat_type") or ""),
+                answers=[str(i.get("text") or "") for i in window],
             )
         return True
     await report_not_delivered(lead, stage, bot, status, chat_type, "по переписке панели")

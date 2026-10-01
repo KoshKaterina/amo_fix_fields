@@ -2777,3 +2777,43 @@ def test_old_rows_without_the_stamp_still_use_the_old_count():
     fresh = {"reply_since": A.shift_iso(A.datetime.datetime.now(A._UTC).isoformat(), -3600),
              "updated_at": A.datetime.datetime.now(A._UTC).isoformat()}
     assert 3500 < A.waiting_for_reply_s(fresh) < 3700
+
+
+def test_confirm_path_also_reads_the_whole_window(monkeypatch):
+    """⚠️ Тот же дефект, что в подборе, но другим путём - поймано ретро-прогоном 01.10.2026.
+    При подтверждении доставки робот брал ОДИН ответ, и им оказывалось последнее сообщение:
+    по заказу 19388 «Заказ подтверждаю» вместо «Да, всё верно» двумя сообщениями раньше."""
+    _settings(settings={"mode": "live", "work_hours": [{"start": "00:00", "end": "23:59"}],
+                        "live_whitelist_enabled": False},
+              pipeline_id=10593102, entry_status_id=83537714)
+    _capture(monkeypatch)
+    seen: list[list[str]] = []
+    monkeypatch.setattr(A.store, "update", lambda *a, **k: None)
+
+    async def activity(chat_id, since, name=""):
+        return {
+            "echo": [{"author_name": "Admin", "status": "read", "chat_type": "whatsapp",
+                      "at": "2026-10-01T02:50:00+00:00"}],
+            "inbound": [   # панель отдаёт свежее первым
+                {"text": "Заказ подтверждаю", "chat_type": "whatsapp",
+                 "at": "2026-10-01T02:56:00+00:00"},
+                {"text": "Заказ оплачен", "chat_type": "whatsapp",
+                 "at": "2026-10-01T02:51:30+00:00"},
+                {"text": "Да, всё верно", "chat_type": "whatsapp",
+                 "at": "2026-10-01T02:51:00+00:00"},
+            ],
+        }
+
+    async def fake_answer(row, text, chat_type="", **kw):
+        seen.append(list(kw.get("answers") or [text]))
+
+    monkeypatch.setattr(A, "fetch_chat_activity", activity)
+    monkeypatch.setattr(A, "on_client_answer", fake_answer)
+    lead = _lead(id=36569279, name="Заказ №19388", pipeline_id=10593102, status_id=83537714)
+
+    asyncio.run(A.confirm_grid_send(lead, _stage(83537714, "Новый лид", []),
+                                    _bot(7131, launched_by="amo_grid"), "79001112233"))
+
+    assert seen, "разбор ответа не вызван вовсе"
+    assert "Да, всё верно" in seen[-1]
+    assert len(seen[-1]) == 3        # все три сообщения окна, а не последнее
