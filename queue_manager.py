@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+import task_queue_store
 from api import add_info_from_ms, api_queue_size, get_lead_by_id, is_circuit_open, set_breaker_category
 from help_function import get_custom_field_value, normalize_text
 from memory import MAX_RETRY_ATTEMPTS
@@ -85,6 +86,27 @@ class WorkItem:
 
 
 _queues: dict[str, asyncio.PriorityQueue] = {}
+
+
+def _put(lane: str, priority: int, payload: dict) -> None:
+    """Единственная точка постановки задачи в дорожку.
+
+    Сведено в одну функцию 05.10.2026 вместе с журналом на диске: раньше
+    `put_nowait` стоял в девяти местах, и журналирование пришлось бы
+    дублировать девять раз — ровно так и расходятся такие вещи.
+
+    Порядок важен: сперва создаём WorkItem (он выдаёт sequence), потом пишем
+    строку журнала, и только потом кладём в очередь. id строки кладём в сам
+    payload под `_row_id` — тогда коалесинг (который правит payload на месте)
+    его не теряет, а воркер достаёт оттуда же, откуда берёт `_kind`.
+    """
+    kind = payload.get("_kind") or "lead_update"
+    item = WorkItem(priority=priority, payload=payload)
+    payload["_row_id"] = task_queue_store.add(
+        lane, priority, item.sequence, kind, payload.get("lead_id"), payload,
+    )
+    _queues[lane].put_nowait(item)
+
 _workers: dict[str, asyncio.Task] = {}
 _monitor_task: asyncio.Task | None = None
 _retry_tasks: set[asyncio.Task] = set()
@@ -108,12 +130,84 @@ _alert_last_sent: dict[str, float] = {}
 
 def init_queue() -> None:
     global _monitor_task
+    task_queue_store.init()
     for lane in LANES:
         _queues[lane] = asyncio.PriorityQueue()
         _workers[lane] = asyncio.create_task(_worker(lane))
         _lane_stats[lane] = {"last_waited": 0.0, "processed": 0}
     _monitor_task = asyncio.create_task(_monitor())
-    logger.info("Task queues started (lanes: %s)", ", ".join(LANES))
+    logger.info(
+        "Task queues started (lanes: %s, журнал на диске: %s)",
+        ", ".join(LANES), "вкл" if task_queue_store.is_enabled() else "ВЫКЛ",
+    )
+
+
+def _remember_pending(kind: str, payload: dict) -> None:
+    """Вернуть задачу в дедуп-пометки. Без этого повторная доставка вебхука
+    сразу после рестарта завела бы ВТОРУЮ задачу по той же сделке."""
+    lead_id = str(payload.get("lead_id", ""))
+    if kind == "waybill":
+        _pending_waybills.add(lead_id)
+    elif kind == "ozon_invoice":
+        _pending_invoice.add(lead_id)
+    elif kind == "office_transfer":
+        _pending_office_transfer.add(lead_id)
+    elif kind == "lead_distribution":
+        _pending_lead_distribution.add(lead_id)
+    elif kind == "metrika_sync":
+        _pending_metrika_sync.add(lead_id)
+    elif kind == "cdek_sync":
+        _pending_cdek_sync.add(str(payload.get("_key", "")))
+    elif kind == "jivo":
+        _pending_jivo.add(str(payload.get("_jivo_key", "")))
+    else:
+        _pending_leads[lead_id] = payload
+
+
+async def restore_queue() -> dict:
+    """Поднять очередь из журнала. Зовётся на старте ПОСЛЕ init_queue.
+
+    Строки, которые повторять нельзя (прерванный счёт — см. докстринг
+    task_queue_store), не возвращаются: по ним зовём человека, потому что
+    повторный заход создал бы в Ozon второй платёж."""
+    data = await asyncio.to_thread(task_queue_store.take_for_restore)
+    resume = data.get("resume") or []
+    skipped = data.get("skipped_running") or []
+    too_old = data.get("too_old") or 0
+
+    restored = 0
+    for row in resume:
+        lane = row.get("lane")
+        if lane not in _queues:
+            logger.warning("restore_queue: неизвестная дорожка %s, пропускаю", lane)
+            continue
+        payload = row.get("payload") or {}
+        kind = row.get("kind") or "lead_update"
+        _remember_pending(kind, payload)
+        _put(lane, int(row.get("priority", PRIORITY_NEW)), payload)
+        restored += 1
+
+    if restored or skipped or too_old:
+        logger.info(
+            "restore_queue: возвращено %s задач, не повторяем %s, выкинуто по возрасту %s",
+            restored, len(skipped), too_old,
+        )
+    else:
+        logger.info("restore_queue: журнал пуст, восстанавливать нечего")
+
+    if skipped:
+        lines = ", ".join(
+            f"{r.get('kind')} сделка {r.get('lead_id') or '—'}" for r in skipped[:10]
+        )
+        _alert_bg(
+            "restore-skipped",
+            f"⚠️ amo_fix_fields: после перезапуска {len(skipped)} задач(и) прерваны посередине "
+            f"и НЕ повторены автоматически — повтор создал бы дубль внешнего действия. "
+            f"Проверить руками: {lines}",
+            "queue_restore_skipped",
+            {"сколько": len(skipped), "задачи": lines},
+        )
+    return {"restored": restored, "skipped": len(skipped), "too_old": too_old}
 
 
 async def shutdown_queue() -> None:
@@ -187,6 +281,7 @@ def queue_stats() -> dict:
         out["api_served"] = detail["api_served"]
         out["api_promoted_by_starvation"] = detail["api_promoted_by_starvation"]
         out["backpressure"] = detail["backpressure"]
+        out["task_journal"] = task_queue_store.stats()
     except Exception:
         logger.exception("queue_stats: срез приоритетов пайплайна не собрался")
     return out
@@ -282,10 +377,11 @@ def enqueue_new(payload: dict) -> None:
         merged = [k for k, v in payload.items() if k != "lead_id" and v is not None]
         for key in merged:
             queued[key] = payload[key]
+        task_queue_store.update_payload(queued.get("_row_id"), queued)
         logger.info("COALESCE lead_id=%s: обновлены поля %s (сделка уже в очереди)", lead_id, merged or "—")
         return
     _pending_leads[lead_id] = payload
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_NEW, payload=payload))
+    _put(LANE_AMO, PRIORITY_NEW, payload)
     logger.info("ENQUEUE lead_id=%s lane=%s queue_size=%d", lead_id, LANE_AMO, _queues[LANE_AMO].qsize())
 
 
@@ -301,10 +397,11 @@ def enqueue_retry(payload: dict) -> None:
         for key, value in payload.items():
             if key not in ("lead_id", "attempt") and value is not None and queued.get(key) is None:
                 queued[key] = value
+        task_queue_store.update_payload(queued.get("_row_id"), queued)
         logger.info("Lead %s retry merged into queued item (fresh webhook wins)", lead_id)
         return
     _pending_leads[lead_id] = payload
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_RETRY, payload=payload))
+    _put(LANE_AMO, PRIORITY_RETRY, payload)
 
 
 def enqueue_waybill(lead_id, source: str = "webhook") -> None:
@@ -317,7 +414,7 @@ def enqueue_waybill(lead_id, source: str = "webhook") -> None:
         return
     _pending_waybills.add(key)
     payload = {"_kind": "waybill", "lead_id": lead_id, "source": source}
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_WAYBILL, payload=payload))
+    _put(LANE_AMO, PRIORITY_WAYBILL, payload)
     logger.info(
         "ENQUEUE waybill lead_id=%s source=%s lane=%s queue_size=%d",
         key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
@@ -338,7 +435,7 @@ def enqueue_invoice(lead_id, source: str = "webhook") -> None:
         return
     _pending_invoice.add(key)
     payload = {"_kind": "ozon_invoice", "lead_id": lead_id, "source": source}
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_INVOICE, payload=payload))
+    _put(LANE_AMO, PRIORITY_INVOICE, payload)
     logger.info(
         "ENQUEUE invoice lead_id=%s source=%s lane=%s queue_size=%d",
         key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
@@ -362,7 +459,7 @@ def enqueue_office_transfer(lead_id, source: str = "webhook") -> None:
         return
     _pending_office_transfer.add(key)
     payload = {"_kind": "office_transfer", "lead_id": lead_id, "source": source}
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_NEW, payload=payload))
+    _put(LANE_AMO, PRIORITY_NEW, payload)
     logger.info(
         "ENQUEUE office_transfer lead_id=%s source=%s lane=%s queue_size=%d",
         key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
@@ -383,7 +480,7 @@ def enqueue_lead_distribution(lead_id, source: str = "webhook") -> None:
         return
     _pending_lead_distribution.add(key)
     payload = {"_kind": "lead_distribution", "lead_id": lead_id, "source": source}
-    _queues[LANE_AMO].put_nowait(WorkItem(priority=PRIORITY_LEAD_DISTRIBUTION, payload=payload))
+    _put(LANE_AMO, PRIORITY_LEAD_DISTRIBUTION, payload)
     logger.info(
         "ENQUEUE lead_distribution lead_id=%s source=%s lane=%s queue_size=%d",
         key, source, LANE_AMO, _queues[LANE_AMO].qsize(),
@@ -404,9 +501,7 @@ def enqueue_cdek_sync(payload: dict) -> None:
         logger.info("CDEK sync %s already in queue, skipping duplicate", key)
         return
     _pending_cdek_sync.add(key)
-    _queues[LANE_CDEK].put_nowait(
-        WorkItem(priority=PRIORITY_CDEK_SYNC, payload={**payload, "_kind": "cdek_sync", "_key": key})
-    )
+    _put(LANE_CDEK, PRIORITY_CDEK_SYNC, {**payload, "_kind": "cdek_sync", "_key": key})
     logger.info(
         "ENQUEUE cdek_sync key=%s code=%s lane=%s queue_size=%d",
         key, payload.get("code"), LANE_CDEK, _queues[LANE_CDEK].qsize(),
@@ -427,10 +522,7 @@ def enqueue_jivo(payload: dict) -> None:
         return
     if key:
         _pending_jivo.add(key)
-    _queues[LANE_AMO].put_nowait(WorkItem(
-        priority=PRIORITY_JIVO,
-        payload={**payload, "_kind": "jivo", "_jivo_key": key},
-    ))
+    _put(LANE_AMO, PRIORITY_JIVO, {**payload, "_kind": "jivo", "_jivo_key": key})
     logger.info("ENQUEUE jivo key=%s lane=%s queue_size=%d", key, LANE_AMO, _queues[LANE_AMO].qsize())
 
 
@@ -451,10 +543,7 @@ def enqueue_metrika_sync(lead_id, status_id=None) -> None:
         return
 
     _pending_metrika_sync.add(key)
-    _queues[LANE_SYNC].put_nowait(WorkItem(
-        priority=PRIORITY_METRIKA_SYNC,
-        payload={"_kind": "metrika_sync", "lead_id": lead_id},
-    ))
+    _put(LANE_SYNC, PRIORITY_METRIKA_SYNC, {"_kind": "metrika_sync", "lead_id": lead_id})
     logger.info(
         "ENQUEUE metrika_sync lead_id=%s lane=%s queue_size=%d",
         key, LANE_SYNC, _queues[LANE_SYNC].qsize(),
@@ -470,6 +559,12 @@ async def _worker(lane: str) -> None:
         kind = item.payload.get("_kind") or "lead_update"
         category = _CATEGORY_BY_KIND.get(kind, "lead")
         set_breaker_category(category)
+        # Журнал: задача взята в работу. Если процесс умрёт сейчас, на старте
+        # строка будет видна как running, и вернём её только для типов из
+        # task_queue_store.RESUME_RUNNING (счёт туда НЕ входит — повтор создал
+        # бы второй платёж в Ozon).
+        _row_id = item.payload.get("_row_id")
+        await asyncio.to_thread(task_queue_store.mark_running, _row_id)
         if kind == "office_transfer":
             _pending_office_transfer.discard(lead_id)
         elif kind == "lead_distribution":
@@ -576,6 +671,10 @@ async def _worker(lane: str) -> None:
                 _pending_jivo.discard(str(item.payload.get("_jivo_key", "")))
             elif kind == "waybill":
                 _pending_waybills.discard(lead_id)
+            # Задача доработана (в том числе если её погасил брейкер или она
+            # упала) — строка журнала больше не нужна. Иначе её подняло бы на
+            # следующем старте и так по кругу.
+            await asyncio.to_thread(task_queue_store.drop, _row_id)
             queue.task_done()
 
 

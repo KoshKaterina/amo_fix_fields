@@ -74,6 +74,7 @@ from queue_manager import (
     enqueue_waybill,
     init_queue,
     queue_stats,
+    restore_queue,
     shutdown_queue,
 )
 from waybill_config import (
@@ -116,6 +117,14 @@ async def lifespan(app):
     except Exception:
         logger.exception("lead_status_store: чистка не прошла, работаем дальше")
     await amo_service.warm_pipeline_cache()
+    # Поднимаем очередь из журнала на диске — ПОСЛЕ прогрева кэша этапов, чтобы
+    # восстановленные задачи сразу работали с нормальной картой воронок.
+    # Прерванные посередине задачи, повтор которых создал бы дубль внешнего
+    # действия (счёт в Ozon), не возвращаются — по ним уходит алерт.
+    try:
+        await restore_queue()
+    except Exception:
+        logger.exception("restore_queue: восстановление очереди не удалось, работаем дальше")
     await cdek_client.init()
     await telegram_bot.init_telegram_bot()
     await cdek_status_sync.init()
