@@ -3,6 +3,8 @@ import contextvars
 import logging
 import os
 import time
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pprint import pprint
 from typing import Any
@@ -108,6 +110,82 @@ def _record_success(category: str | None = None) -> None:
 # из разрешённых 7 (разбор 08.07.2026).
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# ПРИОРИТЕТЫ API-пайплайна (05.10.2026, разбор затора очереди).
+#
+# Зачем. Пайплайн был плоской FIFO, и это обнуляло всю приоритизацию уровнем
+# выше: queue_manager снимает клиентскую задачу с дорожки первой (у него
+# PriorityQueue), но её первый же вызов amo встаёт в хвост за тысячами фоновых
+# запросов. 05.10 так и вышло: в пайплайне стояло 4810 запросов, платёжные
+# ссылки СБП по сделкам 36565047 и 36572215 ждали больше часа, при том что сами
+# задачи были сняты с дорожки вовремя.
+#
+# Откуда берётся приоритет. НЕ новый механизм: пользуемся тем же contextvar
+# категории, что и брейкер (_breaker_category), — его уже ставит воркер дорожки
+# по kind задачи, и contextvars наследуются в create_task, то есть фоновые
+# обработчики, рождённые из вебхука, несут категорию запроса сами.
+# Непомеченные пути («default»: старт, админские ручки панели, сторожа из
+# вебхука) идут НОРМАЛЬНЫМ приоритетом — не хуже, чем было до правки.
+#
+# ⚠️ Чего правка НЕ делает: не меняет баланс «office_transfer против счёта»
+# внутри дорожки. Там office_transfer стоит с PRIORITY_NEW по прямому
+# требованию Кати, и здесь он тоже отнесён к клиентскому классу. Развязка этих
+# двух — отдельное бизнес-решение, пункт 4 плана улучшений.
+# ---------------------------------------------------------------------------
+API_PRIORITY_CLIENT = 0       # человек ждёт прямо сейчас
+API_PRIORITY_NORMAL = 5       # всё непомеченное
+API_PRIORITY_BACKGROUND = 9   # сверки, аналитика, догоняющие опросы
+
+_PRIORITY_BY_CATEGORY = {
+    "invoice": API_PRIORITY_CLIENT,            # клиент ждёт ссылку на оплату
+    "lead_distribution": API_PRIORITY_CLIENT,  # лид ждёт живого менеджера
+    "jivo": API_PRIORITY_CLIENT,               # чат идёт в реальном времени
+    "waybill": API_PRIORITY_CLIENT,            # клиент ждёт отправку
+    "lead": API_PRIORITY_CLIENT,               # заполнение полей по вебхуку
+    "office_transfer": API_PRIORITY_CLIENT,    # см. оговорку выше
+    "cdek": API_PRIORITY_NORMAL,               # движение статусов, операционное
+    "sync": API_PRIORITY_BACKGROUND,           # метрика+woo, реальное время не нужно
+}
+
+# Сколько запрос любого класса может прождать, прежде чем его пропустят вперёд
+# несмотря на приоритет. Без этого непрерывный клиентский поток мог бы держать
+# сверки в очереди бесконечно — а сверки у нас страховка, именно они догоняют
+# потерянное. 30 с: заметно меньше интервала самих сверок (120-180 с).
+API_STARVATION_SECONDS = float(os.getenv("AMO_API_STARVATION_SECONDS", "30"))
+
+_api_priority: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "amo_api_priority", default=None
+)
+
+
+def set_api_priority(priority: int | None) -> None:
+    """Явно задать приоритет для текущего async-контекста (и всех задач,
+    созданных из него). Нужен там, где категория брейкера ничего не говорит о
+    срочности: фоновые циклы сверок помечают себя BACKGROUND сами."""
+    _api_priority.set(priority)
+
+
+def current_api_priority() -> int:
+    explicit = _api_priority.get()
+    if explicit is not None:
+        return explicit
+    return _PRIORITY_BY_CATEGORY.get(_breaker_category.get(), API_PRIORITY_NORMAL)
+
+
+@contextmanager
+def api_priority(priority: int):
+    """Поднять (или опустить) приоритет на время блока и вернуть как было.
+
+    Нужно внутри фоновых циклов: сам обход идёт фоном, но если он нашёл работу,
+    которой ждёт живой человек (сверка счетов нашла сделку без платёжной
+    ссылки), то саму работу делаем клиентским приоритетом."""
+    token = _api_priority.set(priority)
+    try:
+        yield
+    finally:
+        _api_priority.reset(token)
+
+
 @dataclass
 class ApiRequest:
     method: str
@@ -115,28 +193,88 @@ class ApiRequest:
     req_headers: dict
     json_body: dict | None
     future: asyncio.Future
+    priority: int = API_PRIORITY_NORMAL
+    enqueued_at: float = 0.0
 
 
-_api_queue: asyncio.Queue[ApiRequest] | None = None
+# Дорожка на класс приоритета. Намеренно deque, а не PriorityQueue: потребитель
+# ОДИН (воркер), а заглядывать в голову дорожки нужно — без этого не сделать
+# защиту от голодания. Будильник — Event, producers и consumer в одном лупе,
+# поэтому гонок на append/popleft нет.
+_lanes: dict[int, Any] = {}
+_wakeup: asyncio.Event | None = None
 _api_worker_task: asyncio.Task | None = None
 _last_sent_at: float = 0.0
+_served: dict[int, int] = {}
+_promoted_by_starvation = 0
 
 
 def api_queue_size() -> int:
-    """Размер внутренней очереди API-пайплайна — для наблюдаемости.
+    """Суммарный размер внутренней очереди API-пайплайна — для наблюдаемости.
 
     Это ВТОРАЯ очередь сервиса (первая — task-очереди в queue_manager): сюда
     сваливаются запросы и от воркеров дорожек, и от фоновых задач (unmiss/
     urgency/showroom/сверки). До 08.07.2026 её размер не логировался нигде —
     затор здесь был невидим."""
-    return _api_queue.qsize() if _api_queue is not None else 0
+    return sum(len(d) for d in _lanes.values())
+
+
+def api_queue_stats() -> dict:
+    """Срез пайплайна по классам приоритета: глубина и сколько ждёт голова.
+
+    Закрывает слепую зону разбора 05.10.2026: по одной суммарной глубине не
+    видно, стоит ли клиентский путь или это фон копится."""
+    now = time.monotonic()
+    names = {API_PRIORITY_CLIENT: "client", API_PRIORITY_NORMAL: "normal",
+             API_PRIORITY_BACKGROUND: "background"}
+    depth, oldest = {}, {}
+    for prio, lane in _lanes.items():
+        key = names.get(prio, str(prio))
+        depth[key] = len(lane)
+        oldest[key] = round(now - lane[0].enqueued_at, 1) if lane else 0.0
+    return {
+        "api_queue": sum(depth.values()),
+        "api_depth": depth,
+        "api_oldest_wait_s": oldest,
+        "api_served": {names.get(p, str(p)): n for p, n in _served.items()},
+        "api_promoted_by_starvation": _promoted_by_starvation,
+    }
+
+
+def _take_next() -> ApiRequest | None:
+    """Кого отправляем следующим. Сперва проверяем, не переждал ли кто порог
+    (иначе клиентский поток заморозил бы сверки), и только потом — приоритет."""
+    global _promoted_by_starvation
+    now = time.monotonic()
+    starved = [p for p, lane in _lanes.items()
+               if lane and now - lane[0].enqueued_at >= API_STARVATION_SECONDS]
+    if starved:
+        worst = max(starved, key=lambda p: now - _lanes[p][0].enqueued_at)
+        # поднимаем только если впереди него реально кто-то есть
+        if any(_lanes[p] for p in _lanes if p < worst):
+            _promoted_by_starvation += 1
+        _served[worst] = _served.get(worst, 0) + 1
+        return _lanes[worst].popleft()
+    for prio in sorted(_lanes):
+        if _lanes[prio]:
+            _served[prio] = _served.get(prio, 0) + 1
+            return _lanes[prio].popleft()
+    return None
 
 
 def init_api_pipeline() -> None:
-    global _api_queue, _api_worker_task
-    _api_queue = asyncio.Queue()
+    global _lanes, _wakeup, _api_worker_task, _served, _promoted_by_starvation
+    _lanes = {API_PRIORITY_CLIENT: deque(), API_PRIORITY_NORMAL: deque(),
+              API_PRIORITY_BACKGROUND: deque()}
+    _served = {}
+    _promoted_by_starvation = 0
+    _wakeup = asyncio.Event()
     _api_worker_task = asyncio.create_task(_api_worker())
-    logger.info("API sequential pipeline started (interval=%.2fs)", MIN_REQUEST_INTERVAL_SECONDS)
+    logger.info(
+        "API sequential pipeline started (interval=%.2fs, приоритеты: клиент/норма/фон, "
+        "порог голодания %.0fs)",
+        MIN_REQUEST_INTERVAL_SECONDS, API_STARVATION_SECONDS,
+    )
 
 
 async def shutdown_api_pipeline() -> None:
@@ -149,23 +287,29 @@ async def shutdown_api_pipeline() -> None:
             pass
         _api_worker_task = None
 
-    if _api_queue is not None:
-        while not _api_queue.empty():
-            try:
-                req = _api_queue.get_nowait()
-                if not req.future.done():
-                    req.future.set_exception(asyncio.CancelledError())
-            except asyncio.QueueEmpty:
-                break
+    for lane in _lanes.values():
+        while lane:
+            req = lane.popleft()
+            if not req.future.done():
+                req.future.set_exception(asyncio.CancelledError())
 
     logger.info("API sequential pipeline stopped")
+
+
+async def _next_request() -> ApiRequest:
+    while True:
+        req = _take_next()
+        if req is not None:
+            return req
+        _wakeup.clear()
+        await _wakeup.wait()
 
 
 async def _api_worker() -> None:
     global _last_sent_at
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         while True:
-            req = await _api_queue.get()
+            req = await _next_request()
             try:
                 # Зазор — от ОТПРАВКИ прошлого запроса. Последовательность
                 # (ждать ответ) обеспечивает сам цикл: await ниже не вернётся,
@@ -192,22 +336,38 @@ async def _api_worker() -> None:
             except Exception as exc:
                 if not req.future.done():
                     req.future.set_exception(exc)
-            finally:
-                _api_queue.task_done()
 
 
-async def submit_request(method: str, url: str, req_headers: dict, json_body: dict | None = None) -> httpx.Response:
-    if _api_queue is None:
+async def submit_request(
+    method: str,
+    url: str,
+    req_headers: dict,
+    json_body: dict | None = None,
+    priority: int | None = None,
+) -> httpx.Response:
+    """Поставить запрос к amo в пайплайн и дождаться ответа.
+
+    `priority` обычно не передают: он выводится из категории текущего контекста
+    (см. current_api_priority). Явный аргумент — для редких случаев, когда
+    вызывающий знает лучше.
+    """
+    if not _lanes or _wakeup is None:
         raise RuntimeError("API pipeline not initialized — call init_api_pipeline() first")
     loop = asyncio.get_running_loop()
     future = loop.create_future()
-    await _api_queue.put(ApiRequest(
+    prio = current_api_priority() if priority is None else priority
+    if prio not in _lanes:
+        prio = API_PRIORITY_NORMAL
+    _lanes[prio].append(ApiRequest(
         method=method,
         url=url,
         req_headers=req_headers,
         json_body=json_body,
         future=future,
+        priority=prio,
+        enqueued_at=time.monotonic(),
     ))
+    _wakeup.set()
     return await future
 
 

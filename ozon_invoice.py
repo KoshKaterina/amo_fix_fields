@@ -1097,7 +1097,12 @@ async def _retry_missing_link(lead: dict) -> int:
         return 0
     _no_link_tried_at[lead_id] = updated_at
 
-    outcome = await process_invoice_lead(lead_id, source="reconcile")
+    # Сам обход идёт фоном (см. _reconcile_loop), но здесь уже найден живой
+    # клиент, который ждёт платёжную ссылку, — создание счёта поднимаем до
+    # клиентского приоритета (05.10.2026).
+    import api
+    with api.api_priority(api.API_PRIORITY_CLIENT):
+        outcome = await process_invoice_lead(lead_id, source="reconcile")
     if outcome == "created":
         logger.info("Ozon сверка: сделка %s висела без ссылки %.0f мин — счёт создан заново",
                     lead_id, quiet_min)
@@ -1192,6 +1197,13 @@ async def _reconcile_once() -> str:
 
 
 async def _reconcile_loop() -> None:
+    # Догоняющий проход помечаем фоном — см. office_transfer._reconcile_loop.
+    # ⚠️ Фоном идёт только САМ ОБХОД (чтение сделок по этапам, опрос Ozon).
+    # Когда обход находит сделку без платёжной ссылки, он зовёт
+    # process_invoice_lead напрямую, и там приоритет поднимается обратно до
+    # клиентского — см. _retry_missing_link.
+    import api
+    api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         await asyncio.sleep(OZON_RECONCILE_INTERVAL_S)
         try:

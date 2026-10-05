@@ -162,7 +162,7 @@ def queue_stats() -> dict:
     """Срез очередей для /health, QUEUE STATUS и алертов: глубина каждой
     дорожки, глубина внутренней очереди API-пайплайна, последнее ожидание и
     счётчики обработанного по дорожкам."""
-    return {
+    out = {
         "lanes": {lane: q.qsize() for lane, q in _queues.items()},
         "api_queue": api_queue_size(),
         "last_waited_s": {
@@ -170,6 +170,19 @@ def queue_stats() -> dict:
         },
         "processed": {lane: stats["processed"] for lane, stats in _lane_stats.items()},
     }
+    # Разбивка пайплайна по классам приоритета (05.10.2026): по одной суммарной
+    # глубине не видно, стоит ли клиентский путь или это копится фон. Ключ
+    # api_queue выше оставлен как был — на него смотрят монитор и алерты.
+    try:
+        from api import api_queue_stats
+        detail = api_queue_stats()
+        out["api_depth"] = detail["api_depth"]
+        out["api_oldest_wait_s"] = detail["api_oldest_wait_s"]
+        out["api_served"] = detail["api_served"]
+        out["api_promoted_by_starvation"] = detail["api_promoted_by_starvation"]
+    except Exception:
+        logger.exception("queue_stats: срез приоритетов пайплайна не собрался")
+    return out
 
 
 def _alert_bg(key: str, text: str, event: str | None = None, values: dict | None = None) -> None:

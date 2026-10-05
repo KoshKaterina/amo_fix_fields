@@ -836,6 +836,12 @@ async def _reconcile_once() -> str:
 
 
 async def _reconcile_loop() -> None:
+    # Проход — догоняющий, не живой клиентский путь: помечаем себя фоном, чтобы
+    # его запросы к amo не стояли впереди счёта СБП и распределения (05.10.2026).
+    # contextvar ставится один раз на задачу цикла и наследуется всем, что он
+    # внутри создаёт. От голодания страхует порог в api.API_STARVATION_SECONDS.
+    import api
+    api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         await asyncio.sleep(OFFICE_TRANSFER_RECONCILE_INTERVAL_S)
         try:

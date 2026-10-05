@@ -1468,6 +1468,9 @@ async def _reconcile_once() -> str:
 
 
 async def _reconcile_loop() -> None:
+    # Догоняющий проход помечаем фоном — см. office_transfer._reconcile_loop.
+    import api
+    api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         await asyncio.sleep(LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S)
         try:
