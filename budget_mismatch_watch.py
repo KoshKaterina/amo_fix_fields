@@ -455,9 +455,14 @@ async def _notify(found: list[dict]) -> None:
 
 
 async def _loop() -> None:
+    import api
+    api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         try:
-            await sweep_once()
+            # ⚠️ Гейт backpressure ОБОРАЧИВАЕТ работу, а не делает continue:
+            # в этом цикле sleep стоит НИЖЕ, и continue увёл бы в busy-loop.
+            if not api.skip_if_congested("Сторож бюджета"):
+                await sweep_once()
         except asyncio.CancelledError:
             raise
         except Exception:

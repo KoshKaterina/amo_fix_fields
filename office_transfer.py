@@ -844,6 +844,10 @@ async def _reconcile_loop() -> None:
     api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         await asyncio.sleep(OFFICE_TRANSFER_RECONCILE_INTERVAL_S)
+        # Пайплайн забит — не подливаем: проход идемпотентный, повторим через
+        # интервал. Здесь continue безопасен, sleep стоит ВЫШЕ работы.
+        if api.skip_if_congested("office_transfer reconcile"):
+            continue
         try:
             await _reconcile_once()
         except asyncio.CancelledError:

@@ -30,6 +30,7 @@ def _fresh_lanes():
     """Чистый пайплайн без живого воркера: воркер в тестах не нужен, futures
     разрешаем сами."""
     api._lanes = {
+        api.API_PRIORITY_URGENT: deque(),
         api.API_PRIORITY_CLIENT: deque(),
         api.API_PRIORITY_NORMAL: deque(),
         api.API_PRIORITY_BACKGROUND: deque(),
@@ -37,6 +38,10 @@ def _fresh_lanes():
     api._served = {}
     api._promoted_by_starvation = 0
     api._wakeup = None
+    api._congested = False
+    api._backpressure_skips = {}
+    api.BACKPRESSURE_DEPTH = 200
+    api.BACKPRESSURE_CLEAR_DEPTH = 50
     api.set_api_priority(None)
     api.set_breaker_category("default")
 
@@ -58,7 +63,7 @@ def test_priority_derived_from_breaker_category():
     и contextvars наследуются в create_task."""
     _fresh_lanes()
     api.set_breaker_category("invoice")
-    assert api.current_api_priority() == api.API_PRIORITY_CLIENT
+    assert api.current_api_priority() == api.API_PRIORITY_URGENT
     api.set_breaker_category("lead_distribution")
     assert api.current_api_priority() == api.API_PRIORITY_CLIENT
     api.set_breaker_category("sync")
@@ -119,10 +124,11 @@ def test_client_goes_before_background():
     _put(api.API_PRIORITY_BACKGROUND, "фон-2")
     _put(api.API_PRIORITY_NORMAL, "норма")
     _put(api.API_PRIORITY_CLIENT, "клиент")
+    _put(api.API_PRIORITY_URGENT, "счёт")
     order = []
     while api.api_queue_size():
         order.append(api._take_next().url)
-    assert order == ["/клиент", "/норма", "/фон-1", "/фон-2"], order
+    assert order == ["/счёт", "/клиент", "/норма", "/фон-1", "/фон-2"], order
 
 
 def test_fifo_inside_one_class():
@@ -202,7 +208,7 @@ def test_stats_show_depth_and_oldest_wait_per_class():
     _put(api.API_PRIORITY_BACKGROUND, "ф2", waited=3)
     st = api.api_queue_stats()
     assert st["api_queue"] == 3
-    assert st["api_depth"] == {"client": 1, "normal": 0, "background": 2}
+    assert st["api_depth"] == {"urgent": 0, "client": 1, "normal": 0, "background": 2}
     assert st["api_oldest_wait_s"]["background"] >= 11.5   # голова, не хвост
     assert st["api_oldest_wait_s"]["normal"] == 0.0
 
@@ -222,11 +228,11 @@ def test_submit_request_routes_by_context():
     async def scenario():
         _fresh_lanes()
         api._wakeup = asyncio.Event()
-        api.set_breaker_category("invoice")          # клиентская категория
+        api.set_breaker_category("invoice")          # верхний класс: платёжная ссылка
         task = asyncio.create_task(api.submit_request("GET", "/счёт", {}))
         await asyncio.sleep(0)                        # дать задаче поставить запрос
-        assert len(api._lanes[api.API_PRIORITY_CLIENT]) == 1
-        assert api._lanes[api.API_PRIORITY_CLIENT][0].url == "/счёт"
+        assert len(api._lanes[api.API_PRIORITY_URGENT]) == 1
+        assert api._lanes[api.API_PRIORITY_URGENT][0].url == "/счёт"
         assert api._wakeup.is_set(), "воркера надо будить"
         task.cancel()
         try:
@@ -274,6 +280,158 @@ def test_unknown_priority_falls_back_to_normal():
         task = asyncio.create_task(api.submit_request("GET", "/чужой", {}, priority=777))
         await asyncio.sleep(0)
         assert len(api._lanes[api.API_PRIORITY_NORMAL]) == 1
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    run(scenario())
+
+
+# ── платёжная ссылка выше всех (решение Тианы 05.10.2026) ──────────────────
+
+def test_invoice_beats_every_other_client_work():
+    """⚠️ Ядро правки: счёт обгоняет и распределение, и перенос в Офис, и
+    заполнение полей. До 05.10 он стоял НИЖЕ их всех."""
+    _fresh_lanes()
+    api.API_STARVATION_SECONDS = 30
+    _put(api.API_PRIORITY_CLIENT, "распределение")
+    _put(api.API_PRIORITY_CLIENT, "перенос-в-офис")
+    _put(api.API_PRIORITY_CLIENT, "заполнение-полей")
+    _put(api.API_PRIORITY_URGENT, "платёжная-ссылка")
+    assert api._take_next().url == "/платёжная-ссылка"
+
+
+def test_invoice_jumps_a_full_pipeline():
+    """Сценарий 05.10 в миниатюре: 500 переносов и 3000 фоновых запросов, и
+    счёт всё равно идёт первым."""
+    _fresh_lanes()
+    api.API_STARVATION_SECONDS = 1e9   # голодание тут ни при чём
+    for i in range(500):
+        _put(api.API_PRIORITY_CLIENT, f"перенос{i}")
+    for i in range(3000):
+        _put(api.API_PRIORITY_BACKGROUND, f"фон{i}")
+    _put(api.API_PRIORITY_URGENT, "счёт")
+    assert api._take_next().url == "/счёт"
+
+
+def test_invoice_category_maps_to_urgent():
+    _fresh_lanes()
+    assert api._PRIORITY_BY_CATEGORY["invoice"] == api.API_PRIORITY_URGENT
+    assert api.API_PRIORITY_URGENT < api.API_PRIORITY_CLIENT
+
+
+def test_lane_priority_invoice_is_highest():
+    """Второй уровень: приоритет ДОРОЖКИ в queue_manager. Счёт обязан быть
+    строго выше PRIORITY_NEW, иначе задачу снимут позже всех остальных и
+    приоритет в пайплайне уже не поможет."""
+    import queue_manager as qm
+    assert qm.PRIORITY_INVOICE < qm.PRIORITY_NEW, (qm.PRIORITY_INVOICE, qm.PRIORITY_NEW)
+    assert qm.PRIORITY_INVOICE < qm.PRIORITY_WAYBILL
+    assert qm.PRIORITY_INVOICE < qm.PRIORITY_LEAD_DISTRIBUTION
+
+
+# ── backpressure для фона ───────────────────────────────────────────────────
+
+def test_backpressure_off_while_queue_is_shallow():
+    _fresh_lanes()
+    for i in range(10):
+        _put(api.API_PRIORITY_BACKGROUND, f"ф{i}")
+    assert api.is_congested() is False
+    assert api.skip_if_congested("проход") is False
+
+
+def test_backpressure_turns_on_at_threshold():
+    _fresh_lanes()
+    api.BACKPRESSURE_DEPTH = 20
+    api.BACKPRESSURE_CLEAR_DEPTH = 5
+    for i in range(20):
+        _put(api.API_PRIORITY_NORMAL, f"з{i}")
+    assert api.is_congested() is True
+    assert api.skip_if_congested("office_transfer reconcile") is True
+    assert api._backpressure_skips["office_transfer reconcile"] == 1
+
+
+def test_backpressure_hysteresis_does_not_flap():
+    """Между порогами состояние НЕ переключается: вошли на 20, держимся, пока
+    не разгрузимся до 5. Без гистерезиса проходы отваливались бы у порога."""
+    _fresh_lanes()
+    api.BACKPRESSURE_DEPTH = 20
+    api.BACKPRESSURE_CLEAR_DEPTH = 5
+    for i in range(20):
+        _put(api.API_PRIORITY_NORMAL, f"з{i}")
+    assert api.is_congested() is True
+    for _ in range(12):            # осталось 8 — это между порогами
+        api._take_next()
+    assert api.api_queue_size() == 8
+    assert api.is_congested() is True, "между порогами перегрузка должна держаться"
+    for _ in range(4):             # осталось 4 — ниже порога снятия
+        api._take_next()
+    assert api.is_congested() is False
+
+
+def test_backpressure_can_be_disabled_by_zero():
+    _fresh_lanes()
+    api.BACKPRESSURE_DEPTH = 0
+    for i in range(500):
+        _put(api.API_PRIORITY_NORMAL, f"з{i}")
+    assert api.is_congested() is False
+    assert api.skip_if_congested("проход") is False
+
+
+def test_backpressure_counts_skips_per_pass_name():
+    _fresh_lanes()
+    api.BACKPRESSURE_DEPTH = 10
+    api.BACKPRESSURE_CLEAR_DEPTH = 2
+    for i in range(10):
+        _put(api.API_PRIORITY_NORMAL, f"з{i}")
+    api.skip_if_congested("ozon сверка")
+    api.skip_if_congested("ozon сверка")
+    api.skip_if_congested("mail_watch")
+    assert api._backpressure_skips == {"ozon сверка": 2, "mail_watch": 1}
+
+
+def test_stats_expose_backpressure():
+    _fresh_lanes()
+    api.BACKPRESSURE_DEPTH = 10
+    api.BACKPRESSURE_CLEAR_DEPTH = 2
+    for i in range(10):
+        _put(api.API_PRIORITY_NORMAL, f"з{i}")
+    api.skip_if_congested("сторож бюджета")
+    bp = api.api_queue_stats()["backpressure"]
+    assert bp["congested"] is True
+    assert bp["depth_on"] == 10 and bp["depth_off"] == 2
+    assert bp["skipped_passes"]["сторож бюджета"] == 1
+
+
+def test_stats_do_not_move_the_hysteresis_machine():
+    """Срез для health обязан только читать: иначе опрос /health сам решал бы,
+    пропускать ли фоновые проходы."""
+    _fresh_lanes()
+    api.BACKPRESSURE_DEPTH = 10
+    api.BACKPRESSURE_CLEAR_DEPTH = 2
+    for i in range(10):
+        _put(api.API_PRIORITY_NORMAL, f"з{i}")
+    assert api.api_queue_stats()["backpressure"]["congested"] is False
+    assert api._congested is False
+
+
+def test_backpressure_never_blocks_client_or_invoice():
+    """Backpressure — добровольный гейт фоновых проходов. Клиентские и
+    платёжные запросы он не трогает вообще: у них путь строго вперёд."""
+    async def scenario():
+        _fresh_lanes()
+        api._wakeup = asyncio.Event()
+        api.BACKPRESSURE_DEPTH = 5
+        api.BACKPRESSURE_CLEAR_DEPTH = 1
+        for i in range(10):
+            _put(api.API_PRIORITY_BACKGROUND, f"ф{i}")
+        assert api.is_congested() is True
+        api.set_breaker_category("invoice")
+        task = asyncio.create_task(api.submit_request("GET", "/счёт", {}))
+        await asyncio.sleep(0)
+        assert len(api._lanes[api.API_PRIORITY_URGENT]) == 1, "счёт обязан встать в очередь"
+        assert api._take_next().url == "/счёт"
         task.cancel()
         try:
             await task

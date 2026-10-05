@@ -554,11 +554,18 @@ async def _intraday_loop() -> None:
     последний проход неизвестен → берём предыдущий слот расписания
     (_prev_slot_ts; плюс ночная полная сверка добирает всё в пределах
     RECONCILE_DAYS)."""
+    import api
     while True:
         try:
             await asyncio.sleep(_seconds_until_next_of(INTRADAY_HOURS_MSK))
         except asyncio.CancelledError:
             raise
+        # Аналитике реальное время не нужно (08.07.2026): при забитом пайплайне
+        # пропускаем слот целиком. Окно следующего прохода просто растянется —
+        # механика «пропущенный запуск растягивает окно» описана в докстринге,
+        # а ночная полная сверка добирает всё в пределах RECONCILE_DAYS.
+        if api.skip_if_congested("metrika intraday"):
+            continue
         try:
             base = _last_reconcile_ts if _last_reconcile_ts is not None else _prev_slot_ts()
             await reconcile_window(since_ts=base - INTRADAY_OVERLAP_SECONDS)

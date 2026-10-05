@@ -422,10 +422,14 @@ async def _handle_missing(missing: list[dict]) -> None:
 
 async def _loop() -> None:
     # Первый проход - не сразу после старта: даём сервису подняться.
+    import api
+    api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     await asyncio.sleep(30)
     while True:
         try:
-            await check_once()
+            # Гейт оборачивает работу, а не continue: sleep ниже (см. budget_watch).
+            if not api.skip_if_congested("amgroup_fallback"):
+                await check_once()
         except asyncio.CancelledError:
             raise
         except Exception:

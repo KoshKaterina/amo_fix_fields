@@ -21,7 +21,13 @@ PRIORITY_NEW = 0
 # поведению (в 9dd0e93 было PRIORITY_NEW). Тай-брейк с lead_update — FIFO по sequence.
 PRIORITY_JIVO = PRIORITY_NEW
 PRIORITY_WAYBILL = 5
-PRIORITY_INVOICE = PRIORITY_WAYBILL  # счёт СБП «Оплата запрошена» — клиент ЖДЁТ ссылку, путь клиентский
+# ⚠️ Счёт СБП — ВЫШЕ ВСЕГО, включая заполнение полей и перенос в Офис (решение
+# Тианы 05.10.2026). Клиент в этот момент смотрит в экран оплаты: он уже
+# согласился платить и ждёт QR. Было PRIORITY_INVOICE = PRIORITY_WAYBILL = 5,
+# то есть НИЖЕ office_transfer и lead_update (оба PRIORITY_NEW = 0) — при заторе
+# 05.10 платёжные ссылки по сделкам 36565047 и 36572215 именно поэтому и
+# простояли больше часа за пятьюстами задачами переноса.
+PRIORITY_INVOICE = -10
 PRIORITY_RETRY = 10
 PRIORITY_CDEK_SYNC = 20
 PRIORITY_METRIKA_SYNC = 25
@@ -180,6 +186,7 @@ def queue_stats() -> dict:
         out["api_oldest_wait_s"] = detail["api_oldest_wait_s"]
         out["api_served"] = detail["api_served"]
         out["api_promoted_by_starvation"] = detail["api_promoted_by_starvation"]
+        out["backpressure"] = detail["backpressure"]
     except Exception:
         logger.exception("queue_stats: срез приоритетов пайплайна не собрался")
     return out

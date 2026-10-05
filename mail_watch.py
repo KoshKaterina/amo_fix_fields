@@ -468,9 +468,13 @@ async def _notify(created: list[dict]) -> None:
 
 
 async def _loop() -> None:
+    import api
+    api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         try:
-            await reconcile_once()
+            # Гейт оборачивает работу, а не continue: sleep ниже (см. budget_watch).
+            if not api.skip_if_congested("mail_watch"):
+                await reconcile_once()
         except asyncio.CancelledError:
             raise
         except Exception:

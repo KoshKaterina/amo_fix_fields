@@ -132,12 +132,19 @@ def _record_success(category: str | None = None) -> None:
 # требованию Кати, и здесь он тоже отнесён к клиентскому классу. Развязка этих
 # двух — отдельное бизнес-решение, пункт 4 плана улучшений.
 # ---------------------------------------------------------------------------
+# ⚠️ Платёжная ссылка — ВЫШЕ всего остального (решение Тианы 05.10.2026). Клиент
+# в этот момент смотрит в экран оплаты: он уже согласился платить и ждёт QR. Всё
+# прочее, включая перенос в Офис, может подождать секунды, а он — нет. До этого
+# счёт стоял в одном классе с остальным клиентским путём, а в дорожке очереди и
+# вовсе НИЖЕ office_transfer (PRIORITY_INVOICE был равен PRIORITY_WAYBILL = 5
+# против PRIORITY_NEW = 0) — то есть ровно наоборот.
+API_PRIORITY_URGENT = -5      # платёжная ссылка СБП
 API_PRIORITY_CLIENT = 0       # человек ждёт прямо сейчас
 API_PRIORITY_NORMAL = 5       # всё непомеченное
 API_PRIORITY_BACKGROUND = 9   # сверки, аналитика, догоняющие опросы
 
 _PRIORITY_BY_CATEGORY = {
-    "invoice": API_PRIORITY_CLIENT,            # клиент ждёт ссылку на оплату
+    "invoice": API_PRIORITY_URGENT,            # клиент ждёт ссылку на оплату — вперёд всех
     "lead_distribution": API_PRIORITY_CLIENT,  # лид ждёт живого менеджера
     "jivo": API_PRIORITY_CLIENT,               # чат идёт в реальном времени
     "waybill": API_PRIORITY_CLIENT,            # клиент ждёт отправку
@@ -153,9 +160,85 @@ _PRIORITY_BY_CATEGORY = {
 # потерянное. 30 с: заметно меньше интервала самих сверок (120-180 с).
 API_STARVATION_SECONDS = float(os.getenv("AMO_API_STARVATION_SECONDS", "30"))
 
+# ---------------------------------------------------------------------------
+# BACKPRESSURE для фона (05.10.2026).
+#
+# Приоритеты решают, КОГО отправить следующим, но не решают главного: фоновые
+# проходы продолжают СЫПАТЬ в пайплайн, пока он и так забит. 05.10 всплеск
+# вебхуков развернулся в ~4800 запросов именно так — обработчики и сверки
+# стартовали как asyncio.create_task без всякого «а можно ли сейчас».
+#
+# Теперь фоновый проход сам спрашивает разрешения: при глубокой очереди он
+# ПРОПУСКАЕТ тик и повторит через свой интервал. Все такие проходы идемпотентны
+# и периодичны, поэтому пропуск — это отсрочка, а не потеря данных.
+#
+# Гистерезис обязателен: без него состояние дрожало бы у порога и половина
+# проходов отваливалась бы на ровном месте. Входим на DEPTH, выходим на CLEAR.
+# ---------------------------------------------------------------------------
+BACKPRESSURE_DEPTH = int(os.getenv("AMO_BACKPRESSURE_DEPTH", "200"))
+BACKPRESSURE_CLEAR_DEPTH = int(os.getenv("AMO_BACKPRESSURE_CLEAR_DEPTH", "50"))
+
+_congested = False
+_backpressure_skips: dict[str, int] = {}
+
+
+def is_congested() -> bool:
+    """Перегружен ли пайплайн прямо сейчас (с гистерезисом).
+
+    ⚠️ Не чистый геттер: здесь же переключается состояние. Зовут это фоновые
+    проходы раз в свой интервал, поэтому отдельного тикера машине состояний не
+    нужно. Срез для health читает _congested напрямую, не двигая состояние."""
+    global _congested
+    if BACKPRESSURE_DEPTH <= 0:
+        return False
+    depth = api_queue_size()
+    if _congested:
+        if depth <= BACKPRESSURE_CLEAR_DEPTH:
+            _congested = False
+            logger.info("Backpressure СНЯТ: очередь пайплайна %s (порог снятия %s)",
+                        depth, BACKPRESSURE_CLEAR_DEPTH)
+    elif depth >= BACKPRESSURE_DEPTH:
+        _congested = True
+        logger.warning(
+            "Backpressure ВКЛЮЧЁН: очередь пайплайна %s (порог %s) — фоновые проходы "
+            "пропускаем, пока не разгрузится до %s",
+            depth, BACKPRESSURE_DEPTH, BACKPRESSURE_CLEAR_DEPTH,
+        )
+    return _congested
+
+
+def skip_if_congested(name: str) -> bool:
+    """`True` — фоновому проходу «%name%» сейчас ходить не надо.
+
+    Ставится В НАЧАЛЕ итерации фонового цикла, сразу после sleep:
+
+        while True:
+            await asyncio.sleep(INTERVAL)
+            if api.skip_if_congested("office_transfer reconcile"):
+                continue
+            ...
+
+    Клиентский путь этим не пользуется никогда: его задача — наоборот,
+    пролезть вперёд."""
+    if not is_congested():
+        return False
+    _backpressure_skips[name] = _backpressure_skips.get(name, 0) + 1
+    logger.info(
+        "Backpressure: проход «%s» пропущен (очередь %s), повторим на следующем тике",
+        name, api_queue_size(),
+    )
+    return True
+
 _api_priority: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "amo_api_priority", default=None
 )
+
+_CLASS_NAMES = {
+    API_PRIORITY_URGENT: "urgent",
+    API_PRIORITY_CLIENT: "client",
+    API_PRIORITY_NORMAL: "normal",
+    API_PRIORITY_BACKGROUND: "background",
+}
 
 
 def set_api_priority(priority: int | None) -> None:
@@ -225,19 +308,25 @@ def api_queue_stats() -> dict:
     Закрывает слепую зону разбора 05.10.2026: по одной суммарной глубине не
     видно, стоит ли клиентский путь или это фон копится."""
     now = time.monotonic()
-    names = {API_PRIORITY_CLIENT: "client", API_PRIORITY_NORMAL: "normal",
-             API_PRIORITY_BACKGROUND: "background"}
     depth, oldest = {}, {}
     for prio, lane in _lanes.items():
-        key = names.get(prio, str(prio))
+        key = _CLASS_NAMES.get(prio, str(prio))
         depth[key] = len(lane)
         oldest[key] = round(now - lane[0].enqueued_at, 1) if lane else 0.0
     return {
         "api_queue": sum(depth.values()),
         "api_depth": depth,
         "api_oldest_wait_s": oldest,
-        "api_served": {names.get(p, str(p)): n for p, n in _served.items()},
+        "api_served": {_CLASS_NAMES.get(p, str(p)): n for p, n in _served.items()},
         "api_promoted_by_starvation": _promoted_by_starvation,
+        # Срез читает состояние, НЕ двигая машину гистерезиса — иначе опрос
+        # health сам влиял бы на то, пропускать ли фоновые проходы.
+        "backpressure": {
+            "congested": _congested,
+            "depth_on": BACKPRESSURE_DEPTH,
+            "depth_off": BACKPRESSURE_CLEAR_DEPTH,
+            "skipped_passes": dict(_backpressure_skips),
+        },
     }
 
 
@@ -264,16 +353,20 @@ def _take_next() -> ApiRequest | None:
 
 def init_api_pipeline() -> None:
     global _lanes, _wakeup, _api_worker_task, _served, _promoted_by_starvation
-    _lanes = {API_PRIORITY_CLIENT: deque(), API_PRIORITY_NORMAL: deque(),
-              API_PRIORITY_BACKGROUND: deque()}
+    global _congested, _backpressure_skips
+    _lanes = {API_PRIORITY_URGENT: deque(), API_PRIORITY_CLIENT: deque(),
+              API_PRIORITY_NORMAL: deque(), API_PRIORITY_BACKGROUND: deque()}
     _served = {}
     _promoted_by_starvation = 0
+    _congested = False
+    _backpressure_skips = {}
     _wakeup = asyncio.Event()
     _api_worker_task = asyncio.create_task(_api_worker())
     logger.info(
-        "API sequential pipeline started (interval=%.2fs, приоритеты: клиент/норма/фон, "
-        "порог голодания %.0fs)",
+        "API sequential pipeline started (interval=%.2fs, приоритеты: "
+        "счёт/клиент/норма/фон, порог голодания %.0fs, backpressure %s→%s)",
         MIN_REQUEST_INTERVAL_SECONDS, API_STARVATION_SECONDS,
+        BACKPRESSURE_DEPTH, BACKPRESSURE_CLEAR_DEPTH,
     )
 
 

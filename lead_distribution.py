@@ -1473,6 +1473,9 @@ async def _reconcile_loop() -> None:
     api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         await asyncio.sleep(LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S)
+        # Пайплайн забит — пропускаем тик (sleep выше, continue безопасен).
+        if api.skip_if_congested("lead_distribution reconcile"):
+            continue
         try:
             await _reconcile_once()
         except asyncio.CancelledError:

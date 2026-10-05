@@ -1099,9 +1099,9 @@ async def _retry_missing_link(lead: dict) -> int:
 
     # Сам обход идёт фоном (см. _reconcile_loop), но здесь уже найден живой
     # клиент, который ждёт платёжную ссылку, — создание счёта поднимаем до
-    # клиентского приоритета (05.10.2026).
+    # САМОГО ВЕРХНЕГО приоритета (05.10.2026, решение Тианы).
     import api
-    with api.api_priority(api.API_PRIORITY_CLIENT):
+    with api.api_priority(api.API_PRIORITY_URGENT):
         outcome = await process_invoice_lead(lead_id, source="reconcile")
     if outcome == "created":
         logger.info("Ozon сверка: сделка %s висела без ссылки %.0f мин — счёт создан заново",
@@ -1206,6 +1206,12 @@ async def _reconcile_loop() -> None:
     api.set_api_priority(api.API_PRIORITY_BACKGROUND)
     while True:
         await asyncio.sleep(OZON_RECONCILE_INTERVAL_S)
+        # Пайплайн забит — пропускаем тик (sleep выше, continue безопасен).
+        # ⚠️ Пропуск ОБХОДА не задерживает уже найденные счёта: они создаются
+        # верхним приоритетом и в очереди не стоят. Задерживается только
+        # обнаружение новых застрявших, на один интервал.
+        if api.skip_if_congested("ozon сверка"):
+            continue
         try:
             await _reconcile_once()
         except asyncio.CancelledError:
