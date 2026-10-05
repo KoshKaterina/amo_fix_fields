@@ -84,8 +84,11 @@ def _wire(
 
     async def fake_get(path, params=None):
         calls["get"].append((path, params))
-        if path == "entity/demand":
-            return {"rows": list(demand_search_rows)}
+        # Существующие отгрузки читаются у САМОГО ЗАКАЗА через expand=demands -
+        # фильтра по заказу у entity/demand не существует, см. docstring
+        # _find_existing_demand.
+        if path.startswith("entity/customerorder/"):
+            return {"demands": list(demand_search_rows)}
         if path.startswith("entity/store/"):
             return {"name": store_name} if store_name else None
         return None
@@ -222,7 +225,7 @@ def test_pustoe_pole_zakaza_ne_sozdaet(monkeypatch):
 
 
 def test_sklad_ne_otvetil_na_proverku_ne_sozdaet(monkeypatch):
-    """entity/demand (проверка существующих) вернул None - склад НЕ ОТВЕТИЛ,
+    """Заказ (проверка существующих отгрузок) вернул None - склад НЕ ОТВЕТИЛ,
     это не значит «отгрузки нет». Ничего не создаём."""
     calls = _wire(monkeypatch, template=_DEMAND_TEMPLATE, created_demand=_CREATED_DEMAND)
 
@@ -241,8 +244,7 @@ def test_sklad_ne_otvetil_na_proverku_ne_sozdaet(monkeypatch):
 
 
 def test_otgruzka_uzhe_est_v_mojskladom_ne_sozdaet_vtoruyu(monkeypatch):
-    """Проверка entity/demand по заказу вернула существующую отгрузку -
-    выходим молча, вторую не создаём."""
+    """Заказ отдал привязанную отгрузку - выходим молча, вторую не создаём."""
     calls = _wire(
         monkeypatch,
         demand_search_rows=[{"id": "already-there", "name": "00003"}],
@@ -255,6 +257,63 @@ def test_otgruzka_uzhe_est_v_mojskladom_ne_sozdaet_vtoruyu(monkeypatch):
     assert result is None
     assert calls["put"] == []
     assert calls["post"] == []
+
+
+def test_proverka_otgruzok_sprashivaet_zakaz_a_ne_filtr_po_demand(monkeypatch):
+    """Регрессия 05.10.2026: существующие отгрузки читаем У ЗАКАЗА.
+
+    Поля фильтрации `customerOrder` у `entity/demand` НЕ СУЩЕСТВУЕТ, МойСклад
+    отвечает на такой запрос 412 с кодом 1034. Тест держит маршрут: спрашиваем
+    `entity/customerorder/{uuid}?expand=demands` и не трогаем список отгрузок.
+    """
+    calls = _wire(monkeypatch, template=_DEMAND_TEMPLATE, created_demand=_CREATED_DEMAND)
+    lead = _lead(PIPELINE_OFFICE, STATUS_WAYBILL_READY)
+
+    asyncio.run(amgroup_shipment.create_shipment_for_lead(lead))
+
+    paths = [p for p, _ in calls["get"]]
+    assert "entity/demand" not in paths, (
+        "гейт снова ищет отгрузку фильтром по заказу - МойСклад ответит 412"
+    )
+    order_reads = [(p, prm) for p, prm in calls["get"] if p.startswith("entity/customerorder/")]
+    assert order_reads, "гейт вообще не прочитал заказ"
+    assert order_reads[0][0] == f"entity/customerorder/{ORDER_UUID}"
+    assert order_reads[0][1] == {"expand": "demands"}
+
+
+def test_boevoj_sluchaj_08258_otkaz_po_staromu_marshrutu_ne_blokiruet(monkeypatch):
+    """Боевой случай 05.10.2026 целиком (сделка 36572083, заказ 08258).
+
+    Склад на старый маршрут `entity/demand` отвечает отказом - None, ровно то,
+    что ms_client возвращает на 412. Сам заказ при этом честно говорит
+    «отгрузок нет». Отгрузка ДОЛЖНА создаться. На старом коде тест падает:
+    гейт уходил в «МойСклад не ответил» и не создавал ничего, пять попыток
+    подряд, товар остался не списан.
+    """
+    calls = _wire(monkeypatch, template=_DEMAND_TEMPLATE, created_demand=_CREATED_DEMAND)
+
+    async def fake_get(path, params=None):
+        calls["get"].append((path, params))
+        if path == "entity/demand":
+            return None  # 412, код 1034 - неизвестное поле фильтрации
+        if path.startswith("entity/customerorder/"):
+            return {"demands": []}
+        if path.startswith("entity/store/"):
+            return {"name": "Sunscrypt Основной"}
+        return None
+
+    monkeypatch.setattr(amgroup_shipment.ms_client, "get", fake_get)
+    lead = _lead(PIPELINE_OFFICE, STATUS_WAYBILL_READY)
+
+    result = asyncio.run(amgroup_shipment.create_shipment_for_lead(lead))
+
+    assert result == {
+        "shipment_id": "demand-uuid-0001",
+        "shipment_number": "00007",
+        "warehouse": "Sunscrypt Основной",
+    }
+    assert len(calls["post"]) == 1
+    assert calls["post"][0][0] == "entity/demand"
 
 
 def test_shablon_ne_otvetil_nichego_ne_sozdaet(monkeypatch):
@@ -362,8 +421,8 @@ def test_parallelnyy_vyzov_sozdaet_odnu_otgruzku(monkeypatch):
     async def fake_get(path, params=None):
         await asyncio.sleep(0)  # реальная точка переключения - как в бою
         calls["get"].append((path, params))
-        if path == "entity/demand":
-            return {"rows": []}
+        if path.startswith("entity/customerorder/"):
+            return {"demands": []}
         return None  # склад молчит - в этом тесте не важно
 
     async def fake_put(path, body):
@@ -416,8 +475,8 @@ def test_obryv_mezhdu_sozdaniem_i_zaprosom_sklada_ne_sozdaet_vtoruyu(monkeypatch
 
     async def fake_get_boom(path, params=None):
         calls["get"].append((path, params))
-        if path == "entity/demand":
-            return {"rows": []}
+        if path.startswith("entity/customerorder/"):
+            return {"demands": []}
         if path.startswith("entity/store/"):
             raise RuntimeError("МойСклад оборвал соединение на середине")
         return None

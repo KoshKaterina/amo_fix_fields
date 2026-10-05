@@ -208,12 +208,29 @@ async def _find_existing_demand(order_uuid: str) -> list[dict] | None:
     """Отгрузки МойСклада, уже привязанные к этому заказу покупателя.
 
     None - склад НЕ ОТВЕТИЛ (см. докстринг модуля), пустой список - ответил
-    честно и отгрузки нет. Смешивать эти два случая нельзя."""
-    href = f"{MS_API_URL}/entity/customerorder/{order_uuid}"
-    data = await ms_client.get("entity/demand", params={"filter": f"customerOrder={href}", "limit": 1})
+    честно и отгрузки нет. Смешивать эти два случая нельзя.
+
+    ⚠️ Спрашиваем САМ ЗАКАЗ с `expand=demands`, а не список отгрузок с
+    фильтром по заказу: поля фильтрации `customerOrder` у `entity/demand`
+    НЕ СУЩЕСТВУЕТ. На такой запрос МойСклад отдаёт 412 с кодом 1034
+    («неизвестное поле фильтрации»), `ms_client.get` на 4xx возвращает None,
+    а None здесь по уговору значит «склад молчит» - и гейт честно запрещает
+    создание. Отгрузки нет, создать её нельзя, в логе «МойСклад не ответил».
+    Поймано 05.10.2026 на сделке 36572083 (заказ 08258): пять попыток подряд
+    отказались делать отгрузку, которой не было, товар остался не списан.
+    `expand=demands` проверен живьём на заказах 08262, 07144 и 08228 - у
+    заказа с отгрузкой приходит массив самих документов (с `name`, его ждёт
+    вызывающий код), у заказа без отгрузки пусто.
+    """
+    data = await ms_client.get(
+        f"entity/customerorder/{order_uuid}", params={"expand": "demands"},
+    )
     if data is None:
         return None
-    return data.get("rows") or []
+    demands = data.get("demands")
+    if isinstance(demands, dict):  # МС умеет отдать и обёртку со rows
+        demands = demands.get("rows")
+    return demands or []
 
 
 async def _resolve_store_name(store_ref: dict | None) -> str | None:
