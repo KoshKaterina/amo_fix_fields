@@ -36,13 +36,44 @@ CONNECT_TIMEOUT_SECONDS = float(os.getenv("AMO_CONNECT_TIMEOUT_SECONDS", "30"))
 POOL_TIMEOUT_SECONDS = float(os.getenv("AMO_POOL_TIMEOUT_SECONDS", "20"))
 MAX_FETCH_RETRIES = int(os.getenv("AMO_FETCH_RETRIES", "4"))
 MAX_PATCH_RETRIES = int(os.getenv("AMO_PATCH_RETRIES", "4"))
-# Минимальный зазор между ОТПРАВКАМИ запросов к amo. Лимит amo = 7 req/s →
-# 1/7 ≈ 0.143с; берём 0.15с с запасом. Схема остаётся строго последовательной
-# (следующий запрос уходит только после ответа на предыдущий — решение Кати,
-# 08.07.2026: параллельная отправка на практике вела к проблемам), поэтому при
-# типичной задержке ответа amo 0.3–1.5с эта пауза на деле не наступает — она
-# лишь страхует от превышения 7/с на аномально быстрых ответах.
+# Минимальный зазор между ОТПРАВКАМИ запросов к amo — оставлен для совместимости
+# и как нижняя страховка; темп теперь держит общий token bucket (см. ниже).
 MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("AMO_MIN_REQUEST_INTERVAL_SECONDS", "0.15"))
+
+# ---------------------------------------------------------------------------
+# ПАРАЛЛЕЛЬНЫЕ ОТПРАВИТЕЛИ под общим token bucket (05.10.2026, решение Тианы).
+#
+# ⚠️ ЭТО РАЗВОРОТ РЕШЕНИЯ КАТИ ОТ 08.07.2026 («параллельная отправка была
+# хуже», `tech-stack-map.md`). Разворачиваем осознанно, потому что цена
+# последовательной схемы там же названа прямо: «если один запрос завис (таймаут
+# до 20 секунд), вся остальная работа с amoCRM тоже ждёт своей очереди». Один
+# подвисший GET держал весь контур — ровно это и лечим.
+#
+# Почему прошлый раз было хуже: без общего ограничителя N отправителей просто
+# превышали темп. А лимитов у amo ДВА, и второй неочевиден (замеры 03–04.08.2026,
+# `integrations.md`): 7 rps на интеграцию И **~10 rps на IP-адрес**. Два ключа по
+# 6 rps с одной машины дают 429 обоим — то есть разгонять отправку с одного
+# сервера можно только до общего потолка, и держать его должен ОДИН счётчик на
+# весь процесс. Поэтому здесь не «несколько клиентов», а bucket, который все
+# отправители дёргают сообща.
+#
+# Темп по умолчанию 6 rps, а не 7: в заметке прямо написано «безопасный рабочий
+# темп на клиент — 5-6 rps». Запас отдаём добровольно, разница в пропускной
+# против 7 мизерная, а 429 от второго сита прилетает html-ом от nginx и бьёт по
+# всем категориям сразу.
+#
+# ОТКАТ В ОДНУ ПЕРЕМЕННУЮ: AMO_API_SENDERS=1 возвращает последовательную схему
+# (один отправитель, следующий запрос только после ответа на предыдущий).
+# ---------------------------------------------------------------------------
+API_SENDERS = max(1, int(os.getenv("AMO_API_SENDERS", "3")))
+API_RATE_RPS = float(os.getenv("AMO_API_RATE_RPS", "6"))
+# Размер «ведра»: сколько запросов можно выпустить разом после простоя. Держим
+# маленьким — всплеск в десяток запросов за секунду упёрся бы в сито по IP.
+API_RATE_BURST = float(os.getenv("AMO_API_RATE_BURST", "2"))
+# На сколько глохнем ВСЕМИ отправителями, получив 429. Брейкер по категориям
+# остаётся, но он про «эту категорию больше не трогаем», а тут нужно сбить темп
+# целиком: 429 от сита по IP не относится ни к какой категории.
+API_RATE_PENALTY_S = float(os.getenv("AMO_API_RATE_PENALTY_S", "1.0"))
 
 HTTP_TIMEOUT = httpx.Timeout(
     timeout=REQUEST_TIMEOUT_SECONDS,
@@ -88,6 +119,9 @@ def is_circuit_open(category: str | None = None) -> bool:
 
 def _record_429(category: str | None = None) -> None:
     cat = category or _breaker_category.get()
+    # Сбить общий темп ВСЕМ отправителям: 429 от сита по IP (~10 rps на адрес)
+    # не относится ни к какой категории, и брейкер его не поймает.
+    _apply_rate_penalty()
     st = _bstate(cat)
     st["consecutive"] += 1
     if st["consecutive"] >= CIRCUIT_BREAKER_THRESHOLD:
@@ -286,10 +320,72 @@ class ApiRequest:
 # поэтому гонок на append/popleft нет.
 _lanes: dict[int, Any] = {}
 _wakeup: asyncio.Event | None = None
-_api_worker_task: asyncio.Task | None = None
+_api_worker_tasks: list = []
 _last_sent_at: float = 0.0
 _served: dict[int, int] = {}
 _promoted_by_starvation = 0
+
+# ── общий token bucket на все отправители ──────────────────────────────────
+_tokens: float = 0.0
+_bucket_refilled_at: float = 0.0
+_rate_lock: asyncio.Lock | None = None
+_rate_penalty_until: float = 0.0
+_in_flight: int = 0
+_max_in_flight: int = 0
+_rate_waits: int = 0
+_penalty_hits: int = 0
+
+
+def _refill_locked(now: float) -> None:
+    """Долить ведро по прошедшему времени. Зовётся под _rate_lock."""
+    global _tokens, _bucket_refilled_at
+    elapsed = now - _bucket_refilled_at
+    if elapsed > 0:
+        _tokens = min(API_RATE_BURST, _tokens + elapsed * API_RATE_RPS)
+        _bucket_refilled_at = now
+
+
+async def _acquire_slot() -> None:
+    """Дождаться права отправить ОДИН запрос.
+
+    Держит общий темп для всех отправителей и уважает штраф после 429.
+    Сон делаем ВНЕ замка, иначе один ждущий заблокировал бы остальных.
+    """
+    global _tokens, _rate_waits
+    if _rate_lock is None:          # пайплайн не поднят — не ограничиваем
+        return
+    while True:
+        async with _rate_lock:
+            now = time.monotonic()
+            if now < _rate_penalty_until:
+                sleep_for = _rate_penalty_until - now
+            else:
+                _refill_locked(now)
+                if _tokens >= 1.0:
+                    _tokens -= 1.0
+                    return
+                sleep_for = (1.0 - _tokens) / API_RATE_RPS
+        _rate_waits += 1
+        await asyncio.sleep(max(sleep_for, 0.005))
+
+
+def _apply_rate_penalty() -> None:
+    """Сбить темп ВСЕМ отправителям после 429.
+
+    Брейкер по категориям остаётся как был: он решает «эту категорию больше не
+    трогаем». А 429 от сита по IP ни к какой категории не относится, и на него
+    правильная реакция — короткая пауза всего пайплайна."""
+    global _rate_penalty_until, _penalty_hits
+    if API_RATE_PENALTY_S <= 0:
+        return
+    until = time.monotonic() + API_RATE_PENALTY_S
+    if until > _rate_penalty_until:
+        _rate_penalty_until = until
+        _penalty_hits += 1
+        logger.warning(
+            "429 от amo — глушим ВСЕ отправители на %.1fs (общий темп %.1f rps, отправителей %s)",
+            API_RATE_PENALTY_S, API_RATE_RPS, API_SENDERS,
+        )
 
 
 def api_queue_size() -> int:
@@ -319,6 +415,18 @@ def api_queue_stats() -> dict:
         "api_oldest_wait_s": oldest,
         "api_served": {_CLASS_NAMES.get(p, str(p)): n for p, n in _served.items()},
         "api_promoted_by_starvation": _promoted_by_starvation,
+        # Отправители и темп: видно, реально ли параллелится и упираемся ли в
+        # ограничитель. max_in_flight > 1 — параллельная отправка работает.
+        "senders": {
+            "count": API_SENDERS,
+            "rate_rps": API_RATE_RPS,
+            "burst": API_RATE_BURST,
+            "in_flight": _in_flight,
+            "max_in_flight": _max_in_flight,
+            "rate_waits": _rate_waits,
+            "penalty_hits": _penalty_hits,
+            "penalty_active": time.monotonic() < _rate_penalty_until,
+        },
         # Срез читает состояние, НЕ двигая машину гистерезиса — иначе опрос
         # health сам влиял бы на то, пропускать ли фоновые проходы.
         "backpressure": {
@@ -352,8 +460,10 @@ def _take_next() -> ApiRequest | None:
 
 
 def init_api_pipeline() -> None:
-    global _lanes, _wakeup, _api_worker_task, _served, _promoted_by_starvation
+    global _lanes, _wakeup, _api_worker_tasks, _served, _promoted_by_starvation
     global _congested, _backpressure_skips
+    global _tokens, _bucket_refilled_at, _rate_lock, _rate_penalty_until
+    global _in_flight, _max_in_flight, _rate_waits, _penalty_hits
     _lanes = {API_PRIORITY_URGENT: deque(), API_PRIORITY_CLIENT: deque(),
               API_PRIORITY_NORMAL: deque(), API_PRIORITY_BACKGROUND: deque()}
     _served = {}
@@ -361,24 +471,38 @@ def init_api_pipeline() -> None:
     _congested = False
     _backpressure_skips = {}
     _wakeup = asyncio.Event()
-    _api_worker_task = asyncio.create_task(_api_worker())
+    # Ведро стартует полным: после простоя первые запросы уходят без паузы.
+    _rate_lock = asyncio.Lock()
+    _tokens = API_RATE_BURST
+    _bucket_refilled_at = time.monotonic()
+    _rate_penalty_until = 0.0
+    _in_flight = 0
+    _max_in_flight = 0
+    _rate_waits = 0
+    _penalty_hits = 0
+    _api_worker_tasks = [
+        asyncio.create_task(_api_worker(i)) for i in range(API_SENDERS)
+    ]
     logger.info(
-        "API sequential pipeline started (interval=%.2fs, приоритеты: "
-        "счёт/клиент/норма/фон, порог голодания %.0fs, backpressure %s→%s)",
-        MIN_REQUEST_INTERVAL_SECONDS, API_STARVATION_SECONDS,
-        BACKPRESSURE_DEPTH, BACKPRESSURE_CLEAR_DEPTH,
+        "API pipeline started: отправителей %s, общий темп %.1f rps (burst %.0f), "
+        "штраф на 429 %.1fs, приоритеты: счёт/клиент/норма/фон, порог голодания %.0fs, "
+        "backpressure %s→%s%s",
+        API_SENDERS, API_RATE_RPS, API_RATE_BURST, API_RATE_PENALTY_S,
+        API_STARVATION_SECONDS, BACKPRESSURE_DEPTH, BACKPRESSURE_CLEAR_DEPTH,
+        " [ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ]" if API_SENDERS == 1 else "",
     )
 
 
 async def shutdown_api_pipeline() -> None:
-    global _api_worker_task
-    if _api_worker_task is not None:
-        _api_worker_task.cancel()
+    global _api_worker_tasks
+    for task in _api_worker_tasks:
+        task.cancel()
+    for task in _api_worker_tasks:
         try:
-            await _api_worker_task
+            await task
         except asyncio.CancelledError:
             pass
-        _api_worker_task = None
+    _api_worker_tasks = []
 
     for lane in _lanes.values():
         while lane:
@@ -398,20 +522,25 @@ async def _next_request() -> ApiRequest:
         await _wakeup.wait()
 
 
-async def _api_worker() -> None:
-    global _last_sent_at
+async def _api_worker(worker_no: int = 0) -> None:
+    global _last_sent_at, _in_flight, _max_in_flight
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         while True:
             req = await _next_request()
             try:
-                # Зазор — от ОТПРАВКИ прошлого запроса. Последовательность
-                # (ждать ответ) обеспечивает сам цикл: await ниже не вернётся,
-                # пока amo не ответит.
+                # Право на отправку выдаёт общий token bucket — он один на все
+                # отправители и держит темп ниже обоих лимитов amo (7 rps на
+                # интеграцию и ~10 rps на IP).
+                await _acquire_slot()
+                # Нижняя страховка от аномально быстрых ответов осталась: при
+                # одном отправителе поведение ровно как до правки.
                 now = time.monotonic()
                 wait_for = (_last_sent_at + MIN_REQUEST_INTERVAL_SECONDS) - now
-                if wait_for > 0:
+                if API_SENDERS == 1 and wait_for > 0:
                     await asyncio.sleep(wait_for)
                 _last_sent_at = time.monotonic()
+                _in_flight += 1
+                _max_in_flight = max(_max_in_flight, _in_flight)
 
                 if req.method == "GET":
                     response = await client.get(req.url, headers=req.req_headers)
@@ -429,6 +558,8 @@ async def _api_worker() -> None:
             except Exception as exc:
                 if not req.future.done():
                     req.future.set_exception(exc)
+            finally:
+                _in_flight = max(0, _in_flight - 1)
 
 
 async def submit_request(

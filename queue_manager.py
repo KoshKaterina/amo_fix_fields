@@ -281,6 +281,7 @@ def queue_stats() -> dict:
         out["api_served"] = detail["api_served"]
         out["api_promoted_by_starvation"] = detail["api_promoted_by_starvation"]
         out["backpressure"] = detail["backpressure"]
+        out["senders"] = detail["senders"]
         out["task_journal"] = task_queue_store.stats()
     except Exception:
         logger.exception("queue_stats: срез приоритетов пайплайна не собрался")
