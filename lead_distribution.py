@@ -1421,6 +1421,18 @@ async def _created_in_status_leads(pipeline_id: int, status_id: int, ts_from: in
     return leads
 
 
+# Насколько глубоко проход заглядывает назад. При штатной работе окно = интервал
+# между проходами (2 минуты), но после рестарта _last_reconcile_ts обнуляется, и
+# окно раскрывается от cutover — а это НЕ две минуты, а недели. Поймано 05.10.2026
+# при разборе затора очереди: LEAD_DISTRIBUTION_SINCE_TS стоял на 18.08.2026, то
+# есть первый же проход после перезапуска пошёл бы разбирать семь недель сделок и
+# вызвал process_lead_distribution на каждой — массовая смена ответственных по
+# давно отработанным сделкам плюс новый залп по API. У office_transfer такой
+# предохранитель есть с 05.08.2026 (RECONCILE_MAX_LOOKBACK_S там же), здесь его
+# просто забыли. Час назад — запас на любой разумный перезапуск; более долгий
+# простой добираем руками.
+RECONCILE_MAX_LOOKBACK_S = 3600
+
 _last_reconcile_ts: int = 0
 _reconcile_task: asyncio.Task | None = None
 
@@ -1432,6 +1444,10 @@ async def _reconcile_once() -> str:
     if window_from <= 0:
         logger.warning("lead_distribution reconcile: LEAD_DISTRIBUTION_SINCE_TS не задан — проход пропущен")
         return "skipped-no-cutover"
+    # Потолок оглядки ставим ПОСЛЕ проверки cutover: иначе окно всегда выглядело
+    # бы заданным и защита «без границы не запускаться» перестала бы работать
+    # (тот же порядок, что в office_transfer._reconcile_once).
+    window_from = max(window_from, now - RECONCILE_MAX_LOOKBACK_S)
 
     entry_points = {pair for p in _profiles().values() if p.enabled for pair in _entry_pairs(p)}
     leads: set[int] = set()

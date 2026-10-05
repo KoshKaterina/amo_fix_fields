@@ -1467,6 +1467,44 @@ def test_log_outcome_routed_still_marked():
     assert _log_calls[0]["assigned_user_id"] == 1
 
 
+# ── reconciliation: потолок оглядки (05.10.2026) ────────────────────────────
+
+
+def test_reconcile_window_capped_after_restart():
+    """⚠️ Главная мина перезапуска (разбор затора 05.10.2026). После рестарта
+    _last_reconcile_ts обнуляется, и окно раскрывалось от LEAD_DISTRIBUTION_SINCE_TS
+    — в проде это 18.08.2026, то есть первый же проход пошёл бы разбирать СЕМЬ
+    НЕДЕЛЬ сделок и вызвал process_lead_distribution на каждой: массовая смена
+    ответственных по отработанным сделкам плюс залп по API. У office_transfer
+    предохранитель стоит с 05.08.2026, здесь его забыли.
+
+    Проверяем, что окно не уходит в events глубже RECONCILE_MAX_LOOKBACK_S."""
+    _reset_fakes()
+    _seed_profile(name="CapWindow", pipeline_id=10593102, status_id=83537714)
+
+    seen: list = []
+
+    async def _fake_do_get(path, params=None):
+        seen.append((path, dict(params or [])))
+        return {"_embedded": {"events": []}}
+
+    real_do_get = amo_service._do_get
+    amo_service._do_get = _fake_do_get
+    try:
+        ld.LEAD_DISTRIBUTION_SINCE_TS = 1  # «очень давно», как в проде
+        ld._last_reconcile_ts = 0          # как сразу после рестарта
+        now = int(time.time())
+        run(ld._reconcile_once())
+    finally:
+        amo_service._do_get = real_do_get
+
+    assert seen, "проход должен был сходить в /api/v4/events"
+    floor = now - ld.RECONCILE_MAX_LOOKBACK_S
+    for path, params in seen:
+        got = int(params["filter[created_at][from]"])
+        assert got >= floor - 5, f"окно ушло глубже потолка: {got} < {floor} ({params})"
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

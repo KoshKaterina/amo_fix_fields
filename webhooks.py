@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 import logging
@@ -27,6 +28,7 @@ import dup_autoclose
 import jivo_service
 import lead_distribution
 import lead_distribution_profiles_client
+import lead_status_store
 import mail_watch
 import alert_settings_client
 import metrika_sync
@@ -103,6 +105,16 @@ async def lifespan(app):
 
     init_api_pipeline()
     init_queue()
+    # Память о прошлом этапе сделки: нужна гейту office_transfer, чтобы отличать
+    # переход от просто обновления уже закрытой сделки (см. lead_status_store.py).
+    # Пустая база сразу после рестарта — штатное состояние, гейт тогда пропускает.
+    await asyncio.to_thread(lead_status_store.init)
+    try:
+        pruned = await asyncio.to_thread(lead_status_store.prune)
+        if pruned:
+            logger.info("lead_status_store: убрано %s старых строк", pruned)
+    except Exception:
+        logger.exception("lead_status_store: чистка не прошла, работаем дальше")
     await amo_service.warm_pipeline_cache()
     await cdek_client.init()
     await telegram_bot.init_telegram_bot()
@@ -648,6 +660,20 @@ async def lead_change(request: Request):
     # месте: разъехавшиеся гейты вебхука и диспетчера дали бы «вебхук ставит
     # задачу, диспетчер её скипает» — сделка ехала бы только страховкой раз в
     # две минуты, и то молча.
+    # ⚠️ Гейт по ФАКТУ ПЕРЕХОДА, а не по значению статуса (05.10.2026). Подписка
+    # вебхуков у нас без `status_lead`, прошлого статуса в теле нет — поэтому
+    # прошлый этап помним сами в lead_status_store. Без этого любое обновление
+    # давно закрытой сделки (поле, тег, примечание, массовое касание) выглядело
+    # как «сделка только что закрылась»: всплеск 05.10 дал 208 задач за минуту
+    # против 11 реальных переходов в 143 по журналу amo, и дорожка `amo` встала
+    # на часы, вытеснив платёжные ссылки и распределение. Подробности — докстринг
+    # lead_status_store.py.
+    status_changed = True
+    if lead_id is not None and incoming_status is not None:
+        status_changed = await asyncio.to_thread(
+            lead_status_store.note_and_changed, lead_id, incoming_status
+        )
+
     if (
         OFFICE_TRANSFER_ENABLED
         and lead_id is not None
@@ -655,11 +681,20 @@ async def lead_change(request: Request):
         and str(incoming_status) in (str(STATUS_SUCCESS), str(STATUS_CLOSED_LOST))
         and (incoming_pipeline is None or office_transfer.is_source_pipeline(incoming_pipeline))
     ):
-        logger.info(
-            "Lead %s entered %s in pipeline %s — enqueue office_transfer",
-            lead_id, incoming_status, incoming_pipeline,
-        )
-        enqueue_office_transfer(lead_id, source="webhook")
+        if not status_changed:
+            # Сделка УЖЕ лежала в 142/143, когда пришёл этот вебхук — значит он не
+            # про переход. Задачу не ставим: диспетчер всё равно погасил бы её
+            # гейтом по closed_at, но уже ценой чтения сделки и занятого воркера.
+            logger.info(
+                "Lead %s уже была на %s — вебхук не про переход, office_transfer не ставим",
+                lead_id, incoming_status,
+            )
+        else:
+            logger.info(
+                "Lead %s entered %s in pipeline %s — enqueue office_transfer",
+                lead_id, incoming_status, incoming_pipeline,
+            )
+            enqueue_office_transfer(lead_id, source="webhook")
 
     # Lead Distribution: сделка вошла в точку входа (pipeline_id/status_id)
     # какого-то ВКЛЮЧЁННОГО профиля конструктора (lead_distribution.py) —
