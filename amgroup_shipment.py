@@ -73,6 +73,7 @@ import datetime
 import json
 import logging
 import os
+import time
 
 import amo_service
 import ms_client
@@ -139,6 +140,41 @@ _STATE_CAP = 5000
 # event loop хранит только слабую ссылку и сборщик мусора может срезать задачу
 # на любом await (тем же приёмом, что showroom_tag/unmiss_tag/reserve_service).
 _bg_tasks: set = set()
+
+# ---------------------------------------------------------------------------
+# Дебаунс по сделке (05.10.2026). Вебхук `/lead_change` приходит на ЛЮБОЕ
+# изменение сделки, и по сделке на целевом этапе их прилетает несколько: замер
+# за 50 минут дал 211 запусков этого модуля на 77 уникальных сделок, то есть
+# 2.7 на сделку. Каждый запуск — это задача, которая спит AMGROUP_SHIPMENT_GRACE_SEC
+# (300 с), потом читает сделку из amo и проверяет отгрузки в МойСкладе. Повторы
+# не делают ничего полезного, но стоят чтений в обе системы.
+#
+# ⚠️ Почему подавлять ПОВТОРЫ безопасно: ждущая задача читает сделку ЗАНОВО
+# после паузы и заново сверяет воронку с этапом (`create_shipment_for_lead`,
+# гейт 1). То есть к моменту пробуждения она видит актуальное состояние, и
+# свежий вебхук ей ничего нового не сообщает. Корректность двойной отгрузки
+# держат другие механизмы и правка их не касается: слот `pending` в `_created`
+# и замок на lead_id (`_lock_for`).
+#
+# Подавляем только пока задача НЕ ЗАВЕРШИЛАСЬ — это не окно по времени, а флаг
+# «по сделке уже есть незавершённая задача». Как только она отработала, новый
+# вебхук заводит новую задачу обычным порядком: так дебаунс не может проглотить
+# действительно новый переход на этап.
+# ---------------------------------------------------------------------------
+_inflight: dict[str, float] = {}
+
+# Страховка от зависшего флага: если задачу убили так, что finally не отработал
+# (отмена на остановке сервиса, OOM), сделка иначе осталась бы заблокированной
+# навсегда. Пауза плюс запас на чтения и МойСклад.
+DEBOUNCE_STALE_AFTER_S = int(os.getenv(
+    "AMGROUP_SHIPMENT_DEBOUNCE_STALE_AFTER_S",
+    str(AMGROUP_SHIPMENT_GRACE_SEC + 600),
+))
+
+
+def inflight_count() -> int:
+    """Сколько сделок прямо сейчас с незавершённой фоновой задачей. Для health."""
+    return len(_inflight)
 
 # Замок на lead_id - защита от гонки двух вебхуков по одной сделке (см.
 # докстринг модуля). Создаётся лениво, на первое обращение к сделке.
@@ -507,6 +543,28 @@ def handle_lead_status_change_bg(lead_id, status_id, pipeline_id) -> None:
         return
     if _as_int(pipeline_id) != PIPELINE_OFFICE or _as_int(status_id) not in _TRIGGER_STATUSES:
         return
+
+    # Дебаунс по сделке: пока по ней есть незавершённая задача, вторую не плодим
+    # (см. блок про дебаунс выше). Ждущая задача дочитает сделку сама.
+    key = str(lead_id)
+    now = time.monotonic()
+    started = _inflight.get(key)
+    if started is not None:
+        waited = now - started
+        if waited < DEBOUNCE_STALE_AFTER_S:
+            logger.info(
+                "amgroup_shipment: по сделке %s задача уже в работе %.0f с — повтор "
+                "не плодим, она дочитает сделку сама",
+                key, waited,
+            )
+            return
+        logger.warning(
+            "amgroup_shipment: флаг по сделке %s провисел %.0f с (порог %s) — считаю "
+            "зависшим и завожу задачу заново",
+            key, waited, DEBOUNCE_STALE_AFTER_S,
+        )
+    _inflight[key] = now
+
     task = asyncio.create_task(_handle_lead_status_change_bg(lead_id, status_id, pipeline_id))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
@@ -521,6 +579,11 @@ async def _handle_lead_status_change_bg(lead_id, status_id, pipeline_id) -> None
         logger.exception(
             "amgroup_shipment: фоновая отгрузка упала на сделке %s", lead_id,
         )
+    finally:
+        # Флаг дебаунса снимаем ВСЕГДА, в том числе после отказа: не снять —
+        # значит заблокировать отгрузку по сделке до истечения порога. Тем же
+        # соображением живёт освобождение слота в create_shipment_for_lead.
+        _inflight.pop(str(lead_id), None)
 
 
 async def init() -> None:

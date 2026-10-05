@@ -247,7 +247,12 @@ async def health():
             "budget_watch": budget_mismatch_watch.status(),
             # Опрос вступлений: молчащий слушатель внутри живого контейнера
             # иначе неотличим от тишины по отсутствию вступлений.
-            "academy_chat_join": academy_chat_join.stats(), **queue_stats()}
+            "academy_chat_join": academy_chat_join.stats(),
+            # Сколько сделок прямо сейчас с незавершённой фоновой отгрузкой.
+            # Без этого эффект дебаунса (05.10.2026) не виден: повторы просто
+            # перестают появляться в логах, а сколько задач реально живёт — нет.
+            "amgroup_shipment_inflight": amgroup_shipment.inflight_count(),
+            **queue_stats()}
 
 
 def insert_nested(data, keys, value):

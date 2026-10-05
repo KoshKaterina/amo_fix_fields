@@ -11,6 +11,7 @@ amgroup встала, отгрузки в МойСкладе перестал с
 import asyncio
 import os
 import sys
+import time
 
 import pytest
 
@@ -636,3 +637,150 @@ def test_chuzhoy_etap_bez_pauzy_i_bez_chteniya(monkeypatch):
 
     assert touched == []
 
+# ── дебаунс по сделке (05.10.2026) ──────────────────────────────────────────
+# Замер за 50 минут: 211 запусков модуля на 77 уникальных сделок, 2.7 на сделку.
+# Каждый повтор спал 300 с и потом читал сделку из amo и отгрузки в МойСкладе.
+# Подавляем повторы, пока по сделке есть НЕЗАВЕРШЁННАЯ задача: она дочитает
+# сделку сама и заново сверит воронку с этапом.
+
+
+def _reset_debounce():
+    amgroup_shipment._inflight.clear()
+    amgroup_shipment._bg_tasks.clear()
+
+
+def test_debounce_povtornyy_vebhuk_ne_zavodit_vtoruyu_zadachu(monkeypatch):
+    """Ядро правки: три вебхука по одной сделке — одна задача."""
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True)
+    started = []
+
+    async def _fake(lead_id, status_id, pipeline_id):
+        started.append(str(lead_id))
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(amgroup_shipment, "handle_lead_status_change", _fake)
+
+    async def scenario():
+        for _ in range(3):
+            amgroup_shipment.handle_lead_status_change_bg(
+                777001, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+        await asyncio.sleep(0)
+        assert amgroup_shipment.inflight_count() == 1
+        await asyncio.gather(*list(amgroup_shipment._bg_tasks))
+
+    asyncio.run(scenario())
+    assert started == ["777001"], started
+
+
+def test_debounce_raznye_sdelki_ne_meshayut_drug_drugu(monkeypatch):
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True)
+    started = []
+
+    async def _fake(lead_id, status_id, pipeline_id):
+        started.append(str(lead_id))
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(amgroup_shipment, "handle_lead_status_change", _fake)
+
+    async def scenario():
+        for lead in (777002, 777003, 777004):
+            amgroup_shipment.handle_lead_status_change_bg(
+                lead, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+        await asyncio.sleep(0)
+        assert amgroup_shipment.inflight_count() == 3
+        await asyncio.gather(*list(amgroup_shipment._bg_tasks))
+
+    asyncio.run(scenario())
+    assert sorted(started) == ["777002", "777003", "777004"], started
+
+
+def test_debounce_posle_zaversheniya_novyy_vebhuk_rabotaet(monkeypatch):
+    """Это НЕ окно по времени, а флаг «задача не закончилась». Отработала —
+    следующий переход на этап обрабатывается обычным порядком."""
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True)
+    started = []
+
+    async def _fake(lead_id, status_id, pipeline_id):
+        started.append(str(lead_id))
+
+    monkeypatch.setattr(amgroup_shipment, "handle_lead_status_change", _fake)
+
+    async def scenario():
+        amgroup_shipment.handle_lead_status_change_bg(
+            777005, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+        await asyncio.gather(*list(amgroup_shipment._bg_tasks))
+        assert amgroup_shipment.inflight_count() == 0, "флаг должен сняться"
+        amgroup_shipment._bg_tasks.clear()
+        amgroup_shipment.handle_lead_status_change_bg(
+            777005, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+        await asyncio.gather(*list(amgroup_shipment._bg_tasks))
+
+    asyncio.run(scenario())
+    assert started == ["777005", "777005"], started
+
+
+def test_debounce_flag_snimaetsya_i_pri_padenii_zadachi(monkeypatch):
+    """Не снять флаг при отказе — значит заблокировать отгрузку по сделке до
+    истечения порога. Тем же соображением живёт слот в create_shipment_for_lead."""
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True)
+
+    async def _boom(lead_id, status_id, pipeline_id):
+        raise RuntimeError("склад не ответил")
+
+    monkeypatch.setattr(amgroup_shipment, "handle_lead_status_change", _boom)
+
+    async def scenario():
+        amgroup_shipment.handle_lead_status_change_bg(
+            777006, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+        await asyncio.gather(*list(amgroup_shipment._bg_tasks))
+
+    asyncio.run(scenario())
+    assert amgroup_shipment.inflight_count() == 0
+
+
+def test_debounce_zavisshiy_flag_starshe_poroga_ne_blokiruet_navsegda(monkeypatch):
+    """Страховка: задачу убили так, что finally не отработал (остановка сервиса,
+    OOM). Сделка не должна остаться заблокированной навсегда."""
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True)
+    monkeypatch.setattr(amgroup_shipment, "DEBOUNCE_STALE_AFTER_S", 10)
+    started = []
+
+    async def _fake(lead_id, status_id, pipeline_id):
+        started.append(str(lead_id))
+
+    monkeypatch.setattr(amgroup_shipment, "handle_lead_status_change", _fake)
+    # флаг «висит» давно, задачи при этом нет
+    amgroup_shipment._inflight["777007"] = time.monotonic() - 100
+
+    async def scenario():
+        amgroup_shipment.handle_lead_status_change_bg(
+            777007, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+        await asyncio.gather(*list(amgroup_shipment._bg_tasks))
+
+    asyncio.run(scenario())
+    assert started == ["777007"], "зависший флаг не должен блокировать навсегда"
+
+
+def test_debounce_ne_celevoy_etap_flag_ne_stavit(monkeypatch):
+    """Отсечка по воронке и этапу идёт ДО дебаунса: нецелевой переход не должен
+    занимать флаг и тем мешать настоящему."""
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", True)
+    amgroup_shipment.handle_lead_status_change_bg(
+        777008, STATUS_SUCCESS, PIPELINE_CLEVER_MAIN)
+    assert amgroup_shipment.inflight_count() == 0
+    assert not amgroup_shipment._bg_tasks
+
+
+def test_debounce_vyklyuchennyy_modul_flag_ne_stavit(monkeypatch):
+    _reset_debounce()
+    monkeypatch.setattr(amgroup_shipment, "AMGROUP_SHIPMENT_ENABLED", False)
+    amgroup_shipment.handle_lead_status_change_bg(
+        777009, STATUS_WAYBILL_READY, PIPELINE_OFFICE)
+    assert amgroup_shipment.inflight_count() == 0
+    assert not amgroup_shipment._bg_tasks
