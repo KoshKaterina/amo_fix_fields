@@ -66,6 +66,7 @@ from waybill_config import (
     LEAD_DISTRIBUTION_FAIRNESS_GAP,
     LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S,
     LEAD_DISTRIBUTION_SINCE_TS,
+    LEAD_DISTRIBUTION_SKIP_TAGS,
     LEAD_DISTRIBUTION_STALE_ALERT_MIN,
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
     LEAD_DISTRIBUTION_UIS_TAG_POLL_S,
@@ -1168,7 +1169,32 @@ async def process_lead_distribution(
     source_id = _lead_source_id(lead)
     profile = match_profile(pipeline_id, status_id, source_id)
     if profile is None:
+        # ⚠️ Раньше здесь был молчаливый выход, и это дорого стоило: 06.10.2026 сделка
+        # 36573661 («Письмо: Sunscrypt.ru») встала в точку входа профиля, распределение
+        # запускалось четыре раза и каждый раз уходило сюда - источника «amo-fix-fields»
+        # нет в списке профиля. В логе не было НИ СЛОВА, и снаружи это выглядело так,
+        # будто распределение сделку вообще не видело. Различаем две причины: точка
+        # входа чужая (норма, таких вебхуков много) или точка наша, а источник не тот.
+        if has_matching_enabled_profile(pipeline_id, status_id):
+            logger.info(
+                "lead_distribution %s: точка входа совпала (воронка=%s этап=%s), но источник=%s "
+                "не в списке профиля — не распределяем",
+                lead_id, pipeline_id, status_id, source_id,
+            )
         return "no-profile"
+
+    skipped_by_tag = next(
+        (t for t in LEAD_DISTRIBUTION_SKIP_TAGS if amo_service.has_tag(lead, t)), None,
+    )
+    if skipped_by_tag:
+        # Поток, который распределять не положено (Катя 06.10.2026: чаты Jivo). Профиль
+        # подошёл, но решение не принимаем вообще - ротация и счётчики нагрузки не
+        # расходуются, ответственный остаётся тем, кого поставил создатель сделки.
+        logger.info(
+            "lead_distribution %s: тег «%s» в списке исключений — распределение пропущено",
+            lead_id, skipped_by_tag,
+        )
+        return "skipped-tag"
 
     if _is_pickup_delivery(lead):
         return await _assign_office_manager(lead, profile, lid, prev_responsible_user_id)

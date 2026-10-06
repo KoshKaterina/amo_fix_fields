@@ -843,6 +843,51 @@ def test_no_matching_profile_is_noop():
     assert not _patch_calls
 
 
+# ════════════════ теги-исключения (Катя 06.10.2026: «кроме Jivo») ════════════════
+# Источник у сделок, созданных интеграцией, один на три потока: письма сторожа,
+# заявки с форм сайта и чаты Jivo. Источником их не разделить, разделяет тег.
+
+def test_lead_with_skip_tag_is_not_routed():
+    _reset_fakes()
+    _seed_profile(name="SkipTag", participant_ids=[1, 2])
+    lead = _lead(lead_id=360, source_id=1, tags=[{"name": "Jivo"}, {"name": "ОП Розница"}])
+    _lead_by_id[360] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    outcome = run(ld.process_lead_distribution(360))
+
+    assert outcome == "skipped-tag"
+    assert not _patch_calls, "ответственного на такой сделке не меняем"
+    assert 360 not in ld._load_counters_state().get("routed_ids", []), \
+        "счётчики нагрузки на пропущенной сделке не расходуются"
+
+
+def test_skip_tag_match_is_case_insensitive():
+    """amo отдаёт теги как их завели руками — регистр не гарантирован."""
+    _reset_fakes()
+    _seed_profile(name="SkipTagCase", participant_ids=[1, 2])
+    lead = _lead(lead_id=361, source_id=1, tags=[{"name": "jivo"}])
+    _lead_by_id[361] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    assert run(ld.process_lead_distribution(361)) == "skipped-tag"
+    assert not _patch_calls
+
+
+def test_mail_watch_lead_is_routed_normally():
+    """Сделка сторожа писем (та же воронка, этап и источник, что у Jivo) —
+    распределяется как обычно: в списке исключений её тега нет."""
+    _reset_fakes()
+    _seed_profile(name="MailWatch", participant_ids=[1, 2])
+    lead = _lead(lead_id=362, source_id=1,
+                 tags=[{"name": "письмо по закрытой сделке"}, {"name": "ОП Розница"}])
+    _lead_by_id[362] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    assert run(ld.process_lead_distribution(362)) == "routed"
+    assert len(_patch_calls) == 1
+
+
 # ════════════════ двойное распределение одного лида (найдено вживую 19-20.08.2026) ════════════════
 # amgroup дозаполняет поля сразу после создания сделки несколькими вебхуками подряд;
 # между PATCH одного прогона и свежим GET следующего amoCRM какое-то время ещё не
