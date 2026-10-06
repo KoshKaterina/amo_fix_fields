@@ -66,6 +66,7 @@ from waybill_config import (
     LEAD_DISTRIBUTION_FAIRNESS_GAP,
     LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S,
     LEAD_DISTRIBUTION_SINCE_TS,
+    LEAD_DISTRIBUTION_SKIP_NAME_PREFIXES,
     LEAD_DISTRIBUTION_SKIP_TAGS,
     LEAD_DISTRIBUTION_STALE_ALERT_MIN,
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
@@ -1195,6 +1196,21 @@ async def process_lead_distribution(
             lead_id, skipped_by_tag,
         )
         return "skipped-tag"
+
+    lead_name = (lead.get("name") or "").strip().casefold()
+    skipped_by_name = next(
+        (p for p in LEAD_DISTRIBUTION_SKIP_NAME_PREFIXES if lead_name.startswith(p.strip().casefold())),
+        None,
+    )
+    if skipped_by_name:
+        # Тот же запрет, но по имени сделки: тега может не быть вовсе. jivo_service
+        # заводит сделку через «Неразобранное», когда оператор чата не сопоставлен с
+        # пользователем amo, и тегов в этой ветке не передаёт - имя же ставит всегда.
+        logger.info(
+            "lead_distribution %s: имя начинается с «%s» — распределение пропущено",
+            lead_id, skipped_by_name,
+        )
+        return "skipped-name"
 
     if _is_pickup_delivery(lead):
         return await _assign_office_manager(lead, profile, lid, prev_responsible_user_id)

@@ -874,6 +874,50 @@ def test_skip_tag_match_is_case_insensitive():
     assert not _patch_calls
 
 
+def test_lead_with_skip_name_prefix_is_not_routed():
+    """Чат Jivo, заведённый через «Неразобранное» (оператор не сопоставлен): тегов
+    нет вовсе, ловит только имя. Живой пример — сделки 36565213 и 36565297."""
+    _reset_fakes()
+    _seed_profile(name="SkipName", participant_ids=[1, 2])
+    lead = _lead(lead_id=363, source_id=1, tags=[])
+    lead["name"] = "Онлайн-чат Jivo — Андрей"
+    _lead_by_id[363] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    outcome = run(ld.process_lead_distribution(363))
+
+    assert outcome == "skipped-name"
+    assert not _patch_calls
+    assert 363 not in ld._load_counters_state().get("routed_ids", [])
+
+
+def test_skip_name_prefix_matches_site_variant_and_case():
+    """Второй вид имени — с площадкой: «Онлайн-чат Jivo · Tangemshop — <имя>»."""
+    _reset_fakes()
+    _seed_profile(name="SkipNameSite", participant_ids=[1, 2])
+    lead = _lead(lead_id=364, source_id=1, tags=[])
+    lead["name"] = "онлайн-чат jivo · Tangemshop — Василий"
+    _lead_by_id[364] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    assert run(ld.process_lead_distribution(364)) == "skipped-name"
+    assert not _patch_calls
+
+
+def test_skip_name_prefix_does_not_catch_other_leads():
+    """Сторож по имени не должен задевать обычные сделки: совпадение по НАЧАЛУ строки,
+    а не подстрокой где угодно."""
+    _reset_fakes()
+    _seed_profile(name="NamePrefixSafety", participant_ids=[1, 2])
+    lead = _lead(lead_id=365, source_id=1, tags=[])
+    lead["name"] = "Клиент просит выгрузку из Онлайн-чат Jivo"
+    _lead_by_id[365] = lead
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    assert run(ld.process_lead_distribution(365)) == "routed"
+    assert len(_patch_calls) == 1
+
+
 def test_mail_watch_lead_is_routed_normally():
     """Сделка сторожа писем (та же воронка, этап и источник, что у Jivo) —
     распределяется как обычно: в списке исключений её тега нет."""
