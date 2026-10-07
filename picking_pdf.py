@@ -6,10 +6,8 @@
 
 import os
 from collections import Counter
-from datetime import datetime
 from io import BytesIO
 from xml.sax.saxutils import escape
-from zoneinfo import ZoneInfo
 
 from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
@@ -19,6 +17,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
 
+from shared.timez import now_msk
 from waybill_config import parse_composition_items
 
 _PROJECT_FONTS = os.path.join(os.path.dirname(__file__), "fonts")
@@ -107,7 +106,11 @@ def build_pdf_bytes(leads_data: list[dict]) -> bytes:
         ),
     }
 
-    today = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M")
+    # ⚠️ Было `datetime.now(ZoneInfo("Europe/Moscow"))`. Результат тот же (Москва на UTC+3
+    # постоянно с 26.10.2014, а здесь всегда «сейчас»), но `ZoneInfo` требует базу часовых
+    # поясов, которой нет ни в `requirements.txt`, ни на машинах с Windows - и вызов падал
+    # `ZoneInfoNotFoundError`, то есть лист сборки там вообще не собирался (07.10.2026).
+    today = now_msk().strftime("%d.%m.%Y %H:%M")
     flowables = [
         Paragraph(f"Лист сборки — {today}", styles["title"]),
         Paragraph(f"Накладных: {len(leads_data)}", styles["meta"]),
