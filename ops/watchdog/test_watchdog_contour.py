@@ -5,12 +5,19 @@
 старте контейнера и сутки молча глушил алерты отдела продаж. Контейнер был жив,
 докер довольный - заметить было нечем.
 
-Запуск: python3 test_watchdog_contour.py
+⚠️ Переведено в pytest-модуль 07.10.2026. Прежде проверки стояли голыми `assert` на уровне
+модуля, то есть выполнялись на ИМПОРТЕ: провал читался как ошибка СБОРА и ронял сбор всего
+репозитория, а в сводке файл давал ноль тестов. Плюс первый упавший `assert` обрывал файл,
+и про остальные шесть сценариев мы не узнавали ничего.
+
+Запуск: python -m pytest ops/watchdog/test_watchdog_contour.py
 """
 import importlib.util
 import json
 import sys
 from pathlib import Path
+
+import pytest
 
 spec = importlib.util.spec_from_file_location("wd", Path(__file__).with_name("watchdog.py"))
 wd = importlib.util.module_from_spec(spec)
@@ -23,57 +30,70 @@ def fake_http(payload, code=200):
     wd.http = lambda url, **kw: (code, body)
 
 
-# ── 1) всё хорошо: опрос идёт, подавленных нет ─────────────────────────────
-fake_http({"telegram": {"configured": True, "enabled": True, "polling": True,
-                        "suppressed_streak": 0}})
-name, ok, why = wd.telegram_contour_check()
-assert ok and "опрос идёт" in why, (name, ok, why)
-print("✓ живой контур: проверка зелёная")
+def _state(**kw):
+    """Состояние контура с разумными значениями по умолчанию."""
+    base = {"configured": True, "enabled": True, "polling": True, "suppressed_streak": 0}
+    base.update(kw)
+    return {"telegram": base}
 
-# ── 2) боевой случай 28.08: бот выключен, контейнер жив ────────────────────
-fake_http({"telegram": {"configured": True, "enabled": False, "polling": False,
-                        "suppressed_streak": 53}})
-name, ok, why = wd.telegram_contour_check()
-assert not ok and "ВЫКЛЮЧЕН" in why and "рестартом" in why, (name, ok, why)
-print("✓ выключенный бот: ловится, в тексте сразу сказано, чем лечить")
 
-# ── 3) бот включён, а опрос стоит (упавший polling) ────────────────────────
-fake_http({"telegram": {"configured": True, "enabled": True, "polling": False,
-                        "suppressed_streak": 0}})
-name, ok, why = wd.telegram_contour_check()
-assert not ok and "опрос" in why, (name, ok, why)
-print("✓ вставший опрос при включённом боте: ловится отдельно")
+def test_zhivoy_kontur_proverka_zelenaya():
+    fake_http(_state())
+    name, ok, why = wd.telegram_contour_check()
+    assert ok and "опрос идёт" in why, (name, ok, why)
 
-# ── 4) отправка не проходит подряд - тоже повод ────────────────────────────
-fake_http({"telegram": {"configured": True, "enabled": True, "polling": True,
-                        "suppressed_streak": 7}})
-name, ok, why = wd.telegram_contour_check()
-assert not ok and "7" in why, (name, ok, why)
-print("✓ череда неотправленных сообщений: ловится")
 
-# ── 5) молчим там, где сказать нечего ──────────────────────────────────────
-fake_http({"telegram": {"configured": False}})
-assert wd.telegram_contour_check() is None, "контур не настроен - жаловаться не на что"
-fake_http({"lanes": {}})
-assert wd.telegram_contour_check() is None, "старая версия интеграции - состояния нет"
-fake_http("", code=0)
-assert wd.telegram_contour_check() is None, "контейнер лежит - об этом скажет другая проверка"
-print("✓ не настроен, старая версия, лежачий контейнер: молчим, не шумим зря")
+def test_vyklyuchennyy_bot_lovitsya_i_skazano_chem_lechit():
+    """Боевой случай 28.08.2026: бот выключен, контейнер жив."""
+    fake_http(_state(enabled=False, polling=False, suppressed_streak=53))
+    name, ok, why = wd.telegram_contour_check()
+    assert not ok and "ВЫКЛЮЧЕН" in why and "рестартом" in why, (name, ok, why)
 
-# ── 6) мусор вместо JSON - жалуемся, а не падаем ───────────────────────────
-fake_http("это не json", code=200)
-name, ok, why = wd.telegram_contour_check()
-assert not ok and "JSON" in why, (name, ok, why)
-print("✓ мусор вместо состояния: честная жалоба вместо исключения")
 
-# ── 7) проверка реально попадает в общий список сервисов ───────────────────
-fake_http({"telegram": {"configured": True, "enabled": False, "polling": False,
-                        "suppressed_streak": 1}})
-wd._sh = lambda cmd, timeout=60: (0, "")
-wd.WATCH_CONTAINERS = []
-wd.WATCH_TIMERS = []
-names = [n for n, _, _ in wd.services_checks()]
-assert any("Телеграм-бот" in n for n in names), names
-print("✓ проверка встроена в общий обход сервисов")
+def test_vstavshiy_opros_pri_vklyuchennom_bote_lovitsya_otdelno():
+    fake_http(_state(polling=False))
+    name, ok, why = wd.telegram_contour_check()
+    assert not ok and "опрос" in why, (name, ok, why)
 
-print("\nдогляд за контуром телеграм-уведомлений: все проверки прошли")
+
+def test_chereda_neotpravlennyh_soobshcheniy_lovitsya():
+    fake_http(_state(suppressed_streak=7))
+    name, ok, why = wd.telegram_contour_check()
+    assert not ok and "7" in why, (name, ok, why)
+
+
+@pytest.mark.parametrize(
+    ("payload", "code", "pochemu_molchim"),
+    [
+        ({"telegram": {"configured": False}}, 200, "контур не настроен - жаловаться не на что"),
+        ({"lanes": {}}, 200, "старая версия интеграции - состояния нет"),
+        ("", 0, "контейнер лежит - об этом скажет другая проверка"),
+    ],
+)
+def test_molchim_tam_gde_skazat_nechego(payload, code, pochemu_molchim):
+    fake_http(payload, code=code)
+    assert wd.telegram_contour_check() is None, pochemu_molchim
+
+
+def test_musor_vmesto_json_chestnaya_zhaloba_a_ne_isklyuchenie():
+    fake_http("это не json", code=200)
+    name, ok, why = wd.telegram_contour_check()
+    assert not ok and "JSON" in why, (name, ok, why)
+
+
+def test_proverka_vstroena_v_obshchiy_obhod_servisov():
+    """⚠️ Подменяем глобальные списки сервисов - и возвращаем их на место.
+
+    Пока файл был скриптом, возврат был не нужен (процесс заканчивался). В pytest остаток
+    достался бы соседним тестам, а порядок в прогоне не обещан.
+    """
+    was_sh, was_containers, was_timers = wd._sh, wd.WATCH_CONTAINERS, wd.WATCH_TIMERS
+    try:
+        fake_http(_state(enabled=False, polling=False, suppressed_streak=1))
+        wd._sh = lambda cmd, timeout=60: (0, "")
+        wd.WATCH_CONTAINERS = []
+        wd.WATCH_TIMERS = []
+        names = [n for n, _, _ in wd.services_checks()]
+        assert any("Телеграм-бот" in n for n in names), names
+    finally:
+        wd._sh, wd.WATCH_CONTAINERS, wd.WATCH_TIMERS = was_sh, was_containers, was_timers
