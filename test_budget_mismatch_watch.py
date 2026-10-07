@@ -24,7 +24,30 @@ import tempfile
 import types
 
 
+# Что лежало в sys.modules до наших заглушек - чтобы вернуть это после импортов.
+_SAVED_SYS_MODULES: dict = {}
+
+
+def _restore_sys_modules() -> None:
+    """Вернуть `sys.modules` как было. Зовётся после импортов кода под тестом.
+
+    ⚠️ Зачем. Заглушка обязана стоять ДО импорта модуля под тестом, иначе он возьмёт
+    настоящую зависимость. Но оставленная в `sys.modules` навсегда, она достаётся всем
+    файлам, импортированным позже: их подмены ложатся на НАШУ заглушку, боевой код зовёт
+    настоящую отправку, запрос уходит в сеть, и прогон висит. Перебор парами 07.10.2026
+    показал ровно это - прогон одним процессом не доходил до конца.
+
+    Модуль под тестом уже держит свои ссылки на заглушки, возврат ему не мешает.
+    """
+    for name, original in _SAVED_SYS_MODULES.items():
+        if original is not None:
+            sys.modules[name] = original
+        else:
+            sys.modules.pop(name, None)
+
+
 def _stub(name, **attrs):
+    _SAVED_SYS_MODULES.setdefault(name, sys.modules.get(name))
     m = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(m, k, v)
@@ -46,6 +69,11 @@ os.environ.setdefault(
 
 import budget_mismatch_watch as B  # noqa: E402
 from waybill_config import FIELD_ORDER_TOTAL, PIPELINE_CLEVER_MAIN  # noqa: E402
+
+# ⚠️ Код под тестом импортирован и держит заглушки - возвращаем sys.modules, чтобы
+# соседние файлы получили НАСТОЯЩИЕ модули. Разбор - в шапке _restore_sys_modules.
+_restore_sys_modules()
+
 
 NOW = 1790500000
 

@@ -21,6 +21,7 @@ import time
 
 import amo_service
 import lead_distribution as ld
+import pytest
 import lead_distribution_log_client
 import lead_distribution_profiles_client as ldpc
 import team_panel_client
@@ -283,14 +284,71 @@ async def _fake_get_leads_by_ids(lead_ids):
 
 _leads_by_ids_calls: list = []
 
-amo_service.get_lead_full = _fake_get_lead_full
-amo_service.get_contact_by_id = _fake_get_contact_by_id
-amo_service.get_leads_by_ids = _fake_get_leads_by_ids
-amo_service.patch_lead = _fake_patch_lead
-amo_service.add_note = _fake_add_note
-amo_service.add_tag = _fake_add_tag
-amo_service.get_open_deal_counts_by_source = _fake_get_open_deal_counts_by_source
-telegram_bot.send_alert = _fake_send_alert
+# ⚠️ ПОДМЕНЫ СТАВИТ ФИКСТУРА, А НЕ УРОВЕНЬ МОДУЛЯ. Прежде восемь присваиваний стояли прямо
+# здесь, и это ломало прогон вместе с соседями: перебор парами 07.10.2026 показал, что файл
+# неблагополучен с 20 соседями из 57, причём с 13 из них ВИСНЕТ.
+#
+# Механизм. Подмена на уровне модуля ложится на тот объект, который достался строкам
+# `import amo_service` / `import telegram_bot` вверху ЭТОГО файла. Если сосед успел положить
+# в `sys.modules` свою заглушку, нам достаётся заглушка - а боевой `lead_distribution` держит
+# СВОЮ ссылку на настоящий модуль. Тогда подмена уходит в пустоту, боевой код зовёт
+# НАСТОЯЩИЙ `telegram_bot.send_alert`, запрос уходит в сеть, и тест висит до таймаута. На
+# Windows таймаут снимает процесс целиком, то есть один такой вис кончает весь прогон.
+#
+# Поэтому подменяем на объектах, которые держит КОД ПОД ТЕСТОМ (`ld.amo_service`,
+# `ld.telegram_bot`), и на своих тоже - тесты обращаются к ним напрямую в 18 местах. И
+# возвращаем обратно, чтобы не портить соседям.
+_AMO_FAKES = {
+    "get_lead_full": _fake_get_lead_full,
+    "get_contact_by_id": _fake_get_contact_by_id,
+    "get_leads_by_ids": _fake_get_leads_by_ids,
+    "patch_lead": _fake_patch_lead,
+    "add_note": _fake_add_note,
+    "add_tag": _fake_add_tag,
+    "get_open_deal_counts_by_source": _fake_get_open_deal_counts_by_source,
+}
+
+
+def _targets(attr: str) -> list[object]:
+    """Объекты, на которых надо подменить: чей держит код под тестом и свой."""
+    seen: set[int] = set()
+    out: list[object] = []
+    for obj in (getattr(ld, attr, None), globals().get(attr)):
+        if obj is not None and id(obj) not in seen:
+            seen.add(id(obj))
+            out.append(obj)
+    return out
+
+
+def install_fakes() -> list[tuple[object, str, object]]:
+    """Поставить заглушки. Возвращает снятые значения - для восстановления."""
+    saved: list[tuple[object, str, object]] = []
+    for obj in _targets("amo_service"):
+        for name, fake in _AMO_FAKES.items():
+            saved.append((obj, name, getattr(obj, name, None)))
+            setattr(obj, name, fake)
+    for obj in _targets("telegram_bot"):
+        saved.append((obj, "send_alert", getattr(obj, "send_alert", None)))
+        obj.send_alert = _fake_send_alert
+    return saved
+
+
+def restore_fakes(saved: list[tuple[object, str, object]]) -> None:
+    for obj, name, original in reversed(saved):
+        if original is None:
+            continue                      # такого имени не было - не выдумываем его
+        setattr(obj, name, original)
+
+
+@pytest.fixture(autouse=True)
+def _amo_and_telegram_fakes():
+    saved = install_fakes()
+    try:
+        yield
+    finally:
+        restore_fakes(saved)
+
+
 _real_log_send = lead_distribution_log_client.send
 _real_fetch_for_datetime = team_panel_client.fetch_for_datetime
 
@@ -1596,6 +1654,11 @@ def test_reconcile_window_capped_after_restart():
 
 if __name__ == "__main__":
     import traceback
+
+    # ⚠️ В режиме скрипта фикстура pytest не работает, поэтому заглушки ставим руками.
+    # Без этой строки прямой запуск файла пошёл бы в НАСТОЯЩИЕ amoCRM и Телеграм.
+    install_fakes()
+
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = 0
     for fn in fns:

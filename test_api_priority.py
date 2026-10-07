@@ -20,10 +20,38 @@ import time
 from collections import deque
 
 import api
+import pytest
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+# ⚠️ ПОЛЯ МОДУЛЯ `api` НАДО ВОЗВРАЩАТЬ. Файл намеренно подменяет их (см. шапку), и пока он
+# запускался скриптом, возврат был не нужен - процесс заканчивался вместе с проверками. Под
+# pytest `api` общий на процесс, и оставленные дорожки с мёртвым `_wakeup` вешают СОСЕДНИЕ
+# файлы: перебор парами 07.10.2026 показал, что `test_api_priority` и `test_api_senders`
+# вешают `test_autopilot` намертво.
+_API_FIELDS = (
+    "_lanes", "_served", "_promoted_by_starvation", "_wakeup", "_congested",
+    "_backpressure_skips", "BACKPRESSURE_DEPTH", "BACKPRESSURE_CLEAR_DEPTH",
+    "API_STARVATION_SECONDS",
+)
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def _restore_api_fields():
+    saved = {name: getattr(api, name, _MISSING) for name in _API_FIELDS}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is not _MISSING:
+                setattr(api, name, value)
+        # Приоритет и категория брейкера - тоже состояние процесса, возвращаем к исходному.
+        api.set_api_priority(None)
+        api.set_breaker_category("default")
 
 
 def _fresh_lanes():

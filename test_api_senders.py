@@ -18,6 +18,7 @@ import asyncio
 import time
 
 import api
+import pytest
 
 
 class _Resp:
@@ -71,6 +72,85 @@ _real_async_client = api.httpx.AsyncClient
 
 def _restore():
     api.httpx.AsyncClient = _real_async_client
+
+
+# ⚠️ ВОЗВРАТ ОБЯЗАТЕЛЕН, И ЭТОГО НЕ ХВАТАЛО. `api.httpx` - это НЕ локальная копия, а сам
+# модуль `httpx`, общий на процесс. Подмена `AsyncClient` фейком в тесте, который упал до
+# своего `_restore()`, достаётся всему прогону: соседний файл получает фейкового клиента с
+# мёртвым циклом событий и ВИСНЕТ. Перебор парами 07.10.2026: этот файл и
+# `test_api_priority` вешали `test_autopilot`.
+#
+# Та же причина у конвейера: тест поднимает его `init_api_pipeline()` и гасит в конце, но
+# упавший посередине оставляет поднятым, и следующий зовущий `submit_request` ждёт воркера,
+# которого уже нет.
+# ⚠️ Имена полей взяты ИЗ `_cfg` ниже, а не по памяти. Первый раз я их угадала
+# (`API_RPS` вместо `API_RATE_RPS` и так далее) - несуществующие имена молча пропускались,
+# фикстура возвращала почти ничего, и вис остался. Проверка от этого: тест ниже сверяет,
+# что каждое имя в модуле действительно есть.
+_API_FIELDS = (
+    "API_SENDERS",
+    "API_RATE_RPS",
+    "API_RATE_BURST",
+    "API_RATE_PENALTY_S",
+    "MIN_REQUEST_INTERVAL_SECONDS",
+)
+_MISSING = object()
+
+
+def test_imena_poley_api_sushchestvuyut():
+    """Сторож против опечатки в списке выше: нет поля - нет и возврата, молча."""
+    missing = [name for name in _API_FIELDS if not hasattr(api, name)]
+    assert not missing, f"в модуле api нет полей {missing} - список возврата врёт"
+
+
+# ⚠️ ПОЧЕМУ СБРОС, А НЕ `shutdown_api_pipeline()`. Каждый тест здесь зовёт `asyncio.run`,
+# то есть поднимает СВОЙ цикл событий и закрывает его на выходе. Конвейер при этом остаётся
+# в глобалах `api` - вместе с `_wakeup` (Event) и `_rate_lock` (Lock), привязанными к уже
+# МЁРТВОМУ циклу. Следующий, кто позовёт `submit_request`, будет ждать их вечно: ровно так
+# этот файл вешал `test_autopilot` (перебор по тестам 07.10.2026 - травил КАЖДЫЙ тест файла,
+# кроме того, что конвейера не касается).
+#
+# Гасить конвейер нечем: его цикл закрыт, `await` внутри `shutdown` уже не выполнится.
+# Поэтому возвращаем поля к тем значениям, с которыми модуль загружается (строки 321-336
+# в api.py) - и следующий `init_api_pipeline()` поднимает всё заново на живом цикле.
+_PRISTINE_PIPELINE = {
+    "_lanes": dict,
+    "_wakeup": lambda: None,
+    "_api_worker_tasks": list,
+    "_last_sent_at": lambda: 0.0,
+    "_served": dict,
+    "_promoted_by_starvation": lambda: 0,
+    "_congested": lambda: False,
+    "_backpressure_skips": dict,
+    "_tokens": lambda: 0.0,
+    "_bucket_refilled_at": lambda: 0.0,
+    "_rate_lock": lambda: None,
+    "_rate_penalty_until": lambda: 0.0,
+    "_in_flight": lambda: 0,
+    "_max_in_flight": lambda: 0,
+    "_rate_waits": lambda: 0,
+    "_penalty_hits": lambda: 0,
+}
+
+
+def test_imena_poley_konveyera_sushchestvuyut():
+    """Сторож против опечатки: нет поля - нет и сброса, молча."""
+    missing = [name for name in _PRISTINE_PIPELINE if not hasattr(api, name)]
+    assert not missing, f"в модуле api нет полей {missing} - список сброса врёт"
+
+
+@pytest.fixture(autouse=True)
+def _restore_api_state():
+    saved = {name: getattr(api, name, _MISSING) for name in _API_FIELDS}
+    try:
+        yield
+    finally:
+        _restore()
+        for name, value in saved.items():
+            if value is not _MISSING:
+                setattr(api, name, value)
+        for name, make in _PRISTINE_PIPELINE.items():
+            setattr(api, name, make())
 
 
 def run(coro):

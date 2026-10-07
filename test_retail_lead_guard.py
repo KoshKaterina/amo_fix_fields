@@ -20,7 +20,30 @@ os.environ.setdefault(
 
 
 # --- стабы тяжёлых зависимостей -------------------------------------------------
+# Что лежало в sys.modules до наших заглушек - чтобы вернуть это после импорта.
+_SAVED_SYS_MODULES: dict = {}
+
+
+def _restore_sys_modules() -> None:
+    """Вернуть `sys.modules` как было. Звать СРАЗУ после импорта кода под тестом.
+
+    ⚠️ Зачем. Заглушка обязана стоять ДО импорта модуля под тестом, иначе он возьмёт
+    настоящие зависимости. Но оставленная в `sys.modules` навсегда, она достаётся всем
+    файлам, импортированным позже: их подмены ложатся на заглушку, боевой код зовёт
+    настоящую отправку, запрос уходит в сеть и прогон висит. Перебор парами 07.10.2026:
+    этот файл вешал `test_lead_distribution` намертво.
+
+    Модуль под тестом уже держит свои ссылки на заглушки - возврат ему не мешает.
+    """
+    for name, original in _SAVED_SYS_MODULES.items():
+        if original is not None:
+            sys.modules[name] = original
+        else:
+            sys.modules.pop(name, None)
+
+
 def _stub(name, *, base_on_real=False, **attrs):
+    _SAVED_SYS_MODULES.setdefault(name, sys.modules.get(name))
     """Положить в `sys.modules` заглушку модуля.
 
     ⚠️ `base_on_real=True` - для модулей, которые читают СОСЕДНИЕ тестовые файлы. Заглушка
@@ -112,6 +135,10 @@ _stub("alerts", base_on_real=True, decide=_decide,
       lead_link=lambda lead_id: f'<a href="https://amo.example/leads/detail/{lead_id}">Открыть сделку</a>')
 
 import retail_lead_guard as G  # noqa: E402
+
+# ⚠️ Код под тестом импортирован и уже держит заглушки - возвращаем sys.modules,
+# чтобы соседние файлы получили НАСТОЯЩИЕ модули. Разбор - в шапке _restore_sys_modules.
+_restore_sys_modules()
 from waybill_config import (  # noqa: E402
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
