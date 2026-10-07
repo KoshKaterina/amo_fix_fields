@@ -20,8 +20,32 @@ os.environ.setdefault(
 
 
 # --- стабы тяжёлых зависимостей -------------------------------------------------
-def _stub(name, **attrs):
-    m = types.ModuleType(name)
+def _stub(name, *, base_on_real=False, **attrs):
+    """Положить в `sys.modules` заглушку модуля.
+
+    ⚠️ `base_on_real=True` - для модулей, которые читают СОСЕДНИЕ тестовые файлы. Заглушка
+    тогда начинается с КОПИИ настоящего модуля, и подмены ложатся поверх: ничего не
+    исчезает. Без этого сосед, импортированный позже, обращается к отсутствующему имени и
+    падает на ИМПОРТЕ - то есть ошибкой СБОРА, которая роняет сбор всего репозитория. Так
+    ломались `test_uis_callback_watch.py` (ему нужен `amo_service.get_lead_full`) и
+    `test_wazzup_sla.py` (`alerts.panel_notify_bg`). Правило записано в шапке первого из
+    них: «заглушка целым модулем ломала бы сборку соседних тестов» (07.10.2026).
+
+    ⚠️ Копируем, а НЕ правим настоящий модуль: иначе подмены вроде `find_leads_by_query=None`
+    достались бы всем, кто зовёт эту функцию по-настоящему.
+    """
+    m = None
+    if base_on_real:
+        try:
+            import importlib
+
+            real = importlib.import_module(name)
+            m = types.ModuleType(name)
+            m.__dict__.update(real.__dict__)
+        except Exception:                      # noqa: BLE001 - нет модуля, обойдёмся пустым
+            m = None
+    if m is None:
+        m = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(m, k, v)
     sys.modules[name] = m
@@ -58,7 +82,7 @@ async def _find_leads_by_query(query, **kwargs):
     return _leads_answer
 
 
-_stub("amo_service", find_leads_by_query=_find_leads_by_query,
+_stub("amo_service", base_on_real=True, find_leads_by_query=_find_leads_by_query,
       find_contacts_by_query=None, get_talks_by_contact=None,
       get_custom_field_value=_cf_value)
 _stub("api", BASE_URL="https://amo.example")
@@ -84,7 +108,7 @@ def _decide(event_key, *, legacy_text, values=None, chat_id=None, thread_id=None
     return _Decision(legacy_text, chat_id, thread_id)
 
 
-_stub("alerts", decide=_decide,
+_stub("alerts", base_on_real=True, decide=_decide,
       lead_link=lambda lead_id: f'<a href="https://amo.example/leads/detail/{lead_id}">Открыть сделку</a>')
 
 import retail_lead_guard as G  # noqa: E402
