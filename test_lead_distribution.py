@@ -66,6 +66,7 @@ def setup_function(_=None):
     ld.LEAD_DISTRIBUTION_ENABLED = True
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (0, 24)  # все всегда «на месте» по умолчанию
     ld.LEAD_DISTRIBUTION_FAIRNESS_GAP = 2
+    ld.LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS = set()
     ld.LEAD_DISTRIBUTION_CONTACT_WAIT_S = 10
     ld.LEAD_DISTRIBUTION_CONTACT_POLL_S = 2
     ld.LEAD_DISTRIBUTION_STALE_ALERT_MIN = 30
@@ -86,6 +87,28 @@ def setup_function(_=None):
 def teardown_function(_=None):
     lead_distribution_log_client.send = _real_log_send
     team_panel_client.fetch_for_datetime = _real_fetch_for_datetime
+
+
+async def _run_ignore_schedule_profile_uses_full_pool_equally():
+    profile = _seed_profile(
+        id="academy",
+        participant_ids=[13822630, 14289086, 14289446],
+        repeat_contact_mode="random",
+        duty_user_id=11513202,
+    )
+    ld.LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS = {"academy"}
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (0, 0)
+
+    assigned = [
+        await ld.decide_and_record({"id": lead_id, "_embedded": {}}, profile)
+        for lead_id in range(1, 7)
+    ]
+
+    assert assigned == [13822630, 14289086, 14289446, 13822630, 14289086, 14289446]
+
+
+def test_ignore_schedule_profile_uses_full_pool_equally():
+    asyncio.run(_run_ignore_schedule_profile_uses_full_pool_equally())
 
 
 # ── билдеры ──────────────────────────────────────────────────────────────

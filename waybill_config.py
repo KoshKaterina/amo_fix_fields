@@ -1465,6 +1465,15 @@ LEAD_DISTRIBUTION_FAIRNESS_GAP = int(os.getenv("LEAD_DISTRIBUTION_FAIRNESS_GAP",
 # поэтому единое захардкоженное окно на всех участников распределения.
 LEAD_DISTRIBUTION_DEFAULT_WINDOW = (10, 19)  # (час начала МСК, час конца МСК)
 
+# Профили команд вне общего розничного ростера. Для них распределитель берёт
+# весь participant_ids без проверки team-panel / листа «График». CSV из id
+# профилей конструктора; пустое значение сохраняет прежнее поведение.
+LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS = {
+    value.strip()
+    for value in os.getenv("LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS", "").split(",")
+    if value.strip()
+}
+
 # Тег успешного распределения — идемпотентность (повторный вебхук на уже
 # помеченной сделке — no-op).
 TAG_LEAD_DISTRIBUTION_ROUTED = "распределено автоматически"

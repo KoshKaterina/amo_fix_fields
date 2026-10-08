@@ -64,6 +64,7 @@ from waybill_config import (
     LEAD_DISTRIBUTION_DEFAULT_WINDOW,
     LEAD_DISTRIBUTION_ENABLED,
     LEAD_DISTRIBUTION_FAIRNESS_GAP,
+    LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS,
     LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S,
     LEAD_DISTRIBUTION_SINCE_TS,
     LEAD_DISTRIBUTION_SKIP_NAME_PREFIXES,
@@ -702,7 +703,13 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         if any(w != 1 for w in weights.values()):
             meta["weights"] = weights  # веса по умолчанию (все 1) не пишем - шум
 
-    if profile.work_hours:
+    if profile.id in LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS:
+        # У отдельных команд нет строк в розничном ростере. Явная настройка
+        # профиля делает доступным весь его пул и не затрагивает остальные
+        # правила, для которых team-panel остаётся источником присутствия.
+        pool = list(profile.participant_ids)
+        pool_is_future = False
+    elif profile.work_hours:
         today_pool = eligible_pool(profile)
         if not today_pool and not _work_day_ended(profile):
             live_now = await team_panel_client.fetch_for_datetime(
