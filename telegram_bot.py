@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -21,7 +23,6 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
 import waybill_service
-from shared.timez import now_msk
 from waybill_config import TG_ALLOWED_CHAT_ID, TG_BOT_TOKEN, TG_PROXY_URL
 
 logger = logging.getLogger("uvicorn")
@@ -71,11 +72,7 @@ _state: dict = {
 
 
 def _ts() -> str:
-    # ⚠️ Было `datetime.now(ZoneInfo("Europe/Moscow"))`. Результат тот же (Москва на UTC+3
-    # постоянно с 26.10.2014, а здесь всегда «сейчас»), но `ZoneInfo` требует базу часовых
-    # поясов, которой нет ни в `requirements.txt`, ни на машинах с Windows - и вызов падал
-    # `ZoneInfoNotFoundError` (07.10.2026).
-    return now_msk().strftime("%d.%m.%y_%H-%M")
+    return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%y_%H-%M")
 
 
 def _build_dispatcher() -> Dispatcher:

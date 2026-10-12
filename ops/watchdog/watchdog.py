@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
-"""Сторож Sunscrypt: пишет Кате в Telegram, когда нужно её вмешательство.
+"""Сторож Sunscrypt: пишет Кате в личный Telegram, когда нужно её вмешательство.
 
-Что запускает крон:
+Пять проверок, каждая запускается своим кроном:
 
     watchdog.py tokens     - живы ли доступы к внешним системам (раз в час)
+    watchdog.py deadlines  - задачи YouGile: просроченные, сегодня, завтра (утром)
+    watchdog.py renewals   - домены и хостинг: скоро продлевать (утром)
     watchdog.py defi       - жив ли прокси, через который живёт DeFi-дашборд (раз в полчаса)
     watchdog.py services   - упавшие юниты, мёртвые контейнеры, выключенные таймеры (каждые 5 минут)
-    watchdog.py digest     - утренняя сводка одним сообщением (09:00 МСК)
 
-Отдельно, для запуска руками (в сводку входят сами):
-
-    watchdog.py deadlines  - задачи YouGile: просроченные, сегодня, завтра
-    watchdog.py renewals   - домены и хостинг: скоро продлевать
-
-СРОЧНОЕ И НЕСРОЧНОЕ (постановка Кати 22.09.2026). Срочное - то, что прямо сейчас
-видит клиент: не отвечает склад, сайт, amoCRM, доставка, не уходят сообщения.
-Оно будит сразу и напоминает раз в 6 часов. Всё остальное - наша внутренняя
-кухня: лежит меньше 6 часов - сторож молчит вовсе, перевалило за 6 - ОДНО
-сообщение, дальше только строка в утренней сводке. Что именно срочное - список
-URGENT_EXACT ниже.
-
-ПОРОГ УСТОЙЧИВОСТИ. Сырому результату одного прогона не верим: поломка
-засчитывается после нескольких неудач подряд, починка - после нескольких удач.
-Без этого сторож ловит дребезг (22.09.2026: юнит типа oneshot в момент своего
-запуска исчезает из списка failed, сторож ходит тем же пятиминутным ритмом и
-пишет «лежит - работает - лежит - работает» четыре раза за двадцать минут).
+Правила против спама:
+  • tokens шлёт письмо на переходе «работал → сломался» и «сломался → починился»;
+    пока сломано, напоминает раз в 6 часов, не чаще;
+  • renewals по каждому домену пишет не чаще раза в 3 дня и только при пересечении
+    порогов 30/14/7/3/1 день;
+  • deadlines - одна сводка в день, и только если есть о чём писать;
+  • services живёт по тому же правилу, что и tokens: одно письмо на падение,
+    напоминание раз в 6 часов, отдельное письмо про восстановление.
 
 Состояние - в state.json рядом со скриптом. Секреты только читаются из .env,
 никуда не печатаются.
@@ -84,142 +76,19 @@ def save_state(state):
     os.replace(tmp, STATE_PATH)
 
 
-# ------------------------------------------------------ срочное против несрочного
-# Срочное - то, что бьёт по клиенту прямо сейчас: не принимается заказ, не
-# отвечает склад, не уходит сообщение человеку. Такое будит Катю немедленно.
-# Всё остальное (наши таймеры, сборщики, дашборды, чужие панели) ждёт: сначала
-# шесть часов тишины, потом одно письмо, дальше утренняя сводка.
-#
-# Телеграм-бот интеграции сидит тут не за себя: когда он мёртв, молчат ВСЕ
-# уведомления отдела продаж - невзятые лиды, пропущенные звонки, неоплаченные
-# счета. 28.08.2026 так потеряли сутки и 53 сообщения.
-URGENT_EXACT = {
-    "amoCRM", "МойСклад", "WooCommerce (sunscrypt.ru)", "Wazzup", "СДЭК",
-    "Контейнер · amo-fix-fields", "Контейнер · woo-sklad",
-    "Телеграм-бот · интеграция amo",
-}
-QUIET_HOURS = int(ENV.get("QUIET_HOURS") or 6)        # сколько несрочное молчит
-REMIND_HOURS = int(ENV.get("REMIND_HOURS") or 6)      # как часто напоминает срочное
-
-
-def is_urgent(name):
-    return name in URGENT_EXACT
-
-
-def human_age(sec):
-    """Сколько лежит - словами, без секунд и долей."""
-    if sec < 3600:
-        return f"{max(1, sec // 60)} мин"
-    if sec < 86400:
-        return f"{sec // 3600} ч"
-    return f"{sec // 86400} дн"
-
-
-def triage(prev, checks, now, *, fail_to_open=1, ok_to_close=1):
-    """Разложить сырой прогон на «звонить сейчас», «сказать разово» и «молчать».
-
-    На входе прошлое состояние и список (имя, ок, почему) - результат ОДНОГО
-    прогона. На выходе три готовых списка строк и новое состояние.
-
-    Между сырым «не отвечает» и сообщением Кате стоят две вещи. Порог
-    устойчивости гасит дребезг: поломке верим после fail_to_open неудач подряд,
-    починке - после ok_to_close удач. Срочность решает, что делать с поломкой,
-    в которую поверили: клиентское уходит сразу, внутреннее отлёживается
-    QUIET_HOURS часов и потом говорит ровно один раз.
-
-    В состоянии на каждую проверку: ok - во что мы ВЕРИМ (не сырой ответ),
-    fail/okrun - счётчики подряд, down_since - когда поверили в поломку,
-    alerted - когда отправили то самое разовое, last_alert - последнее письмо
-    по срочному, why - причина (нужна утренней сводке).
-    """
-    urgent_broken, urgent_fixed, quiet_once = [], [], []
-    new_state = {}
-
-    for name, ok, why in checks:
-        was = prev.get(name) or {}
-        believed_ok = was.get("ok", True)
-        rec = {
-            "ok": believed_ok,
-            "fail": 0 if ok else was.get("fail", 0) + 1,
-            "okrun": was.get("okrun", 0) + 1 if ok else 0,
-            # у записей, переживших выкатку старой версии, поля нет вовсе: считаем,
-            # что отсчёт шести часов тишины начинается сейчас, а не в 1970 году
-            "down_since": was.get("down_since") or (0 if believed_ok else now),
-            "alerted": was.get("alerted", 0),
-            "last_alert": was.get("last_alert", 0),
-            "why": was.get("why", "") if ok else why,
-        }
-
-        if not ok and believed_ok and rec["fail"] >= fail_to_open:
-            rec.update(ok=False, down_since=now, alerted=0)
-            if is_urgent(name):
-                urgent_broken.append(f"• {name}\n  {why}")
-                rec["last_alert"] = now
-            else:
-                log(f"  {name}: лежит, но это не клиентское - молчу {QUIET_HOURS} ч")
-        elif not ok and not believed_ok:
-            age = now - (rec["down_since"] or now)
-            if is_urgent(name):
-                if now - rec["last_alert"] >= REMIND_HOURS * 3600:
-                    urgent_broken.append(f"• {name}\n  {why}")
-                    rec["last_alert"] = now
-            elif not rec["alerted"] and age >= QUIET_HOURS * 3600:
-                quiet_once.append(f"• {name} - лежит {human_age(age)}\n  {why}")
-                rec["alerted"] = now
-        elif ok and not believed_ok and rec["okrun"] >= ok_to_close:
-            if is_urgent(name):
-                urgent_fixed.append(f"• {name}")
-            rec.update(ok=True, down_since=0, alerted=0, last_alert=0, why="")
-
-        new_state[name] = rec
-
-    return urgent_broken, urgent_fixed, quiet_once, new_state
-
-
-def open_problems(state):
-    """Всё, что сейчас лежит, по всем контурам - для утренней сводки.
-    Отдаёт (когда упало, срочное ли, имя, причина), старое сверху."""
-    out = []
-    for kind in ("tokens", "services", "defi"):
-        for name, rec in (state.get(kind) or {}).items():
-            if rec.get("ok", True):
-                continue
-            out.append((rec.get("down_since") or 0, is_urgent(name), name, rec.get("why") or ""))
-    return sorted(out)
-
-
 # --------------------------------------------------------------------- telegram
-def curl_cfg(key, value):
-    """Строка конфига curl. Всё секретное отдаём curl через stdin, а не аргументами:
-    argv любого процесса читает `ps` от имени ЛЮБОГО пользователя машины, а stdin
-    виден только самому процессу. Значение берём в кавычки - внутри них curl понимает
-    escape-последовательности, поэтому обратный слэш, кавычку и перевод строки экранируем."""
-    v = (str(value).replace("\\", "\\\\").replace('"', '\\"')
-         .replace("\n", "\\n").replace("\r", "\\r"))
-    return f'{key} = "{v}"'
-
-
-def curl_run(config, args, timeout):
-    """curl с секретной частью запроса из stdin. `-K -` ставим ПОСЛЕДНИМ: так конфиг
-    читается после флагов, и --globoff успевает отключить глоббинг до разбора URL."""
-    return subprocess.run(["curl"] + args + ["-K", "-"],
-                          input="\n".join(config) + "\n",
-                          capture_output=True, text=True, timeout=timeout)
-
-
 def tg_send(text):
     token, chat = secret("TG_BOT_TOKEN"), secret("TG_ALLOWED_CHAT_ID")
     if not token or not chat:
         log("некуда слать: нет TG_BOT_TOKEN или TG_ALLOWED_CHAT_ID")
         return False
-    # токен бота сидит в самом URL, а пароль шлюза - в строке прокси: оба в stdin
-    cfg = [curl_cfg("url", f"https://api.telegram.org/bot{token}/sendMessage")]
+    cmd = ["curl", "-s", "--max-time", "30", "-o", "/dev/null", "-w", "%{http_code}",
+           "-d", f"chat_id={chat}", "--data-urlencode", f"text={text}",
+           f"https://api.telegram.org/bot{token}/sendMessage"]
     proxy = secret("TG_PROXY_URL")
     if proxy:  # Telegram из РФ - только через наш шлюз
-        cfg.append(curl_cfg("proxy", proxy))
-    args = ["-s", "--max-time", "30", "-o", "/dev/null", "-w", "%{http_code}",
-            "-d", f"chat_id={chat}", "--data-urlencode", f"text={text}"]
-    p = curl_run(cfg, args, timeout=60)
+        cmd = cmd[:1] + ["--proxy", proxy] + cmd[1:]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     ok = (p.stdout or "").strip() == "200"
     if not ok:
         log(f"telegram не принял: {p.stdout!r}")
@@ -228,20 +97,18 @@ def tg_send(text):
 
 # ------------------------------------------------------------------------- http
 def http(url, headers=None, method="GET", data=None, timeout=30):
-    """Возвращает (код, тело). URL, заголовки и тело уходят в curl через stdin: токены
-    живут во всех трёх (Bearer в заголовке, ключи Woo прямо в URL, секрет СДЭК в теле),
-    а аргументы командной строки видны в `ps` всем. В лог они тоже не попадают."""
-    cfg = [curl_cfg("url", url)]
-    for h in headers or []:
-        cfg.append(curl_cfg("header", h))
-    if data:
-        cfg.append(curl_cfg("data", data))
+    """Возвращает (код, тело). Секреты идут в заголовках, в лог не попадают."""
     # --location нужен RDAP: rdap.org отвечает редиректом на сервер нужной зоны
-    args = ["-s", "--globoff", "--compressed", "--location", "--max-time", str(timeout),
-            "-w", "\n%{http_code}"]
+    cmd = ["curl", "-s", "--globoff", "--compressed", "--location", "--max-time", str(timeout),
+           "-w", "\n%{http_code}"]
     if method != "GET":
-        args += ["-X", method]
-    p = curl_run(cfg, args, timeout=timeout + 30)
+        cmd += ["-X", method]
+    for h in headers or []:
+        cmd += ["-H", h]
+    if data:
+        cmd += ["-d", data]
+    cmd.append(url)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 30)
     out = p.stdout or ""
     nl = out.rfind("\n")
     body, code = (out[:nl], out[nl + 1:].strip()) if nl >= 0 else ("", out.strip())
@@ -329,26 +196,35 @@ def check_metrika_by_logs(hours=24):
 
 def run_tokens():
     state = load_state()
+    prev = state.get("tokens", {})
     now = int(time.time())
     checks = check_tokens()
-    for name, ok, why in checks:
-        log(f"  {name}: {'ок' if ok else 'СЛОМАНО'} {why}".rstrip())
+    lines_broken, lines_fixed = [], []
+    new_state = {}
 
-    # проверка идёт раз в час, сетевой икоты тут не ловили - порог держим на единице,
-    # иначе о мёртвом доступе к складу мы узнаем только через два часа
-    broken, fixed, quiet, new_state = triage(state.get("tokens", {}), checks, now)
+    for name, ok, why in checks:
+        was = prev.get(name, {})
+        was_ok = was.get("ok", True)
+        last_alert = was.get("last_alert", 0)
+        new_state[name] = {"ok": ok, "last_alert": last_alert}
+        log(f"  {name}: {'ок' if ok else 'СЛОМАНО'} {why}".rstrip())
+        if not ok:
+            # первое падение или напоминание раз в 6 часов
+            if was_ok or now - last_alert > 6 * 3600:
+                lines_broken.append(f"• {name}: {why}")
+                new_state[name]["last_alert"] = now
+        elif not was_ok:
+            lines_fixed.append(f"• {name}")
+
     state["tokens"] = new_state
     save_state(state)
 
-    if broken:
-        tg_send("🔴 Клиенты не могут работать: не отвечает доступ\n\n" + "\n".join(broken) +
-                f"\n\nПока не почините, напомню через {REMIND_HOURS} часов.")
-    if fixed:
-        tg_send("✅ Доступ восстановился\n\n" + "\n".join(fixed))
-    if quiet:
-        tg_send(f"🟡 Лежит больше {QUIET_HOURS} часов\n\n" + "\n".join(quiet) +
-                "\n\nКлиентов не задевает. Дальше скажу только в утренней сводке.")
-    if not (broken or fixed or quiet):
+    if lines_broken:
+        tg_send("🔑 Доступ не работает\n\n" + "\n".join(lines_broken) +
+                "\n\nПока не почините, напомню через 6 часов.")
+    if lines_fixed:
+        tg_send("✅ Доступ восстановился\n\n" + "\n".join(lines_fixed))
+    if not lines_broken and not lines_fixed:
         log("  новостей нет, письмо не отправляю")
     return 0
 
@@ -377,8 +253,7 @@ def yougile_tasks():
         offset += len(chunk)
 
 
-def run_deadlines(collect=False):
-    """collect=True - вернуть готовые строки для утренней сводки вместо отправки."""
+def run_deadlines():
     now = datetime.now(MSK)
     today = now.date()
     # Катины задачи в YouGile почти всегда без исполнителя: их заводят ей и никого
@@ -398,8 +273,7 @@ def run_deadlines(collect=False):
         if not dl:
             continue
         d = datetime.fromtimestamp(dl / 1000, MSK).date()
-        # код задачи не пишем: Катя читает названия, а не MAG-283 (правило 03.08.2026)
-        label = (t.get("title") or "").strip() or "задача без названия"
+        label = f"{t.get('idTaskProject') or t.get('idTaskCommon') or ''} {t.get('title','')}".strip()
         if d < today:
             overdue.append((d, label))
         elif d == today:
@@ -414,19 +288,15 @@ def run_deadlines(collect=False):
 
     if not (overdue or due_today or due_tomorrow or fresh):
         log("  дедлайнов и новых задач нет, молчу")
-        return [] if collect else 0
+        return 0
 
-    parts = []
+    parts = ["📅 Задачи на сегодня"]
     if overdue:
-        # ⚠️ Раньше сюда падали десять самых СТАРЫХ - мёртвый груз, который не меняется
-        # неделями, и сводка превращалась в обои. Показываем три свежепросроченных:
-        # по ним ещё можно успеть. Остальные живут в YouGile, счётчиком.
-        fresh_overdue = sorted(overdue, reverse=True)[:3]
-        parts.append(f"\nПросрочено: {len(overdue)}. Протухли последними:")
-        for d, label in fresh_overdue:
+        parts.append(f"\nПросрочено ({len(overdue)}):")
+        for d, label in sorted(overdue)[:10]:
             parts.append(f"• {label} - срок был {d.strftime('%d.%m')}")
-        if len(overdue) > 3:
-            parts.append(f"Остальные {len(overdue) - 3} - в YouGile.")
+        if len(overdue) > 10:
+            parts.append(f"• …и ещё {len(overdue) - 10}")
     if due_today:
         parts.append(f"\nСегодня ({len(due_today)}):")
         parts += [f"• {label}" for _, label in due_today[:10]]
@@ -439,14 +309,12 @@ def run_deadlines(collect=False):
             who = {"864665f1-3697-4993-87bd-f588285bc820": "Андрей",
                    "3480b624-16d8-4f94-80ef-33b2f07d06e8": "Влад",
                    "ce3fe8fc-2a04-4e1c-a510-5c283c690efc": "Гладков"}.get(t.get("createdBy"), "кто-то")
-            label = (t.get("title") or "").strip() or "задача без названия"
+            label = f"{t.get('idTaskProject') or ''} {t.get('title','')}".strip()
             parts.append(f"• {label} (от {who})")
 
-    log(f"  просрочено {len(overdue)}, сегодня {len(due_today)}, "
+    tg_send("\n".join(parts))
+    log(f"  отправлено: просрочено {len(overdue)}, сегодня {len(due_today)}, "
         f"завтра {len(due_tomorrow)}, новых {len(fresh)}")
-    if collect:
-        return parts
-    tg_send("📅 Задачи на сегодня\n" + "\n".join(parts))
     return 0
 
 
@@ -517,8 +385,7 @@ def timeweb_balance():
         return None
 
 
-def run_renewals(collect=False):
-    """collect=True - вернуть готовые строки для утренней сводки вместо отправки."""
+def run_renewals():
     state = load_state()
     prev = state.get("renewals", {})
     now = int(time.time())
@@ -556,8 +423,6 @@ def run_renewals(collect=False):
     state["renewals"] = new_prev
     save_state(state)
 
-    if collect:
-        return lines
     if lines:
         tg_send("⏳ Скоро продлевать\n\n" + "\n".join(lines))
     else:
@@ -646,25 +511,36 @@ def defi_checks():
 
 def run_defi():
     state = load_state()
+    prev = state.get("defi", {})
     now = int(time.time())
-    checks = defi_checks()
-    for name, ok, why in checks:
-        log(f"  {name}: {'ок' if ok else 'ПУСТО'} {why}".rstrip())
+    lines_broken, lines_fixed = [], []
+    new_state = {}
 
-    # DeFi-дашборд не клиентский: ни одна строка URGENT_EXACT сюда не попадает,
-    # поэтому пустой раздел отлёживается шесть часов и говорит ровно один раз
-    _, _, quiet, new_state = triage(state.get("defi", {}), checks, now)
+    for name, ok, why in defi_checks():
+        was = prev.get(name, {})
+        was_ok = was.get("ok", True)
+        last_alert = was.get("last_alert", 0)
+        new_state[name] = {"ok": ok, "last_alert": last_alert}
+        log(f"  {name}: {'ок' if ok else 'ПУСТО'} {why}".rstrip())
+        if not ok:
+            if was_ok or now - last_alert > 6 * 3600:
+                lines_broken.append(f"• {name}: {why}")
+                new_state[name]["last_alert"] = now
+        elif not was_ok:
+            lines_fixed.append(f"• {name}")
+
     state["defi"] = new_state
     save_state(state)
 
-    if quiet:
-        tg_send(f"🟡 DeFi-дашборд: данные пропали больше {QUIET_HOURS} часов назад\n\n" +
-                "\n".join(quiet) +
+    if lines_broken:
+        tg_send("📉 DeFi-дашборд: данные пропали\n\n" + "\n".join(lines_broken) +
                 "\n\nСмотреть: контейнер sundemy-api на 201.51.4.65, а если пусто у "
                 "Morpho, Balancer или Compound - ещё и xray на 82.97.249.88."
-                "\nДальше скажу только в утренней сводке.")
-    else:
-        log("  писать нечего")
+                "\nПока не почините, напомню через 6 часов.")
+    if lines_fixed:
+        tg_send("✅ DeFi-дашборд снова с данными\n\n" + "\n".join(lines_fixed))
+    if not lines_broken and not lines_fixed:
+        log("  данные на месте, письмо не отправляю")
     return 0
 
 
@@ -688,14 +564,6 @@ WATCH_TIMERS = [t.strip() for t in (ENV.get("WATCH_TIMERS") or
 # у кого лог в файле, а не в journalctl: там от сервиса только «process exited»
 UNIT_LOG_FILES = {"tg-analytics-daily.service": "/opt/tg-analytics/logs/daily.log"}
 CONTAINER_GRACE_SEC = 20  # даём подняться, если попали на пересборку при выкатке
-
-# Контур телеграм-уведомлений интеграции amo. Смотреть на него надо СНАРУЖИ:
-# сам бот пожаловаться на себя не может - жалоба ушла бы ровно тем каналом,
-# который и сломался. 28.08.2026 бот не поднялся при старте пересобранного
-# контейнера и сутки молча глушил алерты отдела продаж (53 штуки: невзятые
-# лиды, пропущенные звонки, неоплаченные счета) - узнали от продажников.
-# Контейнер при этом был жив и здоров, проверка контейнера ничего не заметила.
-AMO_HEALTH_URL = ENV.get("AMO_HEALTH_URL") or "http://127.0.0.1:8010/"
 
 
 def _sh(cmd, timeout=60):
@@ -757,40 +625,8 @@ def _container_alive(name, second_try=False):
     return False, f"состояние: {out or 'непонятное'}"
 
 
-def telegram_contour_check():
-    """(имя, ок, почему) по контуру телеграм-уведомлений или None, если смотреть нечего.
-
-    Молчим (None), когда состояние взять неоткуда: контейнер лежит - об этом
-    скажет проверка контейнера, дублировать незачем; версия интеграции старая -
-    контур состояния не отдаёт; контур намеренно не настроен.
-    """
-    name = "Телеграм-бот · интеграция amo"
-    code, body = http(AMO_HEALTH_URL, timeout=15)
-    if code != 200:
-        return None
-    try:
-        tg = (json.loads(body) or {}).get("telegram") or {}
-    except json.JSONDecodeError:
-        return name, False, "состояние контура пришло не в JSON"
-    if not tg or not tg.get("configured"):
-        return None
-    if not tg.get("enabled"):
-        return name, False, ("бот ВЫКЛЮЧЕН - уведомления глушатся молча. "
-                             "Лечится рестартом контейнера amo-fix-fields")
-    if not tg.get("polling"):
-        return name, False, "бот включён, но опрос Telegram не идёт - команды и ответы не принимаются"
-    streak = int(tg.get("suppressed_streak") or 0)
-    if streak:
-        return name, False, f"подряд не отправлено сообщений: {streak}"
-    return name, True, "опрос идёт, подавленных нет"
-
-
 def services_checks():
     checks = []
-
-    tg_contour = telegram_contour_check()
-    if tg_contour:
-        checks.append(tg_contour)
 
     _, out = _sh(["systemctl", "list-units", "--state=failed", "--no-legend",
                   "--plain", "--no-pager"])
@@ -821,91 +657,50 @@ def run_services():
     now = int(time.time())
     checks = services_checks()
     seen = {name for name, _, _ in checks}
-    # Упавший юнит, починившись, просто исчезает из списка failed - сам о себе он
-    # больше ничего не скажет. Поэтому всё, что мы помним лежащим, но в этом
-    # прогоне не увидели, дописываем как удачную проверку.
-    # именно + , а не += : список пришёл из services_checks(), портить его не наше дело
-    checks = checks + [(name, True, "") for name in prev if name not in seen]
+    # упавший юнит, починившись, просто исчезает из списка failed - без этой
+    # строчки о его восстановлении никто бы не узнал
+    checks += [(name, True, "снова в порядке") for name in prev if name not in seen]
 
+    lines_broken, lines_fixed = [], []
+    new_state = {}
     for name, ok, why in checks:
+        was = prev.get(name, {})
+        was_ok = was.get("ok", True)
+        last_alert = was.get("last_alert", 0)
         if not ok:  # проверка идёт каждые 5 минут - в лог пишем только плохое
             log(f"  {name}: ЛЕЖИТ {why}".rstrip())
-
-    # Порог выше, чем у остальных проверок, и вот почему. Юнит типа oneshot по
-    # таймеру на время своего запуска ПРОПАДАЕТ из списка failed: systemd считает
-    # его активным, пока он работает. Сторож ходит тем же пятиминутным ритмом и
-    # видит «лежит - работает - лежит». 22.09.2026 это дало четыре пары писем за
-    # двадцать минут по team-idle-watch. Две неудачи подряд и три удачи подряд
-    # перекрывают такой всплеск, а настоящее падение задерживают на пять минут.
-    broken, fixed, quiet, new_state = triage(prev, checks, now,
-                                             fail_to_open=2, ok_to_close=3)
-    # здоровый динамический юнит в состоянии не держим - иначе state растёт вечно
-    for name in [n for n, rec in new_state.items() if rec["ok"] and n not in seen]:
-        del new_state[name]
+        if ok and name not in seen:
+            if not was_ok:
+                lines_fixed.append(f"• {name}")
+            continue  # динамический юнит починился - в состоянии его больше не держим
+        new_state[name] = {"ok": ok, "last_alert": last_alert}
+        if not ok:
+            if was_ok or now - last_alert > 6 * 3600:
+                lines_broken.append(f"• {name}\n  {why}")
+                new_state[name]["last_alert"] = now
+        elif not was_ok:
+            lines_fixed.append(f"• {name}")
 
     state["services"] = new_state
     save_state(state)
 
-    if broken:
-        tg_send("🔴 Клиентский контур лежит\n\n" + "\n".join(broken) +
+    if lines_broken:
+        tg_send("🔴 На сервере лежит сервис\n\n" + "\n".join(lines_broken) +
                 "\n\nСервер 85.193.91.169. Поднять: systemctl start <юнит> "
                 "(контейнер - docker compose up -d <имя>)."
-                f"\nПока лежит, напомню через {REMIND_HOURS} часов.")
-    if fixed:
-        tg_send("✅ Клиентский контур снова работает\n\n" + "\n".join(fixed))
-    if quiet:
-        tg_send(f"🟡 Лежит больше {QUIET_HOURS} часов\n\n" + "\n".join(quiet) +
-                "\n\nСервер 85.193.91.169. Клиентов не задевает - "
-                "дальше скажу только в утренней сводке.")
-    if not (broken or fixed or quiet):
+                "\nПока лежит, напомню через 6 часов.")
+    if lines_fixed:
+        tg_send("✅ Сервис снова работает\n\n" + "\n".join(lines_fixed))
+    if not lines_broken and not lines_fixed:
         lying = sum(1 for _, ok, _ in checks if not ok)
-        log(f"  нового нет: лежит {lying}, про них уже сказала" if lying
+        log(f"  нового нет: лежит {lying}, про них уже писала" if lying
             else f"  всё живо ({len(checks)} проверок), письмо не отправляю")
-    return 0
-
-
-# ===================================================================== сводка дня
-def run_digest():
-    """Одно сообщение в сутки вместо трёх разных писем.
-
-    Сюда стеклись задачи YouGile, продления доменов и всё, что лежит, но клиента
-    не задевает - ровно по постановке Кати 22.09.2026: «напоминание 1 раз в день
-    в одно время с другими такими же». Писать не о чем - сводку не шлём вовсе:
-    сообщение «всё хорошо» каждое утро учит не читать сообщения сторожа.
-    """
-    now = int(time.time())
-    blocks = []
-
-    problems = open_problems(load_state())
-    if problems:
-        rows = []
-        for since, urgent, name, why in problems:
-            age = f", лежит {human_age(now - since)}" if since else ""
-            rows.append(f"• {'🔴 ' if urgent else ''}{name}{age}"
-                        + (f"\n  {why}" if why else ""))
-        blocks.append(f"Не работает ({len(rows)}):\n" + "\n".join(rows))
-
-    tasks = "\n".join(run_deadlines(collect=True)).strip()
-    if tasks:
-        blocks.append(tasks)
-
-    renew = run_renewals(collect=True)
-    if renew:
-        blocks.append("Скоро продлевать:\n" + "\n".join(renew))
-
-    if not blocks:
-        log("  сводка пустая: ничего не лежит, сроки не горят - молчу")
-        return 0
-
-    tg_send(f"📋 Сводка дня · {datetime.now(MSK).strftime('%d.%m')}\n\n"
-            + "\n\n".join(blocks))
-    log(f"  отправлено блоков: {len(blocks)}")
     return 0
 
 
 # --------------------------------------------------------------------------- main
 CHECKS = {"tokens": run_tokens, "deadlines": run_deadlines, "renewals": run_renewals,
-          "defi": run_defi, "services": run_services, "digest": run_digest}
+          "defi": run_defi, "services": run_services}
 
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -917,20 +712,5 @@ if __name__ == "__main__":
         sys.exit(CHECKS[what]())
     except Exception as e:  # noqa: BLE001
         log(f"ПАДЕНИЕ: {e}")
-        # Без этого троттла сторож, упавший на пятиминутной проверке, шлёт 288
-        # сообщений в сутки - ровно тот шум, от которого мы уходим. Само чтение
-        # состояния тоже может не задаться (диск, битый json) - тогда шлём как
-        # раньше: лучше лишнее письмо, чем немая поломка сторожа.
-        try:
-            st = load_state()
-            crashes = st.get("crashes") or {}
-            fresh = int(time.time()) - int(crashes.get(what) or 0) < REMIND_HOURS * 3600
-            if not fresh:
-                crashes[what] = int(time.time())
-                st["crashes"] = crashes
-                save_state(st)
-        except Exception:  # noqa: BLE001
-            fresh = False
-        if not fresh:
-            tg_send(f"❗️Сторож упал на проверке «{what}»: {e}")
+        tg_send(f"❗️Сторож упал на проверке «{what}»: {e}")
         sys.exit(3)

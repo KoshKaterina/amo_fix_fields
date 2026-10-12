@@ -1,0 +1,410 @@
+{
+  "base": "d07be2c30439008afe118b095231c00d219e9783",
+  "prefix": "opt/integrations/amo_fix_fields/",
+  "files": [
+    {
+      "path": "metrika_sync.py",
+      "sha256": "f2762418cf1a6b0b95086714ffea10b672c8c680089c84f06f26ef14f20226d4"
+    },
+    {
+      "path": "alerts.py",
+      "sha256": "f671b4412cbb9f5a4c02ea08e9d75fbd7dad41e4231b9a9648272cbb99c99682"
+    },
+    {
+      "path": "autopilot.py",
+      "sha256": "32b13a26a289819dc6977161644968831bcca0074910bfecce6f380d7f6a5a36"
+    },
+    {
+      "path": "preorder_lead_name.py",
+      "sha256": "fc829b607b9d0c01588bbb88fd056a7b3828b18b26140c620dd9c292cc447391"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "83b934f56c6f2072b935994b48100696d4bceb92f22682b0250aa0dcf757df83"
+    },
+    {
+      "path": "academy_consent_stamp.py",
+      "sha256": "f734f6c688edb4422a94e639b561d26380072a3940d3bdee5fbb38f5ca8270b7"
+    },
+    {
+      "path": "lead_distribution.py",
+      "sha256": "236542e03a75b36caad7daabf210d221c5cbca97dbd92dbe5f475d054836a299"
+    },
+    {
+      "path": "site_form_store.py",
+      "sha256": "5e115b8eb544308843bef0a44be7f42f4048a526632232359c37ae78b05b4f0a"
+    },
+    {
+      "path": "retail_lead_guard.py",
+      "sha256": "0d5205986389878b714d66f8a4fec4123ea3d9c11eaa650c8ecc9a444f95d74f"
+    },
+    {
+      "path": "woo_status_sync.py",
+      "sha256": "034b4bf5076756eb0a21c2f06e38e96b88529adab25f8d7e58cdbefa8838f891"
+    },
+    {
+      "path": "woo_client.py",
+      "sha256": "f68fabc4cf73b4fa6e587e48388de00ebb9ca088ae72f484055c76fdc0276fa8"
+    },
+    {
+      "path": "academy_intent_alert.py",
+      "sha256": "c099fb7e2edc1c60e87971cb725841cd1ccb0c305e5d16afad861ed81c600a31"
+    },
+    {
+      "path": "order_watchdog.py",
+      "sha256": "760f348ba249e0dd330afe33c409f8f0b3af974e5598d0b9564e84f21c7b25ed"
+    },
+    {
+      "path": "telegram_contact.py",
+      "sha256": "51fa0d1e2abb996ac507e593f35d11c3b0bcf0439b3ebfd63ce6ac9c7f588a3d"
+    },
+    {
+      "path": "team_panel_client.py",
+      "sha256": "de5cbd5983432d61b126bbcc6f0ed59b773ba9a106dceaf345b58fae70f62a08"
+    },
+    {
+      "path": "academy_bothelp_upsert.py",
+      "sha256": "1eefe6fdc26a607a4440c9825d7e28ab2f9fff5120246175ad79716c00fd21a3"
+    },
+    {
+      "path": "academy_invite_delivery.py",
+      "sha256": "9f2621bcb182ede59b8f1bb64fdbb55a4b8cd30ad6b032c641f50aa05d1c7408"
+    },
+    {
+      "path": "telegram_bot.py",
+      "sha256": "9fd6af4ba64f2e90d7b9048792c3d9e834103bfefd1237bcbb3fe381320270c1"
+    },
+    {
+      "path": "api_helpers.py",
+      "sha256": "a9f6e20f6e8662bdd768dd3e6b68334a8a41855254923bf0c5495977a17d83b0"
+    },
+    {
+      "path": "waybill_pending_store.py",
+      "sha256": "204499becab1a88046bc6c90b0073e56c009453e958cffbd77d37a0bbdeca56f"
+    },
+    {
+      "path": "cdek_status_sync.py",
+      "sha256": "0de0f0d2cb9505766f4431882a718922e398ae8870ac24e40e40456b16ac71e1"
+    },
+    {
+      "path": "ms_preorder_dry_run.py",
+      "sha256": "18c4088b3d1940397df410ee4b6a49129b64cd8d5a87c67a914c45ef8827c2b5"
+    },
+    {
+      "path": "Dockerfile",
+      "sha256": "3d9a116b1208f2cafc48f584a006c405410a9b8e5c94c4b64e0e0657f12c2451"
+    },
+    {
+      "path": "urgency_tag.py",
+      "sha256": "b310187abec98e7fd2e3b92ba1eb941e5a0f65ff3fb4c4d7b185d10bb6caca57"
+    },
+    {
+      "path": "ozon_invoice.py",
+      "sha256": "9b72a7d5d0b4c27edc00bcf088c618551833935870d3db8be403ff909f283063"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "afe85815ec686785f7c1d1723976c731f853ed64315575b57401a97b3f2828dd"
+    },
+    {
+      "path": "api.py",
+      "sha256": "6356baeb575620ed6a6f5e6fcdb7fd05cf6e920190f6eb08995bc80f1cd0fb54"
+    },
+    {
+      "path": "dup_autoclose.py",
+      "sha256": "65380797dbce122aa5faa89f67123526804efca9910641eaf5a573dc72ecc41c"
+    },
+    {
+      "path": "mail_watch_store.py",
+      "sha256": "898ac87f8453f9e2b345ab8defa91794ef4d1231bddab085264a3ed46019786e"
+    },
+    {
+      "path": "webhooks.py",
+      "sha256": "471a37f1553d227e103c74f38d30bc1193e43fd2c325bfb1747f7e2be747377b"
+    },
+    {
+      "path": "unmiss_tag.py",
+      "sha256": "1bdabc93197b684e5b0c7b67e67daf34016b0148a479cdfb9eb696de572a5f84"
+    },
+    {
+      "path": "academy_invite_link.py",
+      "sha256": "091cb6dfe83ff4fbc2e9899a3fbe9074c6c23a6d9a64821c69838425630cdfc4"
+    },
+    {
+      "path": "cdek_client.py",
+      "sha256": "88bbaf50892ba0d622aa288ec05b840b04ead754da1f8806f2cc4b4062851958"
+    },
+    {
+      "path": "amgroup_duplicate_watch.py",
+      "sha256": "a837cd708e0792643837c7e1fad92622e49f06d0a617ac37a4d3d581c4f4d44b"
+    },
+    {
+      "path": "academy_assignment.py",
+      "sha256": "98b00d8cd2de11474b906f471e13810f8fb0f29db189a8e225077ecc858507f5"
+    },
+    {
+      "path": "showroom_store.py",
+      "sha256": "c68ea2c11e5a3e1c27b71b0b9ba1dfc82412d8a5fd3ad4cb304674fb9ea74ccb"
+    },
+    {
+      "path": "academy_chat_join_backfill.py",
+      "sha256": "a380be494930aae9e5d1db5461009ba74a9deb63b1f3f13d88639053b76711b0"
+    },
+    {
+      "path": "mail_watch.py",
+      "sha256": "0626c1812360436915c15a5adf362fe62b7cc5769335743cb7749bc9e21904ee"
+    },
+    {
+      "path": "wazzup_sla.py",
+      "sha256": "a646e0b1ba3c93f29fa2c9b2372ce98cbefaed5995a12c416e6ee4dd394f73db"
+    },
+    {
+      "path": "woo_status_backfill.py",
+      "sha256": "d13cea9b914162f9ffcb35494a419a336d07e004dc7b7a662e9f1c3cf918e048"
+    },
+    {
+      "path": "picking_pdf.py",
+      "sha256": "bb9652a8cb6c4d3ffc23f65b5f7010de915b45d74f3a936217d1b06e48e6503b"
+    },
+    {
+      "path": "sla_filter.py",
+      "sha256": "d67a52a8c52b22557b72372b0ce9ad3f0570da8cc50e727c320d07daf5708759"
+    },
+    {
+      "path": "migration_freeze.py",
+      "sha256": "986edf01dbb8d1d66290b1c6e14b27e2b8b5679836075be0b2374422b3efa641"
+    },
+    {
+      "path": "lead_distribution_api.py",
+      "sha256": "170adf4a9c81af89f645fa9983e0d3e2feb65a2d43809cdcbfde5007e56c4de3"
+    },
+    {
+      "path": "office_record_watch.py",
+      "sha256": "53dabdf9943196cc06ac613d5921d17ee1b50420f91ae3fa9bceca1c48de3d0e"
+    },
+    {
+      "path": "autopilot_store.py",
+      "sha256": "9853c5d108c3120b1a56a5dc71520802591fc81bbc9eb8771f5f38d7d757840c"
+    },
+    {
+      "path": "waybill_config.py",
+      "sha256": "b49d6c1fcc5e8dea9473238cca2f503586cb74f40ae1f6a51678397ca473613c"
+    },
+    {
+      "path": "academy_chat_join.py",
+      "sha256": "39faa5754138758b35c76fb30d0807596f4f41bebb2538e41551cd4c4bb105bf"
+    },
+    {
+      "path": "order_note.py",
+      "sha256": "e5c394ac48c5b9a6d7db91f71414e29b204458ad869e5d36df8717e83da18254"
+    },
+    {
+      "path": "showroom_alert.py",
+      "sha256": "88d6e56edcfa0cdcd8d7afa2e93962dec1c3540a251d287579192827ddb7e6d2"
+    },
+    {
+      "path": "showroom_tag.py",
+      "sha256": "2714529fd813dd64ca788291a6139d8988615bb0704922cfa238fc4350be4f0f"
+    },
+    {
+      "path": "site_form_service.py",
+      "sha256": "c8881d53bc1125ef43a26e7bab368c60d2293cafc30b209e58778cb3cdcc7247"
+    },
+    {
+      "path": "wazzup_forward.py",
+      "sha256": "da08c0657f8f586117d8818e6b9aa64053faba85ebf35d8435cc484cc5ea7230"
+    },
+    {
+      "path": "help_function.py",
+      "sha256": "38e1ba94a780ec9c26c25dc39a906e484858cfbbc9ae9071d07e8e4c99dcad19"
+    },
+    {
+      "path": "academy_webhook_app.py",
+      "sha256": "0465bd180bae8528893a8eac35a3f0f46f10657dbc111cdcc594804d347e30f8"
+    },
+    {
+      "path": "amo_service.py",
+      "sha256": "d99b9e6fd371574357cd1fe53f112dc0820f91bf5bfef9c8cfb3f380fb039c25"
+    },
+    {
+      "path": "alert_settings_client.py",
+      "sha256": "2d892c74413643c3c949cc0e947743c76663bcf6779a4bddb9310cb448067e4f"
+    },
+    {
+      "path": "task_queue_store.py",
+      "sha256": "6b4f89fa49be7ddfbce01d12542a606f8557596ba54d7d1a9ba7c559ec9ef916"
+    },
+    {
+      "path": "metrika_backfill.py",
+      "sha256": "a165b924acf8b17315846637913260a0da3fc7276a48da93978efb4991d1a7ae"
+    },
+    {
+      "path": "alert_templates.py",
+      "sha256": "2bc8e1d1597610a4e524a4dee5660c68f4520a091b0538362c5960e063bfa448"
+    },
+    {
+      "path": "ms_client.py",
+      "sha256": "3f4d76248d1ddc7e7c9ff84eb2247d1033aed8f5b213524a36d540ee0f00da5c"
+    },
+    {
+      "path": ".dockerignore",
+      "sha256": "4f7ad0375e1c6bf032a43d2cbb527a1c5b5c4c0859a8fb8887df7ebcc18a4305"
+    },
+    {
+      "path": "uis_missed_call.py",
+      "sha256": "30697e59889bda3c53469bb6701db22c9fd1054f62e3f46a1e457a7d22d393a7"
+    },
+    {
+      "path": "office_transfer.py",
+      "sha256": "ee4ef7a5818b37a56251ced11959ec395f3567b28e5814b5ef227d77f69e13bb"
+    },
+    {
+      "path": "reserve_store.py",
+      "sha256": "5cf844b78084099743c30d545c7e636b5523bfaaf653563bcd481c8a67518764"
+    },
+    {
+      "path": "academy_lead_alert.py",
+      "sha256": "461984f81a7ff2a4580942d72bff107a140831a0da4acfa8331358925e61a5aa"
+    },
+    {
+      "path": "lead_distribution_profiles_client.py",
+      "sha256": "ec3e23d4a57df249700bc474a34888e015e2fdabac58fb09f9823639992504d3"
+    },
+    {
+      "path": "sales_sheet_feed.py",
+      "sha256": "71d915923fc0fe508ab9b27c8ea586bf2a43ba74f49c180049c9b3eddf7de78f"
+    },
+    {
+      "path": "budget_mismatch_watch.py",
+      "sha256": "48c2509ee044471c7dbfca8b7e572a6e6d4d92fedb3d85d52a6a2d791986fed2"
+    },
+    {
+      "path": "metrika_client.py",
+      "sha256": "534120293ba75427dac9ea1e55e42550463cd58019c22ef98403a1be4a9062b9"
+    },
+    {
+      "path": "tg_recipients.py",
+      "sha256": "2443a8fe9a41a128ba0d80b520f631e338be9160484a605fb44ec8d854b582ff"
+    },
+    {
+      "path": "queue_manager.py",
+      "sha256": "32e2fe0c9c70751b9021a908a7cb01caf1a709ed529d675f24a2501dcb9e7410"
+    },
+    {
+      "path": "jivo_service.py",
+      "sha256": "fd5d60678bf8e89e368a0c3882a062651b57b8f618ad4074e1506a141d4d63ce"
+    },
+    {
+      "path": "waybill_service.py",
+      "sha256": "9285a1cff55d5d4df5d99e5fc461e10d3e7b95a2babe44e12ed83575c78e291e"
+    },
+    {
+      "path": "autopilot_settings_client.py",
+      "sha256": "e96c4c3618ea842fb09c6c2f353275fd21f0e47deb16e6f07545081aa572ddc5"
+    },
+    {
+      "path": "wazzup_delivery.py",
+      "sha256": "a0b4610295d369d6c0cf20023d91d763fc8512521a1e91a4ba5e758fb698c291"
+    },
+    {
+      "path": "lead_status_store.py",
+      "sha256": "6af0e803f7bb409dc9e29d0df3c78a7ae143da82af76bd9b705bcd700d436b18"
+    },
+    {
+      "path": "ms_preorder_type.py",
+      "sha256": "64a176359d1c52ece051b25d1ecb310df94bf9246d2f21d3bf8f5c48c53de970"
+    },
+    {
+      "path": "lead_distribution_log_client.py",
+      "sha256": "0c4fe4227056a08c2c53aa0f24770e0697366aa5042515b9107b683cbb1bec63"
+    },
+    {
+      "path": "memory.py",
+      "sha256": "4b167380ef2b69b01aef108f714c006cedb38d72086bef92d2ca0dc2a56461d6"
+    },
+    {
+      "path": "reserve_service.py",
+      "sha256": "fcbeea202f2035813049e8368023c7bc5a917c995a2fde257e81e7567c44201f"
+    },
+    {
+      "path": "new_lead_watch.py",
+      "sha256": "56cbcf8cbd7373ff7739b8bcc482c0489ec55f3493c69843683c255211480be7"
+    },
+    {
+      "path": "amgroup_shipment.py",
+      "sha256": "0b95f52779bbe996bb5c3b80bf201ac5c5918484b132bea52c16f0ed6e6fd613"
+    },
+    {
+      "path": "amgroup_fallback.py",
+      "sha256": "dafeef0401b848e180da52a51bebd2988389282b2d73182f347bc61f3f936ce7"
+    },
+    {
+      "path": "amgroup_lead_builder.py",
+      "sha256": "19525a475be17d4f9f3f1cbc1fa81a220222cf2e76e6a4cdd100088dd312180c"
+    },
+    {
+      "path": "test_fixtures/alert_settings_panel.json",
+      "sha256": "7a26104251262f7aa14cc5b1a777ddd07d77f9efb46f9eeb4eb2c16864ab92e9"
+    },
+    {
+      "path": "ops/watchdog/watchdog.py",
+      "sha256": "5501651a5d0bb4f451384d9dc2d1af6593967d148c4802bcbeb55e133ec57597"
+    },
+    {
+      "path": "ops/watchdog/README.md",
+      "sha256": "fe89a72392e3e261fb1fc69f3e553eb8efb62c935faed5a2cb0646dfd63d0ded"
+    },
+    {
+      "path": "ops/watchdog/deploy/merge-keys.sh",
+      "sha256": "7e276ae7a794676df892c872ad85466633e0babf746ecaaaa6987ab1818bc588"
+    },
+    {
+      "path": "ops/watchdog/deploy/logrotate-watchdog",
+      "sha256": "be9da44063db46eee90dac8dc73793d945465c380629f2d912c3df140f65bf59"
+    },
+    {
+      "path": "ops/watchdog/deploy/run.sh",
+      "sha256": "7cf232aecc114172d3d31541f4a6782c7f61ff803bad923c497f550b5f2c66b4"
+    },
+    {
+      "path": "ops/watchdog/deploy/cron-watchdog",
+      "sha256": "8f037369f69b1c2804e1107be0bcdb990a2fc7bf90f95d2f53e40478df11d7c9"
+    },
+    {
+      "path": "fonts/DejaVuSans.ttf",
+      "sha256": "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954"
+    },
+    {
+      "path": "fonts/DejaVuSans-Bold.ttf",
+      "sha256": "e6476c1b80502924294eed40894c5b18e06c181444ca953e5334262df9c27724"
+    }
+  ],
+  "changed": [
+    ".dockerignore",
+    ".gitignore",
+    "Dockerfile",
+    "academy_intent_alert.py",
+    "alerts.py",
+    "amgroup_fallback.py",
+    "amgroup_shipment.py",
+    "api.py",
+    "budget_mismatch_watch.py",
+    "mail_watch.py",
+    "metrika_sync.py",
+    "office_record_watch.py",
+    "office_transfer.py",
+    "ops/watchdog/README.md",
+    "ops/watchdog/deploy/cron-watchdog",
+    "ops/watchdog/deploy/logrotate-watchdog",
+    "ops/watchdog/deploy/merge-keys.sh",
+    "ops/watchdog/deploy/run.sh",
+    "ops/watchdog/watchdog.py",
+    "ozon_invoice.py",
+    "picking_pdf.py",
+    "requirements.txt",
+    "site_form_service.py",
+    "telegram_bot.py",
+    "wazzup_sla.py"
+  ],
+  "scope_note": "Files listed here are a production snapshot overlay on the recorded GitHub base. Remaining repository files are retained for build/source history. Runtime archives and database snapshots are separate and encrypted. This is a backup branch, not a release."
+}
