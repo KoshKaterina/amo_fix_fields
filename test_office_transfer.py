@@ -14,10 +14,21 @@ get_custom_field_enum_id) — реальные функции, сделки со
 payload amo (custom_fields_values).
 """
 import asyncio
+import os
+import tempfile
 import time
 
-import office_transfer
-from waybill_config import (
+# office_transfer пишет список «ждём дозаполнения» в lead_status_store. Путь к базе
+# резолвится на импорте, поэтому ставим его ДО импорта и через setdefault — грабля 2
+# из knowledge/amo-fix-fields-testy-grabli.md (иначе на Windows уедет в C:\app\var).
+os.environ.setdefault(
+    "LEAD_STATUS_DB_PATH",
+    os.path.join(tempfile.mkdtemp(), "lead_status_test.sqlite3"),
+)
+
+import lead_status_store  # noqa: E402
+import office_transfer  # noqa: E402
+from waybill_config import (  # noqa: E402
     APPLICATION_TYPE_ORDER,
     APPLICATION_TYPE_PREORDER,
     APPLICATION_TYPE_RESERVE,
@@ -897,6 +908,65 @@ def test_polya_dozapolneny_perenos_teg_dostavka_ne_zapolnena_snyat():
     res = run(office_transfer.process_office_transfer(42))
     assert res == "moved", res
     assert (42, TAG_NO_DELIVERY) in _removed_tags, _removed_tags
+
+
+def test_sdelka_36578327_tip_zayavki_dopisali_v_ur_perenos_snova_zhdut():
+    """Сделка 36578327, 12.10.2026: TangemShop, наложка, СДЭК, «Тип заявки» пуст.
+    Закрыли в УР → «заполнено некорректно». Дописали «Заказ» → вебхук про ПОЛЕ,
+    не про переход, и с 05.10 перенос не ставился. Теперь отбитая сделка попадает
+    в список ожидания, по нему webhooks.py повторяет перенос, после переноса
+    список чистится."""
+    global lead
+    saved_src = office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP
+    office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP = True
+    lid = 36578327
+    lead_status_store.clear_awaiting_refill(lid)
+    try:
+        _reset()
+        lead = _lead(lead_id=lid, pipeline_id=PIPELINE_TANGEMSHOP,
+                     warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+                     delivery_text="Наценка за наложенный платеж, 664.00 рубля "
+                                   "CDEK: Самовывоз, (1-2 дней), 238.00 рублей")
+        _install_dispatcher_mocks(lead)
+        assert run(office_transfer.process_office_transfer(lid)) == "no-match-bad-fill"
+        assert lead_status_store.is_awaiting_refill(lid), "отбитая сделка обязана ждать правки"
+
+        # Повторный вебхук до правки (эхо нашего же тега) — алерт не дублируется,
+        # ожидание остаётся.
+        lead["_embedded"] = {"tags": [{"id": 1, "name": TAG_BAD_FILL}]}
+        assert run(office_transfer.process_office_transfer(lid)) == "skipped-already-alerted"
+        assert lead_status_store.is_awaiting_refill(lid)
+
+        # Менеджер дописал «Тип заявки = Заказ» → едет на «Сделать накладную».
+        _reset()
+        lead = _lead(lead_id=lid, pipeline_id=PIPELINE_TANGEMSHOP,
+                     application_type=APPLICATION_TYPE_ORDER,
+                     warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+                     delivery_text="Наценка за наложенный платеж, 664.00 рубля "
+                                   "CDEK: Самовывоз, (1-2 дней), 238.00 рублей")
+        lead["_embedded"] = {"tags": [{"id": 1, "name": TAG_BAD_FILL}]}
+        _install_dispatcher_mocks(lead)
+        assert run(office_transfer.process_office_transfer(lid)) == "moved"
+        assert _patches[0]["pipeline_id"] == PIPELINE_OFFICE
+        assert _patches[0]["status_id"] == STATUS_CREATE_WAYBILL
+        assert (lid, TAG_BAD_FILL) in _removed_tags, _removed_tags
+        assert not lead_status_store.is_awaiting_refill(lid), "уехала — ждать больше нечего"
+    finally:
+        office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP = saved_src
+        lead_status_store.clear_awaiting_refill(lid)
+
+
+def test_ruchnoy_perenos_iz_ur_snimaet_ozhidanie():
+    """Отбитую сделку перетащили руками — следующий вебхук её уже не в УР видит,
+    ожидание снимается, лишних задач по ней больше не будет."""
+    global lead
+    lid = 36578328
+    lead_status_store.mark_awaiting_refill(lid)
+    _reset()
+    lead = _lead(lead_id=lid, pipeline_id=PIPELINE_OFFICE, status_id=STATUS_CREATE_WAYBILL)
+    _install_dispatcher_mocks(lead)
+    assert run(office_transfer.process_office_transfer(lid)) == "skipped-not-applicable"
+    assert not lead_status_store.is_awaiting_refill(lid)
 
 
 def test_opt_flag_vyklyuchen_sdelka_ne_trogaetsya_i_ne_alertit():

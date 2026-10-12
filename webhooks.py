@@ -700,7 +700,21 @@ async def lead_change(request: Request):
         and str(incoming_status) in (str(STATUS_SUCCESS), str(STATUS_CLOSED_LOST))
         and (incoming_pipeline is None or office_transfer.is_source_pipeline(incoming_pipeline))
     ):
-        if not status_changed:
+        if (
+            not status_changed
+            and str(incoming_status) == str(STATUS_SUCCESS)
+            and await asyncio.to_thread(lead_status_store.is_awaiting_refill, lead_id)
+        ):
+            # Не переход, но сделку в УР раньше отбили «заполнено некорректно», и
+            # менеджеру обещано: «поправьте поля — перенос отработает сам». Правка
+            # поля приходит именно таким вебхуком, поэтому повторяем перенос.
+            # Разбор — сделка 36578327, 12.10.2026; список — lead_status_store.
+            logger.info(
+                "Lead %s в УР ждёт дозаполнения полей — повторяем office_transfer",
+                lead_id,
+            )
+            enqueue_office_transfer(lead_id, source="webhook-refill")
+        elif not status_changed:
             # Сделка УЖЕ лежала в 142/143, когда пришёл этот вебхук — значит он не
             # про переход. Задачу не ставим: диспетчер всё равно погасил бы её
             # гейтом по closed_at, но уже ценой чтения сделки и занятого воркера.

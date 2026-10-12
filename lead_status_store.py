@@ -74,6 +74,7 @@ def init() -> None:
                    seen_at   INTEGER NOT NULL
                )"""
         )
+        _ensure_refill_table(conn)
     _initialized = True
 
 
@@ -84,7 +85,83 @@ def prune() -> int:
     cutoff = int(time.time()) - PRUNE_OLDER_THAN_S
     with _conn() as conn:
         cur = conn.execute("DELETE FROM lead_status WHERE seen_at < ?", (cutoff,))
-        return cur.rowcount or 0
+        removed = cur.rowcount or 0
+        _ensure_refill_table(conn)
+        cur = conn.execute(
+            "DELETE FROM awaiting_refill WHERE since < ?",
+            (int(time.time()) - REFILL_WAIT_TTL_S,),
+        )
+        return removed + (cur.rowcount or 0)
+
+
+# ════════════════ сделки, ждущие дозаполнения полей ════════════════
+#
+# Зачем (разбор сделки 36578327, 12.10.2026). Гейт «вебхук про переход» выше
+# сломал обещание из office_transfer: «поправьте поля — перенос отработает сам».
+# Сделка УЖЕ стоит в 142, менеджер дозаполняет «Тип заявки» — amo шлёт вебхук
+# с тем же 142, гейт честно говорит «не переход», и задача не ставится. Страховка
+# reconciliation тоже не спасает: она смотрит события ВХОДА в 142 за окно, а вход
+# был до правки. Сделка висит в УР, пока человек не перетащит её руками.
+#
+# Поэтому office_transfer, сказав «заполнено некорректно», записывает сделку сюда,
+# а webhooks.py ставит перенос и на НЕ-переход, если сделка в этом списке. Список
+# маленький (единицы сделок в день), поэтому всплеска 05.10 это не вернёт. На диске,
+# а не в памяти — по той же причине, что и основная таблица: пересборка контейнера.
+
+# Сколько ждём дозаполнения. Сделка, которую за две недели так и не поправили,
+# дальше обычным путём: переоткрыть и закрыть заново.
+REFILL_WAIT_TTL_S = int(os.getenv("LEAD_REFILL_WAIT_TTL_S", str(14 * 86400)))
+
+
+def _ensure_refill_table(conn) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS awaiting_refill (
+               lead_id INTEGER PRIMARY KEY,
+               since   INTEGER NOT NULL
+           )"""
+    )
+
+
+def mark_awaiting_refill(lead_id) -> None:
+    """Сделка в УР не подошла ни под одно правило — ждём, что поля поправят.
+    Повторная отметка время не сдвигает: срок считаем от первой."""
+    try:
+        with _conn() as conn:
+            _ensure_refill_table(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO awaiting_refill (lead_id, since) VALUES (?, ?)",
+                (int(lead_id), int(time.time())),
+            )
+    except Exception:
+        logger.exception("lead_status_store: сделка %s — не записала ожидание полей", lead_id)
+
+
+def clear_awaiting_refill(lead_id) -> None:
+    """Сделка уехала или ушла из УР — ждать больше нечего."""
+    try:
+        with _conn() as conn:
+            _ensure_refill_table(conn)
+            conn.execute("DELETE FROM awaiting_refill WHERE lead_id = ?", (int(lead_id),))
+    except Exception:
+        logger.exception("lead_status_store: сделка %s — не сняла ожидание полей", lead_id)
+
+
+def is_awaiting_refill(lead_id) -> bool:
+    """Ждёт ли сделка дозаполнения полей. Ошибка хранилища — `False`: тут, в
+    отличие от гейта перехода, сомнение трактуем как «не ставить», иначе сломанная
+    база вернула бы задачу на каждое обновление каждой закрытой сделки."""
+    try:
+        with _conn() as conn:
+            _ensure_refill_table(conn)
+            row = conn.execute(
+                "SELECT since FROM awaiting_refill WHERE lead_id = ?", (int(lead_id),)
+            ).fetchone()
+    except Exception:
+        logger.exception("lead_status_store: сделка %s — не прочитала ожидание полей", lead_id)
+        return False
+    if row is None:
+        return False
+    return int(time.time()) - int(row[0]) < REFILL_WAIT_TTL_S
 
 
 def note_and_changed(lead_id, status_id) -> bool:

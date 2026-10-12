@@ -126,3 +126,47 @@ if __name__ == "__main__":
             fn()
             print(f"✓ {name}")
     print("все тесты lead_status_store прошли")
+
+
+# ── список «ждём дозаполнения полей» (сделка 36578327, 12.10.2026) ──────────
+
+def test_refill_wait_mark_and_clear():
+    """Отбитая «заполнено некорректно» сделка ждёт правки, после переноса — нет."""
+    lid = _lead()
+    assert S.is_awaiting_refill(lid) is False
+    S.mark_awaiting_refill(lid)
+    assert S.is_awaiting_refill(lid) is True
+    S.clear_awaiting_refill(lid)
+    assert S.is_awaiting_refill(lid) is False
+
+
+def test_refill_wait_repeat_mark_keeps_first_time():
+    """Повторная отметка срок не продлевает: считаем от первой."""
+    lid = _lead()
+    S.mark_awaiting_refill(lid)
+    with S._conn() as conn:
+        conn.execute("UPDATE awaiting_refill SET since = 1000 WHERE lead_id = ?", (lid,))
+    S.mark_awaiting_refill(lid)
+    with S._conn() as conn:
+        since = conn.execute("SELECT since FROM awaiting_refill WHERE lead_id = ?", (lid,)).fetchone()[0]
+    assert since == 1000
+
+
+def test_refill_wait_expires_and_is_pruned():
+    """Сделку, которую не поправили за срок, больше не ждём, и чистка её убирает."""
+    lid = _lead()
+    S.mark_awaiting_refill(lid)
+    with S._conn() as conn:
+        conn.execute("UPDATE awaiting_refill SET since = 1000 WHERE lead_id = ?", (lid,))
+    assert S.is_awaiting_refill(lid) is False
+    S.prune()
+    with S._conn() as conn:
+        row = conn.execute("SELECT 1 FROM awaiting_refill WHERE lead_id = ?", (lid,)).fetchone()
+    assert row is None
+
+
+def test_refill_wait_garbage_id_is_not_awaiting():
+    """Мусор вместо id — не ждём и не падаем: вебхук открыт наружу."""
+    assert S.is_awaiting_refill("не число") is False
+    S.mark_awaiting_refill(None)
+    S.clear_awaiting_refill("x")

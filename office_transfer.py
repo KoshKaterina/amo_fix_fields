@@ -115,6 +115,7 @@ import time
 
 import amo_service
 import alerts
+import lead_status_store
 import migration_freeze
 import tg_recipients
 import telegram_bot
@@ -539,10 +540,16 @@ async def _notify_fill_problem(lead: dict, tag: str, note: str, alert: str, outc
     заполнении полей, само не рассосётся (решение Кати 31.07.2026: сигналим
     человеку, НЕ переносим наугад). Тег + примечание + ТГ-алерт СРАЗУ, без
     порога ожидания. Дедуп: тег на сделке + set в памяти. Менеджер дозаполнит
-    поля → amo пришлёт вебхук на обновление сделки (условие в webhooks.py
-    срабатывает и по ТЕКУЩЕМУ статусу 142 в leads[update]) → матчинг
-    повторится, сделка переносится штатно, тег снимается в диспетчере."""
+    поля → amo пришлёт вебхук на обновление сделки → матчинг повторится,
+    сделка переносится штатно, тег снимается в диспетчере.
+
+    ⚠️ С 05.10.2026 вебхук ставит перенос только на ПЕРЕХОД этапа, а правка поля
+    переходом не является. Поэтому сделку записываем в список ожидания
+    (lead_status_store.mark_awaiting_refill) — по нему webhooks.py ставит перенос
+    и на обычное обновление. Без этого обещание из примечания не выполнялось:
+    сделка 36578327 12.10 висела в УР с уже поправленным «Типом заявки»."""
     lead_id = int(lead.get("id"))
+    await asyncio.to_thread(lead_status_store.mark_awaiting_refill, lead_id)
     if lead_id in _fill_alerted or any(
         (t.get("name") or "") == tag for t in amo_service.get_tags(lead)
     ):
@@ -638,6 +645,7 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
             lead_id, pipeline_id, status_id, _source_pipelines(),
         )
         _clear_fail(lead_id)
+        await asyncio.to_thread(lead_status_store.clear_awaiting_refill, lead_id)
         return "skipped-not-applicable"
 
     if OFFICE_TRANSFER_SINCE_TS:
@@ -654,6 +662,7 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
                 lead_id, closed_at, OFFICE_TRANSFER_SINCE_TS,
             )
             _clear_fail(lead_id)
+            await asyncio.to_thread(lead_status_store.clear_awaiting_refill, lead_id)
             return "skipped-pre-cutover"
 
     # Гейта «578151 заполнен = уже переносили» больше нет (решение Кати 15.09.2026).
@@ -724,6 +733,7 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
     # Сделка уехала штатно — снимаем сигналы проблем заполнения, если висели
     # (менеджер дозаполнил поля после алерта — тег больше не актуален).
     _fill_alerted.discard(int(lead.get("id")))
+    await asyncio.to_thread(lead_status_store.clear_awaiting_refill, lead_id)
     for _tag in (TAG_NO_DELIVERY, TAG_BAD_FILL):
         if any((t.get("name") or "") == _tag for t in amo_service.get_tags(lead)):
             await amo_service.remove_tag(lead_id, _tag, lead=lead)
