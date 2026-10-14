@@ -8,6 +8,7 @@ import re
 import secrets
 import sqlite3
 import time
+import weakref
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -26,7 +27,17 @@ SECRET = os.environ.get("OZON_PAY_SECRET_KEY", "")
 NOTIFY_SECRET = os.environ.get("OZON_PAY_NOTIFICATION_SECRET_KEY", "")
 SESSION_SECRET = os.environ.get("ACADEMY_PAYMENT_SESSION_SECRET", "")
 DB_PATH = Path(os.environ.get("ACADEMY_PAYMENT_DB", "/data/payments.sqlite3"))
-lock = asyncio.Lock()
+session_locks = weakref.WeakValueDictionary()
+
+
+def session_lock(session):
+    """Serialize one browser's requests without queueing unrelated visitors."""
+    key = session_hash(session)
+    existing = session_locks.get(key)
+    if existing is None:
+        existing = asyncio.Lock()
+        session_locks[key] = existing
+    return existing
 
 
 @contextmanager
@@ -203,7 +214,7 @@ async def create(request: Request):
         token = parse_qs(raw.decode()).get("csrf", [""])[0]
     if not hmac.compare_digest(token, csrf(session)):
         raise HTTPException(403, "Откройте ссылку на оплату заново")
-    async with lock:
+    async with session_lock(session):
         row = payment(session)
         if row:
             if row["status"] == "paid":
