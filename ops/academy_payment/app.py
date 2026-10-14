@@ -11,7 +11,7 @@ import time
 import weakref
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -21,7 +21,8 @@ PREFIX = "/academy-pay"
 ORIGIN = "https://team.sunscrypt.ru"
 AMOUNT = 1_000_000  # 10 000 RUB; same units as Woo and ozon_invoice.
 TTL = 86400
-COOKIE = "academy_deposit_session"
+COOKIE = "academy_sbp_deposit_session"
+LEGACY_COOKIE = "academy_deposit_session"
 ACCESS = os.environ.get("OZON_PAY_ACCESS_KEY", "")
 SECRET = os.environ.get("OZON_PAY_SECRET_KEY", "")
 NOTIFY_SECRET = os.environ.get("OZON_PAY_NOTIFICATION_SECRET_KEY", "")
@@ -140,12 +141,18 @@ async def entry(request: Request):
     if not re.fullmatch(r"[a-f0-9]{64}", session):
         session = secrets.token_hex(32)
     row = payment(session)
+    # Preserve the paid guard when upgrading a visitor from the old checkout.
+    legacy = request.cookies.get(LEGACY_COOKIE, "")
+    if row is None and re.fullmatch(r"[a-f0-9]{64}", legacy):
+        legacy_row = payment(legacy)
+        if legacy_row and legacy_row["status"] == "paid":
+            session, row = legacy, legacy_row
     if row and row["status"] == "pending" and row["created"] <= time.time() - TTL:
         session = secrets.token_hex(32)
         row = None
     if row and row["status"] == "paid":
         return page("Предоплата получена", "Спасибо! Менеджер свяжется с вами.", session, returning=True)
-    return page("Предоплата 10 000 ₽", "Открываем страницу оплаты Ozon…", session)
+    return page("Предоплата 10 000 ₽", "Открываем оплату через СБП…", session)
 
 
 @app.get(PREFIX + "/payment.js")
@@ -191,10 +198,13 @@ async def create_ozon(body):
 
 
 def safe_link(data):
-    order = data.get("order") or {}
-    link = (order.get("item") or {}).get("payLink") or order.get("payLink") or ""
+    # Never fall back to Ozon checkout: it also exposes cards/installments.
+    link = ((data.get("paymentDetails") or {}).get("sbp") or {}).get("payload") or ""
     url = urlsplit(link)
-    if url.scheme != "https" or url.hostname != "checkout.ozon.ru" or url.username or url.password:
+    params = parse_qs(url.query)
+    if (url.scheme != "https" or url.hostname != "qr.nspk.ru" or url.port not in (None, 443)
+            or url.username or url.password or params.get("sum") != [str(AMOUNT)]
+            or params.get("cur") != ["RUB"] or params.get("type") != ["02"]):
         raise ValueError("Invalid payment redirect")
     return link
 
@@ -221,6 +231,10 @@ async def create(request: Request):
                 return JSONResponse({"paid": True})
             if row["status"] == "pending" and row["created"] > time.time() - TTL:
                 link = row["pay_link"]
+                try:
+                    safe_link({"paymentDetails": {"sbp": {"payload": link}}})
+                except (ValueError, TypeError):
+                    raise HTTPException(409, "Ссылка обновлена для оплаты через СБП. Откройте общий адрес заново.") from None
             else:
                 raise HTTPException(409, "Не удалось подтвердить создание счёта. Свяжитесь с менеджером, повторно не оплачивайте.")
         else:

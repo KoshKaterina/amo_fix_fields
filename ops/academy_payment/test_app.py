@@ -24,7 +24,7 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         module.lock = asyncio.Lock()
         module.init_db()
         self.client = self.new_client()
-        self.mock = AsyncMock(return_value={"order": {"item": {"payLink": "https://checkout.ozon.ru/pay/test"}}, "paymentDetails": {"paymentId": "test-id"}})
+        self.mock = AsyncMock(return_value={"order": {"item": {"payLink": "https://checkout.ozon.ru/pay/test"}}, "paymentDetails": {"paymentId": "test-id", "sbp": {"payload": "https://qr.nspk.ru/TEST?type=02&sum=1000000&cur=RUB"}}})
         self.patch = patch.object(module, "create_ozon", self.mock)
         self.patch.start()
 
@@ -113,6 +113,40 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         headers = await self.enter()
         r = await self.client.post(module.PREFIX + "/create", headers=headers)
         self.assertEqual(r.status_code, 502)
+
+    async def test_checkout_without_sbp_is_never_a_fallback(self):
+        self.mock.return_value = {"order": {"item": {"payLink": "https://checkout.ozon.ru/order/test"}}}
+        headers = await self.enter()
+        r = await self.client.post(module.PREFIX + "/create", headers=headers)
+        self.assertEqual(r.status_code, 502)
+
+    async def test_sbp_wins_over_checkout_and_amount_is_encoded(self):
+        headers = await self.enter()
+        r = await self.client.post(module.PREFIX + "/create", headers=headers)
+        self.assertTrue(r.json()["url"].startswith("https://qr.nspk.ru/"))
+        for url in ("https://qr.nspk.ru/T?type=02&sum=100&cur=RUB", "https://qr.nspk.ru.evil.invalid/T?type=02&sum=1000000&cur=RUB", "https://qr.nspk.ru/T?type=01&sum=1000000&cur=RUB"):
+            with self.assertRaises(ValueError):
+                module.safe_link({"paymentDetails": {"sbp": {"payload": url}}})
+
+    async def test_legacy_unpaid_checkout_session_gets_new_sbp_cookie(self):
+        headers = await self.issue()
+        old = self.client.cookies[module.COOKIE]
+        with module.db() as conn:
+            conn.execute("UPDATE payments SET pay_link='https://checkout.ozon.ru/order/old' WHERE session=?", (module.session_hash(old),))
+        self.client.cookies.clear()
+        self.client.cookies.set(module.LEGACY_COOKIE, old, domain="team.sunscrypt.ru", path=module.PREFIX)
+        await self.enter()
+        self.assertNotEqual(self.client.cookies[module.COOKIE], old)
+
+    async def test_legacy_paid_session_stays_paid(self):
+        await self.issue()
+        old = self.client.cookies[module.COOKIE]
+        await self.client.post(module.PREFIX + "/notify", json=self.signed(self.row()))
+        self.client.cookies.clear()
+        self.client.cookies.set(module.LEGACY_COOKIE, old, domain="team.sunscrypt.ru", path=module.PREFIX)
+        r = await self.client.get(module.PREFIX + "/deposit-10000")
+        self.assertIn("Предоплата получена", r.text)
+        self.assertEqual(self.client.cookies[module.COOKIE], old)
 
     async def test_unsigned_and_wrong_amount_notifications_do_not_mark_paid(self):
         await self.issue()
