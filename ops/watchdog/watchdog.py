@@ -684,7 +684,10 @@ WATCH_CONTAINERS = [c.strip() for c in (ENV.get("WATCH_CONTAINERS") or
 WATCH_TIMERS = [t.strip() for t in (ENV.get("WATCH_TIMERS") or
                 "tg-analytics-daily.timer,tg-analytics-watchdog.timer,"
                 "team-sync-hourly.timer,team-scheduler-recompute.timer,"
-                "team-nightly.timer").split(",") if t.strip()]
+                "team-nightly.timer,"
+                # Бэкап панели, заведён 14.10.2026. Выключенный таймер тут страшнее
+                # прочих: бэкапа не будет, а узнаем мы об этом в день аварии.
+                "team-backup.timer,team-backup-verify.timer").split(",") if t.strip()]
 # у кого лог в файле, а не в journalctl: там от сервиса только «process exited»
 UNIT_LOG_FILES = {"tg-analytics-daily.service": "/opt/tg-analytics/logs/daily.log"}
 CONTAINER_GRACE_SEC = 20  # даём подняться, если попали на пересборку при выкатке
@@ -696,6 +699,18 @@ CONTAINER_GRACE_SEC = 20  # даём подняться, если попали �
 # лиды, пропущенные звонки, неоплаченные счета) - узнали от продажников.
 # Контейнер при этом был жив и здоров, проверка контейнера ничего не заметила.
 AMO_HEALTH_URL = ENV.get("AMO_HEALTH_URL") or "http://127.0.0.1:8010/"
+
+# Отметка бэкапа панели. ⚠️ Её пишет сам бэкап (`ops/backup/backup.sh` панели), и до
+# 14.10.2026 её никто не читал. Дыра тут не в том, что прогон может упасть - про падение
+# бэкап пишет в Телеграм сам. Дыра в том, что «прогон НЕ СОСТОЯЛСЯ» ничем не отличается
+# от тишины: выключили таймер, сервер постоял выключенным, кто-то снёс юнит - и бэкапа
+# нет, а чат молчит, потому что падать было нечему. Поэтому смотрим на отметку, а не на
+# отсутствие писем.
+BACKUP_STATUS_FILE = ENV.get("BACKUP_STATUS_FILE") or "/var/backups/team/STATUS"
+# Прогон стоит на 02:00 МСК, значит в худшем случае отметке почти сутки плюс время самого
+# прогона. 26 часов - сутки с запасом: ровно 24 давали бы ложную тревогу от одного
+# медленного прогона или сдвига таймера на пару минут.
+BACKUP_MAX_AGE_H = int(ENV.get("BACKUP_MAX_AGE_H") or 26)
 
 
 def _sh(cmd, timeout=60):
@@ -785,12 +800,50 @@ def telegram_contour_check():
     return name, True, "опрос идёт, подавленных нет"
 
 
+def backup_status_check():
+    """(имя, ок, почему) по отметке бэкапа панели.
+
+    Три разных беды, и их надо различать в тексте, иначе человек не поймёт, куда идти:
+    отметки нет вовсе (прогона не было ни разу или каталог пропал), отметка говорит
+    «fail» (прогон падал, и его собственная тревога могла не дойти), отметка протухла
+    (прогоны перестали запускаться - самый тихий случай).
+    """
+    name = "Бэкап панели · отметка"
+    try:
+        with open(BACKUP_STATUS_FILE, encoding="utf-8") as fh:
+            raw = fh.read().strip()
+        age = int(time.time() - os.path.getmtime(BACKUP_STATUS_FILE))
+    except FileNotFoundError:
+        return name, False, (f"нет файла {BACKUP_STATUS_FILE} - прогона не было ни разу "
+                             "или каталог бэкапов пропал")
+    except PermissionError:
+        # Каталог 700 и владелец root, а сторож ходит из крона root - сейчас прав хватает.
+        # Но если его когда-нибудь переселят под другого пользователя, молчать нельзя:
+        # иначе проверка станет вечно зелёной и никто этого не заметит.
+        return name, False, f"нет прав прочитать {BACKUP_STATUS_FILE} - проверка ослепла"
+    except OSError as exc:
+        return name, False, f"{BACKUP_STATUS_FILE} не читается: {exc}"
+
+    first = raw.splitlines()[0][:200] if raw else ""
+    if not first:
+        return name, False, "отметка пустая - прогон не дошёл до записи результата"
+    if not first.startswith("ok "):
+        return name, False, f"последний прогон НЕ удался: {first}"
+    if age > BACKUP_MAX_AGE_H * 3600:
+        return name, False, (f"последний удачный прогон был {human_age(age)} назад "
+                             f"(порог {BACKUP_MAX_AGE_H} ч) - бэкапы перестали запускаться. "
+                             f"Отметка: {first}")
+    return name, True, f"свежая, {human_age(age)} назад"
+
+
 def services_checks():
     checks = []
 
     tg_contour = telegram_contour_check()
     if tg_contour:
         checks.append(tg_contour)
+
+    checks.append(backup_status_check())
 
     _, out = _sh(["systemctl", "list-units", "--state=failed", "--no-legend",
                   "--plain", "--no-pager"])
