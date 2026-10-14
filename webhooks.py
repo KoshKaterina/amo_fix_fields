@@ -492,25 +492,6 @@ async def ozon_notify(request: Request):
     return {"ok": True}
 
 
-@app.post("/talk_probe")
-async def talk_probe(request: Request):
-    """ВРЕМЕННЫЙ логгер вебхука amo add_talk/update_talk (эксперимент 31.07.2026:
-    ловится ли кнопка «Не требует ответа»). Пишет тело в лог, отвечает 200.
-    Снести вместе с подпиской вебхука 48238698, когда эксперимент закончится."""
-    try:
-        raw = (await request.body()).decode("utf-8", "replace")
-        logger.info("TALK_PROBE raw: %s", raw[:3000])
-        form = await request.form()
-        nested: dict = {}
-        for raw_key, value in form.items():
-            keys = re.findall(r"([^\[\]]+)", raw_key)
-            insert_nested(nested, keys, value)
-        logger.info("TALK_PROBE parsed: %s", json.dumps(nested, ensure_ascii=False)[:3000])
-    except Exception:
-        logger.exception("TALK_PROBE: ошибка разбора (отвечаем 200)")
-    return {"ok": True}
-
-
 @app.post("/contact_change")
 async def contact_change(request: Request):
     """Изменение контакта amoCRM — триггер одноразовой ссылки Академии.
