@@ -21,7 +21,7 @@ PREFIX = "/academy-pay"
 ORIGIN = "https://team.sunscrypt.ru"
 AMOUNT = 1_000_000  # 10 000 RUB; same units as Woo and ozon_invoice.
 TTL = 86400
-COOKIE = "academy_sbp_deposit_session"
+COOKIE = "academy_sbp_only_session"
 LEGACY_COOKIE = "academy_deposit_session"
 ACCESS = os.environ.get("OZON_PAY_ACCESS_KEY", "")
 SECRET = os.environ.get("OZON_PAY_SECRET_KEY", "")
@@ -179,13 +179,6 @@ def body_for(ext_id, order_ext_id):
         "extId": ext_id, "requestSign": signature(ext_id), "ttl": TTL,
         "redirectUrl": ORIGIN + PREFIX + "/return",
         "notificationUrl": ORIGIN + PREFIX + "/notify",
-        "order": {
-            "extId": order_ext_id, "amount": amount,
-            "paymentAlgorithm": "PAY_ALGO_SMS", "mode": "MODE_SHORTENED",
-            "expiresAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + TTL)),
-            "successUrl": ORIGIN + PREFIX + "/return",
-            "failUrl": ORIGIN + PREFIX + "/return", "enableFiscalization": False,
-        },
     }
 
 
@@ -203,8 +196,12 @@ def safe_link(data):
     url = urlsplit(link)
     params = parse_qs(url.query)
     if (url.scheme != "https" or url.hostname != "qr.nspk.ru" or url.port not in (None, 443)
-            or url.username or url.password or params.get("sum") != [str(AMOUNT)]
-            or params.get("cur") != ["RUB"] or params.get("type") != ["02"]):
+            or not url.path.strip("/") or url.username or url.password
+            or ("sum" in params and params["sum"] != [str(AMOUNT)])
+            or ("cur" in params and params["cur"] != ["RUB"])
+            or ("type" in params and params["type"] != ["02"])):
+        # Current Ozon also returns opaque NSPK URLs without query parameters.
+        # Their amount is fixed in the authenticated createPayment request.
         raise ValueError("Invalid payment redirect")
     return link
 

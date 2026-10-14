@@ -71,7 +71,8 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200)
         body = self.mock.call_args.args[0]
         self.assertEqual(body["amount"]["value"], "1000000")
-        self.assertEqual(body["order"]["amount"]["value"], "1000000")
+        self.assertEqual(body["payType"], "SBP")
+        self.assertNotIn("order", body)
         self.assertNotIn("amo-", body["extId"])
 
     async def test_refresh_and_concurrent_requests_reuse_one_bill(self):
@@ -88,7 +89,8 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status_code, 200)
         a, b = [call.args[0] for call in self.mock.call_args_list]
         self.assertNotEqual(a["extId"], b["extId"])
-        self.assertNotEqual(a["order"]["extId"], b["order"]["extId"])
+        self.assertNotIn("order", a)
+        self.assertNotIn("order", b)
 
     async def test_foreign_origin_and_wrong_csrf_fail_before_bank(self):
         headers = await self.enter()
@@ -124,6 +126,7 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         headers = await self.enter()
         r = await self.client.post(module.PREFIX + "/create", headers=headers)
         self.assertTrue(r.json()["url"].startswith("https://qr.nspk.ru/"))
+        self.assertEqual(module.safe_link({"paymentDetails": {"sbp": {"payload": "https://qr.nspk.ru/OPAQUE"}}}), "https://qr.nspk.ru/OPAQUE")
         for url in ("https://qr.nspk.ru/T?type=02&sum=100&cur=RUB", "https://qr.nspk.ru.evil.invalid/T?type=02&sum=1000000&cur=RUB", "https://qr.nspk.ru/T?type=01&sum=1000000&cur=RUB"):
             with self.assertRaises(ValueError):
                 module.safe_link({"paymentDetails": {"sbp": {"payload": url}}})
