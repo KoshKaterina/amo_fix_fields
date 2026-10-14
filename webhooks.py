@@ -90,6 +90,48 @@ from waybill_config import (
 )
 
 
+# Маршруты, у которых секрет лежит в ПУТИ. Пока он там (мера 11 аудита 28.09 не сделана:
+# перенос в заголовки требует перенастройки на стороне Jivo, UIS, Wazzup и BotHelp), путь
+# нельзя писать в журнал целиком.
+SECRET_PATH_PREFIXES = ("/jivo/", "/uis/", "/wazzup/", "/bothelp/academy/",
+                        "/admin/lead-distribution/")
+
+
+def mask_secret_path(path: str) -> str:
+    """`/wazzup/abc123` -> `/wazzup/HIDDEN`. Остальные пути возвращает как есть."""
+    for prefix in SECRET_PATH_PREFIXES:
+        if path.startswith(prefix):
+            tail = path[len(prefix):]
+            rest = tail.split("/", 1)
+            hidden = "HIDDEN" + ("/" + rest[1] if len(rest) > 1 else "")
+            return prefix + hidden
+    return path
+
+
+class MaskSecretsInAccessLog(logging.Filter):
+    """Прячет секрет в строке запроса, которую пишет uvicorn.
+
+    ⚠️ ЗАЧЕМ ОТДЕЛЬНО ОТ nginx. Секреты из пути убрали из access-лога nginx форматом лога
+    (15.10.2026, `/etc/nginx/conf.d/00-log-sanitize.conf`), но uvicorn пишет строку запроса
+    САМ, в журнал контейнера - и там секрет оставался. Журнал контейнера живёт до следующей
+    пересборки и читается всем, у кого есть доступ к докеру.
+
+    ⚠️ Фильтр обязан быть безотказным: исключение отсюда прилетело бы в середину
+    журналирования запроса. Поэтому любое неожиданное - пропускаем запись как есть.
+    """
+
+    def filter(self, record):
+        try:
+            # uvicorn.access зовёт logger.info(fmt, client_addr, method, path, version, status)
+            if record.args and len(record.args) >= 3 and isinstance(record.args[2], str):
+                args = list(record.args)
+                args[2] = mask_secret_path(args[2])
+                record.args = tuple(args)
+        except Exception:  # noqa: BLE001 - журналирование важнее аккуратности
+            pass
+        return True
+
+
 @asynccontextmanager
 async def lifespan(app):
     msk = datetime.timezone(datetime.timedelta(hours=3))
@@ -103,6 +145,11 @@ async def lifespan(app):
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         for handler in logging.getLogger(name).handlers:
             handler.setFormatter(formatter)
+
+    # Секрет из пути не должен попасть в журнал контейнера - см. MaskSecretsInAccessLog.
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, MaskSecretsInAccessLog) for f in access_logger.filters):
+        access_logger.addFilter(MaskSecretsInAccessLog())
 
     init_api_pipeline()
     init_queue()
