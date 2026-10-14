@@ -3,7 +3,6 @@ import asyncio
 import hashlib
 import hmac
 import html
-import logging
 import os
 import re
 import secrets
@@ -100,7 +99,6 @@ def csrf(session):
 def valid_session(request):
     session = request.cookies.get(COOKIE, "")
     if not re.fullmatch(r"[a-f0-9]{64}", session):
-        logging.warning("Academy payment rejected: invalid session cookie")
         raise HTTPException(403, "Откройте ссылку на оплату заново")
     return session
 
@@ -204,7 +202,6 @@ def safe_link(data):
 @app.post(PREFIX + "/create")
 async def create(request: Request):
     if request.headers.get("origin") != ORIGIN:
-        logging.warning("Academy payment rejected: foreign or missing Origin")
         raise HTTPException(403, "Откройте ссылку на оплату заново")
     session = valid_session(request)
     token = request.headers.get("X-Academy-CSRF", "")
@@ -216,7 +213,6 @@ async def create(request: Request):
             raise HTTPException(413, "Запрос слишком большой")
         token = parse_qs(raw.decode()).get("csrf", [""])[0]
     if not hmac.compare_digest(token, csrf(session)):
-        logging.warning("Academy payment rejected: invalid CSRF")
         raise HTTPException(403, "Откройте ссылку на оплату заново")
     async with session_lock(session):
         row = payment(session)
