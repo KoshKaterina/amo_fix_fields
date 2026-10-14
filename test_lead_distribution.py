@@ -18,6 +18,7 @@ import json
 import pathlib
 import tempfile
 import time
+import types
 
 import amo_service
 import lead_distribution as ld
@@ -279,7 +280,7 @@ async def _fake_fetch_for_datetime(user_ids, at):
     причину tomorrow_shift_fallback, а бой писал load - и бой был ПРАВ, потому
     что по этой подделке человек действительно «был на месте». Врал тест.
     """
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     if abs((at - now).total_seconds()) <= 60:
         return {uid: _live_now_statuses.get(uid, False) for uid in user_ids}
     return {uid: _tomorrow_statuses.get(uid, False) for uid in user_ids}
@@ -460,7 +461,7 @@ def test_always_mode_waits_when_previous_responsible_off_shift():
     p = _seed_profile(name="Always", repeat_contact_mode="always", participant_ids=[1, 2, 3])
     lead = _lead(source_id=42, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": 2, "updated_at": 1}])
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # никто не «на месте», в т.ч. R
     target = run(ld.decide_and_record(lead, p))
     assert target is None  # ждём его, не отдаём другому
@@ -724,7 +725,7 @@ def test_open_deals_counter_repeat_responsible_priority_still_applies():
 
 def test_duty_user_fallback_when_pool_empty():
     p = _seed_profile(name="Duty", participant_ids=[1, 2], duty_user_id=9)
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна
     lead = _lead(source_id=1, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])
@@ -734,12 +735,61 @@ def test_duty_user_fallback_when_pool_empty():
 
 def test_no_candidate_waiting_without_duty():
     p = _seed_profile(name="NoDuty", participant_ids=[1, 2], duty_user_id=None)
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)
     lead = _lead(source_id=1, contacts=[{"id": 500}])
     _contact_by_id[500] = _contact(500, other_leads=[])
     target = run(ld.decide_and_record(lead, p))
     assert target is None
+
+
+# ════════════════ замороженные часы ════════════════
+#
+# ⚠️ ПОЧЕМУ ВРЕМЯ ЗАМОРОЖЕНО. Шестнадцать тестов в этом файле строят график относительно
+# «сейчас»: окно через два часа, окно два часа назад, окно с перерывом. Формат графика -
+# только `HH:MM`, без даты. Значит при настоящих часах окно легко уезжает за сутки: в 23:06
+# «через два часа» это 01:06, то есть в сегодняшних терминах окно, закончившееся 21 час
+# назад. Три теста падали ровно так (поймано 14.10.2026 в 23:06), а днём были зелёными -
+# худший вид красноты, потому что в CI это выглядело бы случайным мерцанием.
+#
+# Лечим причину, а не три теста: внутри модуля распределения «сейчас» всегда полдень.
+# Полдень выбран как самая середина суток - от него любое окно в пределах трёх часов
+# остаётся внутри тех же суток в обе стороны.
+#
+# Смены, пересекающие полночь, у нас не бывают - подтвердила Катя 14.10.2026. Поэтому
+# заморозка ничего не упрощает по сравнению с боем: такого случая в проде нет.
+_FROZEN_NOW = datetime.datetime.now(ld._MSK).replace(hour=12, minute=0, second=0, microsecond=0)
+
+
+def _now() -> datetime.datetime:
+    """«Сейчас» для тестов - ровно то же, что видит код под тестом."""
+    return _FROZEN_NOW
+
+
+class _FrozenDatetime(datetime.datetime):
+    """Настоящий datetime, у которого только `now()` отвечает замороженным временем."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return _FROZEN_NOW.astimezone(tz) if tz is not None else _FROZEN_NOW.replace(tzinfo=None)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_msk_clock(monkeypatch):
+    """Подменяет модуль `datetime` ВНУТРИ кода распределения на копию с замороженным now.
+
+    ⚠️ Заглушка собирается из КОПИИ настоящего модуля, а не с нуля: код под тестом берёт из
+    `datetime` ещё `time`, `timedelta` и `timezone`, и заглушка «только с datetime»
+    развалилась бы на первом же обращении к ним (разбор этой болезни - в AGENTS.md).
+    Фикстура с возвратом: `monkeypatch` снимает подмену после каждого теста, иначе она
+    досталась бы соседним файлам.
+    """
+    stub = types.ModuleType("datetime")
+    for attr in dir(datetime):
+        setattr(stub, attr, getattr(datetime, attr))
+    stub.datetime = _FrozenDatetime
+    monkeypatch.setattr(ld, "datetime", stub)
+    return _FROZEN_NOW
 
 
 # ════════════════ work_hours профиля ════════════════
@@ -752,7 +802,7 @@ def test_profile_before_first_interval_routes_via_today_pool():
     """До начала первого интервала - НЕ "рабочий день закончился" (это другое
     состояние, не должно триггерить tomorrow-fallback) - обычный today-пул."""
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     work_hours = [{"start": _hhmm(now + datetime.timedelta(hours=2)), "end": _hhmm(now + datetime.timedelta(hours=3))}]
     _seed_profile(name="BeforeStart", participant_ids=[1, 2], work_hours=work_hours)
     lead = _lead(lead_id=210, source_id=1, contacts=[{"id": 500}])
@@ -767,7 +817,7 @@ def test_profile_gap_between_intervals_routes_via_today_pool():
     """Между двумя интервалами (обеденный перерыв и т.п.) - тоже не "конец дня"
     (последний интервал ещё не кончился) - обычный today-пул, не завтра."""
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     work_hours = [
         {"start": _hhmm(now - datetime.timedelta(hours=2)), "end": _hhmm(now - datetime.timedelta(hours=1))},
         {"start": _hhmm(now + datetime.timedelta(hours=1)), "end": _hhmm(now + datetime.timedelta(hours=2))},
@@ -783,7 +833,7 @@ def test_profile_gap_between_intervals_routes_via_today_pool():
 
 def test_profile_past_last_interval_end_routes_to_tomorrow_pool():
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
     _seed_profile(name="DayEnded", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
     _tomorrow_statuses[2] = True  # только 2 работает завтра
@@ -798,7 +848,7 @@ def test_profile_past_last_interval_end_routes_to_tomorrow_pool():
 
 def test_profile_past_last_interval_end_tomorrow_pool_empty_falls_to_duty():
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
     _seed_profile(name="DayEndedNoOne", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
     # _tomorrow_statuses пуст - никто не работает завтра
@@ -819,7 +869,7 @@ def test_profile_before_first_interval_empty_live_pool_uses_upcoming_pool():
     пустой пул тоже триггерит upcoming-пул (ближайший будущий старт - сегодня,
     не обязательно "завтра")."""
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now.hour, now.hour)  # никто не «на месте» по плейсхолдеру
     work_hours = [{"start": _hhmm(now + datetime.timedelta(hours=2)), "end": _hhmm(now + datetime.timedelta(hours=3))}]
     _seed_profile(name="BeforeStartEmptyPool", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
@@ -838,7 +888,7 @@ def test_always_mode_repeat_client_routed_to_tomorrow_pool():
     под tomorrow-пулом это всегда False (сегодняшний день уже кончился),
     повторный клиент завис бы навсегда. Должен смотреть в tomorrow-пул."""
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
     _seed_profile(name="AlwaysTomorrow", participant_ids=[1, 2], repeat_contact_mode="always", work_hours=work_hours)
     _tomorrow_statuses[1] = True
@@ -877,7 +927,7 @@ def test_load_mode_repeat_responsible_wins_under_upcoming_pool():
     повторный клиент молча уходил по общей балансировке. Для режима always это
     чинили раньше (_repeat_on_shift), ветку load пропустили (18.08.2026)."""
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
     _seed_profile(name="RepeatUpcoming", participant_ids=[1, 2], work_hours=work_hours)
     _tomorrow_statuses[1] = True
@@ -1113,7 +1163,7 @@ def test_in_flight_released_on_empty_pool_allows_immediate_retry():
     """Пустой пул (нет решения) не должен застревать в _in_flight на всё окно
     дедупа - иначе следующий заход reconciliation ждал бы впустую."""
     _reset_fakes()
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # никто не «на месте»
     _seed_profile(name="EmptyPoolRetry", participant_ids=[1, 2], duty_user_id=None)
     lead = _lead(lead_id=323, source_id=1, contacts=[{"id": 500}])
@@ -1413,7 +1463,7 @@ def test_log_send_failure_does_not_affect_routing_outcome():
 def test_log_send_reports_duty_fallback_rule():
     _reset_fakes()
     p = _seed_profile(name="LogDuty", participant_ids=[1, 2], duty_user_id=9)
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна
     lead = _lead(lead_id=602, source_id=7, contacts=[{"id": 500}])
     _lead_by_id[602] = lead
@@ -1482,7 +1532,7 @@ def test_log_send_detail_carries_repeat_and_prev_responsible():
     _reset_fakes()
     _seed_profile(name="LogDetail", participant_ids=[1, 2], duty_user_id=9,
                    pipeline_id=111, status_id=222)
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна -> duty_fallback
     lead = _lead(lead_id=613, pipeline_id=111, status_id=222, source_id=7,
                  contacts=[{"id": 500}], responsible_user_id=42)
@@ -1561,7 +1611,7 @@ def test_log_outcome_no_candidate_carries_decision_snapshot():
     """Пул пуст и дежурного нет: сделка висит без ответственного - в журнале
     отдельный исход со снимком, из которого видно, что пул был пуст."""
     _reset_fakes()
-    now_h = datetime.datetime.now(ld._MSK).hour
+    now_h = _now().hour
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now_h, now_h)  # весь пул вне окна
     _seed_profile(name="NoCandidate", participant_ids=[1, 2], duty_user_id=None, source_ids=[1])
     lead = _lead(lead_id=712, source_id=1)
@@ -1718,7 +1768,7 @@ def test_empty_schedule_pool_but_someone_live_now_goes_by_load():
     будущий пул, и причина load в журнале - правильная подпись, а не промах.
     Добавлено 29.09.2026: до этого путь живой проверки не был закрыт тестом."""
     _reset_fakes()
-    now = datetime.datetime.now(ld._MSK)
+    now = _now()
     ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (now.hour, now.hour)  # по графику никого
     work_hours = [{"start": _hhmm(now + datetime.timedelta(hours=2)), "end": _hhmm(now + datetime.timedelta(hours=3))}]
     _seed_profile(name="LiveNowBeatsSchedule", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
