@@ -703,7 +703,8 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         if any(w != 1 for w in weights.values()):
             meta["weights"] = weights  # веса по умолчанию (все 1) не пишем - шум
 
-    if profile.id in LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS:
+    ignore_schedule = profile.id in LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS
+    if ignore_schedule:
         # У отдельных команд нет строк в розничном ростере. Явная настройка
         # профиля делает доступным весь его пул и не затрагивает остальные
         # правила, для которых team-panel остаётся источником присутствия.
@@ -745,7 +746,13 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     def _repeat_on_shift(uid: int) -> bool:
         # Под forward-пулом "на месте" значит "участвует в пуле на ближайшую
         # будущую смену" - _is_on_shift (сейчас) для него не годится.
-        return uid in pool if pool_is_future else _is_on_shift(uid)
+        # Профиль без графика - то же самое: доступен тот, кто в пуле. Через
+        # _is_on_shift участники такого профиля всегда "не на месте" (в ростере
+        # их нет), и режим always оставлял повторного клиента без ответственного
+        # навсегда (найдено вживую 15.10.2026, сделка 36579769, Академия).
+        if pool_is_future or ignore_schedule:
+            return uid in pool
+        return _is_on_shift(uid)
 
     # use_open_deals_counter - живой запрос к amoCRM ДО блокировки: _counters_lock
     # общий на ВСЕ профили (не только этот), держать его на время сетевого похода

@@ -112,6 +112,56 @@ def test_ignore_schedule_profile_uses_full_pool_equally():
     asyncio.run(_run_ignore_schedule_profile_uses_full_pool_equally())
 
 
+# Повторный клиент в профиле без графика (15.10.2026, сделка 36579769, Академия):
+# доступность прежнего менеджера проверялась через _is_on_shift, а участников
+# такого профиля в ростере нет - режим always отдавал None, сделка висела без
+# ответственного. Окно (0, 0) ниже - «по графику никого», как у Академии в бою.
+
+def _seed_academy_repeat(mode: str, repeat_uid: int) -> ld.Profile:
+    profile = _seed_profile(
+        id="academy",
+        participant_ids=[13822630, 14289086, 14289446],
+        repeat_contact_mode=mode,
+        duty_user_id=13822630,
+    )
+    ld.LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS = {"academy"}
+    ld.LEAD_DISTRIBUTION_DEFAULT_WINDOW = (0, 0)
+    _contact_by_id[500] = _contact(500, other_leads=[{"id": 999, "responsible_user_id": repeat_uid, "updated_at": 1}])
+    return profile
+
+
+def test_ignore_schedule_always_mode_gives_repeat_client_to_previous_responsible():
+    profile = _seed_academy_repeat("always", 14289086)
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    assert run(ld.decide_and_record(lead, profile)) == 14289086
+
+
+def test_ignore_schedule_load_mode_keeps_repeat_priority():
+    profile = _seed_academy_repeat("load", 14289446)
+    # У прежнего на одну сделку больше - в пределах gap, приоритет за ним. Без
+    # обхода в _repeat_on_shift приоритет пропадал и побеждал наименее занятый.
+    _seed_counts({14289446: {42: 1}, 13822630: {42: 0}, 14289086: {42: 0}})
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    assert run(ld.decide_and_record(lead, profile)) == 14289446
+
+
+def test_ignore_schedule_always_mode_routes_repeat_client_end_to_end():
+    _reset_fakes()
+    _seed_academy_repeat("always", 13822630)
+    lead = _lead(lead_id=36579769, source_id=42, contacts=[{"id": 500}], responsible_user_id=6653350)
+    _lead_by_id[36579769] = lead
+
+    outcome = run(_call_and_drain(ld.process_lead_distribution(36579769)))
+
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 13822630
+    assert _log_calls[-1]["outcome"] == "routed"
+    assert _log_calls[-1]["rule"] == "always"
+    detail = _log_calls[-1]["detail"]
+    assert detail["repeat_in_profile"] is True
+    assert detail["repeat_available"] is True
+
+
 # ── билдеры ──────────────────────────────────────────────────────────────
 
 def _seed_profile(**over) -> ld.Profile:
