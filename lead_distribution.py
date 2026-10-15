@@ -332,9 +332,15 @@ async def _next_in_rotation(profile_id: str, pool: list[int]) -> int:
         return candidate
 
 
-# ════════════════ счётчики нагрузки — ПО ИСТОЧНИКУ, сброс по дате МСК ════════════════
+# ════════════ счётчики нагрузки — ПО ВОРОНКЕ и ИСТОЧНИКУ, сброс по дате МСК ════════════
+#
+# 15.10.2026 (Катя): у каждой воронки свои счётчики. До этого счётчик был один на
+# человека на весь аккаунт: Игорь и Егор стоят и в рознице, и в Tangemshop, и сделка
+# розницы делала их «загруженными» для Tangemshop - и наоборот. Теперь сделка
+# считается только в воронке, куда пришла, и «нагрузку» правило видит только свою.
 
 COUNTERS_PATH = pathlib.Path(os.getenv("LEAD_DISTRIBUTION_COUNTERS_PATH", "var/lead_distribution_counters.json"))
+COUNTERS_VERSION = 2
 _counters_lock = asyncio.Lock()
 
 
@@ -343,14 +349,20 @@ def _today_msk() -> str:
 
 
 def _load_counters_state() -> dict:
-    """{"date": "YYYY-MM-DD", "counts": {user_id: {source_id: n}}, "assignments": {lead_id: {...}},
-    "routed_ids": [lead_id, ...]}. Дата в файле отличается от сегодняшней → пустое
-    состояние (вчерашние счётчики просто перестают использоваться, явного сброса
-    не нужно) - routed_ids (см. _is_locally_routed/_mark_locally_routed) едет тем
-    же рейсом, суточного окна с огромным запасом хватает на саму задачу (пережить
-    read-after-write задержку amoCRM, которая разрешается за секунды)."""
+    """{"v": 2, "date": "YYYY-MM-DD", "counts_by_pipeline": {pipeline_id: {user_id: {source_id: n}}},
+    "assignments": {lead_id: {...}}, "routed_ids": [lead_id, ...]}. Дата в файле
+    отличается от сегодняшней → пустое состояние (вчерашние счётчики просто перестают
+    использоваться, явного сброса не нужно) - routed_ids (см. _is_locally_routed/
+    _mark_locally_routed) едет тем же рейсом, суточного окна с огромным запасом хватает
+    на саму задачу (пережить read-after-write задержку amoCRM, которая разрешается за
+    секунды).
+
+    Сегодняшний файл старого вида (общие "counts" без воронки) переводится на месте:
+    счётчики и журнал назначений обнуляются - разложить их по воронкам не из чего,
+    воронки там не записано. routed_ids и outcomes_logged переезжают как есть: это
+    защита от повторной раздачи и повторной записи в журнал, терять её нельзя."""
     today = _today_msk()
-    empty = {"date": today, "counts": {}, "assignments": {}, "routed_ids": []}
+    empty = {"v": COUNTERS_VERSION, "date": today, "counts_by_pipeline": {}, "assignments": {}, "routed_ids": []}
     if not COUNTERS_PATH.exists():
         return empty
     try:
@@ -360,11 +372,32 @@ def _load_counters_state() -> dict:
         return empty
     if state.get("date") != today:
         return empty
+    if state.get("v") != COUNTERS_VERSION:
+        logger.warning(
+            "lead_distribution: счётчики старого вида (общие на все воронки) - сегодняшние "
+            "обнулены, routed_ids сохранены (%d)", len(state.get("routed_ids") or []),
+        )
+        migrated = dict(empty)
+        migrated["routed_ids"] = list(state.get("routed_ids") or [])
+        if "outcomes_logged" in state:
+            migrated["outcomes_logged"] = list(state.get("outcomes_logged") or [])
+        return migrated
     return state
 
 
 def _save_counters_state(state: dict) -> None:
     _atomic_write_json(COUNTERS_PATH, state)
+
+
+def _pipeline_key(pipeline_id) -> str:
+    return str(pipeline_id) if pipeline_id is not None else "0"
+
+
+def _pipeline_counts(state: dict, pipeline_id) -> dict:
+    """Срез счётчиков одной воронки в форме {"counts": {user_id: {source_id: n}}} -
+    той же, что у _open_deals_state, поэтому _source_count/_total_count и
+    _decide_load_balanced работают с ним без правок."""
+    return {"counts": (state.get("counts_by_pipeline") or {}).get(_pipeline_key(pipeline_id)) or {}}
 
 
 def _source_count(state: dict, user_id: int, source_id: int) -> int:
@@ -375,12 +408,17 @@ def _total_count(state: dict, user_id: int) -> int:
     return sum(((state.get("counts") or {}).get(str(user_id)) or {}).values())
 
 
-def _apply_assignment(state: dict, *, lead_id: int, source_id: int, user_id: int) -> None:
-    counts = state.setdefault("counts", {})
+def _bump(state: dict, pipeline_id, user_id: int, source_id: int, delta: int) -> None:
+    counts = state.setdefault("counts_by_pipeline", {}).setdefault(_pipeline_key(pipeline_id), {})
     user_counts = counts.setdefault(str(user_id), {})
-    user_counts[str(source_id)] = user_counts.get(str(source_id), 0) + 1
+    user_counts[str(source_id)] = max(0, user_counts.get(str(source_id), 0) + delta)
+
+
+def _apply_assignment(state: dict, *, lead_id: int, source_id: int, user_id: int, pipeline_id) -> None:
+    _bump(state, pipeline_id, user_id, source_id, +1)
     state.setdefault("assignments", {})[str(lead_id)] = {
         "source_id": source_id, "user_id": user_id, "date": state["date"],
+        "pipeline_id": _pipeline_key(pipeline_id),
     }
 
 
@@ -428,13 +466,13 @@ async def correct_reassignment(lead_id: int, new_user_id: int) -> None:
         source_id = record.get("source_id")
         if old_user_id == new_user_id:
             return
-        counts = state.setdefault("counts", {})
+        # Поправка идёт в счётчиках той воронки, куда сделка была роздана.
+        pipeline_id = record.get("pipeline_id")
         if source_id is not None:
-            old_counts = counts.get(str(old_user_id)) or {}
+            old_counts = _pipeline_counts(state, pipeline_id)["counts"].get(str(old_user_id)) or {}
             if str(source_id) in old_counts:
-                old_counts[str(source_id)] = max(0, old_counts[str(source_id)] - 1)
-            new_counts = counts.setdefault(str(new_user_id), {})
-            new_counts[str(source_id)] = new_counts.get(str(source_id), 0) + 1
+                _bump(state, pipeline_id, old_user_id, source_id, -1)
+            _bump(state, pipeline_id, new_user_id, source_id, +1)
         state["assignments"][str(lead_id)] = {**record, "user_id": new_user_id}
         _save_counters_state(state)
         logger.info(
@@ -764,7 +802,11 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
     )
 
     async with _counters_lock:
-        state = open_deals_state if open_deals_state is not None else _load_counters_state()
+        # Файл держит счётчики всех воронок, решение смотрит только на срез воронки
+        # этой сделки. Режим открытых сделок и так считает по воронкам профиля.
+        stored = _load_counters_state() if open_deals_state is None else None
+        lead_pipeline_id = lead.get("pipeline_id")
+        state = open_deals_state if open_deals_state is not None else _pipeline_counts(stored, lead_pipeline_id)
         rule = ""
 
         if profile.repeat_contact_mode == "always":
@@ -813,6 +855,8 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
             # на которые смотрел алгоритм, а не уже увеличенные этим же решением.
             # Только для "load": в always/random счётчики решение не определяют.
             meta["counter_kind"] = "open_deals" if open_deals_state is not None else "daily"
+            if open_deals_state is None:
+                meta["counter_pipeline_id"] = lead_pipeline_id
             meta["fairness_gap"] = LEAD_DISTRIBUTION_FAIRNESS_GAP
             counter_uids = list(dict.fromkeys(
                 [*pool, *([repeat_priority_candidate] if repeat_priority_candidate is not None else [])]
@@ -829,8 +873,9 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
             # open_deals_state: писать некуда и незачем - источник правды amoCRM,
             # следующее решение просто перезапросит его живьём (уже с учётом
             # PATCH, который process_lead_distribution сделает следом).
-            _apply_assignment(state, lead_id=int(lead["id"]), source_id=source_id, user_id=target)
-            _save_counters_state(state)
+            _apply_assignment(stored, lead_id=int(lead["id"]), source_id=source_id, user_id=target,
+                              pipeline_id=lead_pipeline_id)
+            _save_counters_state(stored)
         if meta is not None:
             meta["rule"] = rule
             meta["repeat_responsible_user_id"] = repeat_responsible
@@ -953,6 +998,7 @@ async def _log_decision(
         "weights": meta.get("weights"),
         "counters": meta.get("counters"),
         "counter_kind": meta.get("counter_kind"),
+        "counter_pipeline_id": meta.get("counter_pipeline_id"),
         "fairness_gap": meta.get("fairness_gap"),
         "reason": meta.get("reason"),
         "tied": meta.get("tied"),

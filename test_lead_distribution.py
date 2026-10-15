@@ -235,12 +235,23 @@ def _contact(contact_id=500, other_leads=None, name=None, phone=None):
     return c
 
 
-def _seed_counts(user_source_counts: dict) -> None:
-    """user_source_counts: {user_id: {source_id: count}}"""
-    state = {"date": ld._today_msk(), "counts": {}, "assignments": {}}
+_DEFAULT_PIPELINE = 10593102  # воронка, которую по умолчанию ставят _lead и _seed_profile
+
+
+def _seed_counts(user_source_counts: dict, pipeline_id: int = _DEFAULT_PIPELINE, *, keep: bool = False) -> None:
+    """user_source_counts: {user_id: {source_id: count}} в одной воронке.
+    keep=True дописывает воронку к уже лежащему файлу, а не начинает с чистого."""
+    state = ld._load_counters_state() if keep else {
+        "v": ld.COUNTERS_VERSION, "date": ld._today_msk(), "counts_by_pipeline": {}, "assignments": {},
+    }
+    bucket = state.setdefault("counts_by_pipeline", {}).setdefault(str(pipeline_id), {})
     for uid, per_source in user_source_counts.items():
-        state["counts"][str(uid)] = {str(sid): n for sid, n in per_source.items()}
+        bucket[str(uid)] = {str(sid): n for sid, n in per_source.items()}
     ld._save_counters_state(state)
+
+
+def _counts_of(state: dict, pipeline_id: int = _DEFAULT_PIPELINE) -> dict:
+    return ld._pipeline_counts(state, pipeline_id)
 
 
 # ── фейки amo_service / telegram_bot ────────────────────────────────────
@@ -661,14 +672,69 @@ def test_counters_persist_and_reset_by_date():
     _seed_counts({1: {42: 0}, 2: {42: 0}, 3: {42: 0}})
     target = run(ld.decide_and_record(lead, p))
     state = ld._load_counters_state()
-    assert ld._source_count(state, target, 42) == 1
+    assert ld._source_count(_counts_of(state), target, 42) == 1
 
     # смена даты в файле → счётчик как будто не существовал
     stale = ld._load_counters_state()
     stale["date"] = "2000-01-01"
     ld._save_counters_state(stale)
     fresh = ld._load_counters_state()
-    assert fresh["counts"] == {}
+    assert fresh["counts_by_pipeline"] == {}
+
+
+# ════════════════ счётчики по воронкам (15.10.2026) ════════════════
+# У каждой воронки свои счётчики: сделка розницы не делает человека «загруженным»
+# для Tangemshop. 9822330 - воронка Tangemshop, 10593102 - розница.
+
+def test_counters_of_other_pipeline_do_not_affect_decision():
+    p = _seed_profile(name="Retail", repeat_contact_mode="load", participant_ids=[1, 2])
+    _seed_counts({2: {42: 1}})                                 # в рознице у 2 одна сделка
+    _seed_counts({1: {42: 10}}, pipeline_id=9822330, keep=True)  # у 1 десять, но в Tangemshop
+    lead = _lead(source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    # Общий счётчик отдал бы сделку 2 (у 1 «десять»), по воронке у 1 ноль.
+    assert run(ld.decide_and_record(lead, p)) == 1
+
+
+def test_assignment_is_counted_only_in_its_pipeline():
+    p = _seed_profile(name="Tangemshop", repeat_contact_mode="load", participant_ids=[1],
+                      pipeline_id=9822330, status_id=78157066)
+    lead = _lead(lead_id=77, pipeline_id=9822330, status_id=78157066, source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    assert run(ld.decide_and_record(lead, p)) == 1
+    state = ld._load_counters_state()
+    assert ld._source_count(_counts_of(state, 9822330), 1, 42) == 1
+    assert ld._total_count(_counts_of(state), 1) == 0  # розница не тронута
+    assert state["assignments"]["77"]["pipeline_id"] == "9822330"
+
+
+def test_old_shared_counters_file_of_today_is_migrated():
+    """Файл, записанный до правки: общие counts без воронки. Счётчики и назначения
+    обнуляются (разложить не из чего), защита от повторной раздачи сохраняется."""
+    ld.COUNTERS_PATH.write_text(json.dumps({
+        "date": ld._today_msk(), "counts": {"1": {"42": 7}},
+        "assignments": {"900": {"source_id": 42, "user_id": 1, "date": ld._today_msk()}},
+        "routed_ids": [900, 901], "outcomes_logged": ["902:no_candidate"],
+    }), encoding="utf-8")
+    state = ld._load_counters_state()
+    assert state["v"] == ld.COUNTERS_VERSION
+    assert state["counts_by_pipeline"] == {}
+    assert state["assignments"] == {}
+    assert state["routed_ids"] == [900, 901]
+    assert state["outcomes_logged"] == ["902:no_candidate"]
+    assert "counts" not in state
+
+
+def test_correct_reassignment_fixes_counters_of_record_pipeline():
+    state = ld._load_counters_state()
+    ld._apply_assignment(state, lead_id=905, source_id=42, user_id=1, pipeline_id=9822330)
+    ld._save_counters_state(state)
+    _seed_counts({1: {42: 4}}, keep=True)  # розница: у того же человека своя цифра
+    run(ld.correct_reassignment(905, 2))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final, 9822330), 1, 42) == 0
+    assert ld._source_count(_counts_of(final, 9822330), 2, 42) == 1
+    assert ld._source_count(_counts_of(final), 1, 42) == 4  # розница не тронута
 
 
 # ════════════════ use_open_deals_counter (12.08.2026) ════════════════
@@ -709,7 +775,7 @@ def test_open_deals_counter_does_not_touch_daily_counters_file():
     _contact_by_id[500] = _contact(500, other_leads=[])
     run(ld.decide_and_record(lead, p))
     state = ld._load_counters_state()
-    assert state["counts"] == {}, "источник правды - amoCRM, дневной JSON не должен получить запись"
+    assert state["counts_by_pipeline"] == {}, "источник правды - amoCRM, дневной JSON не должен получить запись"
 
 
 def test_open_deals_counter_sums_across_profile_pipelines():
@@ -1412,13 +1478,14 @@ def test_contact_wait_loop_times_out_and_alerts():
 # ════════════════ коррекция счётчиков при ручной смене ответственного ════════════════
 
 def test_correct_reassignment_moves_counters_same_day():
-    state = {"date": ld._today_msk(), "counts": {"1": {"42": 3}}, "assignments": {}}
-    ld._apply_assignment(state, lead_id=900, source_id=42, user_id=1)
+    _seed_counts({1: {42: 3}})
+    state = ld._load_counters_state()
+    ld._apply_assignment(state, lead_id=900, source_id=42, user_id=1, pipeline_id=_DEFAULT_PIPELINE)
     ld._save_counters_state(state)
     run(ld.correct_reassignment(900, 2))
     final = ld._load_counters_state()
-    assert ld._source_count(final, 1, 42) == 3  # было 4 (3 базовых + 1 от apply), стало 3
-    assert ld._source_count(final, 2, 42) == 1
+    assert ld._source_count(_counts_of(final), 1, 42) == 3  # было 4 (3 базовых + 1 от apply), стало 3
+    assert ld._source_count(_counts_of(final), 2, 42) == 1
     assert final["assignments"]["900"]["user_id"] == 2
 
 
@@ -1426,17 +1493,19 @@ def test_correct_reassignment_ignores_lead_not_assigned_today():
     _seed_counts({1: {42: 5}})
     run(ld.correct_reassignment(999999, 2))  # нет в journal — no-op
     final = ld._load_counters_state()
-    assert ld._source_count(final, 1, 42) == 5
-    assert ld._source_count(final, 2, 42) == 0
+    assert ld._source_count(_counts_of(final), 1, 42) == 5
+    assert ld._source_count(_counts_of(final), 2, 42) == 0
 
 
 def test_correct_reassignment_ignores_stale_date_record():
-    state = {"date": "2000-01-01", "counts": {"1": {"42": 5}},
-             "assignments": {"901": {"source_id": 42, "user_id": 1, "date": "2000-01-01"}}}
+    state = {"v": ld.COUNTERS_VERSION, "date": "2000-01-01",
+             "counts_by_pipeline": {str(_DEFAULT_PIPELINE): {"1": {"42": 5}}},
+             "assignments": {"901": {"source_id": 42, "user_id": 1, "date": "2000-01-01",
+                                     "pipeline_id": str(_DEFAULT_PIPELINE)}}}
     ld._save_counters_state(state)  # текущая дата в файле «2000-01-01» → load_counters_state сам увидит несовпадение
     run(ld.correct_reassignment(901, 2))
     final = ld._load_counters_state()
-    assert final["counts"] == {}  # состояние было признано устаревшим целиком, поправка не применилась
+    assert final["counts_by_pipeline"] == {}  # состояние было признано устаревшим целиком, поправка не применилась
 
 
 # ════════════════ reconciliation ════════════════
@@ -1612,9 +1681,7 @@ def test_log_send_detail_carries_load_counters_and_reason():
     _seed_profile(name="LogLoad", participant_ids=[1, 2], repeat_contact_mode="load",
                    pipeline_id=111, status_id=222)
     # У сотрудника 1 уже есть сделка по источнику 7, у 2 - ни одной.
-    ld._save_counters_state({
-        "date": ld._today_msk(), "counts": {"1": {"7": 1}}, "assignments": {}, "routed_ids": [],
-    })
+    _seed_counts({1: {7: 1}}, pipeline_id=111)
     lead = _lead(lead_id=614, pipeline_id=111, status_id=222, source_id=7, contacts=[{"id": 500}])
     _lead_by_id[614] = lead
     _contact_by_id[500] = _contact(500, other_leads=[])
@@ -1626,6 +1693,7 @@ def test_log_send_detail_carries_load_counters_and_reason():
     detail = _log_calls[0]["detail"]
     assert detail["reason"] == "min_source"
     assert detail["counter_kind"] == "daily"
+    assert detail["counter_pipeline_id"] == 111  # счётчики именно этой воронки
     assert detail["fairness_gap"] == 2
     # Счётчики - СНИМОК ДО этого решения (у 2 ноль, а не уже единица).
     assert detail["counters"] == {"1": {"source": 1, "total": 1}, "2": {"source": 0, "total": 0}}
