@@ -1,0 +1,19 @@
+[Unit]
+Description=Academy open-deal deduplication guard
+After=network-online.target
+Wants=network-online.target
+OnFailure=academy-dedup-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/academy-dedup
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/academy-dedup/run_cycle.py --apply
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=multi-user.target

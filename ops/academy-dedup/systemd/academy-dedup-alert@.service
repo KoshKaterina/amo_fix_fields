@@ -1,0 +1,10 @@
+[Unit]
+Description=Telegram alert for failed Academy deduplication cycle (%i)
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/academy-dedup
+ExecStart=/usr/bin/python3 /opt/academy-dedup/notify_failure.py --service %i
+TimeoutStartSec=45s
+

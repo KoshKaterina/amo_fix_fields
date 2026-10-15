@@ -1,0 +1,19 @@
+[Unit]
+Description=amoCRM webhook receiver for Academy duplicate guard
+After=network-online.target
+Wants=network-online.target
+OnFailure=academy-dedup-alert@%n.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/academy-dedup
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/academy-dedup/webhook_daemon.py
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
