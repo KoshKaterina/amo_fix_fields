@@ -32,6 +32,14 @@ Ozon оба в копейках, 1:1) или из поля «Другая сум
 вебхук в окне не создаёт второй счёт). Повторный вход в тех-этап позже окна —
 осознанно новая ссылка (поле перезаписывается, старая протухнет по ttl;
 отменять её в Ozon не нужно).
+
+Ключи Ozon Pay — ПО ВОРОНКЕ, не глобальные (16.10.2026, см. _keys_for_pipeline):
+TangemShop может выставлять счета своей парой OZON_PAY_TANGEMSHOP_* (свой ЛК
+Ozon Pay = свой расчётный счёт, ИП Абовян), остальные воронки — общей парой
+OZON_PAY_* (ИП Перфилов). Пока TangemShop-переменные пусты, поведение не
+меняется: _keys_for_pipeline тихо отдаёт общую пару. Входящий вебхук
+(verify_notification) не знает воронку платежа заранее — подпись пробуется по
+всем настроенным парам сразу (_all_credential_sets).
 """
 
 import asyncio
@@ -62,6 +70,9 @@ from waybill_config import (
     OZON_PAY_API_URL,
     OZON_PAY_NOTIFICATION_SECRET_KEY,
     OZON_PAY_SECRET_KEY,
+    OZON_PAY_TANGEMSHOP_ACCESS_KEY,
+    OZON_PAY_TANGEMSHOP_NOTIFICATION_SECRET_KEY,
+    OZON_PAY_TANGEMSHOP_SECRET_KEY,
     OZON_RECONCILE_INTERVAL_S,
     OZON_ALERT_WINDOW_END_H,
     OZON_ALERT_WINDOW_START_H,
@@ -240,6 +251,62 @@ def _is_checked(raw) -> bool:
     return str(raw or "").strip().lower() in ("1", "on", "true", "yes")
 
 
+def _pipeline_key_overrides() -> dict[int, tuple[str, str, str]]:
+    """Воронка → своя пара ключей Ozon Pay (свой ЛК = свой расчётный счёт/
+    юрлицо). Читаем переменные НА КАЖДОМ вызове, а не собираем словарь на
+    импорте — тот же приём, что у _invoice_pipelines(): иначе ни тест, ни
+    консоль при разборе инцидента не могут подменить ключи модуля."""
+    return {
+        PIPELINE_TANGEMSHOP: (
+            OZON_PAY_TANGEMSHOP_ACCESS_KEY,
+            OZON_PAY_TANGEMSHOP_SECRET_KEY,
+            OZON_PAY_TANGEMSHOP_NOTIFICATION_SECRET_KEY,
+        ),
+    }
+
+
+def _keys_for_pipeline(pipeline_id) -> tuple[str, str, str]:
+    """(accessKey, secretKey, notification secretKey) для воронки.
+
+    Своя пара задана у воронки И обе обязательные половинки (accessKey,
+    secretKey) непустые → возвращаем её. Иначе — ключи по умолчанию
+    (розница, ИП Перфилов), это и есть сегодняшнее поведение. Половинчатая
+    пара (одно поле заполнено, другое нет) — это недописанный .env, а не
+    повод тихо подмешать ключ одного ЛК к секрету другого: тоже уходим на
+    умолчание, так безопаснее, чем угадывать."""
+    try:
+        pid = int(pipeline_id)
+    except (TypeError, ValueError):
+        pid = None
+    access_key, secret_key, notify_key = _pipeline_key_overrides().get(pid, ("", "", ""))
+    if access_key and secret_key:
+        return access_key, secret_key, notify_key
+    return OZON_PAY_ACCESS_KEY, OZON_PAY_SECRET_KEY, OZON_PAY_NOTIFICATION_SECRET_KEY
+
+
+def _all_credential_sets() -> list[tuple[str, str, str]]:
+    """Все настроенные пары (accessKey, secretKey, notify-секрет) для подписи
+    ВЕБХУКОВ, без дублей. Нужно там, где воронка платежа ещё не известна -
+    входящий вебхук от Ozon (см. verify_notification): пробуем подпись по
+    каждой настроенной паре, пока не найдём совпадение.
+
+    Формула подписи уведомления не использует secretKey (только accessKey +
+    notify-секрет) — поэтому для ВКЛЮЧЕНИЯ пары в перебор требуем непустыми
+    только их, secretKey может быть не задан. Пустой notify-секрет саму пару
+    исключает (как и раньше для одиночного OZON_PAY_NOTIFICATION_SECRET_KEY)."""
+    sets: list[tuple[str, str, str]] = []
+    seen_access_keys: set[str] = set()
+    for access_key, secret_key, notify_key in (
+        (OZON_PAY_ACCESS_KEY, OZON_PAY_SECRET_KEY, OZON_PAY_NOTIFICATION_SECRET_KEY),
+        *_pipeline_key_overrides().values(),
+    ):
+        if not (access_key and notify_key) or access_key in seen_access_keys:
+            continue
+        seen_access_keys.add(access_key)
+        sets.append((access_key, secret_key, notify_key))
+    return sets
+
+
 def build_order_ext_id(ext_id: str, ms_order_name: str) -> str:
     """extId заказа Ozon для оплаты картой. Одна формула на два места: тело
     createPayment и примечание в сделке (оттуда его берёт сверка)."""
@@ -254,6 +321,7 @@ def _sign_create_payment(ext_id: str, access_key: str, secret_key: str) -> str:
 
 async def _create_payment(
     ext_id: str, amount_kopecks: int, by_card: bool = False, ms_order_name: str = "",
+    pipeline_id=None,
 ) -> tuple[str | None, str, str]:
     """POST /v1/createPayment. Возвращает (payLink, paymentId, err).
 
@@ -262,6 +330,10 @@ async def _create_payment(
     order.item.payLink ведёт на checkout.ozon.ru (страница выбора: карта/СБП/
     Ozon Карта). У Ozon нет «прямой только-карты» ссылки — карта только через
     эту страницу (проверено доке + живой ссылкой 21.07.2026).
+
+    pipeline_id — какой парой ключей Ozon Pay подписывать (см.
+    _keys_for_pipeline): у TangemShop своя пара, когда она задана, у
+    остальных воронок — общая (розница, ИП Перфилов).
 
     ms_order_name — номер заказа МС (05740). Идёт в НАЧАЛО order.extId, чтобы в
     ЛК Ozon Pay строка читалась как «Заказ 05740_amo-…» и офис матчил
@@ -273,20 +345,23 @@ async def _create_payment(
     счёт клиенту — при ошибке честно отдаём её менеджеру (fail-путь)."""
     if _client is None:
         return None, "", "httpx-клиент Ozon не инициализирован"
+    access_key, secret_key, notify_key = _keys_for_pipeline(pipeline_id)
     amount = {"currencyCode": "643", "value": str(amount_kopecks)}
     body = {
-        "accessKey": OZON_PAY_ACCESS_KEY,
+        "accessKey": access_key,
         "payType": "SBP",
         "amount": amount,
         "extId": ext_id,
         "redirectUrl": OZON_INVOICE_REDIRECT_URL,
         "ttl": OZON_INVOICE_TTL_S,
-        "requestSign": _sign_create_payment(ext_id, OZON_PAY_ACCESS_KEY, OZON_PAY_SECRET_KEY),
+        "requestSign": _sign_create_payment(ext_id, access_key, secret_key),
     }
-    if OZON_PAY_NOTIFICATION_SECRET_KEY:
+    if notify_key:
         # Вебхук факта оплаты (этап 2): Ozon пришлёт Completed на наш эндпоинт,
         # и сделка сама уедет в «Оплата получена». notificationUrl per-payment —
         # сайтовые платежи продолжают ходить на URL сайта, не пересекаемся.
+        # URL общий для всех воронок/пар ключей — verify_notification разбирает
+        # вебхук, пробуя подпись по каждой настроенной паре.
         body["notificationUrl"] = f"{PUBLIC_BASE_URL}/ozon_notify"
     if by_card:
         # Сокращённый заказ (формат смока v0.6.1, боевой). order в подпись НЕ
@@ -560,6 +635,7 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     _recent[key] = time.monotonic()
     pay_link, payment_id, err = await _create_payment(
         ext_id, kopecks, by_card=by_card, ms_order_name=ms_order_name,
+        pipeline_id=lead.get("pipeline_id"),
     )
     if not pay_link:
         await _fail(lead, "Ozon не создал счёт - ссылки нет", detail=err)
@@ -666,9 +742,14 @@ def _lead_and_ts_from_ext(*values) -> tuple[int | None, int | None]:
 
 def verify_notification(data: dict) -> bool:
     """Подпись уведомления Ozon — обе боевые формулы плагина sunscrypt-sbp
-    (подтверждены на реальных payload 09.07.2026), сравнение constant-time."""
-    if not OZON_PAY_NOTIFICATION_SECRET_KEY:
-        return False
+    (подтверждены на реальных payload 09.07.2026), сравнение constant-time.
+
+    На один notificationUrl приходят вебхуки платежей, созданных РАЗНЫМИ
+    парами ключей (розница и, когда заданы, TangemShop) — какая пара подписала
+    именно этот платёж, из самого вебхука не видно. Поэтому пробуем подпись по
+    каждой настроенной паре (_all_credential_sets) и считаем валидной, если
+    совпало хотя бы с одной — так же, как уже сделано для accessKey/secretKey
+    в _create_payment."""
     received = str(data.get("requestSign") or "")
     if not received:
         return False
@@ -678,14 +759,16 @@ def verify_notification(data: dict) -> bool:
     ext_ord = str(data.get("extOrderID") or data.get("extOrderId") or "")
     order_id = str(data.get("orderID") or data.get("orderId") or "")
     tx_id = str(data.get("transactionID") or "")
-    secret = OZON_PAY_NOTIFICATION_SECRET_KEY
-    sig_self = hashlib.sha256(
-        f"{OZON_PAY_ACCESS_KEY}|||{ext_tx}|{amount}|{currency}|{secret}".encode()
-    ).hexdigest()
-    sig_attempt = hashlib.sha256(
-        f"{OZON_PAY_ACCESS_KEY}|{order_id}|{tx_id}|{ext_ord}|{amount}|{currency}|{secret}".encode()
-    ).hexdigest()
-    return hmac.compare_digest(sig_self, received) or hmac.compare_digest(sig_attempt, received)
+    for access_key, _secret_key, notify_key in _all_credential_sets():
+        sig_self = hashlib.sha256(
+            f"{access_key}|||{ext_tx}|{amount}|{currency}|{notify_key}".encode()
+        ).hexdigest()
+        sig_attempt = hashlib.sha256(
+            f"{access_key}|{order_id}|{tx_id}|{ext_ord}|{amount}|{currency}|{notify_key}".encode()
+        ).hexdigest()
+        if hmac.compare_digest(sig_self, received) or hmac.compare_digest(sig_attempt, received):
+            return True
+    return False
 
 
 def handle_notification_bg(payload: dict) -> None:
@@ -793,17 +876,34 @@ async def _handle_notification(data: dict) -> str:
 # Реконсиляция: сами спрашиваем Ozon по висящим счетам.
 # ---------------------------------------------------------------------------
 
-def _sign_get_details(value: str) -> str:
+def _sign_get_details(value: str, access_key: str | None = None, secret_key: str | None = None) -> str:
     """Подпись getPaymentDetails: <искомый id> + accessKey + secretKey
-    (ТЗ §6.1, та же формула в боевом плагине сайта — active_resolve)."""
-    return hashlib.sha256(f"{value}{OZON_PAY_ACCESS_KEY}{OZON_PAY_SECRET_KEY}".encode()).hexdigest()
+    (ТЗ §6.1, та же формула в боевом плагине сайта — active_resolve).
+
+    access_key/secret_key не переданы → ключи розницы, но ЧИТАЕМ ГЛОБАЛ НА
+    КАЖДОМ ВЫЗОВЕ (а не default-параметром): default вычислился бы один раз
+    на импорте и не увидел бы подмену в тестах/консоли, как и остальные
+    ключи/флаги модуля (см. _invoice_pipelines)."""
+    if access_key is None:
+        access_key = OZON_PAY_ACCESS_KEY
+    if secret_key is None:
+        secret_key = OZON_PAY_SECRET_KEY
+    return hashlib.sha256(f"{value}{access_key}{secret_key}".encode()).hexdigest()
 
 
-async def _details_request(key: str, value: str) -> tuple[dict | None, str]:
-    """Один POST /v1/getPaymentDetails по ключу «id» или «extId»."""
+async def _details_request(
+    key: str, value: str, access_key: str | None = None, secret_key: str | None = None,
+) -> tuple[dict | None, str]:
+    """Один POST /v1/getPaymentDetails по ключу «id» или «extId», ключами
+    той пары (розница/TangemShop), которой был создан платёж — иначе Ozon
+    ответит на свой же платёж «не найдено» (ключи принадлежат разным ЛК)."""
     if _client is None:
         return None, "httpx-клиент Ozon не инициализирован"
-    body = {key: value, "accessKey": OZON_PAY_ACCESS_KEY, "requestSign": _sign_get_details(value)}
+    if access_key is None:
+        access_key = OZON_PAY_ACCESS_KEY
+    if secret_key is None:
+        secret_key = OZON_PAY_SECRET_KEY
+    body = {key: value, "accessKey": access_key, "requestSign": _sign_get_details(value, access_key, secret_key)}
     try:
         resp = await _client.post(f"{OZON_PAY_API_URL}/v1/getPaymentDetails", json=body)
     except httpx.RequestError as exc:
@@ -852,22 +952,27 @@ def is_paid_status(status: str) -> bool:
 
 
 async def get_payment_status(
-    payment_id: str, ext_id: str = "", order_ext_id: str = "",
+    payment_id: str, ext_id: str = "", order_ext_id: str = "", pipeline_id=None,
 ) -> tuple[str, int | None, str]:
     """POST /v1/getPaymentDetails → (status, amount_kopecks|None, err).
+
+    pipeline_id — какой парой ключей спрашивать (см. _keys_for_pipeline):
+    платёж TangemShop живёт в своём ЛК Ozon Pay, ключи розницы его там не
+    найдут.
 
     Спрашиваем по очереди: paymentId → extId платежа → extId ЗАКАЗА. Так надо
     из-за карты: живой тест 28.07.2026 показал, что по нашему paymentId Ozon
     отвечает пустым items — «карточный» платёж он заводит внутри заказа сам, а
     наш остаётся пустышкой. Первый ответ со статусом побеждает; что именно
     сработало — видно в логе (это и есть разведка по order-флоу)."""
+    access_key, secret_key, _notify_key = _keys_for_pipeline(pipeline_id)
     tried: list[str] = []
     last_err = ""
     for key, value in (("id", payment_id), ("extId", ext_id), ("extId", order_ext_id)):
         if not value or value in tried:
             continue
         tried.append(value)
-        data, err = await _details_request(key, value)
+        data, err = await _details_request(key, value, access_key, secret_key)
         if err:
             # Отказ по ОДНОМУ ключу не повод бросать поиск. Боевой случай
             # 29.08.2026: по paymentId Ozon отдал пустоту (карта, штатно), по
@@ -1174,7 +1279,9 @@ async def _reconcile_once() -> str:
                     continue
 
                 checked += 1
-                status, kopecks, err = await get_payment_status(payment_id, ext_id, order_ext_id)
+                status, kopecks, err = await get_payment_status(
+                    payment_id, ext_id, order_ext_id, pipeline_id=pipeline_id,
+                )
                 if err:
                     logger.warning("ozon сверка: lead %s paymentId %s — %s", lead_id, payment_id, err)
                     continue

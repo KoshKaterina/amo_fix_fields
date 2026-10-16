@@ -106,7 +106,7 @@ def _install_mocks(lead, *, order_sum=1234500, ozon_ok=True, patch_ok=True):
         _alerts.append(text)
         return True
 
-    async def fake_create_payment(ext_id, kopecks, by_card=False, ms_order_name=""):
+    async def fake_create_payment(ext_id, kopecks, by_card=False, ms_order_name="", pipeline_id=None):
         _ozon_calls.append((ext_id, kopecks, by_card, ms_order_name))
         if ozon_ok:
             base = "https://checkout.ozon.ru/order/" if by_card else "https://qr.nspk.ru/"
@@ -213,7 +213,7 @@ async def fake_notes(lead_id, limit=100):
              "extId amo-777001-1785242820\npaymentId 019fa8c3-9ed2-7eca-99d0-b9a314ad5563\n"
              "orderExtId 05748_amo-777001-1785242820"}}]
 
-async def fake_status_completed(payment_id, ext_id="", order_ext_id=""):
+async def fake_status_completed(payment_id, ext_id="", order_ext_id="", pipeline_id=None):
     assert payment_id == "019fa8c3-9ed2-7eca-99d0-b9a314ad5563", payment_id
     # сверка обязана прокинуть оба extId — без них карта не ищется
     assert ext_id == "amo-777001-1785242820", ext_id
@@ -226,17 +226,17 @@ async def fake_notes_old(lead_id, limit=100):
              "Счёт СБП создан автоматически: 10 ₽\nextId amo-777001-1\npaymentId pay-old"}}]
 
 
-async def fake_status_pending(payment_id, ext_id="", order_ext_id=""):
+async def fake_status_pending(payment_id, ext_id="", order_ext_id="", pipeline_id=None):
     return "PAYMENT_NEW", None, ""
 
 
-async def fake_status_rejected(payment_id, ext_id="", order_ext_id=""):
+async def fake_status_rejected(payment_id, ext_id="", order_ext_id="", pipeline_id=None):
     return "PAYMENT_REJECTED", None, ""
 
 async def fake_by_status_nolink(status_id, with_=("contacts",), page_limit=50):
     return [_no_link] if status_id == STATUS_LINK_SENT else []
 
-async def fake_status_spy(payment_id, ext_id="", order_ext_id=""):
+async def fake_status_spy(payment_id, ext_id="", order_ext_id="", pipeline_id=None):
     _asked.append(payment_id)
     return "PAYMENT_COMPLETED", 1000, ""
 

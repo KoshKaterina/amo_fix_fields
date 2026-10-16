@@ -1149,10 +1149,25 @@ OZON_INVOICE_DB_WORK = os.getenv("OZON_INVOICE_DB_WORK", "").strip() == "1"
 # Счёт СБП в Академии — свой флаг по той же причине: включаем и наблюдаем отдельно.
 OZON_INVOICE_ACADEMY = os.getenv("OZON_INVOICE_ACADEMY", "").strip() == "1"
 # Счёт СБП в TangemShop (29.09.2026) — свой флаг по той же причине.
-# ⚠️ Денежная развилка, решается ДО включения: счёт выставляется на организацию
-# из ключей Ozon Pay, а заказы Tangemshop в МойСкладе идут на ИП Абовян. На чьи
-# реквизиты уходит ссылка клиенту — вопрос к Кате, а не к коду.
+# ⚠️ Денежная развилка: без своей пары ключей ниже счёт выставляется на
+# организацию из ключей розницы (ИП Перфилов), а заказы Tangemshop в
+# МойСкладе идут на ИП Абовян. Закрывается переменными
+# OZON_PAY_TANGEMSHOP_*, см. комментарий там же.
 OZON_INVOICE_TANGEMSHOP = os.getenv("OZON_INVOICE_TANGEMSHOP", "").strip() == "1"
+
+# Своя пара ключей Ozon Pay для TangemShop (ИП Абовян, отдельный ЛК Ozon
+# Pay — "Магазин" в чужом ЛК деньги на другое юрлицо не переведёт). Пока
+# Катя не получила accessKey/secretKey и не вписала их в .env — обе строки
+# пустые, и ozon_invoice._keys_for_pipeline() тихо отдаёт ключи розницы
+# (ИП Перфилов), то есть ПОВЕДЕНИЕ НЕ МЕНЯЕТСЯ до появления этих переменных.
+# notification-секрет — отдельный от secretKey, из того же нового ЛК
+# (ЛК Ozon Pay → Магазины → Интеграция), нужен для проверки подписи вебхука
+# платежей, созданных этой парой ключей.
+OZON_PAY_TANGEMSHOP_ACCESS_KEY = os.getenv("OZON_PAY_TANGEMSHOP_ACCESS_KEY", "").strip()
+OZON_PAY_TANGEMSHOP_SECRET_KEY = os.getenv("OZON_PAY_TANGEMSHOP_SECRET_KEY", "").strip()
+OZON_PAY_TANGEMSHOP_NOTIFICATION_SECRET_KEY = os.getenv(
+    "OZON_PAY_TANGEMSHOP_NOTIFICATION_SECRET_KEY", ""
+).strip()
 
 FIELD_PAYMENT_LINK = 577617           # «Ссылка для оплаты»
 # «Другая сумма» (text, создано Катей 20.07.2026): если заполнено — счёт СБП
