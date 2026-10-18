@@ -1805,3 +1805,15 @@ def test_miniapp_delivery_requires_route_tags_and_note(v2,monkeypatch):
     asyncio.run(sf.run_due())
     assert store.get(SID)['status']=='done'
     assert records(store.DB_PATH)[0]['delivered_at'] is not None
+
+
+def test_shop_generic_keeps_process_and_source_context():
+    import miniapp_form_routes as r
+    cfg={'pipeline_id':10593102,'status_id':83537714,'source':'Форма: обратный звонок','tags':[]}
+    p=_mini_payload('shop-callback')
+    p['comment']='Источник: Mini App\nТочка входа: catalog-protection\nУслуга: Поможем подобрать защиту'
+    result=r.route(cfg,p,{})
+    assert (result['pipeline_id'],result['status_id'])==(10593102,83537714)
+    assert result['tags']==['Mini App']
+    assert 'catalog-protection' in sf.note_text_v2(p,result['source'])
+    assert r.delivery_event(p)['entry']=='shop-callback'

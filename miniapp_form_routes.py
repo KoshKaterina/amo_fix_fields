@@ -3,7 +3,7 @@ import hashlib
 
 ENTRIES = {'consultations-free','consultations-course','consultations-setup','consultations-individual',
            'cooperation-wholesale','cooperation-affiliate','cooperation-media',
-           'waitlist-club','waitlist-vladimir','academy-individual'}
+           'waitlist-club','waitlist-vladimir','academy-individual','shop-callback','shop-consultation'}
 
 def is_miniapp(payload):
     return (payload.get('context') or {}).get('entry', '') in {'miniapp-' + entry for entry in ENTRIES}
