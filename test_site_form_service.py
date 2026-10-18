@@ -1702,3 +1702,106 @@ def test_entry_override_without_stage_drops_foreign_stage(monkeypatch):
     # source и теги формы остаются, если переопределение их не задало
     assert out["source"] == "ContactForm_Связаться"
     assert out["tags"] == ["Форма сайта"]
+
+# Mini App regression: isolated fake API, no CRM requests.
+def _mini_payload(entry='waitlist-club', **kw):
+    value = _v2_payload(**kw)
+    value['context']['entry'] = 'miniapp-' + entry
+    return value
+
+def test_miniapp_routes_keep_existing_partner_and_academy_process():
+    import miniapp_form_routes as routes
+    cfg={'pipeline_id':1,'status_id':2,'source':'Form','tags':[]}
+    assert routes.route(cfg,_mini_payload(),{})['status_id']==83669950
+    assert routes.route(cfg,_mini_payload('waitlist-vladimir'),{})['source']=='Mini App: Консультация Владимира'
+    academy=routes.route(cfg,_mini_payload('academy-individual'),{})
+    assert (academy['pipeline_id'],academy['status_id'])==(8642410,87654850)
+    partner=routes.route(cfg,_mini_payload('cooperation-media'),{'cooperation-media':{'pipeline_id':3,'status_id':4,'source':'Media','tags':[],'responsible_user_id':5}})
+    assert (partner['pipeline_id'],partner['status_id'],partner['responsible_user_id'])==(3,4,5)
+    assert partner['tags']==['Mini App']
+    plain=_v2_payload()
+    assert routes.route(cfg,plain,{}) is cfg
+
+def test_miniapp_each_intent_new_retry_same_intent_dedup(v2):
+    import json
+    from miniapp_form_export import records
+    first=_mini_payload()
+    async def run():
+        assert (await sf.accept_v2(first))[1]['status']=='accepted'
+        assert (await sf.accept_v2(first))[1]['status']=='duplicate'
+        second=_mini_payload(submission_id='aaaaaaaa-0000-4000-8000-000000000001')
+        assert (await sf.accept_v2(second))[1]['status']=='accepted'
+    asyncio.run(run())
+    evidence=records(store.DB_PATH)
+    assert len(evidence)==2
+    assert all(row['delivered_at'] is None for row in evidence)
+    assert len({row['submission_hash'] for row in evidence})==2
+    assert '+7999' not in json.dumps(evidence)
+
+def test_miniapp_mark_done_and_evidence_atomic(v2,monkeypatch):
+    import json
+    from miniapp_form_export import records
+    import miniapp_form_routes
+    p=_mini_payload()
+    store.insert_pending(SID,p['form'],json.dumps(p),now=10)
+    assert not store.mark_done(SID,42,now=20,require_finishing=True)
+    assert records(store.DB_PATH)[0]['delivered_at'] is None
+    store.claim_pending(SID,now=11)
+    store.mark_created(SID,42,'uid',now=12,claim_finish=True)
+    original=miniapp_form_routes.delivery_event
+    def fail(_):raise RuntimeError('db-evidence-simulation')
+    monkeypatch.setattr(miniapp_form_routes,'delivery_event',fail)
+    with pytest.raises(RuntimeError):store.mark_done(SID,42,now=20,require_finishing=True)
+    assert store.get(SID)['status']=='finishing'
+    assert store.get(SID)['payload'] is not None
+    monkeypatch.setattr(miniapp_form_routes,'delivery_event',original)
+    assert store.mark_done(SID,42,now=20,require_finishing=True)
+    assert store.get(SID)['payload'] is None
+    row=records(store.DB_PATH)[0]
+    assert row['accepted_at']==10 and row['delivered_at']==20
+    assert not store.mark_done(SID,42,now=30,require_finishing=True)
+    assert records(store.DB_PATH)[0]['delivered_at']==20
+
+def test_miniapp_unknown_remote_create_is_not_retried(v2,monkeypatch):
+    import json
+    p=_mini_payload()
+    store.insert_pending(SID,p['form'],json.dumps(p))
+    calls=[]
+    async def find(_):return 7
+    async def create(**kw):
+        calls.append(kw)
+        raise TimeoutError('unknown-after-send')
+    monkeypatch.setattr(api,'find_contact_id',find)
+    monkeypatch.setattr(api,'create_unsorted_lead_ex',create)
+    async def run():
+        await sf.run_due()
+        await sf.run_due()
+    asyncio.run(run())
+    assert len(calls)==1 and calls[0]['max_attempts']==1
+    assert calls[0]['contact']=={'id':7}
+    assert store.get(SID)['status']=='uncertain'
+
+def test_miniapp_delivery_requires_route_tags_and_note(v2,monkeypatch):
+    import json
+    from miniapp_form_export import records
+    p=_mini_payload()
+    store.insert_pending(SID,p['form'],json.dumps(p))
+    async def find(_):return 7
+    async def create(**kw):return {'lead_id':42,'uid':'uid'}
+    async def accept(*args):return 42
+    async def yes(*args,**kw):return True
+    async def no(*args,**kw):return False
+    monkeypatch.setattr(api,'find_contact_id',find)
+    monkeypatch.setattr(api,'create_unsorted_lead_ex',create)
+    monkeypatch.setattr(api,'accept_unsorted',accept)
+    monkeypatch.setattr(api,'set_lead_tags',no)
+    monkeypatch.setattr(api,'set_lead_utm',yes)
+    monkeypatch.setattr(api,'add_note_to_lead',yes)
+    asyncio.run(sf.run_due())
+    assert records(store.DB_PATH)[0]['delivered_at'] is None
+    assert store.get(SID)['status']=='created'
+    monkeypatch.setattr(api,'set_lead_tags',yes)
+    with store._connect() as db:db.execute('UPDATE site_form_submissions SET next_try_at=0 WHERE submission_id=?',(SID,))
+    asyncio.run(sf.run_due())
+    assert store.get(SID)['status']=='done'
+    assert records(store.DB_PATH)[0]['delivered_at'] is not None

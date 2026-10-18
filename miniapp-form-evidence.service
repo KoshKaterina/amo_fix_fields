@@ -1,0 +1,14 @@
+[Unit]
+Description=Export private Mini App form CRM evidence (read only)
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/integrations/amo_fix_fields/miniapp_form_export.py --db /opt/integrations/amo_fix_fields/var/site_form.sqlite3 --export /var/lib/miniapp-analytics/form-crm-evidence.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/miniapp-analytics

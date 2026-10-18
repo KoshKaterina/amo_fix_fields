@@ -22,6 +22,8 @@
 """
 
 import os
+import json
+import miniapp_form_routes
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -67,6 +69,9 @@ def init_db() -> None:
                 updated_at REAL NOT NULL
             )"""
         )
+        conn.execute("""CREATE TABLE IF NOT EXISTS miniapp_form_events (
+            submission_hash TEXT PRIMARY KEY, entry TEXT NOT NULL,
+            accepted_at REAL NOT NULL, delivered_at REAL)""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS site_form_due ON site_form_submissions (status, next_try_at)"
         )
@@ -83,6 +88,11 @@ def insert_pending(submission_id: str, form: str, payload_json: str, now: float 
             (submission_id, form, payload_json, now, now, now),
         )
         inserted = cur.rowcount == 1
+        if inserted:
+            event = miniapp_form_routes.delivery_event(json.loads(payload_json))
+            if event:
+                conn.execute("INSERT OR IGNORE INTO miniapp_form_events(submission_hash,entry,accepted_at) VALUES(?,?,?)",
+                    (event['dedup_id'],event['entry'],now))
         row = conn.execute(
             f"SELECT {_COLS} FROM site_form_submissions WHERE submission_id = ?", (submission_id,)
         ).fetchone()
@@ -197,11 +207,20 @@ def mark_done(
     now = time.time() if now is None else now
     expected_status = " AND status = 'finishing'" if require_finishing else ""
     with _connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        previous = conn.execute("SELECT payload,created_at FROM site_form_submissions WHERE submission_id=?", (submission_id,)).fetchone()
         cur = conn.execute(
             "UPDATE site_form_submissions SET status = 'done', lead_id = ?, payload = NULL, last_error = NULL, "
             f"updated_at = ? WHERE submission_id = ?{expected_status}",
             (int(lead_id), now, submission_id),
         )
+        if cur.rowcount == 1 and previous and previous[0]:
+            payload = json.loads(previous[0])
+            event = miniapp_form_routes.delivery_event(payload)
+            if event:
+                conn.execute("INSERT INTO miniapp_form_events(submission_hash,entry,accepted_at,delivered_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(submission_hash) DO UPDATE SET delivered_at=COALESCE(miniapp_form_events.delivered_at,excluded.delivered_at)",
+                    (event['dedup_id'],event['entry'],previous[1],now))
         return cur.rowcount == 1
 
 

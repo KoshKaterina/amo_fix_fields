@@ -57,6 +57,7 @@ Env:
 """
 
 import asyncio
+import miniapp_form_routes
 import hmac
 import json
 import logging
@@ -710,7 +711,7 @@ async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None
     contact_in = p["contact"]
     source = cfg["source"]
     lead_name = f"{source}: {contact_in['name']}"
-    if p["form_type"] == "unavailable":
+    if p["form_type"] == "unavailable" or miniapp_form_routes.is_miniapp(p):
         # Уникальный ключ должен попасть именно в первичный POST: после timeout
         # примечание может не существовать, а source_uid/form_id остаются slug.
         suffix = f" [ID заявки: {p['submission_id']}]"
@@ -725,7 +726,7 @@ async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None
         contact = {"name": contact_in["name"], "custom_fields_values": fields}
     # С этого момента timeout/отмена не доказывают, что amo не создала сделку.
     attempt["remote_create_started"] = True
-    create_options = {"max_attempts": 1} if p["form_type"] == "unavailable" else {}
+    create_options = {"max_attempts": 1} if p["form_type"] == "unavailable" or miniapp_form_routes.is_miniapp(p) else {}
     res = await api.create_unsorted_lead_ex(
         lead_name=lead_name,
         pipeline_id=cfg["pipeline_id"],
@@ -754,16 +755,20 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
         )
         if accepted:
             lead_id = int(accepted)
+        elif miniapp_form_routes.is_miniapp(p):
+            raise RuntimeError("miniapp-route-not-confirmed")
         else:
             logger.error("site_form[%s]: accept в этап %s не прошёл, сделка %s осталась в Неразобранном",
                          p["form"], cfg["status_id"], lead_id)
-    await api.set_lead_tags(lead_id, [source] + cfg["tags"])
+    tagged = await api.set_lead_tags(lead_id, [source] + cfg["tags"])
+    if miniapp_form_routes.is_miniapp(p) and not tagged:
+        raise RuntimeError("miniapp-tags-not-confirmed")
     if p["context"]["utm"]:
         if not await api.set_lead_utm(lead_id, p["context"]["utm"]):
             logger.warning("site_form[%s]: UTM в поля сделки %s не записались, остались в примечании",
                            p["form"], lead_id)
     note = note_text_v2(p, source)
-    if p["form_type"] == "unavailable":
+    if p["form_type"] == "unavailable" or miniapp_form_routes.is_miniapp(p):
         # Если ответ на добавление примечания потерян, повтор может его удвоить.
         attempt["note_started"] = True
         if not await api.add_note_to_lead(lead_id, note, max_attempts=1):
@@ -842,7 +847,8 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         logger.error("site_form[%s]: заявка %s испорчена в очереди", row["form"], submission_id[:8])
         return
     is_unavailable = payload.get("form_type") == "unavailable"
-    attempt["is_unavailable"] = is_unavailable
+    strict_write = is_unavailable or miniapp_form_routes.is_miniapp(payload)
+    attempt["is_unavailable"] = strict_write
     if is_unavailable and not SITE_FORM_UNAVAILABLE_ENABLED:
         # Убираем из due, сохраняя строку/попытки до восстановления gate.
         await asyncio.to_thread(store.mark_held, submission_id, "unavailable-disabled")
@@ -872,7 +878,7 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
     # Переопределение по пометке кнопки - уже после всех проверок карты форм: приём заявки
     # по-прежнему требует, чтобы slug был в SITE_FORM_MAP, меняется только адрес назначения.
     # Считаем здесь, а не на приёме: карту можно поправить, пока заявка ждёт в очереди.
-    routed = apply_entry_override(cfg, payload)
+    routed = miniapp_form_routes.route(apply_entry_override(cfg, payload), payload, ENTRY_MAP)
     if routed is not cfg:
         logger.info("site_form[%s]: пометка %s → воронка %s, этап %s, ответственный %s",
                     row["form"], (payload.get("context") or {}).get("entry"),
@@ -882,7 +888,7 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         if row["status"] == "pending":
             lead_id, uid = await _create_lead_v2(payload, cfg, attempt)
             if not lead_id:
-                if is_unavailable:
+                if strict_write:
                     await _hold_unknown_external_write(row, "amo-create-outcome-unknown")
                 else:
                     await _retry_or_fail(row, "amo-create-failed")
@@ -901,9 +907,9 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         logger.info("site_form[%s]: заявка %s → сделка %s", row["form"], submission_id[:8], lead_id)
     except Exception as exc:
         logger.exception("site_form[%s]: заявка %s — сбой доставки", row["form"], submission_id[:8])
-        if is_unavailable and row["status"] == "pending" and attempt["remote_create_started"]:
+        if strict_write and row["status"] == "pending" and attempt["remote_create_started"]:
             await _hold_unknown_external_write(row, f"amo-create-outcome-unknown:{type(exc).__name__}")
-        elif is_unavailable and row["status"] == "created" and attempt["note_started"]:
+        elif strict_write and row["status"] == "created" and attempt["note_started"]:
             await _hold_unknown_external_write(row, f"amo-note-outcome-unknown:{type(exc).__name__}")
         elif row["status"] == "pending" and attempt.get("confirmed_lead"):
             # Remote create уже подтвердил id. Ошибка локального mark_created
