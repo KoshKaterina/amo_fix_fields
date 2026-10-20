@@ -65,10 +65,13 @@ SQLite хранит курсор и очередь: опоздавшая сде�
 Общий guard test_no_new_copies.py имеет одно прежнее падение в неизменённом
 miniapp_form_export.py; новый обработчик guard не нарушает. Остальные8 guard-проверок PASS.
 
-## Подготовленный запуск, пока НЕ активирован
+## Запуск подключён20.10.2026
 
-Установить исходный файл в `/opt/integrations/amo_fix_fields/checkout_consent_sync.py`;
-юниты из этой папки — в /etc/systemd/system. Код передаётся отдельному python-процессу
+Исходный файл установлен в `/opt/integrations/amo_fix_fields/checkout_consent_sync.py`;
+собственные юниты установлены в /etc/systemd/system. Таймер включён, первые два
+apply-прохода success/exit0, новых snapshots0, контактных PATCH0. Код603b225; runtimeSHA3/3,
+PID amo-fix-fields3678487 сохранён. Manifest/кандидат находятся в
+`/opt/backups/checkout-consents-candidate-20261020/`. Код передаётся отдельному python-процессу
 в контейнере через stdin, поэтому пересборка/перезапуск amo-fix-fields не требуется.
 Ключи остаются у существующих клиентов; новые env-файлы и доступы не нужны.
 
