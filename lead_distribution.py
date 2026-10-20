@@ -52,6 +52,7 @@ from typing import Any
 import amo_service
 import alerts
 import lead_distribution_log_client
+import lead_distribution_routed_store as routed_store
 import lead_distribution_profiles_client
 import team_panel_client
 import telegram_bot
@@ -350,19 +351,22 @@ def _today_msk() -> str:
 
 def _load_counters_state() -> dict:
     """{"v": 2, "date": "YYYY-MM-DD", "counts_by_pipeline": {pipeline_id: {user_id: {source_id: n}}},
-    "assignments": {lead_id: {...}}, "routed_ids": [lead_id, ...]}. Дата в файле
+    "assignments": {lead_id: {...}}, "outcomes_logged": [...]}. Дата в файле
     отличается от сегодняшней → пустое состояние (вчерашние счётчики просто перестают
-    использоваться, явного сброса не нужно) - routed_ids (см. _is_locally_routed/
-    _mark_locally_routed) едет тем же рейсом, суточного окна с огромным запасом хватает
-    на саму задачу (пережить read-after-write задержку amoCRM, которая разрешается за
-    секунды).
+    использоваться, явного сброса не нужно).
+
+    ⚠️ Защиты от повторной раздачи здесь больше НЕТ (20.10.2026): список routed_ids
+    жил в этом файле и обнулялся вместе со счётчиками в полночь, и сделку,
+    переночевавшую на точке входа, утром раздавали заново. Теперь это
+    lead_distribution_routed_store (sqlite, 30 дней). Ключ routed_ids из файлов,
+    записанных до правки, просто выбрасывается.
 
     Сегодняшний файл старого вида (общие "counts" без воронки) переводится на месте:
     счётчики и журнал назначений обнуляются - разложить их по воронкам не из чего,
-    воронки там не записано. routed_ids и outcomes_logged переезжают как есть: это
-    защита от повторной раздачи и повторной записи в журнал, терять её нельзя."""
+    воронки там не записано. outcomes_logged переезжает как есть: это защита от
+    повторной записи в журнал, терять её нельзя."""
     today = _today_msk()
-    empty = {"v": COUNTERS_VERSION, "date": today, "counts_by_pipeline": {}, "assignments": {}, "routed_ids": []}
+    empty = {"v": COUNTERS_VERSION, "date": today, "counts_by_pipeline": {}, "assignments": {}}
     if not COUNTERS_PATH.exists():
         return empty
     try:
@@ -372,13 +376,12 @@ def _load_counters_state() -> dict:
         return empty
     if state.get("date") != today:
         return empty
+    state.pop("routed_ids", None)
     if state.get("v") != COUNTERS_VERSION:
         logger.warning(
-            "lead_distribution: счётчики старого вида (общие на все воронки) - сегодняшние "
-            "обнулены, routed_ids сохранены (%d)", len(state.get("routed_ids") or []),
+            "lead_distribution: счётчики старого вида (общие на все воронки) - сегодняшние обнулены",
         )
         migrated = dict(empty)
-        migrated["routed_ids"] = list(state.get("routed_ids") or [])
         if "outcomes_logged" in state:
             migrated["outcomes_logged"] = list(state.get("outcomes_logged") or [])
         return migrated
@@ -929,13 +932,13 @@ async def _outcome_already_logged(lead_id: int, outcome: str) -> bool:
     Без него reconciliation (раз в LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S)
     писала бы «никого нет на месте» по одному и тому же лиду до конца дня, а
     вебхучный шквал amgroup - по строке «самовывоз» на каждый свой вебхук.
-    Едет тем же рейсом, что routed_ids: lead_distribution_counters.json,
-    тот же _counters_lock, сброс каждую полночь МСК (_load_counters_state).
+    Живёт в lead_distribution_counters.json рядом со счётчиками, тот же
+    _counters_lock, сброс каждую полночь МСК (_load_counters_state).
     Суток достаточно: журнал отвечает на вопрос «что было с этой сделкой
     сегодня», а назавтра ситуация уже другая и новая строка уместна.
 
     Состоявшееся назначение через дедуп не проводим - оно и так происходит
-    ровно один раз, дальше срабатывает _routed_ids."""
+    ровно один раз, дальше срабатывает lead_distribution_routed_store."""
     key = f"{lead_id}:{outcome}"
     async with _counters_lock:
         state = _load_counters_state()
@@ -1043,21 +1046,23 @@ _pending_fail: dict[int, dict] = {}
 # сделка 36538301, 20.08.2026 - засчиталась дважды за 1-9 секунд). Без тега
 # вообще эта проблема была бы постоянной, а не редкой гонкой.
 #
-# Замена - routed_ids внутри lead_distribution_counters.json (не отдельный
-# файл): проверяется РАНЬШЕ тега и не зависит от amoCRM на чтение вообще -
-# свой же процесс видит свою же запись мгновенно и без сети, сама причина
-# гонки исчезает, а не просто сужается до окна. Тег для СТАРЫХ сделок
-# по-прежнему проверяется отдельно (см. process_lead_distribution) -
-# идемпотентность для них не теряется при переходе на новый механизм.
+# Замена - lead_distribution_routed_store (sqlite в var/): проверяется РАНЬШЕ
+# тега и не зависит от amoCRM на чтение вообще - свой же процесс видит свою же
+# запись мгновенно и без сети, сама причина гонки исчезает, а не просто
+# сужается до окна. Тег для СТАРЫХ сделок по-прежнему проверяется отдельно (см.
+# process_lead_distribution) - идемпотентность для них не теряется.
 #
-# 25.08.2026, по вопросу Тианы: отдельный вечно растущий файл был бы плохой
-# идеей (каждая запись перезаписывала бы ВЕСЬ список целиком - линейный рост
-# стоимости записи без потолка). Настоящая задача - пережить гонку
-# read-after-write, которая разрешается за секунды; суточного окна с огромным
-# запасом достаточно. lead_distribution_counters.json и так сбрасывается
-# каждую полночь МСК (_load_counters_state) - routed_ids просто едет тем же
-# рейсом, тот же _counters_lock, тот же атомарный write, никакого нового
-# механизма не потребовалось.
+# ⚠️ 25.08-20.10.2026 запись жила списком routed_ids внутри
+# lead_distribution_counters.json, «тем же рейсом», что суточные счётчики, - и
+# вместе с ними обнулялась в полночь МСК. Расчёт был на то, что защищать надо
+# только от гонки read-after-write (секунды). Это неверно: сделка, переночевавшая
+# на точке входа, при любом утреннем обновлении (закрыли задачу «Новый заказ с
+# сайта» → вебхук update_lead) раздавалась заново. 20.10.2026 так ушли от Егора
+# Константинова к Кириллу Полесскому сделки 36582977 и 36582987, за 30 дней - 53
+# таких раздачи. Теперь запись живёт 30 дней, отдельной строкой на сделку (рост
+# стоимости записи, из-за которого отказались от отдельного json, у sqlite нет).
+# Снимается она ещё при возврате сделки на точку входа с другого этапа - см.
+# forget_routed_on_reentry.
 #
 # _in_flight - вторая, отдельная защита: блокирует ПЕРЕСЕКАЮЩИЕСЯ по времени
 # прогоны одного lead_id (держится на весь цикл решение→PATCH→запись, не
@@ -1065,19 +1070,57 @@ _pending_fail: dict[int, dict] = {}
 _in_flight: set[int] = set()
 
 
-async def _is_locally_routed(lead_id: int) -> bool:
-    async with _counters_lock:
-        state = _load_counters_state()
-        return lead_id in (state.get("routed_ids") or [])
+async def _is_locally_routed(lead_id: int) -> bool | None:
+    """True/False - есть ли свежая запись «распределена». None - хранилище не
+    ответило: тогда не решаем вовсе (раздать заново - ровно та бага, от которой
+    запись защищает), вызывающий уходит в _fail, и сделку подберёт следующий
+    вебхук или reconciliation."""
+    try:
+        return await asyncio.to_thread(routed_store.is_routed, lead_id)
+    except Exception:
+        logger.exception("lead_distribution %s: хранилище распределённых не ответило", lead_id)
+        return None
 
 
-async def _mark_locally_routed(lead_id: int) -> None:
-    async with _counters_lock:
-        state = _load_counters_state()
-        routed = state.setdefault("routed_ids", [])
-        if lead_id not in routed:
-            routed.append(lead_id)
-        _save_counters_state(state)
+async def _mark_locally_routed(lead_id: int, assigned_user_id: int | None, profile_id: str | None) -> None:
+    try:
+        await asyncio.to_thread(routed_store.mark_routed, lead_id, assigned_user_id, profile_id)
+    except Exception:
+        # Назначение в amo уже состоялось - откатывать нечего. Без записи сделку
+        # могут раздать повторно, это должно быть видно в логе.
+        logger.exception("lead_distribution %s: не записала «распределена» в хранилище", lead_id)
+
+
+async def forget_routed_on_reentry(lead_id, prev_status_id, status_id) -> bool:
+    """Ручной возврат сделки на точку входа профиля с ДРУГОГО этапа - снять
+    запись «распределена», чтобы раздача прошла заново (решение Кати 20.10.2026).
+
+    Зовёт webhooks.py: наша подписка вебхуков без события смены этапа, прошлый
+    этап знает только lead_status_store. Поэтому:
+      - прошлый этап известен и он другой - это возврат, запись снимаем;
+      - этап тот же - сделка и стояла на точке входа (правка поля, закрытая
+        задача, эхо нашего PATCH), запись остаётся;
+      - прошлый этап неизвестен (lead_status_store пустой после потери базы или
+        сделку видим впервые) - главная запись «распределена», не трогаем.
+    Возвращает True, если запись была и снята."""
+    if prev_status_id is None:
+        return False
+    try:
+        if int(prev_status_id) == int(status_id):
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        removed = await asyncio.to_thread(routed_store.forget, lead_id)
+    except Exception:
+        logger.exception("lead_distribution %s: не сняла запись «распределена» при возврате", lead_id)
+        return False
+    if removed:
+        logger.info(
+            "lead_distribution %s: вернули на точку входа (этап %s → %s) — раздаём заново",
+            lead_id, prev_status_id, status_id,
+        )
+    return removed
 
 
 def _spawn(coro) -> None:
@@ -1153,12 +1196,16 @@ async def _assign_office_manager(
     шоурум») намеренно: самовывоз из офиса — тот же класс и тот же человек,
     отдельная ветка для него означала бы две копии одного правила.
 
-    Идемпотентность — та же, что у обычного распределения: тег/`routed_ids`
+    Идемпотентность — та же, что у обычного распределения: тег/`routed_store`
     против повторного захода, `_in_flight` против пересекающихся по времени.
     Без них шквал вебхуков переназначал бы ответственного по кругу и затирал
     ручную правку менеджера.
     """
-    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
+    routed = amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid)
+    if routed is None:
+        await _fail(lead, "хранилище распределённых сделок не ответило")
+        return "failed-routed-store"
+    if routed:
         return "skipped-already-routed"
     if lid in _in_flight:
         return "skipped-in-flight"
@@ -1177,7 +1224,7 @@ async def _assign_office_manager(
                     extra_detail={"intended_user_id": RESPONSIBLE_OFFICE_MANAGER_USER_ID,
                                   "patch_status_code": result.get("status_code")}))
                 return "failed-patch"
-        await _mark_locally_routed(lid)
+        await _mark_locally_routed(lid, RESPONSIBLE_OFFICE_MANAGER_USER_ID, profile.id)
     finally:
         _in_flight.discard(lid)
 
@@ -1216,7 +1263,7 @@ async def process_lead_distribution(
         return "failed-lead-read"
 
     # Нормализуем сразу - lead_id приходит то int (reconcile), то str (очередь,
-    # из payload вебхука), а _in_flight/_routed_ids ниже ключуются им же:
+    # из payload вебхука), а _in_flight/routed_store ниже ключуются им же:
     # разнотипица тихо сломала бы дедуп (int(1) и "1" - разные ключи/элементы).
     lid = int(lead["id"])
 
@@ -1275,11 +1322,15 @@ async def process_lead_distribution(
     if _is_pickup_delivery(lead):
         return await _assign_office_manager(lead, profile, lid, prev_responsible_user_id)
 
-    if amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid):
-        # Идемпотентно: решение уже зафиксировано - тег (старые сделки, им
-        # его ещё ставили) или локальная запись (новые - тег больше не
-        # ставим, см. _routed_ids выше). Повторный вебхук (в т.ч. эхо от
-        # нашего же PATCH) — no-op.
+    # Идемпотентно: решение уже зафиксировано - тег (старые сделки, им его ещё
+    # ставили) или запись в routed_store (новые - тег больше не ставим, см.
+    # комментарий над _in_flight). Повторный вебхук (в т.ч. эхо от нашего же
+    # PATCH или утреннее обновление сделки, распределённой вчера) — no-op.
+    routed = amo_service.has_tag(lead, TAG_LEAD_DISTRIBUTION_ROUTED) or await _is_locally_routed(lid)
+    if routed is None:
+        await _fail(lead, "хранилище распределённых сделок не ответило")
+        return "failed-routed-store"
+    if routed:
         _clear_fail(lid)
         return "skipped-already-routed"
 
@@ -1347,7 +1398,7 @@ async def process_lead_distribution(
                                                "patch_status_code": result.get("status_code")}))
             return "failed-patch"
 
-        await _mark_locally_routed(lid)
+        await _mark_locally_routed(lid, target, profile.id)
     finally:
         _in_flight.discard(lid)
 
@@ -1498,7 +1549,7 @@ async def _created_in_status_leads(pipeline_id: int, status_id: int, ts_from: in
     путь) эту сделку ловит нормально (webhooks.py читает leads[add][0][status_id]
     точно так же, как leads[update][0][status_id]) — а вот reconciliation как
     страховка от ПРОПУЩЕННОГО вебхука эту сделку раньше не подстраховывал.
-    Идемпотентность (тег для старых сделок / _routed_ids для новых, см.
+    Идемпотентность (тег для старых сделок / routed_store для новых, см.
     process_lead_distribution) делает пересечение с _entered_status_leads
     безопасным — задвоенная обработка просто no-op."""
     leads: set[int] = set()
@@ -1557,6 +1608,13 @@ async def _reconcile_once() -> str:
         leads |= await _entered_status_leads(pipeline_id, status_id, window_from, now)
         leads |= await _created_in_status_leads(pipeline_id, status_id, window_from, now)
 
+    try:
+        pruned = await asyncio.to_thread(routed_store.prune)
+        if pruned:
+            logger.info("lead_distribution: снято %s записей «распределена» старше срока", pruned)
+    except Exception:
+        logger.exception("lead_distribution: чистка хранилища распределённых не прошла")
+
     processed = 0
     for lead_id in leads:
         await process_lead_distribution(lead_id, source="reconcile")
@@ -1611,6 +1669,14 @@ async def init() -> None:
     if not LEAD_DISTRIBUTION_ENABLED:
         logger.info("lead_distribution: ВЫКЛЮЧЕН (LEAD_DISTRIBUTION_ENABLED)")
         return
+
+    try:
+        await asyncio.to_thread(routed_store.init)
+        pruned = await asyncio.to_thread(routed_store.prune)
+        if pruned:
+            logger.info("lead_distribution: снято %s записей «распределена» старше срока", pruned)
+    except Exception:
+        logger.exception("lead_distribution: хранилище распределённых не поднялось, работаем дальше")
 
     if LEAD_DISTRIBUTION_SINCE_TS <= 0:
         msg = (
