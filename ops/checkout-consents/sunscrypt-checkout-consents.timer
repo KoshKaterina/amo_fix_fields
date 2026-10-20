@@ -1,0 +1,12 @@
+[Unit]
+Description=Check new warehouse checkout consent evidence every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=2min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Unit=sunscrypt-checkout-consents.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Sunscrypt checkout consent field to existing amoCRM contacts
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/integrations/amo_fix_fields
+# Source is streamed into a separate process in the existing container. No app restart.
+ExecStart=/bin/sh -c 'exec /usr/bin/docker exec -i -w /app amo-fix-fields python - --apply --since now --state /app/var/checkout-consents.sqlite3 < /opt/integrations/amo_fix_fields/checkout_consent_sync.py'
+TimeoutStartSec=150
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal

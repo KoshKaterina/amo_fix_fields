@@ -1,0 +1,54 @@
+[
+    {
+        "id": 0,
+        "meta_data": [
+            {
+                "key": "_sc_checkout_consent_snapshot",
+                "value": {
+                    "schema": 1,
+                    "pdn": "yes",
+                    "marketing": "no",
+                    "recorded_at": "2026-10-19T18:59:12+03:00",
+                    "pdn_version": "policy-e1b5bd67831c",
+                    "marketing_version": "checkout-marketing-v1-2026-10-19",
+                    "channels": [
+                        "email",
+                        "sms",
+                        "messengers",
+                        "calls"
+                    ],
+                    "source": "checkout",
+                    "label": "Хочу получать новости, обзоры и специальные предложения Sunscrypt (необязательно).",
+                    "marketing_document_sha256": "8bc5be491c0f168db422480b1b541272618f8bb40681459edd1cda64ac0224cc"
+                }
+            }
+        ],
+        "expected": "ПДн: да, реклама (email\/SMS\/мессенджеры\/звонки): нет, дата: 2026-10-19T18:59:12+03:00, версия ПДн: policy-e1b5bd67831c, версия рекламы: checkout-marketing-v1-2026-10-19"
+    },
+    {
+        "id": 0,
+        "meta_data": [
+            {
+                "key": "_sc_checkout_consent_snapshot",
+                "value": {
+                    "schema": 1,
+                    "pdn": "yes",
+                    "marketing": "yes",
+                    "recorded_at": "2026-10-19T18:59:12+03:00",
+                    "pdn_version": "policy-e1b5bd67831c",
+                    "marketing_version": "checkout-marketing-v1-2026-10-19",
+                    "channels": [
+                        "email",
+                        "sms",
+                        "messengers",
+                        "calls"
+                    ],
+                    "source": "checkout",
+                    "label": "Хочу получать новости, обзоры и специальные предложения Sunscrypt (необязательно).",
+                    "marketing_document_sha256": "8bc5be491c0f168db422480b1b541272618f8bb40681459edd1cda64ac0224cc"
+                }
+            }
+        ],
+        "expected": "ПДн: да, реклама (email\/SMS\/мессенджеры\/звонки): да, дата: 2026-10-19T18:59:12+03:00, версия ПДн: policy-e1b5bd67831c, версия рекламы: checkout-marketing-v1-2026-10-19"
+    }
+]
