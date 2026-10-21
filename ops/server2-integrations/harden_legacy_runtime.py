@@ -21,6 +21,19 @@ ALLOWED = {
     'amo-academy-webhook-v13-source-fields', 'amo-academy-webhook-v14-lines-merged',
 }
 
+# Reviewed against all v11-v14 import graphs and effective configuration values.
+# Keep the complete Academy namespace for legacy flags and future campaign changes.
+ACADEMY_ENV_EXACT = {
+    'TOKEN', 'SECRET_KEY', 'INTEGRATION_ID', 'WAZZUP_API_KEY', 'WAZZUP_API_URL',
+    'TG_BOT_TOKEN', 'TG_PROXY_URL', 'PATH', 'LANG', 'LC_ALL', 'TZ', 'HOME', 'GPG_KEY',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+}
+
+def academy_environment(values):
+    return [value for value in values if value.split('=', 1)[0] in ACADEMY_ENV_EXACT
+            or value.split('=', 1)[0].startswith(('ACADEMY_', 'AMO_', 'PYTHON'))]
+
 class DockerConnection(http.client.HTTPConnection):
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -51,13 +64,16 @@ def main():
     parser.add_argument('--image', help='Optional verified image with identical application bytes')
     parser.add_argument('--dependency-refresh', action='store_true',
                         help='Replace an already hardened container with a tested dependency image')
+    parser.add_argument('--minimize-env', action='store_true',
+                        help='Keep only reviewed Academy and runtime environment keys')
     args = parser.parse_args()
+    assert not (args.minimize_env and (args.dependency_refresh or args.image)), 'Use a separate env-only deployment'
     name = args.container
     original = inspect(name)
     assert original['State']['Running']
     assert original['HostConfig']['NetworkMode'] == 'bridge'
-    if args.dependency_refresh:
-        assert args.image, 'Dependency refresh requires an explicit verified image'
+    if args.dependency_refresh or args.minimize_env:
+        assert args.image or args.minimize_env, 'Dependency refresh requires an explicit verified image'
         assert original['Config']['User'] == '65532:65532'
         assert original['HostConfig']['ReadonlyRootfs']
     else:
@@ -76,6 +92,13 @@ def main():
     chosen_image = api('GET', '/images/' + args.image + '/json')['Id'] if args.image else original['Image']
     config['Image'] = chosen_image
     config['User'] = '65532:65532'
+    if args.minimize_env:
+        config['Env'] = academy_environment(config['Env'])
+    expected_env = dict(value.split('=', 1) for value in config['Env'])
+    removed_env = sorted(set(value.split('=', 1)[0] for value in original['Config']['Env']) - set(expected_env))
+    if args.minimize_env:
+        image_env = api('GET', '/images/' + chosen_image + '/json')['Config'].get('Env') or []
+        assert {value.split('=', 1)[0] for value in image_env} <= set(expected_env), 'Image defaults would reintroduce removed environment keys'
     host = dict(original['HostConfig'])
     host['ReadonlyRootfs'] = True
     host['CapDrop'] = ['ALL']
@@ -89,7 +112,7 @@ def main():
     if not args.apply:
         print(f'{name}: preflight passed; no runtime changes')
         return
-    suffix = '-deps' if args.dependency_refresh else '-security'
+    suffix = '-env' if args.minimize_env else ('-deps' if args.dependency_refresh else '-security')
     candidate = name + suffix + '-candidate'
     rollback_name = name + suffix + '-rollback'
     # A stopped worker can safely resume its current queue, but do not interrupt
@@ -106,7 +129,7 @@ def main():
         assert active == 0, 'Active delivery lease; defer this replacement'
     created = api('POST', '/containers/create?name=' + candidate, config)['Id']
     new = inspect(created)
-    assert new['Config']['Env'] == original['Config']['Env']
+    assert dict(value.split('=', 1) for value in new['Config']['Env']) == expected_env
     assert new['Image'] == chosen_image
     assert new['HostConfig']['Binds'] == original['HostConfig']['Binds']
     assert new['HostConfig']['PortBindings'] == original['HostConfig']['PortBindings']
@@ -130,18 +153,19 @@ def main():
         else:
             raise RuntimeError('Replacement failed health check')
         current = inspect(name)
-        assert current['Config']['Env'] == original['Config']['Env']
+        assert dict(value.split('=', 1) for value in current['Config']['Env']) == expected_env
         assert current['Image'] == chosen_image
         assert current['Config']['User'] == '65532:65532'
         assert current['HostConfig']['ReadonlyRootfs']
         record = {'id': current['Id'], 'original_id': original['Id'], 'rollback_container': rollback_name,
-                  'image': current['Image'], 'health': 200, 'user': current['Config']['User']}
+                  'image': current['Image'], 'health': 200, 'user': current['Config']['User'],
+                  'removed_env_names': removed_env, 'env_count': len(expected_env)}
         (backup / 'verified.json').write_text(json.dumps(record))
         (backup / 'rollback.sh').write_text('#!/bin/sh\nset -eu\ndocker stop -t 30 ' + name + '\n'
             + 'docker rename ' + name + ' ' + candidate + '\n'
             + 'docker rename ' + rollback_name + ' ' + name + '\ndocker start ' + name + '\n')
         (backup / 'rollback.sh').chmod(0o700)
-        print(f'{name}: health200 UID65532 readonly; verified image and exact env/state retained')
+        print(f'{name}: health200 UID65532 readonly; verified image/state and expected env; removed {len(removed_env)} unused keys')
     except Exception:
         # Use the CURRENT mounted queue. Never copy state-before over live data.
         try:
