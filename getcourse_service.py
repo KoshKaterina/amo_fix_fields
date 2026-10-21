@@ -17,7 +17,8 @@ UTM). Нет - создать новую на «Входящем лиде», г�
     order_id      {object.id}             - внутренний ID заказа, из адреса карточки
     order_number  {object.number}         - номер, который видит человек
     status, positions, cost, payed, created_at, payed_at
-    page_url      {object.deal_created_url} - страница формы; пусто у заказов, созданных вручную
+    origin        client - заказ создал ученик (процесс отобран по «Заказ создан клиентом»)
+    page_url      {object.deal_created_url} - страница формы; GetCourse пишет её не всегда
     user_id, email, phone, first_name, last_name, telegram
     deal_utm_*    {object.deal_utm_source}... - UTM заказа (первые по приоритету)
     gc_utm_*      {object.gc_system_deal_utm_source}... - UTM, которые GetCourse пишет сам
@@ -127,7 +128,7 @@ def _load_map() -> dict:
     except (OSError, ValueError):
         logger.exception("getcourse: карта %s не прочиталась — только базовый тег", MAP_PATH)
         data = {}
-    pages = [p for p in data.get("pages") or [] if isinstance(p, dict) and p.get("match")]
+    pages = [p for p in data.get("pages") or [] if isinstance(p, dict) and (p.get("match") or p.get("offer"))]
     return {
         "base_tags": list(data.get("base_tags") or ["GetCourse"]),
         "paid_tags": list(data.get("paid_tags") or []),
@@ -187,6 +188,7 @@ def parse(payload: dict) -> dict:
         "created_at": _clean(payload.get("created_at")),
         "payed_at": _clean(payload.get("payed_at")),
         "page_url": _clean(payload.get("page_url")),
+        "origin": _clean(payload.get("origin")).lower()[:20],
         "user_id": pick("user_id", "id"),
         "email": pick("email"),
         "phone": pick("phone"),
@@ -381,9 +383,29 @@ async def resolve(ev: dict) -> dict:
 
 def page_entry(page_url: str) -> dict | None:
     for entry in MAP["pages"]:
-        if entry["match"] in page_url:
+        if entry.get("match") and entry["match"] in page_url:
             return entry
     return None
+
+
+def from_client(ev: dict) -> bool:
+    """Заказ создал сам ученик (анкета, виджет), а не сотрудник.
+
+    Адрес страницы GetCourse пишет не всегда: 21.10.2026 два заказа с одной и той же формы
+    пришли без `deal_created_url`, а вчерашний - с ним. Поэтому главный признак - `origin=client`:
+    его ставит процесс, отобранный по условию «Заказ создан клиентом». Адрес - запасной.
+    """
+    return bool(ev.get("page_url")) or ev.get("origin") == "client"
+
+
+def form_entry(ev: dict) -> dict | None:
+    """Строка карты для заказа: по адресу страницы, а без него - по названию предложения."""
+    entry = page_entry(ev["page_url"]) if ev.get("page_url") else None
+    if entry is None and ev.get("positions"):
+        for candidate in MAP["pages"]:
+            if candidate.get("offer") and candidate["offer"] in ev["positions"]:
+                return candidate
+    return entry
 
 
 def _page_path(page_url: str) -> str:
@@ -401,11 +423,10 @@ def tags_for(ev: dict) -> list[str]:
     tags = list(MAP["base_tags"])
     if ev["event"] == "order_paid":
         tags += MAP["paid_tags"]
-    elif not ev.get("page_url"):
+    elif not from_client(ev):
         tags += MAP["manual_tags"]
     else:
-        entry = page_entry(ev["page_url"])
-        tags += (entry or {}).get("tags") or []
+        tags += (form_entry(ev) or {}).get("tags") or []
     seen, result = set(), []
     for tag in tags:
         if tag and tag.lower() not in seen:
@@ -436,14 +457,17 @@ def _person_name(ev: dict) -> str:
 
 
 def note_text(ev: dict) -> str:
-    entry = page_entry(ev.get("page_url") or "") if ev.get("page_url") else None
+    entry = form_entry(ev)
+    label = (entry or {}).get("label")
     number = ev.get("order_number") or ev["order_id"]
     lines = [marker(ev), f"GetCourse: {EVENTS[ev['event']]} (заказ #{number})"]
     if ev.get("positions"):
         lines.append(f"Предложение: {ev['positions']}")
     if ev.get("page_url"):
-        label = (entry or {}).get("label")
         lines.append(f"Форма: {label} - {ev['page_url']}" if label else f"Форма: {ev['page_url']}")
+    elif from_client(ev):
+        lines.append(f"Форма: {label} (адрес страницы GetCourse не передал)" if label
+                     else "Форма: заказ создал ученик, адрес страницы GetCourse не передал")
     else:
         lines.append("Форма: нет, заказ создан в GetCourse вручную или процессом")
     lines.append(f"Заказ: {GETCOURSE_ACCOUNT_URL}/sales/control/deal/update/id/{ev['order_id']}")
@@ -516,8 +540,7 @@ def _new_contact(ev: dict) -> dict:
 
 
 def new_lead_body(ev: dict, contact: dict | None) -> dict:
-    entry = page_entry(ev.get("page_url") or "") if ev.get("page_url") else None
-    what = (entry or {}).get("label") or ev.get("positions") or "заказ"
+    what = (form_entry(ev) or {}).get("label") or ev.get("positions") or "заказ"
     number = ev.get("order_number") or ev["order_id"]
     body = {
         "name": f"ГК #{number}: {what} - {_person_name(ev)}"[:MAX_NAME_LEN],
@@ -650,7 +673,7 @@ async def process(row: dict) -> None:
             lead_id = int(decision["lead"]["id"])
             contact_id = decision["contact_id"]
         else:
-            can_create = ev["event"] == "order_created" and bool(ev.get("page_url"))
+            can_create = ev["event"] == "order_created" and from_client(ev)
             if not can_create:
                 reason = "paid-without-open-deal" if ev["event"] == "order_paid" else "manual-order-without-open-deal"
                 await _finish(row, "skipped", reason)
@@ -707,12 +730,16 @@ async def _review(row: dict, ev: dict, decision: dict) -> None:
 
 
 async def _note_new_page(ev: dict) -> None:
-    if not ev.get("page_url") or page_entry(ev["page_url"]):
+    if ev["event"] != "order_created" or not from_client(ev) or form_entry(ev):
         return
-    path = _page_path(ev["page_url"])
-    if await asyncio.to_thread(store.first_seen, "page:" + path):
+    if ev.get("page_url"):
+        what, key = f"новая форма {_page_path(ev['page_url'])}", "page:" + _page_path(ev["page_url"])
+    else:
+        offer = (ev.get("positions") or "без предложения")[:100]
+        what, key = f"новое предложение «{offer}» (адрес страницы не передан)", "offer:" + offer
+    if await asyncio.to_thread(store.first_seen, key):
         await _alert("getcourse_new_form",
-                     f"GetCourse → amo: новая форма {path}. Сделки идут с тегом "
+                     f"GetCourse → amo: {what}. Сделки идут с тегом "
                      f"{', '.join(MAP['base_tags'])}; свой тег и название - строкой в getcourse_map.json.")
 
 

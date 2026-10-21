@@ -403,11 +403,45 @@ def test_manual_order_only_augments(fake):
 
 
 def test_new_form_alerts_once(fake):
-    accept_and_process(payload(page_url="https://edu.sunscrypt.ru/anketa/new-form"))
+    accept_and_process(payload(page_url="https://edu.sunscrypt.ru/anketa/new-form", positions="Новый курс"))
     accept_and_process(payload(page_url="https://edu.sunscrypt.ru/anketa/new-form?x=1", order_id="910002425",
-                               email="other@example.com", phone=""))
+                               email="other@example.com", phone="", positions="Новый курс"))
     new_form = [a for a in fake.alerts if a[0] == "getcourse_new_form"]
     assert len(new_form) == 1 and "/anketa/new-form" in new_form[0][1]
+
+
+# 21.10.2026: заказы с формы пришли без deal_created_url - GetCourse пишет его не всегда.
+
+def test_client_order_without_page_url_creates_deal(fake):
+    row = accept_and_process(payload(page_url="", origin="client"))
+    assert row["status"] == "done" and row["action"] == "created"
+    lead = fake.leads[row["lead_id"]]
+    # Форма узнана по предложению «Живая онлайн-конференция…».
+    assert [t["name"] for t in lead["_embedded"]["tags"]] == ["GetCourse", "реклама", "ГК: конференция"]
+    note = fake.notes[row["lead_id"]][0]
+    assert "Форма: Анкета strategy (онлайн-конференция) (адрес страницы GetCourse не передал)" in note
+    assert not [a for a in fake.alerts if a[0] == "getcourse_new_form"]
+
+
+def test_defi_channel_offer_without_page_url(fake):
+    row = accept_and_process(payload(page_url="", origin="client",
+                                     positions="Анкета-заявка на доступ в закрытый DeFi-канал [10.26]"))
+    names = [t["name"] for t in fake.leads[row["lead_id"]]["_embedded"]["tags"]]
+    assert names == ["GetCourse", "ГК: анкета DeFi-канала"]
+    assert "ГК #20619: Анкета-заявка на доступ в DeFi-канал" in fake.writes[0][1]["name"]
+
+
+def test_client_order_with_unknown_offer_alerts_once(fake):
+    accept_and_process(payload(page_url="", origin="client", positions="Совсем новый продукт"))
+    accept_and_process(payload(page_url="", origin="client", positions="Совсем новый продукт",
+                               order_id="910002426", email="other@example.com", phone=""))
+    new_form = [a for a in fake.alerts if a[0] == "getcourse_new_form"]
+    assert len(new_form) == 1 and "Совсем новый продукт" in new_form[0][1]
+
+
+def test_order_without_page_url_and_origin_is_manual(fake):
+    row = accept_and_process(payload(page_url="", origin=""))
+    assert row["status"] == "skipped" and row["action"] == "manual-order-without-open-deal"
 
 
 # ─────────────────────────── сбои ───────────────────────────
