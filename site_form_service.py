@@ -638,6 +638,52 @@ def _page_title(title: str) -> str:
     return re.sub(r"\s+[-–—|]\s+Sunscrypt\s*$", "", title or "").strip()
 
 
+def _quiz_note_blocks(p: dict) -> list[str] | None:
+    """Readable quiz note; ordinary forms and unrecognized summaries keep their format."""
+    if p["context"].get("entry") != "quiz-result":
+        return None
+    summary, separator, customer_comment = p["comment"].partition("\n\nКомментарий клиента: ")
+    lines = summary.splitlines()
+    partial = "Квиз не завершен. Выбранные ответы:" in lines
+    if not partial and "Результаты квиза:" not in lines:
+        return None
+    answers, recommendations, extra = [], [], []
+    reason = promise = addon = ""
+    discount = bool(lines and lines[0] == "ДАТЬ СКИДКУ")
+    for line in lines:
+        if line in ("ДАТЬ СКИДКУ", "Результаты квиза:", "Квиз не завершен. Выбранные ответы:"):
+            continue
+        if line.startswith(("Задачи: ", "Монеты: ", "Опыт: ", "Бюджет: ", "Важно: ")):
+            answers.append(line)
+        elif re.match(r"^\d+\. ", line):
+            recommendations.append(line)
+        elif line.startswith("Причина обращения: "):
+            reason = line.removeprefix("Причина обращения: ")
+        elif line.startswith("Обещано клиенту: "):
+            promise = line.removeprefix("Обещано клиенту: ")
+        elif line.startswith("Выбрано дополнение: "):
+            addon = line.removeprefix("Выбрано дополнение: ")
+        elif line:
+            extra.append(line)
+    blocks = ["ДАТЬ СКИДКУ"] if discount else []
+    blocks.append("ПОДБОР КОШЕЛЬКА" + (" — КВИЗ НЕ ЗАВЕРШЁН" if partial else ""))
+    if answers:
+        blocks.append("ОТВЕТЫ КЛИЕНТА\n\n" + "\n\n".join(answers))
+    if recommendations:
+        blocks.append("ПОДОБРАННЫЕ КОШЕЛЬКИ\n" + "\n".join(recommendations))
+    if addon:
+        blocks.append("ВЫБРАННОЕ ДОПОЛНЕНИЕ\n" + addon)
+    if reason:
+        blocks.append("ПОЧЕМУ ПОКА НЕ ПОКУПАЕТ\n" + reason)
+    if promise:
+        blocks.append("ОБЕЩАНО КЛИЕНТУ\n" + promise[:1].upper() + promise[1:])
+    if extra:
+        blocks.append("ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ\n" + "\n".join(extra))
+    if separator and customer_comment:
+        blocks.append("КОММЕНТАРИЙ КЛИЕНТА\n" + customer_comment)
+    return blocks
+
+
 def note_text_v2(p: dict, source: str) -> str:
     """Примечание к сделке - три блока через пустую строку.
 
@@ -702,6 +748,17 @@ def note_text_v2(p: dict, source: str) -> str:
         tech.append(f"Пришёл с: {ctx['referrer']}")
     tech.append(f"Номер заявки: {p['submission_id'][:8]}")
 
+    quiz_blocks = _quiz_note_blocks(p)
+    if quiz_blocks is not None:
+        person[0] = "КОНТАКТ"
+        tech[0] = "ИСТОЧНИК И ТЕХНИЧЕСКАЯ ИНФОРМАЦИЯ"
+        details = []
+        if page_title:
+            details.append(f"Страница: {page_title}")
+        if ctx["title"]:
+            details.append(f"Форма: {ctx['title']}")
+        tech[1:1] = details
+        return "\n\n".join(quiz_blocks + ["\n".join(person), "\n".join(tech)])[:MAX_NOTE_LEN]
     return "\n\n".join("\n".join(block) for block in (head, person, tech))[:MAX_NOTE_LEN]
 
 

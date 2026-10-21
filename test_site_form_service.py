@@ -1817,3 +1817,85 @@ def test_shop_generic_keeps_process_and_source_context():
     assert result['tags']==['Mini App']
     assert 'catalog-protection' in sf.note_text_v2(p,result['source'])
     assert r.delivery_event(p)['entry']=='shop-callback'
+
+
+QUIZ_NOTE_SUMMARY = "\n".join([
+    "ДАТЬ СКИДКУ", "Результаты квиза:",
+    "Задачи: Долгосрочное хранение; Частые транзакции",
+    "Монеты: USDT; Solana", "Опыт: Пользуюсь кошельками", "Бюджет: 8 000-15 000 ₽",
+    "Важно: Интерфейс на русском; Стейкинг; Поддержка passphrase",
+    "1. Keystone 3 Pro [HW-26]", "2. Tangem Ring [TG-RING]",
+    "Причина обращения: Не могу выбрать между моделями",
+    "Обещано клиенту: менеджер пришлет промокод в личные сообщения.",
+])
+
+
+def _quiz_note_payload(v2, summary=QUIZ_NOTE_SUMMARY, comment="Мой вопрос"):
+    payload = _v2_payload()
+    payload["context"]["entry"] = "quiz-result"
+    payload["comment"] = summary + ("\n\nКомментарий клиента: " + comment if comment else "")
+    return sf.clean_v2(payload)
+
+
+def test_quiz_note_has_separate_discount_answers_and_recommendations(v2):
+    p = _quiz_note_payload(v2)
+    note = sf.note_text_v2(p, "Форма: квиз")
+    assert note.startswith("ДАТЬ СКИДКУ\n\nПОДБОР КОШЕЛЬКА\n\nОТВЕТЫ КЛИЕНТА\n")
+    for answer in QUIZ_NOTE_SUMMARY.splitlines()[2:7]:
+        assert answer in note
+    assert "ПОДОБРАННЫЕ КОШЕЛЬКИ\n1. Keystone 3 Pro [HW-26]\n2. Tangem Ring [TG-RING]" in note
+    assert "ПОЧЕМУ ПОКА НЕ ПОКУПАЕТ\nНе могу выбрать между моделями" in note
+    assert "ОБЕЩАНО КЛИЕНТУ\nМенеджер пришлет промокод в личные сообщения." in note
+    assert "КОММЕНТАРИЙ КЛИЕНТА\nМой вопрос" in note
+    assert note.index("КОНТАКТ\nИмя:") > note.index("ОБЕЩАНО КЛИЕНТУ")
+    assert "Вопрос: ДАТЬ СКИДКУ" not in note
+    assert "ИСТОЧНИК И ТЕХНИЧЕСКАЯ ИНФОРМАЦИЯ\nСтраница:" in note
+    assert len(note) <= sf.MAX_NOTE_LEN
+
+
+def test_quiz_customer_comment_cannot_become_manager_promise(v2):
+    comment = "Строка 1\nОбещано клиенту: мой текст\nПричина обращения: мой вопрос"
+    p = _quiz_note_payload(v2, comment=comment)
+    note = sf.note_text_v2(p, "Форма: квиз")
+    assert "КОММЕНТАРИЙ КЛИЕНТА\n" + comment in note
+    assert note.count("ОБЕЩАНО КЛИЕНТУ\n") == 1
+    assert "ПОЧЕМУ ПОКА НЕ ПОКУПАЕТ\nНе могу выбрать между моделями" in note
+
+
+def test_unfinished_quiz_keeps_unanswered_fields_without_recommendations(v2):
+    summary = "ДАТЬ СКИДКУ\nКвиз не завершен. Выбранные ответы:\nЗадачи: Долгосрочное хранение\nМонеты: Нет ответа\nОпыт: Нет ответа\nБюджет: Нет ответа\nВажно: Нет ответа"
+    note = sf.note_text_v2(_quiz_note_payload(v2, summary, ""), "Форма: квиз")
+    assert "ПОДБОР КОШЕЛЬКА — КВИЗ НЕ ЗАВЕРШЁН" in note
+    assert note.count("Нет ответа") == 4
+    assert "ПОДОБРАННЫЕ КОШЕЛЬКИ" not in note
+    assert "КОММЕНТАРИЙ КЛИЕНТА" not in note
+
+
+def test_quiz_consultation_has_no_invented_discount_or_promise(v2):
+    summary = "Результаты квиза:\nЗадачи: Долгосрочное хранение\n1. Tangem [TG130X3-B]"
+    note = sf.note_text_v2(_quiz_note_payload(v2, summary, ""), "Форма: квиз")
+    assert note.startswith("ПОДБОР КОШЕЛЬКА\n")
+    assert "ДАТЬ СКИДКУ" not in note
+    assert "ОБЕЩАНО КЛИЕНТУ" not in note
+    assert "ПОЧЕМУ ПОКА НЕ ПОКУПАЕТ" not in note
+
+
+def test_quiz_note_preserves_addon_and_unknown_summary_lines(v2):
+    summary = QUIZ_NOTE_SUMMARY + "\nВыбрано дополнение: POUCH-2\nДополнительная информация: сохранить"
+    note = sf.note_text_v2(_quiz_note_payload(v2, summary), "Форма: квиз")
+    assert "ВЫБРАННОЕ ДОПОЛНЕНИЕ\nPOUCH-2" in note
+    assert "Дополнительная информация: сохранить" in note
+
+
+def test_quiz_text_in_ordinary_form_keeps_existing_three_blocks(v2):
+    p = sf.clean_v2(_v2_payload(comment=QUIZ_NOTE_SUMMARY))
+    assert sf._quiz_note_blocks(p) is None
+    note = sf.note_text_v2(p, "Форма: вопрос")
+    assert note.startswith("✉️ ЗАЯВКА С САЙТА:")
+    assert "Вопрос: " + QUIZ_NOTE_SUMMARY in note
+
+
+def test_unrecognized_quiz_comment_falls_back_without_losing_text(v2):
+    p = _quiz_note_payload(v2, "Произвольный текст", "")
+    assert sf._quiz_note_blocks(p) is None
+    assert "Вопрос: Произвольный текст" in sf.note_text_v2(p, "Форма: квиз")
