@@ -10,6 +10,17 @@ services:
   # 15.09.2026: amo-fix-fields ходит в МойСклад (api и online) напрямую, мимо шлюза.
   # Телеграм по-прежнему через шлюз - своей переменной TG_PROXY_URL в .env сервиса.
   amo-fix-fields:
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     environment:
       HTTPS_PROXY: ${MS_PROXY_URL:-}
       NO_PROXY: ${MS_NO_PROXY:-},api.moysklad.ru,online.moysklad.ru
