@@ -1,0 +1,9 @@
+// Only the receiver may request the existing fixed dedup job. No other systemd administration.
+polkit.addRule(function(action, subject) {
+    if (subject.user === "academy-hook" &&
+        action.id === "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") === "academy-dedup.service" &&
+        action.lookup("verb") === "start") {
+        return polkit.Result.YES;
+    }
+});
