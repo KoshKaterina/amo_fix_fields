@@ -16,3 +16,11 @@ The acl OS package is required. Keep existing ownership and existing user/group 
 Do not start another live business worker to test these settings. Offline import checks use --network none, a state copy and no lifespan. Verify Telegram getMe through the configured proxy immediately before the approved targeted restart, then health, the whole integration smoke and normal webhook delivery. Legacy Academy queues are separate; this configuration does not merge, delete, disable or migrate them.
 
 Runtime rollback restores the saved compose override and recreates only amo-fix-fields. It uses the CURRENT state directory, never an older queue backup. Existing ACLs remain compatible with root; restore saved ACL metadata separately only after the nonroot service is no longer using it.
+
+## Python dependency refresh, 2026-10-22
+
+Security constraints pin FastAPI 0.159.1, Starlette 1.9.0, aiohttp 3.14.5, multidict 6.9.1, certifi 2026.10.19 and Pillow 13.0.0. Test each test file in a separate process with run_tests.py. Against the unchanged deployed application, baseline and candidate both produced 1636 passed, 13 failed and 13 errors across 69 files; the same five failing files concern missing operations sources and source-copy guard drift. This is a dependency regression comparison, not a fully green repository suite. Offline ASGI root health, image PDF generation and Telegram getMe through the configured proxy also passed.
+
+The historical runtime image contained .env backup files. The build exclusions now cover .env* at every depth. The one-time production patch used the exact previous application bytes, removed these credential files in a builder and copied the sanitized filesystem into a scratch final stage; no historical secret-bearing layers are ancestors of the final image. All 338 Python source SHA values stayed equal; the final image has one filesystem layer, no .env files and no exact matches for the 17 known credential variable values under /app. This does not revoke previously exposed credentials or remove protected rollback images.
+
+The protected deployment backup includes the prior image, config and fresh consistent SQLite snapshots. Runtime rollback retags the saved image and recreates only amo-fix-fields; it always keeps current queues. Never overwrite live state with the diagnostic snapshots.
