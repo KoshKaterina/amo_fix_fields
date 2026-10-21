@@ -784,6 +784,48 @@ async def find_contacts_by_query(query: str, limit: int = 10) -> list[dict] | No
     return (data.get("_embedded") or {}).get("contacts") or []
 
 
+async def link_contact_to_lead(lead_id: int | str, contact_id: int | str, *, is_main: bool = True) -> dict[str, Any]:
+    """Привязать существующий контакт к сделке. Повтор после таймаута безопасен:
+    amoCRM повторную привязку той же пары не задваивает. Ответ ok не доказывает
+    привязку - вызывающий проверяет её чтением сделки."""
+    body = [{
+        "to_entity_id": int(contact_id),
+        "to_entity_type": "contacts",
+        "metadata": {"is_main": bool(is_main)},
+    }]
+    return await _do_post(f"/api/v4/leads/{lead_id}/link", body)
+
+
+async def get_leads_created_between(
+    ts_from: int, ts_to: int, with_: tuple[str, ...] = (), page_limit: int = 250
+) -> list[dict] | None:
+    """Сделки всех воронок, созданные в [ts_from, ts_to] (unix).
+
+    None - сбой выборки на любой странице: частичный список за полный не выдаём
+    (тот же приём, что get_leads_updated_since). Пустой список - честный ноль."""
+    leads: list[dict] = []
+    page = 1
+    while True:
+        params: list[tuple[str, str]] = [
+            ("filter[created_at][from]", str(int(ts_from))),
+            ("filter[created_at][to]", str(int(ts_to))),
+            ("limit", str(page_limit)),
+            ("page", str(page)),
+        ]
+        if with_:
+            params.append(("with", ",".join(with_)))
+        data = await _do_get("/api/v4/leads", params)
+        if data is None:
+            logger.warning("get_leads_created_between: сбой выборки (страница %s) — частичный результат не отдаём", page)
+            return None
+        batch = (data.get("_embedded") or {}).get("leads") or []
+        leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        page += 1
+    return leads
+
+
 async def get_talks_by_contact(contact_id: int | str) -> list[dict]:
     """Беседы (talks) контакта. У беседы: status in_work/closed, is_in_work,
     origin (com.wazzup24* — каналы Wazzup), updated_at. Закрытие беседы в amo

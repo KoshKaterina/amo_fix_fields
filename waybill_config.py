@@ -605,6 +605,20 @@ AMGROUP_DUP_WATCH_LOOKBACK_H = int(os.getenv("AMGROUP_DUP_WATCH_LOOKBACK_H", "48
 # потом разрешаем отправку в Телеграм.
 AMGROUP_DUP_WATCH_DRY_RUN = os.getenv("AMGROUP_DUP_WATCH_DRY_RUN", "1") == "1"
 
+# Самоисцеление сделок без контакта (21.10.2026, amgroup_contact_heal.py): amgroup
+# создал сделку из заказа МС, а шаг «привязать контакт» упал на сбое API amo и не
+# повторился. Модуль находит контакт по телефону/почте контрагента и привязывает,
+# только если кандидат ровно один; контакт не создаёт никогда. Оба умолчания
+# безопасные: выключен и в сухом режиме (только лог, без записей в amo и в чат).
+AMGROUP_CONTACT_HEAL_ENABLED = os.getenv("AMGROUP_CONTACT_HEAL_ENABLED", "0") == "1"
+AMGROUP_CONTACT_HEAL_DRY_RUN = os.getenv("AMGROUP_CONTACT_HEAL_DRY_RUN", "1") == "1"
+AMGROUP_CONTACT_HEAL_INTERVAL_SEC = int(os.getenv("AMGROUP_CONTACT_HEAL_INTERVAL_SEC", "180"))
+# Сколько ждём amgroup, прежде чем вмешаться. В норме он привязывает за 2-5 с,
+# при тормозах amo бывало 16 с; пять минут - с запасом, чтобы не гоняться с ним.
+AMGROUP_CONTACT_HEAL_MIN_AGE_MIN = int(os.getenv("AMGROUP_CONTACT_HEAL_MIN_AGE_MIN", "5"))
+# Окно фонового прохода по времени создания сделки.
+AMGROUP_CONTACT_HEAL_LOOKBACK_H = int(os.getenv("AMGROUP_CONTACT_HEAL_LOOKBACK_H", "24"))
+
 # ---------------------------------------------------------------------------
 # Склад шоурума (задача Кати 06.08.2026). Кирилл отгружает из отдельного склада
 # «Sunscrypt Шоурум», заведённого в МойСкладе 03.08.

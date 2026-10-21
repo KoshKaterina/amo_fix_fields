@@ -1401,6 +1401,13 @@ async def _contact_wait_loop(lead_id: int, source: str) -> None:
             if profile is not None:
                 _spawn(_log_decision(lead, profile, outcome=OUTCOME_CONTACT_MISSING,
                                      extra_detail={"contact_wait_s": LEAD_DISTRIBUTION_CONTACT_WAIT_S}))
+            # Сделка из МойСклада: amgroup мог уронить шаг привязки на сбое API amo
+            # (20-21.10.2026) и не повторить его. Самоисцеление выждет свой порог и
+            # привяжет контакт, если он находится однозначно, а потом позовёт
+            # распределение заново. Без AMGROUP_CONTACT_HEAL_ENABLED - ничего.
+            # Импорт локальный: amgroup_contact_heal сам импортирует этот модуль.
+            import amgroup_contact_heal
+            amgroup_contact_heal.schedule_after_contact_wait(lead)
         else:
             logger.warning(
                 "lead_distribution %s: контакт не появился, и сделка не прочиталась на таймауте", lead_id,

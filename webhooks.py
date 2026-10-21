@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.status import HTTP_200_OK
 
+import amgroup_contact_heal
 import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
@@ -228,6 +229,9 @@ async def lifespan(app):
     await amgroup_fallback.init()
     await amgroup_shipment.init()
     await amgroup_duplicate_watch.init()
+    # Самоисцеление сделок amgroup без контакта (21.10.2026): сам смотрит
+    # AMGROUP_CONTACT_HEAL_ENABLED и без него не поднимает цикл.
+    await amgroup_contact_heal.init()
     # Авто-режим ОП розница: ведёт сделку по этапам вместо менеджера. Сам первым делом
     # смотрит флаг AUTOPILOT_ENABLED и без него не поднимает ни хранилища, ни опроса
     # панели, ни фонового цикла.
@@ -255,6 +259,7 @@ async def lifespan(app):
     await amgroup_fallback.shutdown()
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
+    await amgroup_contact_heal.shutdown()
     await autopilot.shutdown()
     await academy_invite_delivery.stop()
     await academy_chat_join.stop()
