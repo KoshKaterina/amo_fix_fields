@@ -210,27 +210,6 @@ def parse(payload: dict) -> dict:
     return ev
 
 
-def answer_states(payload: dict) -> str:
-    """ВРЕМЕННО, 21.10.2026: что пришло в параметрах a_* - диагностика ответа «заработок» у
-    анкеты strategy. Значения ответов в журнал не идут: только длина, а у неподставленной
-    переменной - её текст (это название поля ГК, не данные человека). Убрать после проверки."""
-    states = []
-    for key, value in payload.items():
-        if not str(key).startswith("a_"):
-            continue
-        text = str(value if value is not None else "").strip()
-        if not text:
-            states.append(f"{key}=пусто")
-        elif _PLACEHOLDER.match(text):
-            states.append(f"{key}=не подставлено {text[:120]!r}")
-        else:
-            states.append(f"{key}={len(text)} симв.")
-    missing = [f"a_{code}" for code in MAP["answers"] if f"a_{code}" not in payload]
-    if missing:
-        states.append("нет параметров: " + ", ".join(missing))
-    return "; ".join(states) or "параметров a_* нет"
-
-
 async def accept(payload: dict) -> tuple[int, dict]:
     """Приём вызова процесса: 200 только когда событие легло в очередь."""
     try:
@@ -247,10 +226,6 @@ async def accept(payload: dict) -> tuple[int, dict]:
     except Exception:
         logger.exception("getcourse: очередь недоступна, событие %s не принято", event_id)
         return 503, {"ok": False, "error": "store"}
-    # Временно: и для повтора - повторный вызов процесса по уже принятому заказу ничего не
-    # пишет в amo, а состав параметров покажет.
-    logger.info("getcourse: ответы %s%s: %s", event_id, "" if inserted else " (повтор)",
-                answer_states(payload))
     if inserted:
         logger.info("getcourse: принято %s (заказ #%s)", event_id, ev["order_number"] or "?")
         _kick()
