@@ -17,6 +17,19 @@ services:
   # заказы сайта не доезжали до МойСклада. amo-fix-fields с того же дня тоже напрямую.
   # Разбор: knowledge/zakaz-sayta-poteryan-pri-sboe-svyazi.md в dev-workspace-and-journal.
   woo-sklad:
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     environment:
+      WOO_LOG_FILE: /tmp/woo_moysklad.log
+      PYTHONDONTWRITEBYTECODE: "1"
       HTTPS_PROXY: ${MS_PROXY_URL:-}
       NO_PROXY: ${MS_NO_PROXY:-},api.moysklad.ru
