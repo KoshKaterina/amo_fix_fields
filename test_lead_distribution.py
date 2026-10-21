@@ -491,6 +491,17 @@ def test_match_profile_multiple_matches_picks_lowest_priority():
     assert picked.id == "dup"  # меньший priority выигрывает
 
 
+def test_match_profile_specific_source_beats_wildcard():
+    # «Академия» (любой источник) и «Академия: GetCourse» (свой источник) на одном этапе:
+    # сделка GetCourse уходит своему правилу даже при меньшем priority у общего.
+    _seed_profile(id="any", name="Академия", pipeline_id=10, status_id=20, source_ids=[], priority=1)
+    _seed_profile(id="gc", name="Академия: GetCourse", pipeline_id=10, status_id=20,
+                  source_ids=[23478671], priority=50)
+    assert ld.match_profile(10, 20, 23478671).id == "gc"
+    assert ld.match_profile(10, 20, 23478555).id == "any"  # чужой источник - общему правилу
+    assert ld.match_profile(10, 20, None).id == "any"
+
+
 def test_disabled_profile_does_not_match():
     _seed_profile(name="Выкл", status_id=1, enabled=False)
     assert ld.match_profile(10593102, 1, None) is None

@@ -29,7 +29,8 @@
 запросом (аудит 28.09, `research/audit-arhitektury-2026-09-28.md`), а не предположение.
 
 Секрет или токен проверяют только `/jivo/{token}`, `/uis/{secret}`, `/wazzup/{secret}`,
-`/site_form`, `/bothelp/academy/{secret}`. **Признаков проверки нет у трёх вебхуков** —
+`/site_form`, `/bothelp/academy/{secret}`, `/getcourse/{secret}` (с 21.10.2026, заказы
+GetCourse → сделки Академии, `getcourse_service.py`). **Признаков проверки нет у трёх вебхуков** —
 `/cdek_status`, `/contact_change`, `/lead_change` — **и у прокси штрихкодов
 `/barcode/{ident}`** (корневой `/` отдаёт состояние). То есть любой, кто
 знает адрес, может прислать событие сделки.

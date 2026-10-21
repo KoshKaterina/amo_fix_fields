@@ -24,6 +24,7 @@ import webhooks
     ("/uis/secretVALUE", "/uis/HIDDEN"),
     ("/bothelp/academy/sss", "/bothelp/academy/HIDDEN"),
     ("/admin/lead-distribution/sss/sources", "/admin/lead-distribution/HIDDEN/sources"),
+    ("/getcourse/gcSECRET", "/getcourse/HIDDEN"),
 ])
 def test_sekret_iz_puti_pryachetsya(path, expected):
     assert webhooks.mask_secret_path(path) == expected

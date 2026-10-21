@@ -1125,6 +1125,53 @@ ACADEMY_INTENT_ALERT_ENABLED = os.getenv("ACADEMY_INTENT_ALERT_ENABLED", "0") ==
 ACADEMY_ASSIGNMENT_ENABLED = os.getenv("ACADEMY_ASSIGNMENT_ENABLED", "0") == "1"
 ACADEMY_RESPONSIBLE_USER_ID = int(os.getenv("ACADEMY_RESPONSIBLE_USER_ID", "13822630"))
 ACADEMY_ASSIGNMENT_DELAY_S = float(os.getenv("ACADEMY_ASSIGNMENT_DELAY_S", "5"))
+# Источники amo, чьи сделки Академии этот модуль НЕ назначает Артёму: их раздаёт своё
+# правило распределителя. Первый такой источник - интеграция «GetCourse Академия»
+# (23478671): новые сделки из GetCourse делятся поровну между Артёмом и Кириллом
+# (Катя 21.10.2026), и без исключения модуль через 5 секунд перебивал бы Кирилла.
+# CSV из ID источников; пусто - прежнее поведение.
+ACADEMY_ASSIGNMENT_SKIP_SOURCE_IDS = {
+    int(value.strip())
+    for value in os.getenv("ACADEMY_ASSIGNMENT_SKIP_SOURCE_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+
+# Интеграция GetCourse → amo (getcourse_service.py). Процесс GetCourse по заказам вызывает
+# наш адрес, событие ложится в очередь, сделка Академии создаётся или дополняется фоном.
+# OFF по умолчанию: без флага маршрут отвечает 404 и ничего не делает.
+GETCOURSE_ENABLED = os.getenv("GETCOURSE_ENABLED", "0") == "1"
+# Холостой ход: человека и сделку ищем, решение пишем в журнал, в amo и GetCourse не пишем.
+GETCOURSE_DRY_RUN = os.getenv("GETCOURSE_DRY_RUN", "0") == "1"
+# Секрет последним сегментом пути /getcourse/{secret}: заголовки процесса GetCourse на нашем
+# тарифе не проверены. Путь маскируется в журналах (SECRET_PATH_PREFIXES в webhooks.py).
+GETCOURSE_SECRET = os.getenv("GETCOURSE_SECRET", "").strip()
+# Долгосрочный токен ОТДЕЛЬНОЙ интеграции amo «GetCourse Академия»: у её сделок свой источник,
+# по нему их раздаёт отдельное правило, и у неё свой лимит запросов. Общий TOKEN не подходит.
+GETCOURSE_AMO_TOKEN = os.getenv("GETCOURSE_AMO_TOKEN", "").strip()
+GETCOURSE_AMO_BASE_URL = os.getenv("GETCOURSE_AMO_BASE_URL", "https://new5a2e8ea7b16b4.amocrm.ru").rstrip("/")
+# Ключ API GetCourse (чтение + запись) и адрес школы. Нужен для двух вещей: записать номер
+# сделки amo в заказ GetCourse и сверить очередь с выгрузкой заказов.
+GETCOURSE_API_KEY = os.getenv("GETCOURSE_API_KEY", "").strip()
+GETCOURSE_ACCOUNT_URL = os.getenv("GETCOURSE_ACCOUNT_URL", "https://edu.sunscrypt.ru").rstrip("/")
+# Куда создавать новую сделку: «Входящий лид» Академии - точка входа распределителя.
+GETCOURSE_PIPELINE_ID = int(os.getenv("GETCOURSE_PIPELINE_ID", str(PIPELINE_ACADEMY)))
+GETCOURSE_STATUS_ID = int(os.getenv("GETCOURSE_STATUS_ID", "87654850"))
+# Поле сделки amo «ID заказа GetCourse» (заводится при выкатке). 0 - не писать.
+GETCOURSE_LEAD_ORDER_FIELD_ID = int(os.getenv("GETCOURSE_LEAD_ORDER_FIELD_ID", "0") or 0)
+# Название доп. поля ЗАКАЗА в GetCourse, куда пишем номер сделки amo. Пусто - не писать.
+# ⚠️ Включать только после проверки на тестовом заказе: Import API по номеру заказа
+# обновляет существующий, но поведение на нашем тарифе не проверено.
+GETCOURSE_GC_LEAD_FIELD = os.getenv("GETCOURSE_GC_LEAD_FIELD", "").strip()
+# Тестовый фильтр: обрабатывать события только этих учеников GetCourse (CSV ID). Пусто - всех.
+GETCOURSE_ONLY_USER_IDS = {
+    value.strip() for value in os.getenv("GETCOURSE_ONLY_USER_IDS", "").split(",") if value.strip()
+}
+# Сверка с выгрузкой заказов: раз в столько секунд, заказы не раньше этой даты (ГГГГ-ММ-ДД,
+# день включения интеграции - старые 18 тысяч заказов не сверяем). Пустая дата - сверки нет.
+GETCOURSE_RECONCILE_INTERVAL_S = int(os.getenv("GETCOURSE_RECONCILE_INTERVAL_S", "3600"))
+GETCOURSE_RECONCILE_FROM = os.getenv("GETCOURSE_RECONCILE_FROM", "").strip()
+GETCOURSE_KEEP_DAYS = int(os.getenv("GETCOURSE_KEEP_DAYS", "30"))
+GETCOURSE_WORKER_INTERVAL_S = int(os.getenv("GETCOURSE_WORKER_INTERVAL_S", "15"))
 
 STATUS_PAYMENT_REQUESTED = 87280230   # «Оплата запрошена» (тех-этап, вход)
 STATUS_LINK_SENT = 83537866           # «Ссылка отправлена» (боты этапа живут здесь)

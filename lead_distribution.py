@@ -272,6 +272,12 @@ def match_profile(pipeline_id: int, status_id: int, source_id: int | None) -> Pr
     ]
     if not candidates:
         return None
+    # Правило с конкретным источником точнее правила «любой источник» на той же точке входа
+    # и выигрывает у него без аномалии: так сделки GetCourse (свой источник) уходят своему
+    # пулу, а остальные сделки «Входящего лида» Академии - прежнему правилу (21.10.2026).
+    specific = [p for p in candidates if p.source_ids]
+    if specific:
+        candidates = specific
     if len(candidates) > 1:
         logger.error(
             "lead_distribution: НЕСКОЛЬКО профилей совпали (pipeline=%s status=%s source=%s): %s — "

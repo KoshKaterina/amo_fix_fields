@@ -7,6 +7,7 @@ import amo_service
 from waybill_config import (
     ACADEMY_ASSIGNMENT_ENABLED,
     ACADEMY_ASSIGNMENT_DELAY_S,
+    ACADEMY_ASSIGNMENT_SKIP_SOURCE_IDS,
     ACADEMY_CUTOVER_TS,
     ACADEMY_RESPONSIBLE_USER_ID,
     PIPELINE_ACADEMY,
@@ -53,11 +54,16 @@ async def apply(
 ) -> str:
     if delay:
         await asyncio.sleep(delay)
-    lead = await amo_service.get_lead_full(lead_id, with_=())
+    lead = await amo_service.get_lead_full(lead_id, with_=("source",) if ACADEMY_ASSIGNMENT_SKIP_SOURCE_IDS else ())
     if not lead:
         return "no_lead"
     if str(lead.get("pipeline_id")) != str(PIPELINE_ACADEMY):
         return "other_pipeline"
+    # Сделки этих источников раздаёт своё правило распределителя (GetCourse: Артём и
+    # Кирилл поровну). Назначение здесь перебило бы его выбор.
+    source = (lead.get("_embedded") or {}).get("source") or {}
+    if source.get("id") is not None and int(source["id"]) in ACADEMY_ASSIGNMENT_SKIP_SOURCE_IDS:
+        return "skipped_source"
     if not ACADEMY_CUTOVER_TS or int(lead.get("created_at") or 0) < ACADEMY_CUTOVER_TS:
         return "before_cutover"
     if str(lead.get("responsible_user_id")) == str(ACADEMY_RESPONSIBLE_USER_ID):

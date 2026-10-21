@@ -48,7 +48,11 @@ STAGE_PAY_LINK = 577617         # Ссылка для оплаты
 ARTEM = 13822630
 ACADEMY_MANAGER_1 = 14289086   # Акчурина Нина / manager1@sunscrypt.ru
 ACADEMY_MANAGER_2 = 14289446   # Калугин Денис / manager2@sunscrypt.ru
-ACADEMY_TEAM = (ARTEM, ACADEMY_MANAGER_1, ACADEMY_MANAGER_2)
+# Кирилл Полесский - в пуле Академии с 15.10, с 21.10 получает половину новых сделок из
+# GetCourse. Без него в списке склейка его сделки бота с формой отдавала кому-то из троих.
+ACADEMY_MANAGER_3 = 13946318   # Полесский Кирилл
+ACADEMY_MANAGERS = (ACADEMY_MANAGER_1, ACADEMY_MANAGER_2, ACADEMY_MANAGER_3)
+ACADEMY_TEAM = (ARTEM, *ACADEMY_MANAGERS)
 
 # Ранг этапа повторяет фактическое положение слева направо в воронке:
 # чем правее, тем выше приоритет. Единственное исключение — «Не трогать».
@@ -307,12 +311,12 @@ def choose_responsible(group, person_key):
     if ARTEM in owners:
         return ARTEM, "в группе есть Артём"
 
-    academy_present = [uid for uid in (ACADEMY_MANAGER_1, ACADEMY_MANAGER_2) if uid in owners]
+    academy_present = [uid for uid in ACADEMY_MANAGERS if uid in owners]
     chooser = random.Random(f"academy-dedup-2026-10-08:{person_key}")
     if len(academy_present) == 1:
         return academy_present[0], "сохранён единственный менеджер Академии из группы"
-    if len(academy_present) == 2:
-        return chooser.choice(academy_present), "случайно выбран один из двух менеджеров Академии"
+    if len(academy_present) > 1:
+        return chooser.choice(academy_present), "случайно выбран один из менеджеров Академии в группе"
 
     return chooser.choice(ACADEMY_TEAM), "прочий ответственный перераспределён внутри команды Академии"
 

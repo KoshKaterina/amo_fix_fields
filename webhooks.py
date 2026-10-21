@@ -49,6 +49,7 @@ import showroom_alert
 import showroom_store
 import showroom_tag
 import site_form_service
+import getcourse_service
 import team_panel_client
 import telegram_bot
 import telegram_contact
@@ -95,7 +96,7 @@ from waybill_config import (
 # перенос в заголовки требует перенастройки на стороне Jivo, UIS, Wazzup и BotHelp), путь
 # нельзя писать в журнал целиком.
 SECRET_PATH_PREFIXES = ("/jivo/", "/uis/", "/wazzup/", "/bothelp/academy/",
-                        "/admin/lead-distribution/")
+                        "/admin/lead-distribution/", "/getcourse/")
 
 
 def mask_secret_path(path: str) -> str:
@@ -218,6 +219,9 @@ async def lifespan(app):
     await budget_mismatch_watch.init()
     # Формы сайта: без SITE_FORM_ENABLED роут отвечает 404 и ничего не делает.
     await site_form_service.init()
+    # Заказы GetCourse → сделки Академии (21.10.2026): без GETCOURSE_ENABLED роут отвечает
+    # 404, ни очередь, ни обработчик не поднимаются.
+    await getcourse_service.init()
     # Сторож писем (26.09.2026): входящее письмо в закрытую сделку теряется для работы -
     # amoCRM продолжает старую цепочку и нового «Неразобранного» не создаёт. Модуль сам
     # первым делом смотрит MAIL_WATCH_ENABLED и без него не поднимает ни базу, ни цикл.
@@ -255,6 +259,7 @@ async def lifespan(app):
     await office_record_watch.shutdown()
     await budget_mismatch_watch.shutdown()
     await site_form_service.shutdown()
+    await getcourse_service.shutdown()
     await mail_watch.shutdown()
     await amgroup_fallback.shutdown()
     await amgroup_shipment.shutdown()
@@ -524,6 +529,31 @@ async def site_form(request: Request):
         return {"ok": True}
     site_form_service.handle_bg(payload, ip)
     return {"ok": True}
+
+
+@app.post("/getcourse/{secret}")
+async def getcourse(secret: str, request: Request):
+    """Вызов процесса GetCourse по заказу → очередь → сделка Академии (getcourse_service).
+
+    Секрет в пути: заголовки процесса GetCourse на нашем тарифе не проверены. Путь
+    маскируется в журнале (SECRET_PATH_PREFIXES). 200 - только когда событие легло в очередь:
+    GetCourse вызов не повторяет, и потерянный ответ увидит только сверка с выгрузкой.
+    Тело - JSON, на запасной случай принимаем и форму с теми же плоскими ключами.
+    """
+    if not getcourse_service.is_enabled():
+        return Response("disabled", status_code=404)
+    if not getcourse_service.authorized(secret):
+        raise HTTPException(status_code=404, detail="Not found")
+    raw = await request.body()
+    if len(raw) > getcourse_service.MAX_BODY_BYTES:
+        return JSONResponse({"ok": False, "error": "too-large"}, status_code=413)
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw.strip().startswith(b"{") else dict(await request.form())
+    except Exception:
+        logger.warning("getcourse: тело не разобралось")
+        return JSONResponse({"ok": False, "error": "bad-body"}, status_code=422)
+    status_code, body = await getcourse_service.accept(payload if isinstance(payload, dict) else {})
+    return JSONResponse(body, status_code=status_code)
 
 
 @app.post("/ozon_notify")
