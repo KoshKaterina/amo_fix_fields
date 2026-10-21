@@ -1,0 +1,3 @@
+ARG SOURCE_IMAGE
+FROM ${SOURCE_IMAGE}
+RUN chmod 0644 /app/academy_bothelp_upsert.py
