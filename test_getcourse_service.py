@@ -215,6 +215,15 @@ def test_parse_rejects(bad, code):
         gs.parse(payload(**bad))
 
 
+def test_answer_states_names_state_not_values():
+    line = gs.answer_states({"a_experience": "Есть базовый опыт", "a_earn": "{object.Что важнее?}",
+                             "a_level": " ", "email": "x@y.ru"})
+    assert "a_experience=17 симв." in line and "Есть базовый" not in line
+    assert "a_earn=не подставлено '{object.Что важнее?}'" in line
+    assert "a_level=пусто" in line
+    assert "нет параметров: a_interest" in line and "x@y.ru" not in line
+
+
 def test_accept_validation_and_duplicate(fake):
     assert run(gs.accept({"order_id": "x"}))[0] == 422
     assert run(gs.accept(payload())) == (200, {"ok": True, "status": "accepted"})
