@@ -2,8 +2,11 @@
 .idea/
 __pycache__/
 *.log
-.env
-.env.test
+# Never bake active credentials or backup copies into any image layer.
+.env*
+**/.env*
+.git/
+.pytest_cache/
 
 # runtime state/cache (lead_distribution rotation/counters/profiles-кэш) — не должно
 # запекаться в образ: единственный источник на сервере — смонтированный volume под var/
