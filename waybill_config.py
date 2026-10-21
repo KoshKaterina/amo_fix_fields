@@ -612,6 +612,9 @@ AMGROUP_DUP_WATCH_DRY_RUN = os.getenv("AMGROUP_DUP_WATCH_DRY_RUN", "1") == "1"
 # безопасные: выключен и в сухом режиме (только лог, без записей в amo и в чат).
 AMGROUP_CONTACT_HEAL_ENABLED = os.getenv("AMGROUP_CONTACT_HEAL_ENABLED", "0") == "1"
 AMGROUP_CONTACT_HEAL_DRY_RUN = os.getenv("AMGROUP_CONTACT_HEAL_DRY_RUN", "1") == "1"
+# Сухой режим с алертом (Катя 21.10.2026: «го на сухой выкат и на сообщение алерта»): в amo
+# по-прежнему ничего не пишем, но решение по каждой сделке уходит в тех.чат один раз.
+AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS = os.getenv("AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS", "0") == "1"
 AMGROUP_CONTACT_HEAL_INTERVAL_SEC = int(os.getenv("AMGROUP_CONTACT_HEAL_INTERVAL_SEC", "180"))
 # Сколько ждём amgroup, прежде чем вмешаться. В норме он привязывает за 2-5 с,
 # при тормозах amo бывало 16 с; пять минут - с запасом, чтобы не гоняться с ним.

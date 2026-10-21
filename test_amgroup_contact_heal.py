@@ -126,12 +126,17 @@ def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(heal, "_state_loaded", False)
     monkeypatch.setattr(heal, "_PAUSE_SEC", 0)
     monkeypatch.setattr(heal, "_SCHEDULE_MARGIN_S", 0)
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS", False)
+    monkeypatch.setattr(heal, "_DRY_STATE_PATH", str(tmp_path / "heal_dry.json"))
+    monkeypatch.setattr(heal, "_dry_alerted_loaded", False)
     heal._state.clear()
     heal._dry_logged.clear()
+    heal._dry_alerted.clear()
     heal._in_flight.clear()
     yield
     heal._state.clear()
     heal._dry_logged.clear()
+    heal._dry_alerted.clear()
 
 
 PHONE_Q = "79123456789"
@@ -353,6 +358,64 @@ def test_suhoy_rezhim_nol_kandidatov_bez_alerta(monkeypatch):
     assert fake.run() == heal.NO_CANDIDATE
     assert not fake.notes and not fake.alerts
     assert not heal._handled(LEAD_ID)
+
+
+def test_suhoy_rezhim_s_alertom_odin_raz_na_sdelku(monkeypatch):
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN", True)
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS", True)
+    fake = Fake(monkeypatch, leads=[_lead()],
+                search={PHONE_Q: [_contact(48559931, phones=["+79123456789"])]})
+
+    assert fake.run() == heal.DRY_RUN_WOULD_LINK
+    assert len(fake.alerts) == 1
+    assert "Сухой режим" in fake.alerts[0] and "contacts/detail/48559931" in fake.alerts[0]
+    assert str(LEAD_ID) in fake.alerts[0] and "19805" in fake.alerts[0]
+    assert not fake.links and not fake.notes and not fake.distributed
+    assert not heal._handled(LEAD_ID)  # боевое состояние не тронуто
+    # Следующий проход и перезапуск - повторного сообщения нет.
+    assert fake.run() == heal.DRY_RUN_WOULD_LINK
+    heal._dry_alerted.clear()
+    monkeypatch.setattr(heal, "_dry_alerted_loaded", False)
+    assert fake.run() == heal.DRY_RUN_WOULD_LINK
+    assert len(fake.alerts) == 1
+
+
+def test_suhoy_rezhim_s_alertom_nol_kandidatov(monkeypatch):
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN", True)
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS", True)
+    fake = Fake(monkeypatch, leads=[_lead()])
+    assert fake.run() == heal.NO_CANDIDATE
+    assert len(fake.alerts) == 1 and "Позвали бы человека" in fake.alerts[0]
+    assert not fake.notes
+
+
+def test_suhoy_rezhim_alert_ne_ushel_povtorim(monkeypatch):
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN", True)
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS", True)
+    fake = Fake(monkeypatch, leads=[_lead()])
+    sent = []
+
+    async def flaky(text, **kw):
+        sent.append(text)
+        return len(sent) > 1
+
+    monkeypatch.setattr(heal.telegram_bot, "send_alert", flaky)
+    fake.run()
+    fake.run()
+    fake.run()
+    assert len(sent) == 2
+
+
+def test_suhoy_rezhim_ne_meshaet_boevomu(monkeypatch):
+    """Отметки сухого режима не делают сделку «обработанной» для боевого."""
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN", True)
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS", True)
+    fake = Fake(monkeypatch, leads=[_lead(), _lead(), _lead(), _lead(contacts=[1])],
+                search={PHONE_Q: [_contact(1, phones=["+79123456789"])]})
+    assert fake.run() == heal.DRY_RUN_WOULD_LINK
+    monkeypatch.setattr(heal, "AMGROUP_CONTACT_HEAL_DRY_RUN", False)
+    assert fake.run() == heal.LINKED
+    assert fake.links == [(LEAD_ID, 1, True)]
 
 
 def test_vyklyuchen_flag_nichego_ne_chitaet(monkeypatch):

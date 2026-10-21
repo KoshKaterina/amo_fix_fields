@@ -32,7 +32,9 @@ amo_service: сеть, таймаут, 5xx, 429, открытый брейкер
 сделку видит первым (schedule_after_contact_wait).
 
 Сухой режим (по умолчанию): все чтения и решение как в боевом, в лог пишем,
-что сделали бы; ни привязки, ни примечаний, ни алертов, ни состояния на диске.
+что сделали бы; ни привязки, ни примечаний, ни боевого состояния на диске. С
+AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS решение ещё и уходит в тех.чат с пометкой
+«сухой режим», один раз на сделку (отметки - в отдельном файле).
 
 Состояние на диске - сделки с завершённым исходом (привязали или позвали
 человека), чтобы не повторять алерт на каждом проходе и после пересборки.
@@ -57,6 +59,7 @@ from shared.files import read_json, write_json_atomic
 from shared.phones import digits_only, ru_8_to_7
 from waybill_config import (
     AMGROUP_CONTACT_HEAL_DRY_RUN,
+    AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS,
     AMGROUP_CONTACT_HEAL_ENABLED,
     AMGROUP_CONTACT_HEAL_INTERVAL_SEC,
     AMGROUP_CONTACT_HEAL_LOOKBACK_H,
@@ -117,6 +120,10 @@ _state: dict[str, dict] = {}
 _state_loaded = False
 # Сухой режим: что уже залогировали, чтобы один и тот же вывод не повторялся каждые 3 минуты.
 _dry_logged: set[tuple[int, str]] = set()
+# Сухой режим с алертами: по каким сделкам решение уже ушло в тех.чат (на диске).
+_DRY_STATE_PATH = os.getenv("AMGROUP_CONTACT_HEAL_DRY_STATE_PATH", "/app/var/amgroup_contact_heal_dry.json")
+_dry_alerted: set[str] = set()
+_dry_alerted_loaded = False
 
 _in_flight: set[int] = set()
 _bg_tasks: set[asyncio.Task] = set()
@@ -304,6 +311,7 @@ async def _heal(lid: int) -> str:
 
     if AMGROUP_CONTACT_HEAL_DRY_RUN:
         _dry_log(lid, DRY_RUN_WOULD_LINK, f"привязали бы контакт {contact_id}")
+        await _dry_alert(lead, f"Привязали бы контакт {AMO_CONTACT_URL.format(contact_id)}")
         return DRY_RUN_WOULD_LINK
 
     # Перечитываем прямо перед записью: amgroup мог успеть, пока мы ходили в склад.
@@ -369,6 +377,9 @@ async def _call_human(lead: dict, outcome: str, contact_ids: list[int]) -> str:
     contacts_line = ", ".join(AMO_CONTACT_URL.format(c) for c in contact_ids)
     if AMGROUP_CONTACT_HEAL_DRY_RUN:
         _dry_log(lid, outcome, f"позвали бы человека: {reason} {contacts_line}".strip())
+        await _dry_alert(
+            lead, f"Позвали бы человека: {reason}." + (f"\nКандидаты: {contacts_line}" if contacts_line else ""),
+        )
         return outcome
 
     await amo_service.add_note(
@@ -377,21 +388,64 @@ async def _call_human(lead: dict, outcome: str, contact_ids: list[int]) -> str:
         + (f" Кандидаты: {contacts_line}." if contacts_line else "")
         + " Привяжите контакт вручную - без него не создаётся накладная СДЭК.",
     )
-    order = str(amo_service.get_custom_field_value(lead, FIELD_ORDER_NUMBER) or "").strip()
     text = (
-        f"⚠️ Сделка без контакта: amgroup не привязал контакт{f' (заказ МС {order})' if order else ''}.\n"
+        f"⚠️ Сделка без контакта: amgroup не привязал контакт{_order_suffix(lead)}.\n"
         f"Автоматически не привязали: {reason}.\n"
         + (f"Кандидаты: {contacts_line}\n" if contacts_line else "")
         + f"{AMO_LEAD_URL.format(lid)}\nКонтакт не создавали, привяжите вручную."
     )
-    try:
-        d = alerts.decide("amgroup_contact_heal", legacy_text=text, values={}, keep_text=True)
-        if d is not None:
-            await telegram_bot.send_alert(d.text, **d.send_kwargs())
-    except Exception:
-        logger.exception("amgroup_contact_heal %s: алерт не отправился", lid)
+    await _send_alert(lid, text)
     _remember(lid, outcome)
     return outcome
+
+
+def _order_suffix(lead: dict) -> str:
+    order = str(amo_service.get_custom_field_value(lead, FIELD_ORDER_NUMBER) or "").strip()
+    return f" (заказ МС {order})" if order else ""
+
+
+async def _send_alert(lid: int, text: str) -> bool:
+    try:
+        d = alerts.decide("amgroup_contact_heal", legacy_text=text, values={}, keep_text=True)
+        if d is None:
+            return True
+        return bool(await telegram_bot.send_alert(d.text, **d.send_kwargs()))
+    except Exception:
+        logger.exception("amgroup_contact_heal %s: алерт не отправился", lid)
+        return False
+
+
+def _load_dry_state() -> None:
+    global _dry_alerted_loaded
+    if _dry_alerted_loaded:
+        return
+    _dry_alerted_loaded = True
+    data = read_json(_DRY_STATE_PATH, default=[])
+    if isinstance(data, list):
+        _dry_alerted.update(str(x) for x in data)
+
+
+async def _dry_alert(lead: dict, verdict: str) -> None:
+    """Сухой режим с AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS: решение в тех.чат, один раз на
+    сделку (отметки на диске отдельно от боевого состояния - боевой режим их не видит)."""
+    if not AMGROUP_CONTACT_HEAL_DRY_RUN_ALERTS:
+        return
+    lid = int(lead["id"])
+    _load_dry_state()
+    if str(lid) in _dry_alerted:
+        return
+    text = (
+        f"🧪 Сухой режим, в amo ничего не записано.\n"
+        f"Сделка без контакта: amgroup не привязал контакт{_order_suffix(lead)}.\n"
+        f"{verdict}\n{AMO_LEAD_URL.format(lid)}"
+    )
+    if not await _send_alert(lid, text):
+        return
+    _dry_alerted.add(str(lid))
+    try:
+        write_json_atomic(_DRY_STATE_PATH, sorted(_dry_alerted)[-_STATE_CAP:])
+    except Exception:
+        logger.exception("amgroup_contact_heal: не записался %s", _DRY_STATE_PATH)
 
 
 # ════════════════ входы: фоновый проход и хвост ожидания распределения ════════════════
