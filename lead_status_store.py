@@ -166,6 +166,13 @@ def is_awaiting_refill(lead_id) -> bool:
 
 def note_and_changed(lead_id, status_id) -> bool:
     """Запомнить этап сделки и сказать, СМЕНИЛСЯ ли он с прошлого раза.
+    Обёртка над `note_and_previous` — см. там.
+    """
+    return note_and_previous(lead_id, status_id)[0]
+
+
+def note_and_previous(lead_id, status_id) -> tuple[bool, int | None]:
+    """Запомнить этап сделки; вернуть (сменился ли он, прошлый этап или None).
 
     `True`  — этап другой, чем в прошлый раз, ИЛИ сделку видим впервые;
     `False` — этап тот же самый, то есть этот вебхук про что-то другое
@@ -176,12 +183,17 @@ def note_and_changed(lead_id, status_id) -> bool:
 
     Любая ошибка хранилища — тоже `True`: гейт обязан пропускать при сомнении,
     иначе сломанная база молча остановит переносы в Офис.
+
+    Прошлый этап `None` — сделку видим впервые или хранилище не ответило.
+    lead_distribution по нему отличает ручной возврат на точку входа с другого
+    этапа (`(True, <другой этап>)`) от «не знаю, что было» (`(True, None)`):
+    в первом случае раздаёт заново, во втором — нет (20.10.2026).
     """
     try:
         lid = int(lead_id)
         sid = int(status_id)
     except (TypeError, ValueError):
-        return True
+        return True, None
     now = int(time.time())
     try:
         with _conn() as conn:
@@ -196,10 +208,11 @@ def note_and_changed(lead_id, status_id) -> bool:
             )
     except Exception:
         logger.exception("lead_status_store: сделка %s — ошибка хранилища, считаем переходом", lid)
-        return True
+        return True, None
     if row is None:
-        return True
-    return int(row[0]) != sid
+        return True, None
+    prev = int(row[0])
+    return prev != sid, prev
 
 
 def last_seen(lead_id):

@@ -18,7 +18,7 @@
 | **общие мелочи — брать отсюда** | `shared/`: `timez.py` (московское время), `files.py` (атомарная запись json), `phones.py` (примитивы над номером). Сторож против новых копий — `test_no_new_copies.py` |
 | клиенты наружу | `amo_service.py`, `cdek_client.py`, `api.py` (очередь, токен-бакет, предохранитель) |
 | очередь задач | `queue_manager.py`, `task_queue_store.py` |
-| хранилища | 8 файлов `*_store.py` (7 из них на sqlite); всего **8 баз** `/app/var/*.sqlite3` |
+| хранилища | 9 файлов `*_store.py` (8 из них на sqlite); всего **9 баз** `/app/var/*.sqlite3` (с 20.10.2026 + `lead_distribution_routed` — защита от повторной раздачи лидов) |
 | состояние «что уже сделали» | 13 json в `/app/var/` (дедуп алертов, отметки отгрузок) |
 | прод | сервер №2 `85.193.91.169`, `/opt/integrations/amo_fix_fields`, docker compose, контейнер `amo-fix-fields` на `127.0.0.1:8010`, вебхуки через `team.sunscrypt.ru/amo/` |
 | свои README | `ops/watchdog/README.md`, `ops/server2-integrations/README.md` |

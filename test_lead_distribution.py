@@ -25,6 +25,8 @@ import lead_distribution as ld
 import pytest
 import lead_distribution_log_client
 import lead_distribution_profiles_client as ldpc
+import lead_distribution_routed_store as routed_store
+import lead_status_store
 import team_panel_client
 import telegram_bot
 from waybill_config import FIELD_PHONE
@@ -60,6 +62,11 @@ def setup_function(_=None):
     ldpc._cache = {}
     ld.COUNTERS_PATH = _TMP / f"counters_{time.monotonic_ns()}.json"
     ld.ROTATION_PATH = _TMP / f"rotation_{time.monotonic_ns()}.json"
+    # Запись «распределена» - своя база на тест: подменяем путь на модуле, который
+    # держит lead_distribution (ld.routed_store), а не на своём import - грабля 1.
+    ld.routed_store.DB_PATH = str(_TMP / f"routed_{time.monotonic_ns()}.sqlite3")
+    lead_status_store.DB_PATH = str(_TMP / f"lead_status_{time.monotonic_ns()}.sqlite3")
+    lead_status_store.init()
     ld._pending_fail.clear()
     ld._contact_wait_pending.clear()
     ld._bg_tasks.clear()
@@ -721,7 +728,9 @@ def test_assignment_is_counted_only_in_its_pipeline():
 
 def test_old_shared_counters_file_of_today_is_migrated():
     """Файл, записанный до правки: общие counts без воронки. Счётчики и назначения
-    обнуляются (разложить не из чего), защита от повторной раздачи сохраняется."""
+    обнуляются (разложить не из чего), дедуп журнала сохраняется. routed_ids из
+    файла выбрасывается: защита от повторной раздачи с 20.10.2026 живёт в
+    lead_distribution_routed_store, а не в суточном файле."""
     ld.COUNTERS_PATH.write_text(json.dumps({
         "date": ld._today_msk(), "counts": {"1": {"42": 7}},
         "assignments": {"900": {"source_id": 42, "user_id": 1, "date": ld._today_msk()}},
@@ -731,7 +740,7 @@ def test_old_shared_counters_file_of_today_is_migrated():
     assert state["v"] == ld.COUNTERS_VERSION
     assert state["counts_by_pipeline"] == {}
     assert state["assignments"] == {}
-    assert state["routed_ids"] == [900, 901]
+    assert "routed_ids" not in state
     assert state["outcomes_logged"] == ["902:no_candidate"]
     assert "counts" not in state
 
@@ -1116,8 +1125,8 @@ def test_lead_with_skip_tag_is_not_routed():
 
     assert outcome == "skipped-tag"
     assert not _patch_calls, "ответственного на такой сделке не меняем"
-    assert 360 not in ld._load_counters_state().get("routed_ids", []), \
-        "счётчики нагрузки на пропущенной сделке не расходуются"
+    assert not routed_store.is_routed(360), \
+        "пропущенная сделка распределённой не считается"
 
 
 def test_skip_tag_match_is_case_insensitive():
@@ -1146,7 +1155,7 @@ def test_lead_with_skip_name_prefix_is_not_routed():
 
     assert outcome == "skipped-name"
     assert not _patch_calls
-    assert 363 not in ld._load_counters_state().get("routed_ids", [])
+    assert not routed_store.is_routed(363)
 
 
 def test_skip_name_prefix_matches_site_variant_and_case():
@@ -1200,7 +1209,9 @@ def test_locally_routed_lead_is_not_processed_again():
     """Фейковое хранилище _lead_by_id НЕ мутируется PATCH'ем - как и настоящий
     amoCRM какое-то время после записи, повторный GET видит сделку БЕЗ тега
     (25.08.2026: новым сделкам тег вообще больше не ставится). Идемпотентность
-    держит _routed_ids - постоянная локальная запись, без окна/истечения."""
+    держит lead_distribution_routed_store - запись на 30 дней, переживает полночь
+    (до 20.10.2026 здесь было написано «постоянная, без окна» - это было неверно:
+    routed_ids жил в суточном файле счётчиков и обнулялся в полночь)."""
     _reset_fakes()
     _seed_profile(name="Dedup", participant_ids=[1, 2])
     lead = _lead(lead_id=320, source_id=1, contacts=[{"id": 500}])
@@ -1210,7 +1221,10 @@ def test_locally_routed_lead_is_not_processed_again():
     first = run(ld.process_lead_distribution(320))
     assert first == "routed"
     assert len(_patch_calls) == 1
-    assert 320 in ld._load_counters_state().get("routed_ids", [])
+    assert routed_store.is_routed(320)
+    row = routed_store.get(320)
+    assert row["assigned_user_id"] == _patch_calls[0]["responsible_user_id"]
+    assert row["profile_id"]
 
     second = run(ld.process_lead_distribution(320))
     assert second == "skipped-already-routed"
@@ -1232,37 +1246,151 @@ def test_new_lead_patch_does_not_add_routed_tag():
     assert "tags" not in _patch_calls[0]
 
 
-def test_routed_ids_reset_with_daily_counters():
-    """routed_ids живёт внутри суточного состояния счётчиков, не отдельным
-    вечно растущим файлом (по вопросу Тианы 25.08.2026: рост стоимости записи
-    без потолка был бы проблемой, суточного окна с огромным запасом хватает,
-    чтобы пережить саму гонку read-after-write - та разрешается за секунды)."""
-    _reset_fakes()
-    _seed_profile(name="RoutedIdsReset", participant_ids=[1, 2])
-    lead = _lead(lead_id=326, source_id=1, contacts=[{"id": 500}])
-    _lead_by_id[326] = lead
-    _contact_by_id[500] = _contact(500, other_leads=[])
-    run(ld.process_lead_distribution(326))
-    assert 326 in ld._load_counters_state().get("routed_ids", [])
+# ════════════════ повторная раздача на следующий день (найдено вживую 20.10.2026) ════════════════
+# routed_ids жил в суточном файле счётчиков и обнулялся в полночь. Сделка, переночевавшая
+# на точке входа, при утреннем обновлении (закрыли задачу «Новый заказ с сайта») уходила
+# другому менеджеру: 36582977 и 36582987 - от Егора Константинова к Кириллу Полесскому.
 
-    # эмулируем наступление нового дня - _load_counters_state сам сбрасывает
-    # всё состояние целиком (counts/assignments/routed_ids), как уже делает
-    # для дневных счётчиков нагрузки.
+def _route_once(lead_id: int) -> int:
+    _reset_fakes()
+    _seed_profile(name=f"Routed{lead_id}", participant_ids=[1, 2])
+    _lead_by_id[lead_id] = _lead(lead_id=lead_id, source_id=1, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    assert run(ld.process_lead_distribution(lead_id)) == "routed"
+    return _patch_calls[0]["responsible_user_id"]
+
+
+def test_lead_routed_yesterday_is_not_rerouted_by_todays_webhook():
+    """Ядро правки: распределена вчера, сегодня пришёл вебхук по той же сделке на
+    том же входном этапе - решение не принимается заново."""
+    _reset_fakes()
+    _seed_profile(name="Yesterday", participant_ids=[1, 2])
+    _lead_by_id[330] = _lead(lead_id=330, source_id=1, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    routed_store.mark_routed(330, 1, "p", routed_at=int(time.time()) - 86400)
+    # вчерашний файл счётчиков - такой, каким его видит процесс после полуночи
+    ld.COUNTERS_PATH.write_text(json.dumps({"v": ld.COUNTERS_VERSION, "date": "2000-01-01",
+                                            "counts_by_pipeline": {}, "assignments": {}}),
+                                encoding="utf-8")
+
+    assert run(ld.process_lead_distribution(330)) == "skipped-already-routed"
+    assert not _patch_calls
+
+
+def test_day_change_does_not_lose_routed_protection():
+    """Смена суток обнуляет счётчики нагрузки (так и задумано), но не защиту:
+    сделка, распределённая сегодня, завтра не раздаётся заново."""
+    _route_once(326)
     stale = json.loads(ld.COUNTERS_PATH.read_text(encoding="utf-8"))
     stale["date"] = "2000-01-01"
     ld.COUNTERS_PATH.write_text(json.dumps(stale), encoding="utf-8")
-    assert 326 not in ld._load_counters_state().get("routed_ids", [])
+    assert ld._load_counters_state()["counts_by_pipeline"] == {}, "счётчики суточные"
+
+    _patch_calls.clear()
+    assert run(ld.process_lead_distribution(326)) == "skipped-already-routed"
+    assert not _patch_calls
+
+
+def test_return_to_entry_from_other_stage_routes_again():
+    """Ручной возврат в «Новый лид» с другого этапа - раздать заново (решение Кати
+    20.10.2026). Прошлый этап знает lead_status_store - тем же путём, что webhooks.py."""
+    _route_once(327)
+    entry = 83537714
+    lead_status_store.note_and_previous(327, entry)          # распределили на входе
+    changed, prev = lead_status_store.note_and_previous(327, 83537718)  # унесли в работу
+    assert changed and prev == entry
+    changed, prev = lead_status_store.note_and_previous(327, entry)     # вернули
+    assert changed and prev == 83537718
+
+    assert run(ld.forget_routed_on_reentry(327, prev, entry)) is True
+    _patch_calls.clear()
+    assert run(ld.process_lead_distribution(327)) == "routed"
+    assert len(_patch_calls) == 1
+    assert routed_store.is_routed(327), "после новой раздачи запись снова стоит"
+
+
+def test_update_on_same_entry_stage_keeps_routed_record():
+    """Стояла на точке входа и раньше (закрыли задачу, поправили поле, эхо PATCH) -
+    это не возврат, запись не снимается."""
+    _route_once(328)
+    lead_status_store.note_and_previous(328, 83537714)
+    changed, prev = lead_status_store.note_and_previous(328, 83537714)
+    assert not changed and prev == 83537714
+
+    assert run(ld.forget_routed_on_reentry(328, prev, 83537714)) is False
+    _patch_calls.clear()
+    assert run(ld.process_lead_distribution(328)) == "skipped-already-routed"
+    assert not _patch_calls
+
+
+def test_unknown_previous_stage_keeps_routed_record():
+    """lead_status_store сделку не знает (база потеряна, видим впервые) - главная
+    запись «распределена», перераздачи нет."""
+    _route_once(329)
+    changed, prev = lead_status_store.note_and_previous(329, 83537714)
+    assert changed and prev is None
+
+    assert run(ld.forget_routed_on_reentry(329, prev, 83537714)) is False
+    _patch_calls.clear()
+    assert run(ld.process_lead_distribution(329)) == "skipped-already-routed"
+
+
+def test_routed_record_older_than_30_days_is_removed():
+    now = int(time.time())
+    routed_store.mark_routed(331, 1, "p", routed_at=now - 31 * 86400)
+    routed_store.mark_routed(332, 1, "p", routed_at=now - 29 * 86400)
+    assert not routed_store.is_routed(331), "просроченная запись уже не защищает"
+    assert routed_store.is_routed(332)
+
+    assert routed_store.prune() == 1
+    assert routed_store.get(331) is None
+    assert routed_store.get(332) is not None
+
+
+def test_routed_store_failure_does_not_reroute():
+    """Хранилище не ответило - решение не принимаем: раздать заново ровно та бага,
+    от которой запись защищает. Сделку подберёт следующий вебхук или reconciliation."""
+    _reset_fakes()
+    _seed_profile(name="StoreDown", participant_ids=[1, 2])
+    _lead_by_id[333] = _lead(lead_id=333, source_id=1, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+
+    def _boom(_lead_id):
+        raise OSError("disk I/O error")
+
+    real = ld.routed_store.is_routed
+    ld.routed_store.is_routed = _boom
+    try:
+        assert run(ld.process_lead_distribution(333)) == "failed-routed-store"
+    finally:
+        ld.routed_store.is_routed = real
+    assert not _patch_calls
+
+
+def test_backfill_keeps_newer_live_record():
+    """Заполнение из журнала панели при выкатке: вставляет недостающие, свежую живую
+    запись старой строкой журнала не затирает."""
+    now = int(time.time())
+    routed_store.mark_routed(334, 7, "live", routed_at=now)
+    changed = routed_store.backfill([
+        (334, now - 3600, 1, "log"),
+        (335, now - 86400, 2, "log"),
+        (335, now - 2 * 86400, 3, "log"),
+    ])
+    assert changed == 1
+    assert routed_store.get(334)["profile_id"] == "live"
+    assert routed_store.get(335)["assigned_user_id"] == 2
 
 
 def test_old_tag_still_recognized_for_idempotency():
     """Обратная совместимость: сделки, помеченные ДО 25.08.2026 (тег уже стоит),
     по-прежнему считаются распределёнными - тег с них не снимаем и не задваиваем
-    решение, даже если их lead_id никогда не попадал в routed_ids."""
+    решение, даже если записи в lead_distribution_routed_store по ним нет."""
     _reset_fakes()
     _seed_profile(name="OldTag")
     lead = _lead(lead_id=325, source_id=1, tags=[{"name": ld.TAG_LEAD_DISTRIBUTION_ROUTED}])
     _lead_by_id[325] = lead
-    assert 325 not in ld._load_counters_state().get("routed_ids", [])
+    assert not routed_store.is_routed(325)
     outcome = run(ld.process_lead_distribution(325))
     assert outcome == "skipped-already-routed"
     assert not _patch_calls

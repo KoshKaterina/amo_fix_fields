@@ -751,9 +751,10 @@ async def lead_change(request: Request):
     # на часы, вытеснив платёжные ссылки и распределение. Подробности — докстринг
     # lead_status_store.py.
     status_changed = True
+    prev_status = None
     if lead_id is not None and incoming_status is not None:
-        status_changed = await asyncio.to_thread(
-            lead_status_store.note_and_changed, lead_id, incoming_status
+        status_changed, prev_status = await asyncio.to_thread(
+            lead_status_store.note_and_previous, lead_id, incoming_status
         )
 
     if (
@@ -815,6 +816,11 @@ async def lead_change(request: Request):
             else:
                 _ld_matched = lead_distribution.has_matching_status(_ld_status)
             if _ld_matched:
+                # Вернули на точку входа с другого этапа (прошлый этап - из
+                # lead_status_store выше) - снять запись «распределена», раздать
+                # заново. Стояла на точке входа и раньше - запись держит, повторной
+                # раздачи нет. См. lead_distribution.forget_routed_on_reentry.
+                await lead_distribution.forget_routed_on_reentry(lead_id, prev_status, _ld_status)
                 logger.info("Lead %s entered %s — enqueue lead_distribution", lead_id, incoming_status)
                 enqueue_lead_distribution(lead_id, source="webhook")
 
