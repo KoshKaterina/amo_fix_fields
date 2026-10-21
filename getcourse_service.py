@@ -247,9 +247,12 @@ async def accept(payload: dict) -> tuple[int, dict]:
     except Exception:
         logger.exception("getcourse: очередь недоступна, событие %s не принято", event_id)
         return 503, {"ok": False, "error": "store"}
+    # Временно: и для повтора - повторный вызов процесса по уже принятому заказу ничего не
+    # пишет в amo, а состав параметров покажет.
+    logger.info("getcourse: ответы %s%s: %s", event_id, "" if inserted else " (повтор)",
+                answer_states(payload))
     if inserted:
         logger.info("getcourse: принято %s (заказ #%s)", event_id, ev["order_number"] or "?")
-        logger.info("getcourse: ответы %s: %s", event_id, answer_states(payload))
         _kick()
     return 200, {"ok": True, "status": "accepted" if inserted else "duplicate"}
 
