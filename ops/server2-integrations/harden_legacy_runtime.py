@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
+from contextlib import closing
 import subprocess
 import time
 import urllib.request
@@ -47,12 +49,19 @@ def main():
     parser.add_argument('--backup-dir', type=Path, required=True)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--image', help='Optional verified image with identical application bytes')
+    parser.add_argument('--dependency-refresh', action='store_true',
+                        help='Replace an already hardened container with a tested dependency image')
     args = parser.parse_args()
     name = args.container
     original = inspect(name)
     assert original['State']['Running']
     assert original['HostConfig']['NetworkMode'] == 'bridge'
-    assert original['Config']['User'] in ('', '0', 'root')
+    if args.dependency_refresh:
+        assert args.image, 'Dependency refresh requires an explicit verified image'
+        assert original['Config']['User'] == '65532:65532'
+        assert original['HostConfig']['ReadonlyRootfs']
+    else:
+        assert original['Config']['User'] in ('', '0', 'root')
     assert original['HostConfig']['PortBindings']['8000/tcp'][0]['HostIp'] == '127.0.0.1'
     assert len(original['Mounts']) == 1 and original['Mounts'][0]['Destination'] == '/app/var'
     backup = args.backup_dir / name
@@ -80,8 +89,21 @@ def main():
     if not args.apply:
         print(f'{name}: preflight passed; no runtime changes')
         return
-    candidate = name + '-security-candidate'
-    rollback_name = name + '-security-rollback'
+    suffix = '-deps' if args.dependency_refresh else '-security'
+    candidate = name + suffix + '-candidate'
+    rollback_name = name + suffix + '-rollback'
+    # A stopped worker can safely resume its current queue, but do not interrupt
+    # an explicitly leased delivery when a short defer is enough.
+    env = dict(value.split('=', 1) for value in original['Config']['Env'])
+    queue_path = env.get('ACADEMY_INVITE_OUTBOX_PATH')
+    if queue_path:
+        relative = Path(queue_path).relative_to('/app/var')
+        assert '..' not in relative.parts
+        source = Path(original['Mounts'][0]['Source']) / relative
+        with closing(sqlite3.connect('file:' + str(source) + '?mode=ro', uri=True)) as db:
+            active = db.execute('SELECT count(*) FROM invite_job WHERE lease_until > ?',
+                                (time.time(),)).fetchone()[0]
+        assert active == 0, 'Active delivery lease; defer this replacement'
     created = api('POST', '/containers/create?name=' + candidate, config)['Id']
     new = inspect(created)
     assert new['Config']['Env'] == original['Config']['Env']
