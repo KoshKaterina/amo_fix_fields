@@ -15,7 +15,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = pathlib.Path(__file__).resolve().parent
-STATE = pathlib.Path("/var/lib/academy-dedup")
+STATE = pathlib.Path(os.environ.get("ACADEMY_DEDUP_WEBHOOK_STATE", "/var/lib/academy-dedup"))
 DB_PATH = STATE / "webhook-queue.sqlite3"
 AMO_ENV = "/opt/integrations/amo_fix_fields/.env"
 HOST = "127.0.0.1"
