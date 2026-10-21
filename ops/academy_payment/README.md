@@ -52,3 +52,5 @@ legacy sessions get a new SBP invoice. Legacy checkout invoices stay in the
 audit database and their callbacks remain recognized. Previously opened
 bank checkout windows were not revoked by this code update: close them and
 reopen the common Team URL.
+
+Security maintenance (2026-10-22): use the tested sanitized CRM dependency image, with no .env backup files in its final filesystem or ancestor layers. Keep the payment app bind-mounted read-only, its existing UID65534 and current /data. JSON logs rotate at 10 MiB with five files. Dependency validation runs test_app.py with --network none, no production environment and temporary SQLite only. A live GET of the public HTML must not execute its JavaScript or POST /create; issuing a real payment is not a health check. Preserve the current payment ledger on rollback.

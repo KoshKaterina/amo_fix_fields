@@ -44,10 +44,18 @@ def main():
     image = run("docker", "inspect", "amo-fix-fields", "--format", "{{.Image}}")
     if not image.startswith("sha256:"):
         raise SystemExit("Immutable dependency image is required")
+    # A shared dependency image must not expose historical credential files.
+    credential_files = run(
+        "docker", "run", "--rm", "--network", "none", "--user", "0",
+        "--entrypoint", "python", image, "-c",
+        "from pathlib import Path; print(len(list(Path('/app').rglob('.env*'))))")
+    if credential_files != "0":
+        raise SystemExit("Dependency image contains credential files; rebuild it without secret-bearing layers")
     result = run(
         "docker", "run", "-d", "--name", "academy-deposit-link", "--restart", "unless-stopped",
         "--user", "65534:65534", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--memory", "256m", "--cpus", "1", "--pids-limit", "128", "--tmpfs", "/tmp:rw,nosuid,size=16m",
+        "--memory", "256m", "--cpus", "1", "--pids-limit", "128",
+        "--log-opt", "max-size=10m", "--log-opt", "max-file=5", "--tmpfs", "/tmp:rw,nosuid,size=16m",
         "--env-file", str(env_file), "-p", "127.0.0.1:8040:8000",
         "-v", f"{ROOT}/app.py:/service/app.py:ro", "-v", f"{data}:/data:rw",
         "-w", "/service", "--entrypoint", "python", image,
