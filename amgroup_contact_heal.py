@@ -468,11 +468,12 @@ async def check_once() -> dict:
             await asyncio.sleep(_PAUSE_SEC)
         outcome = await heal_lead(lid, source="scan")
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
-    if candidates:
-        logger.info(
-            "amgroup_contact_heal: сделок в окне %s, без контакта %s, исходы %s",
-            len(leads), len(candidates), outcomes,
-        )
+    # Строка на каждый проход: по ней на сухом этапе видно, что выборка живая и что список
+    # отдаёт контакты (иначе «без контакта» будет почти каждая заказная сделка окна).
+    logger.info(
+        "amgroup_contact_heal: сделок в окне %s, из МС без контакта %s, исходы %s",
+        len(leads), len(candidates), outcomes,
+    )
     return {"amo_answered": True, "candidates": len(candidates), "outcomes": outcomes}
 
 
