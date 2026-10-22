@@ -706,7 +706,7 @@ def note_text_v2(p: dict, source: str) -> str:
 
     heading = "ЗАЯВКА — ТЕЛЕГРАМ ПРИЛОЖЕНИЕ" if miniapp_form_routes.is_miniapp(p) else "ЗАЯВКА С САЙТА"
     head = [f"✉️ {heading}: {FORM_TYPES[p['form_type']].upper()}"]
-    if p["form_type"] == "unavailable" or miniapp_form_routes.academy_lead_name(p):
+    if p["form_type"] == "unavailable":
         # Даже если длинное примечание обрежется до MAX_NOTE_LEN, полный ключ
         # остаётся в начале для сопоставления с локальной очередью.
         head.append(f"ID заявки: {p['submission_id']}")
@@ -732,6 +732,8 @@ def note_text_v2(p: dict, source: str) -> str:
         person.append(f"Telegram: {contact['telegram']}")
 
     tech = ["⚙️ ТЕХНИЧЕСКОЕ", f"Источник: {source}"]
+    if miniapp_form_routes.is_miniapp(p):
+        tech.append(f"ID заявки: {p['submission_id']}")
     if ctx["page_url"]:
         tech.append(f"Адрес страницы: {ctx['page_url']}")
     if consultation and service and service["url"]:
@@ -803,7 +805,7 @@ async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None
 
 async def _set_lead_name(lead_id: int, name: str) -> bool:
     data = await api._request_json("PATCH", f"{api.BASE_URL}/api/v4/leads/{lead_id}",
-                                   body={"name": name}, what=f"academy_title[{lead_id}]")
+                                   body={"name": name}, what=f"miniapp_title[{lead_id}]")
     return data is not None
 
 
@@ -841,12 +843,12 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
         # Прежняя политика callback/consultation: API сам повторяет POST,
         # отрицательный ответ note не препятствует завершению заявки.
         await api.add_note_to_lead(lead_id, note)
-    readable_name = miniapp_form_routes.academy_lead_name(p)
+    readable_name = miniapp_form_routes.miniapp_lead_name(p)
     if readable_name:
         # Initial POST retains the UUID for unknown create outcomes. Only remove
         # it after durable lead_id and confirmed note containing the full UUID.
         if not await _set_lead_name(lead_id, readable_name):
-            raise RuntimeError("academy-title-not-confirmed")
+            raise RuntimeError("miniapp-title-not-confirmed")
     return lead_id
 
 

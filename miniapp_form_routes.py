@@ -35,11 +35,30 @@ def delivery_event(payload):
             'dedup_id':hashlib.sha256(payload['submission_id'].encode()).hexdigest()}
 
 
-def academy_lead_name(payload):
-    labels = {'academy-base': 'BASE', 'academy-pro': 'PRO', 'academy-individual': 'Высшая лига',
-              'consultations-course': 'вопрос об обучении'}
+LEAD_LABELS = {
+    'academy-base': 'Академия — BASE',
+    'academy-pro': 'Академия — PRO',
+    'academy-individual': 'Академия — Высшая лига',
+    'consultations-course': 'Академия — вопрос об обучении',
+    'consultations-free': 'Бесплатная консультация',
+    'consultations-setup30': 'Настройка кошелька — 30 минут',
+    'consultations-setup': 'Настройка кошелька',
+    'consultations-individual': 'Индивидуальная консультация',
+    'cooperation-wholesale': 'Оптовая закупка',
+    'cooperation-affiliate': 'Реферальная программа',
+    'cooperation-media': 'Медиа / проект',
+    'waitlist-club': 'Клуб — лист ожидания',
+    'waitlist-vladimir': 'Консультация Владимира — лист ожидания',
+    'shop-callback': 'Вопрос / обратный звонок',
+    'shop-consultation': 'Консультация по кошельку',
+    'shop-unavailable': 'Нет в наличии',
+    'quiz-result': 'Подбор кошелька',
+}
+
+
+def miniapp_lead_name(payload):
     entry = (payload.get('context') or {}).get('entry', '').removeprefix('miniapp-')
-    if not is_miniapp(payload) or entry not in labels:
+    if not is_miniapp(payload) or entry not in LEAD_LABELS:
         return None
     name = ' '.join(str((payload.get('contact') or {}).get('name') or 'Без имени').split())
-    return f"Академия — {labels[entry]} — {name}"[:255]
+    return f"{LEAD_LABELS[entry]} — {name}"[:255]

@@ -1802,6 +1802,7 @@ def test_miniapp_delivery_requires_route_tags_and_note(v2,monkeypatch):
     monkeypatch.setattr(api,'set_lead_tags',no)
     monkeypatch.setattr(api,'set_lead_utm',yes)
     monkeypatch.setattr(api,'add_note_to_lead',yes)
+    monkeypatch.setattr(sf,'_set_lead_name',yes)
     asyncio.run(sf.run_due())
     assert records(store.DB_PATH)[0]['delivered_at'] is None
     assert store.get(SID)['status']=='created'
@@ -1971,3 +1972,60 @@ def test_academy_title_failure_never_replays_create_or_note(v2, monkeypatch):
     assert store.get(SID)['status'] == 'uncertain'
     assert SID in calls['note'][1]
     assert asyncio.run(sf.run_due(now=time.time()+10**6)) == 0
+
+
+@pytest.mark.parametrize('entry,label', [
+    ('consultations-free','Бесплатная консультация'),
+    ('consultations-setup30','Настройка кошелька — 30 минут'),
+    ('consultations-setup','Настройка кошелька'),
+    ('consultations-individual','Индивидуальная консультация'),
+    ('cooperation-wholesale','Оптовая закупка'),
+    ('cooperation-affiliate','Реферальная программа'),
+    ('cooperation-media','Медиа / проект'),
+    ('waitlist-club','Клуб — лист ожидания'),
+    ('waitlist-vladimir','Консультация Владимира — лист ожидания'),
+    ('shop-callback','Вопрос / обратный звонок'),
+    ('shop-consultation','Консультация по кошельку'),
+    ('shop-unavailable','Нет в наличии'),
+    ('quiz-result','Подбор кошелька'),
+])
+def test_other_miniapp_titles_are_readable_and_keep_reconciliation_key(v2, monkeypatch, entry, label):
+    calls = _mock_api_v2(monkeypatch)
+    payload = _mini_payload(entry)
+    if entry == 'quiz-result':
+        payload['comment'] = QUIZ_NOTE_SUMMARY
+    assert asyncio.run(sf.accept_v2(payload))[1]['status'] == 'accepted'
+    assert asyncio.run(sf.run_due()) == 1
+    assert SID in calls['create']['lead_name']
+    assert 'ID заявки: ' + SID in calls['note'][1]
+    assert calls['rename'] == (301, f'{label} — Иван')
+    assert SID not in calls['rename'][1] and 'ID заявки' not in calls['rename'][1]
+    if entry == 'quiz-result':
+        assert calls['note'][1].startswith('ДАТЬ СКИДКУ\n\nПОДБОР КОШЕЛЬКА')
+    assert store.get(SID)['status'] == 'done'
+
+
+def test_readable_title_map_covers_all_allowed_miniapp_entries():
+    import miniapp_form_routes as routes
+    assert set(routes.LEAD_LABELS) == routes.ENTRIES
+    p = _v2_payload()
+    assert routes.miniapp_lead_name(p) is None
+    p = _mini_payload('unknown')
+    assert routes.miniapp_lead_name(p) is None
+    p = _mini_payload('shop-callback')
+    p['contact']['name'] = '  Анна\n  Иванова '
+    assert routes.miniapp_lead_name(p) == 'Вопрос / обратный звонок — Анна Иванова'
+    p['contact']['name'] = 'А' * 500
+    assert len(routes.miniapp_lead_name(p)) <= 255
+
+
+def test_readable_title_patch_changes_only_name(monkeypatch):
+    calls = []
+    async def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return {'id': 301}
+    monkeypatch.setattr(api, '_request_json', request)
+    assert asyncio.run(sf._set_lead_name(301, 'Подбор кошелька — Анна'))
+    assert calls[0][0] == 'PATCH'
+    assert calls[0][1].endswith('/api/v4/leads/301')
+    assert calls[0][2]['body'] == {'name': 'Подбор кошелька — Анна'}
