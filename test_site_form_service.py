@@ -1717,7 +1717,12 @@ def _mini_payload(entry='waitlist-club', **kw):
 def test_miniapp_routes_keep_existing_partner_and_academy_process():
     import miniapp_form_routes as routes
     cfg={'pipeline_id':1,'status_id':2,'source':'Form','tags':[]}
-    assert routes.route(cfg,_mini_payload(),{})['status_id']==83669950
+    # Лист ожидания (Катя 22.10.2026): у формы клуба и у формы консультации свои этапы, не «Товар».
+    club=routes.route(cfg,_mini_payload(),{})
+    assert (club['pipeline_id'],club['status_id'])==(10611934,89550306)
+    vladimir=routes.route(cfg,_mini_payload('waitlist-vladimir'),{})
+    assert (vladimir['pipeline_id'],vladimir['status_id'])==(10611934,89550310)
+    assert 83669950 not in (club['status_id'],vladimir['status_id'])
     assert routes.route(cfg,_mini_payload('waitlist-vladimir'),{})['source']=='Телеграм приложение: Консультация Владимира'
     academy=routes.route(cfg,_mini_payload('academy-individual'),{})
     assert (academy['pipeline_id'],academy['status_id'])==(8642410,87654850)
