@@ -444,3 +444,22 @@ def test_limit_opta_ne_glushit_list_ozhidaniya(monkeypatch):
           monkeypatch, lead_id=LEAD_ID + 1)
     assert len(_sent) == 2
     assert not any("приглушены" in s["text"] for s in _sent)
+
+
+# ── адреса веток ─────────────────────────────────────────────────────────────
+
+def test_nomera_vetok_snyaty_iz_ssylok_kati(monkeypatch):
+    """Ссылки Кати 22.10.2026: t.me/c/3680811996/27598/27599 (опт) и .../27600/27601 (лист
+    ожидания). Чат у обеих тот же, что у остальных веток отдела продаж."""
+    import importlib
+    import waybill_config
+
+    monkeypatch.delenv("OPT_NOTIFY_THREAD_ID", raising=False)
+    monkeypatch.delenv("WAITLIST_NOTIFY_THREAD_ID", raising=False)
+    cfg = importlib.reload(waybill_config)
+    try:
+        assert cfg.OPT_NOTIFY_THREAD_ID == 27598
+        assert cfg.WAITLIST_NOTIFY_THREAD_ID == 27600
+    finally:
+        importlib.reload(waybill_config)
+    assert tg_recipients.NOTIFY_CHAT_ID == -1003680811996
