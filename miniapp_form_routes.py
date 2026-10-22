@@ -17,8 +17,8 @@ def route(cfg, payload, entry_map):
     if key in {'waitlist-club','waitlist-vladimir'}:
         target.update(pipeline_id=10611934,status_id=83669950,source='Телеграм приложение: ' + ('Клуб' if key == 'waitlist-club' else 'Консультация Владимира'))
         target.pop('responsible_user_id',None)
-    elif key in {'academy-base', 'academy-pro', 'academy-individual'}:
-        target.update(pipeline_id=8642410,status_id=87654850,source='Телеграм приложение: ' + {'academy-base':'Инвестиции в DeFi — BASE', 'academy-pro':'Инвестиции в DeFi — PRO', 'academy-individual':'Высшая лига'}[key])
+    elif key in {'academy-base', 'academy-pro', 'academy-individual', 'consultations-course'}:
+        target.update(pipeline_id=8642410,status_id=87654850,source='Телеграм приложение: ' + {'academy-base':'Инвестиции в DeFi — BASE', 'academy-pro':'Инвестиции в DeFi — PRO', 'academy-individual':'Высшая лига', 'consultations-course':'Вопрос об обучении в Академии'}[key])
         target.pop('responsible_user_id',None)
     elif key in entry_map:
         target.update(entry_map[key])
@@ -33,3 +33,13 @@ def delivery_event(payload):
     return {'event':'service_form_crm_delivered',
             'entry':payload['context']['entry'].removeprefix('miniapp-'),
             'dedup_id':hashlib.sha256(payload['submission_id'].encode()).hexdigest()}
+
+
+def academy_lead_name(payload):
+    labels = {'academy-base': 'BASE', 'academy-pro': 'PRO', 'academy-individual': 'Высшая лига',
+              'consultations-course': 'вопрос об обучении'}
+    entry = (payload.get('context') or {}).get('entry', '').removeprefix('miniapp-')
+    if not is_miniapp(payload) or entry not in labels:
+        return None
+    name = ' '.join(str((payload.get('contact') or {}).get('name') or 'Без имени').split())
+    return f"Академия — {labels[entry]} — {name}"[:255]

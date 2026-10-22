@@ -157,6 +157,11 @@ def _mock_api(monkeypatch, contact_id=None, lead_id=101, uid="u-1", accepted=201
     monkeypatch.setattr(api, "create_unsorted_lead_ex", create_unsorted_lead_ex)
     monkeypatch.setattr(api, "accept_unsorted", accept_unsorted)
     monkeypatch.setattr(api, "add_note_to_lead", add_note_to_lead)
+    async def set_lead_name(lid, name):
+        calls['rename'] = (lid, name)
+        return True
+
+    monkeypatch.setattr(sf, '_set_lead_name', set_lead_name)
     monkeypatch.setattr(api, "set_lead_tags", set_lead_tags)
     return calls
 
@@ -1924,3 +1929,45 @@ def test_miniapp_quiz_preserves_discount_and_readable_blocks():
     assert note.startswith('ДАТЬ СКИДКУ\n\nПОДБОР КОШЕЛЬКА')
     assert 'ОТВЕТЫ КЛИЕНТА' in note
     assert 'Источник: Телеграм приложение' in note
+
+
+@pytest.mark.parametrize('entry', ['academy-base', 'academy-pro', 'academy-individual', 'consultations-course'])
+def test_every_academy_miniapp_form_uses_academy_even_with_retail_override(entry):
+    import miniapp_form_routes as routes
+    cfg = {'pipeline_id':10593102, 'status_id':83537714, 'source':'Форма: вопрос', 'tags':[], 'responsible_user_id':123}
+    mapped = routes.route(cfg, _mini_payload(entry), {entry: {'pipeline_id':10593102, 'status_id':83537714}})
+    assert (mapped['pipeline_id'], mapped['status_id']) == (8642410, 87654850)
+    assert 'responsible_user_id' not in mapped
+    assert mapped['tags'] == ['Телеграм приложение']
+    assert mapped['source'].startswith('Телеграм приложение: ')
+    assert cfg['pipeline_id'] == 10593102
+
+
+def test_other_consultations_remain_outside_academy():
+    import miniapp_form_routes as routes
+    cfg = {'pipeline_id':10593102, 'status_id':83537714, 'source':'Форма: вопрос', 'tags':[]}
+    for entry in ('consultations-free', 'consultations-setup', 'consultations-setup30', 'consultations-individual', 'shop-callback'):
+        result = routes.route(cfg, _mini_payload(entry), {})
+        assert (result['pipeline_id'], result['status_id']) == (10593102, 83537714)
+
+
+@pytest.mark.parametrize('entry,label', [('consultations-course','вопрос об обучении'), ('academy-base','BASE'), ('academy-pro','PRO'), ('academy-individual','Высшая лига')])
+def test_academy_readable_title_keeps_initial_reconciliation_id(v2, monkeypatch, entry, label):
+    calls = _mock_api_v2(monkeypatch)
+    assert asyncio.run(sf.accept_v2(_mini_payload(entry)))[1]['status'] == 'accepted'
+    assert asyncio.run(sf.run_due()) == 1
+    assert SID in calls['create']['lead_name']
+    assert 'ID заявки: ' + SID in calls['note'][1]
+    assert calls['rename'] == (301, f'Академия — {label} — Иван')
+    assert store.get(SID)['status'] == 'done'
+
+
+def test_academy_title_failure_never_replays_create_or_note(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    async def failed(*args): return False
+    monkeypatch.setattr(sf, '_set_lead_name', failed)
+    assert asyncio.run(sf.accept_v2(_mini_payload('consultations-course')))[1]['status'] == 'accepted'
+    asyncio.run(sf.run_due())
+    assert store.get(SID)['status'] == 'uncertain'
+    assert SID in calls['note'][1]
+    assert asyncio.run(sf.run_due(now=time.time()+10**6)) == 0
