@@ -18,6 +18,9 @@ from waybill_config import (
     ACADEMY_NOTIFY_THREAD_ID,
     ACADEMY_TEAM_AMO_IDS,
     ACADEMY_TEAM_CHAT_ID,
+    OPT_NOTIFY_THREAD_ID,
+    RESPONSIBLE_OPT_MANAGER_USER_ID,
+    WAITLIST_NOTIFY_THREAD_ID,
     MANAGER_NAMES,
     ROP_ALERT_CHAT_ID,
     WAZZUP_ALWAYS_TAG,
@@ -70,6 +73,14 @@ ACADEMY_ALERT_TAG = "@gladkov_369"
 # None → остаётся общий топик УВЕДОМЛЕНИЯ, то есть поведение до 29.09. Не молчим, как
 # SHOWROOM_ALERT_THREAD_ID: там своя ветка — смысл алерта, а здесь только место.
 ACADEMY_NOTIFY_THREAD = ACADEMY_NOTIFY_THREAD_ID
+# ── Опт и лист ожидания: свои ветки и один адресат - Артём (Катя 22.10.2026) ──
+# Ветки в той же супергруппе ОП (NOTIFY_CHAT_ID). None → событие не шлётся (см. waybill_config).
+OPT_NOTIFY_THREAD = OPT_NOTIFY_THREAD_ID
+WAITLIST_NOTIFY_THREAD = WAITLIST_NOTIFY_THREAD_ID
+# Тег Артёма: основной источник - карточка сотрудника в панели (режим «названным»), эта
+# строка - запасной путь для режима `off` и для пустого кэша настроек.
+B2B_ALERT_TAG = WAZZUP_TG_HANDLES.get(RESPONSIBLE_OPT_MANAGER_USER_ID, "@temossska")
+
 # Группа команды Академии. Отдельный чат, а не топик: новые менеджеры в супергруппе ОП не
 # состоят, и тег там нарисовался бы серым текстом при ok=true в логе.
 ACADEMY_TEAM_CHAT = ACADEMY_TEAM_CHAT_ID
