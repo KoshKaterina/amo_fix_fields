@@ -1713,12 +1713,12 @@ def test_miniapp_routes_keep_existing_partner_and_academy_process():
     import miniapp_form_routes as routes
     cfg={'pipeline_id':1,'status_id':2,'source':'Form','tags':[]}
     assert routes.route(cfg,_mini_payload(),{})['status_id']==83669950
-    assert routes.route(cfg,_mini_payload('waitlist-vladimir'),{})['source']=='Mini App: Консультация Владимира'
+    assert routes.route(cfg,_mini_payload('waitlist-vladimir'),{})['source']=='Телеграм приложение: Консультация Владимира'
     academy=routes.route(cfg,_mini_payload('academy-individual'),{})
     assert (academy['pipeline_id'],academy['status_id'])==(8642410,87654850)
     partner=routes.route(cfg,_mini_payload('cooperation-media'),{'cooperation-media':{'pipeline_id':3,'status_id':4,'source':'Media','tags':[],'responsible_user_id':5}})
     assert (partner['pipeline_id'],partner['status_id'],partner['responsible_user_id'])==(3,4,5)
-    assert partner['tags']==['Mini App']
+    assert partner['tags']==['Телеграм приложение']
     plain=_v2_payload()
     assert routes.route(cfg,plain,{}) is cfg
 
@@ -1814,7 +1814,7 @@ def test_shop_generic_keeps_process_and_source_context():
     p['comment']='Источник: Mini App\nТочка входа: catalog-protection\nУслуга: Поможем подобрать защиту'
     result=r.route(cfg,p,{})
     assert (result['pipeline_id'],result['status_id'])==(10593102,83537714)
-    assert result['tags']==['Mini App']
+    assert result['tags']==['Телеграм приложение']
     assert 'catalog-protection' in sf.note_text_v2(p,result['source'])
     assert r.delivery_event(p)['entry']=='shop-callback'
 
@@ -1899,3 +1899,28 @@ def test_unrecognized_quiz_comment_falls_back_without_losing_text(v2):
     p = _quiz_note_payload(v2, "Произвольный текст", "")
     assert sf._quiz_note_blocks(p) is None
     assert "Вопрос: Произвольный текст" in sf.note_text_v2(p, "Форма: квиз")
+
+@pytest.mark.parametrize('entry', ['academy-base', 'academy-pro', 'consultations-setup30', 'shop-unavailable', 'quiz-result'])
+def test_new_miniapp_entries_are_strict_and_have_readable_source(entry):
+    import miniapp_form_routes as routes
+    cfg = {'pipeline_id':10593102,'status_id':83537714,'source':'Форма: заявка','tags':[]}
+    p = _mini_payload(entry)
+    target = routes.route(cfg, p, {})
+    assert routes.is_miniapp(p)
+    assert target['source'].startswith('Телеграм приложение: ')
+    assert target['tags'] == ['Телеграм приложение']
+    assert routes.delivery_event(p)['entry'] == entry
+    if entry.startswith('academy-'):
+        assert (target['pipeline_id'], target['status_id']) == (8642410, 87654850)
+    else:
+        assert (target['pipeline_id'], target['status_id']) == (10593102, 83537714)
+    assert cfg['source'] == 'Форма: заявка'
+
+
+def test_miniapp_quiz_preserves_discount_and_readable_blocks():
+    p = _mini_payload('quiz-result')
+    p['comment'] = QUIZ_NOTE_SUMMARY
+    note = sf.note_text_v2(p, 'Телеграм приложение: подбор кошелька')
+    assert note.startswith('ДАТЬ СКИДКУ\n\nПОДБОР КОШЕЛЬКА')
+    assert 'ОТВЕТЫ КЛИЕНТА' in note
+    assert 'Источник: Телеграм приложение' in note

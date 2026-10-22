@@ -640,7 +640,7 @@ def _page_title(title: str) -> str:
 
 def _quiz_note_blocks(p: dict) -> list[str] | None:
     """Readable quiz note; ordinary forms and unrecognized summaries keep their format."""
-    if p["context"].get("entry") != "quiz-result":
+    if p["context"].get("entry") not in {"quiz-result", "miniapp-quiz-result"}:
         return None
     summary, separator, customer_comment = p["comment"].partition("\n\nКомментарий клиента: ")
     lines = summary.splitlines()
@@ -704,7 +704,8 @@ def note_text_v2(p: dict, source: str) -> str:
     product = ctx["product"]
     same_item = bool(service and product and service.get("id") and service.get("id") == product.get("id"))
 
-    head = [f"✉️ ЗАЯВКА С САЙТА: {FORM_TYPES[p['form_type']].upper()}"]
+    heading = "ЗАЯВКА — ТЕЛЕГРАМ ПРИЛОЖЕНИЕ" if miniapp_form_routes.is_miniapp(p) else "ЗАЯВКА С САЙТА"
+    head = [f"✉️ {heading}: {FORM_TYPES[p['form_type']].upper()}"]
     if p["form_type"] == "unavailable":
         # Даже если длинное примечание обрежется до MAX_NOTE_LEN, полный ключ
         # остаётся в начале для сопоставления с локальной очередью.
