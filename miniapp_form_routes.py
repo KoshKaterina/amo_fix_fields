@@ -5,6 +5,17 @@ ENTRIES = {'consultations-free','consultations-course','consultations-setup','co
            'cooperation-wholesale','cooperation-affiliate','cooperation-media',
            'waitlist-club','waitlist-vladimir','academy-base','academy-pro','academy-individual','shop-callback','shop-consultation','shop-unavailable','quiz-result'}
 
+# Воронка «Лист ожидания» (10611934): у каждой формы свой этап (Катя 22.10.2026). Раньше обе
+# клали сделку на «Товар» (83669950), и уведомление про клуб и консультацию не от чего было
+# ждать. «Товар» остаётся за остальными путями (ЗНР, «Нет в наличии», ручной ввод).
+# Номера сверены живым чтением amo 22.10.2026.
+WAITLIST_PIPELINE_ID = 10611934
+WAITLIST_STAGES = {
+    'waitlist-club': (89550306, 'Клуб'),                      # «Клуб»
+    'waitlist-vladimir': (89550310, 'Консультация Владимира'),  # «Консультация Владимир»
+}
+
+
 def is_miniapp(payload):
     return (payload.get('context') or {}).get('entry', '') in {'miniapp-' + entry for entry in ENTRIES}
 
@@ -14,8 +25,9 @@ def route(cfg, payload, entry_map):
         return cfg
     key = entry.removeprefix('miniapp-')
     target = dict(cfg)
-    if key in {'waitlist-club','waitlist-vladimir'}:
-        target.update(pipeline_id=10611934,status_id=83669950,source='Телеграм приложение: ' + ('Клуб' if key == 'waitlist-club' else 'Консультация Владимира'))
+    if key in WAITLIST_STAGES:
+        status_id, label = WAITLIST_STAGES[key]
+        target.update(pipeline_id=WAITLIST_PIPELINE_ID,status_id=status_id,source='Телеграм приложение: ' + label)
         target.pop('responsible_user_id',None)
     elif key in {'academy-base', 'academy-pro', 'academy-individual', 'consultations-course'}:
         target.update(pipeline_id=8642410,status_id=87654850,source='Телеграм приложение: ' + {'academy-base':'Инвестиции в DeFi — BASE', 'academy-pro':'Инвестиции в DeFi — PRO', 'academy-individual':'Высшая лига', 'consultations-course':'Вопрос об обучении в Академии'}[key])
