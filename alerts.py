@@ -120,6 +120,16 @@ def _destination(channel_key: str | None) -> tuple[int | str | None, int | None]
         return tg_recipients.NOTIFY_CHAT_ID, (
             tg_recipients.ACADEMY_NOTIFY_THREAD or tg_recipients.NOTIFY_THREAD_ID
         )
+    if channel_key == "op_opt":
+        # Ветка «Уведомления опт». Номер не задан - молчим, как op_showroom: в общий топик
+        # лиды Опта не сваливаем, там их никто не ждёт.
+        if tg_recipients.OPT_NOTIFY_THREAD is None:
+            return None
+        return tg_recipients.NOTIFY_CHAT_ID, tg_recipients.OPT_NOTIFY_THREAD
+    if channel_key == "op_waitlist":
+        if tg_recipients.WAITLIST_NOTIFY_THREAD is None:
+            return None
+        return tg_recipients.NOTIFY_CHAT_ID, tg_recipients.WAITLIST_NOTIFY_THREAD
     if channel_key == "academy_team":
         return (tg_recipients.ACADEMY_TEAM_CHAT, None) if tg_recipients.ACADEMY_TEAM_CHAT else None
     if channel_key == "rop":

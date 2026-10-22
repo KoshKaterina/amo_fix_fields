@@ -14,6 +14,7 @@ import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
 import academy_lead_alert
+import stage_lead_alert
 import academy_invite_delivery
 import academy_intent_alert
 import academy_assignment
@@ -699,6 +700,9 @@ async def lead_change(request: Request):
     # воронки и этапа, чтение сделки и отправка уходят в фон (academy_lead_alert).
     # Стоит ВЫШЕ блока `updates`: этап меняют и без правки полей сделки.
     academy_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
+    # Новый лид в ОПТ / «Клуб» / «Консультация Владимир» (Катя 22.10.2026): та же схема,
+    # одно сравнение в памяти, остальное в фоне (stage_lead_alert).
+    stage_lead_alert.notify_bg(lead_id, incoming_pipeline, incoming_status)
     initial_responsible_user_id = await get_nested(
         nested, ["leads", "add", "0", "responsible_user_id"],
     )
