@@ -50,6 +50,7 @@ from waybill_config import (  # noqa: E402
     PIPELINE_ACADEMY,
     PIPELINE_CLEVER_MAIN,
     STATUS_ACADEMY_BOT_STARTED,
+    STATUS_ACADEMY_QUESTIONNAIRE,
     STATUS_ACADEMY_FIRST_CONTACT,
     STATUS_ACADEMY_INBOUND_LEAD,
     STATUS_NEW_LEAD,
@@ -143,6 +144,12 @@ def test_stroki_iz_vebhuka_tozhe_prohodyat(scheduled):
 def test_bot_zapushchen_tozhe_zavodit_fon(scheduled):
     """С 29.09.2026 бот кладёт сделку сразу сюда, минуя «Входящий лид» (Катя)."""
     academy_lead_alert.notify_bg(LEAD_ID, PIPELINE_ACADEMY, STATUS_ACADEMY_BOT_STARTED)
+    assert len(scheduled) == 1
+
+
+def test_anketa_tozhe_zavodit_fon(scheduled):
+    """С 22.10.2026 сделки GetCourse создаются сразу на «Анкете» (Катя)."""
+    academy_lead_alert.notify_bg(LEAD_ID, PIPELINE_ACADEMY, STATUS_ACADEMY_QUESTIONNAIRE)
     assert len(scheduled) == 1
 
 

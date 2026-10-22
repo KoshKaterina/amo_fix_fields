@@ -81,6 +81,7 @@ from waybill_config import (
     PIPELINE_CLEVER_MAIN,
     PIPELINE_TANGEMSHOP,
     STATUS_ACADEMY_INBOUND_LEAD,
+    STATUS_ACADEMY_QUESTIONNAIRE,
     STATUS_NEW_LEAD_ALL,
     STATUS_TANGEM_NEW_ORDER,
 )
@@ -109,7 +110,9 @@ _WATCHED: dict[int, _Watch] = {
         chat="rop", subject="Новый лид", tags=False, route=False, panel=False,
     ),
     PIPELINE_ACADEMY: _Watch(
-        event="academy_lead_untaken", statuses=frozenset({STATUS_ACADEMY_INBOUND_LEAD}),
+        # «Анкета» - вход сделок GetCourse (Катя 22.10.2026).
+        event="academy_lead_untaken",
+        statuses=frozenset({STATUS_ACADEMY_INBOUND_LEAD, STATUS_ACADEMY_QUESTIONNAIRE}),
         chat="op_notify", subject="Лид Академии", tags=True, route=True, panel=True,
     ),
     # TangemShop (29.09.2026, «да» Кати по списку А8 плана запуска воронки).

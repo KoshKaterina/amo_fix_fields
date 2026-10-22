@@ -66,6 +66,7 @@ from waybill_config import (  # noqa: E402
     PIPELINE_CLEVER_MAIN,
     PIPELINE_TANGEMSHOP,
     STATUS_ACADEMY_INBOUND_LEAD,
+    STATUS_ACADEMY_QUESTIONNAIRE,
     STATUS_CLEVER_IN_PROGRESS,
     STATUS_NEW_LEAD,
     STATUS_NEW_LEAD_BUFFERS,
@@ -371,6 +372,12 @@ def _enable_route():
 
 def test_academy_inbound_lead_starts_the_clock():
     N.note_lead(LEAD, PIPELINE_ACADEMY, STATUS_ACADEMY_INBOUND_LEAD)
+    assert N._pending[LEAD]["pipeline"] == PIPELINE_ACADEMY
+
+
+def test_academy_questionnaire_stage_starts_the_clock():
+    """«Анкета» - вход сделок GetCourse с 22.10.2026 (Катя): счётчик идёт и там."""
+    N.note_lead(LEAD, PIPELINE_ACADEMY, STATUS_ACADEMY_QUESTIONNAIRE)
     assert N._pending[LEAD]["pipeline"] == PIPELINE_ACADEMY
 
 

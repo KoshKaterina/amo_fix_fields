@@ -1153,9 +1153,10 @@ GETCOURSE_AMO_BASE_URL = os.getenv("GETCOURSE_AMO_BASE_URL", "https://new5a2e8ea
 # сделки amo в заказ GetCourse и сверить очередь с выгрузкой заказов.
 GETCOURSE_API_KEY = os.getenv("GETCOURSE_API_KEY", "").strip()
 GETCOURSE_ACCOUNT_URL = os.getenv("GETCOURSE_ACCOUNT_URL", "https://edu.sunscrypt.ru").rstrip("/")
-# Куда создавать новую сделку: «Входящий лид» Академии - точка входа распределителя.
+# Куда создавать новую сделку: этап «Анкета» Академии (Катя 22.10.2026, до этого «Входящий
+# лид») - точка входа правила распределителя «Академия: GetCourse».
 GETCOURSE_PIPELINE_ID = int(os.getenv("GETCOURSE_PIPELINE_ID", str(PIPELINE_ACADEMY)))
-GETCOURSE_STATUS_ID = int(os.getenv("GETCOURSE_STATUS_ID", "87654850"))
+GETCOURSE_STATUS_ID = int(os.getenv("GETCOURSE_STATUS_ID", "89549878"))
 # Поле сделки amo «ID заказа GetCourse» (заводится при выкатке). 0 - не писать.
 GETCOURSE_LEAD_ORDER_FIELD_ID = int(os.getenv("GETCOURSE_LEAD_ORDER_FIELD_ID", "0") or 0)
 # Название доп. поля ЗАКАЗА в GetCourse, куда пишем номер сделки amo. Пусто - не писать.
@@ -1451,6 +1452,9 @@ STATUS_ACADEMY_FIRST_CONTACT = 70070966  # в amo этот этап называ
 # Вход воронки Академии — сюда падают новые лиды, отсюда алерт Гладкову (academy_lead_alert).
 STATUS_ACADEMY_INBOUND_LEAD = 87654850   # «Входящий лид»
 STATUS_ACADEMY_BOT_STARTED = 88838378    # «Бот запущен»
+# Вход сделок GetCourse (Катя 22.10.2026: «не во входящий лид, а в этап Анкета»). Отсюда тоже
+# алерт «новый лид» и счётчик «лид не взят в работу» - иначе сделки ГК их бы не получали.
+STATUS_ACADEMY_QUESTIONNAIRE = 89549878  # «Анкета»
 
 # Этапы, на которых Гладкову уходит «новый лид в Академии» (Катя 29.09.2026).
 # Почему их два. Раньше телеграм-бот клал сделку во «Входящий лид» штатным действием BotHelp
@@ -1461,10 +1465,12 @@ STATUS_ACADEMY_BOT_STARTED = 88838378    # «Бот запущен»
 # мероприятия, письмо в телеграм, — поэтому этап не заменён, а добавлен второй.
 # ⚠️ Дедуп в academy_lead_alert ключуется по сделке, а не по этапу: переезд
 # «Входящий лид» → «Бот запущен» в пределах окна второго сообщения не даёт.
-ACADEMY_LEAD_ALERT_STATUSES = (STATUS_ACADEMY_INBOUND_LEAD, STATUS_ACADEMY_BOT_STARTED)
+ACADEMY_LEAD_ALERT_STATUSES = (STATUS_ACADEMY_INBOUND_LEAD, STATUS_ACADEMY_BOT_STARTED,
+                               STATUS_ACADEMY_QUESTIONNAIRE)
 ACADEMY_LEAD_ALERT_STAGE_NAMES = {
     STATUS_ACADEMY_INBOUND_LEAD: "Входящий лид",
     STATUS_ACADEMY_BOT_STARTED: "Бот запущен",
+    STATUS_ACADEMY_QUESTIONNAIRE: "Анкета",
 }
 
 # Целевые этапы воронки ОПТ (PIPELINE_OPT уже определена выше) — причина ЗИН=Опт
