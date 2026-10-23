@@ -1647,6 +1647,104 @@ def test_correct_reassignment_ignores_stale_date_record():
     assert final["counts_by_pipeline"] == {}  # состояние было признано устаревшим целиком, поправка не применилась
 
 
+# ════════════════ тоггл: передача вне пула правила не меняет счётчики (23.10.2026) ════════════════
+# Робот переводит заказ Tangemshop в Офис на Зубалий (id 99, в правиле его нет). Без
+# тоггла счётчик менеджера возвращается к нулю, и он получает следующую сделку.
+
+def _assign_today(profile_id, *, lead_id=900, user_id=1, source_id=42):
+    state = ld._load_counters_state()
+    ld._apply_assignment(state, lead_id=lead_id, source_id=source_id, user_id=user_id,
+                         pipeline_id=_DEFAULT_PIPELINE, profile_id=profile_id)
+    ld._save_counters_state(state)
+
+
+def test_external_handoff_toggle_off_still_moves_counter(monkeypatch):
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", False)
+    p = _seed_profile(participant_ids=[1, 2])
+    _assign_today(p.id)
+    run(ld.correct_reassignment(900, 99))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 0
+    assert ld._source_count(_counts_of(final), 99, 42) == 1
+    assert final["assignments"]["900"]["user_id"] == 99
+
+
+def test_external_handoff_toggle_on_keeps_counter_and_record(monkeypatch):
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", True)
+    p = _seed_profile(participant_ids=[1, 2])
+    _assign_today(p.id)
+    run(ld.correct_reassignment(900, 99))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 1   # выдача за сегодня не «вернулась»
+    assert ld._source_count(_counts_of(final), 99, 42) == 0  # человек вне пула в счётчик не попал
+    assert final["assignments"]["900"]["user_id"] == 1
+
+
+def test_external_handoff_toggle_on_still_moves_counter_inside_pool(monkeypatch):
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", True)
+    p = _seed_profile(participant_ids=[1, 2])
+    _assign_today(p.id)
+    run(ld.correct_reassignment(900, 2))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 0
+    assert ld._source_count(_counts_of(final), 2, 42) == 1
+    assert final["assignments"]["900"]["user_id"] == 2
+
+
+def test_external_handoff_toggle_on_chain_pool_then_office(monkeypatch):
+    """Кирилл → Игорь вручную, потом Игорь → Зубалий роботом: единица остаётся у Игоря,
+    у Кирилла её нет, у Зубалий не появляется."""
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", True)
+    p = _seed_profile(participant_ids=[1, 2])
+    _assign_today(p.id, user_id=1)
+    run(ld.correct_reassignment(900, 2))
+    run(ld.correct_reassignment(900, 99))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 0
+    assert ld._source_count(_counts_of(final), 2, 42) == 1
+    assert ld._source_count(_counts_of(final), 99, 42) == 0
+    assert final["assignments"]["900"]["user_id"] == 2
+
+
+def test_external_handoff_toggle_on_ignores_record_without_profile(monkeypatch):
+    """Сделка роздана до правки (в записи нет profile_id): правим счётчик как раньше."""
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", True)
+    _assign_today(None)
+    run(ld.correct_reassignment(900, 99))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 0
+    assert ld._source_count(_counts_of(final), 99, 42) == 1
+
+
+def test_external_handoff_toggle_on_ignores_deleted_profile(monkeypatch):
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", True)
+    _assign_today("нет-такого-правила")
+    run(ld.correct_reassignment(900, 99))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 0
+
+
+def test_external_handoff_toggle_on_robot_echo_does_not_touch_counters(monkeypatch):
+    """Вебхук после раздачи показывает прежнего ответственного (робот интеграции), потом
+    нашего получателя: при тоггле обе правки пустые, счётчик остаётся единицей."""
+    monkeypatch.setattr(ld, "LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", True)
+    p = _seed_profile(participant_ids=[1, 2])
+    _assign_today(p.id)
+    run(ld.correct_reassignment(900, 6653350))
+    run(ld.correct_reassignment(900, 1))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 1
+    assert ld._source_count(_counts_of(final), 6653350, 42) == 0
+
+
+def test_decision_writes_profile_id_into_assignment():
+    p = _seed_profile(name="Rule", repeat_contact_mode="load", participant_ids=[1])
+    lead = _lead(lead_id=78, source_id=42, contacts=[{"id": 500}])
+    _contact_by_id[500] = _contact(500, other_leads=[])
+    assert run(ld.decide_and_record(lead, p)) == 1
+    assert ld._load_counters_state()["assignments"]["78"]["profile_id"] == p.id
+
+
 # ════════════════ reconciliation ════════════════
 
 def test_reconcile_skipped_without_cutover():

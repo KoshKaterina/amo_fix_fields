@@ -66,6 +66,7 @@ from waybill_config import (
     LEAD_DISTRIBUTION_ENABLED,
     LEAD_DISTRIBUTION_FAIRNESS_GAP,
     LEAD_DISTRIBUTION_IGNORE_SCHEDULE_PROFILE_IDS,
+    LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF,
     LEAD_DISTRIBUTION_RECONCILE_INTERVAL_S,
     LEAD_DISTRIBUTION_SINCE_TS,
     LEAD_DISTRIBUTION_SKIP_NAME_PREFIXES,
@@ -423,12 +424,22 @@ def _bump(state: dict, pipeline_id, user_id: int, source_id: int, delta: int) ->
     user_counts[str(source_id)] = max(0, user_counts.get(str(source_id), 0) + delta)
 
 
-def _apply_assignment(state: dict, *, lead_id: int, source_id: int, user_id: int, pipeline_id) -> None:
+def _apply_assignment(state: dict, *, lead_id: int, source_id: int, user_id: int, pipeline_id,
+                      profile_id: str | None = None) -> None:
     _bump(state, pipeline_id, user_id, source_id, +1)
     state.setdefault("assignments", {})[str(lead_id)] = {
         "source_id": source_id, "user_id": user_id, "date": state["date"],
-        "pipeline_id": _pipeline_key(pipeline_id),
+        "pipeline_id": _pipeline_key(pipeline_id), "profile_id": profile_id,
     }
+
+
+def _outside_rule_pool(record: dict, user_id: int) -> bool:
+    """True - сделка передана человеку, которого нет среди участников правила, по
+    которому её раздали (Зубалий после перевода в Офис, дежурный). Запись без
+    profile_id (сделка роздана до этой правки) или правило, которого уже нет, -
+    False: тогда счётчик правится как раньше."""
+    profile = get_profile(record.get("profile_id") or "")
+    return profile is not None and int(user_id) not in profile.participant_ids
 
 
 async def _open_deals_state(profile: Profile) -> dict:
@@ -465,7 +476,13 @@ async def correct_reassignment(lead_id: int, new_user_id: int) -> None:
     """Ручная смена ответственного на сделке, распределённой этим модулем
     СЕГОДНЯ: снять счётчик у прежнего получателя, добавить новому. Сделки не
     из сегодняшнего журнала назначений игнорируются (не наша сегодняшняя
-    выдача — вчерашние счётчики уже неактуальны)."""
+    выдача — вчерашние счётчики уже неактуальны).
+
+    При LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF=1 передача человеку вне
+    пула правила (_outside_rule_pool) счётчики и запись назначения не трогает:
+    счётчик остаётся «сколько роздано», а не «сколько сейчас на руках». Запись
+    остаётся на последнем получателе из пула, поэтому следующая передача внутри
+    пула снимет единицу именно с него."""
     async with _counters_lock:
         state = _load_counters_state()
         record = (state.get("assignments") or {}).get(str(lead_id))
@@ -474,6 +491,13 @@ async def correct_reassignment(lead_id: int, new_user_id: int) -> None:
         old_user_id = record.get("user_id")
         source_id = record.get("source_id")
         if old_user_id == new_user_id:
+            return
+        if LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF and _outside_rule_pool(record, new_user_id):
+            logger.info(
+                "lead_distribution: коррекция счётчиков пропущена сделка=%s источник=%s %s→%s "
+                "(новый ответственный вне пула правила)",
+                lead_id, source_id, old_user_id, new_user_id,
+            )
             return
         # Поправка идёт в счётчиках той воронки, куда сделка была роздана.
         pipeline_id = record.get("pipeline_id")
@@ -883,7 +907,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
             # следующее решение просто перезапросит его живьём (уже с учётом
             # PATCH, который process_lead_distribution сделает следом).
             _apply_assignment(stored, lead_id=int(lead["id"]), source_id=source_id, user_id=target,
-                              pipeline_id=lead_pipeline_id)
+                              pipeline_id=lead_pipeline_id, profile_id=profile.id)
             _save_counters_state(stored)
         if meta is not None:
             meta["rule"] = rule

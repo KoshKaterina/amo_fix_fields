@@ -1577,6 +1577,16 @@ LEAD_DISTRIBUTION_UIS_TAG_POLL_S = float(os.getenv("LEAD_DISTRIBUTION_UIS_TAG_PO
 # кандидату — см. lead_distribution._pick_load_balanced.
 LEAD_DISTRIBUTION_FAIRNESS_GAP = int(os.getenv("LEAD_DISTRIBUTION_FAIRNESS_GAP", "2"))
 
+# Тоггл, OFF по умолчанию (23.10.2026, Катя). Дневной счётчик «по нагрузке» после
+# смены ответственного возвращается прежнему получателю - в том числе когда сделку
+# переводит в Офис робот и она уходит человеку вне пула правила (Зубалий, Гладков):
+# менеджер, быстро сдающий заказы, снова выглядит свободным и получает почти всё.
+# При =1 такая смена счётчики не трогает; передача между участниками пула правила
+# работает как раньше. См. lead_distribution.correct_reassignment.
+LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF = (
+    os.getenv("LEAD_DISTRIBUTION_KEEP_COUNTER_ON_EXTERNAL_HANDOFF", "").strip() == "1"
+)
+
 # Индивидуальный график сотрудника («на месте ли он сейчас») — источника этих
 # данных в компании пока нет (team-panel не отслеживает присутствие/перерывы),
 # поэтому единое захардкоженное окно на всех участников распределения.
