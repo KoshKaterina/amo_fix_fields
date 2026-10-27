@@ -2116,3 +2116,61 @@ def test_cf7_same_submission_is_queued_once(cf7, monkeypatch):
     p = _v2_payload(form='cf7-question')
     assert asyncio.run(sf.accept_v2(p))[1]['status'] == 'accepted'
     assert asyncio.run(sf.accept_v2(p))[1]['status'] == 'duplicate'
+
+
+@pytest.mark.parametrize('current', [None, {},
+    {'id':302,'pipeline_id':10593102,'status_id':83537714},
+    {'id':301,'pipeline_id':8642414,'status_id':83537714},
+    {'id':301,'pipeline_id':10593102,'status_id':83537710},
+    {'id':301,'pipeline_id':10593102,'status_id':86794354},
+])
+def test_cf7_failed_accept_does_not_confirm_wrong_or_unknown_route(cf7, monkeypatch, current):
+    calls = _mock_api_v2(monkeypatch, accepted=None)
+    async def read(lid):
+        assert lid == 301
+        return current
+    monkeypatch.setattr(api, 'get_lead_by_id', read)
+    p = sf.clean_v2(_v2_payload(form='cf7-question'))
+    with pytest.raises(RuntimeError, match='cf7-route-not-confirmed'):
+        asyncio.run(sf._finish_lead_v2(p, sf.FORM_MAP[p['form']],
+                                     {'lead_id':301,'unsorted_uid':'U-301'}, {}))
+    assert 'note' not in calls
+
+
+def test_cf7_preorder_accepted_by_automation_finishes_same_queued_lead(cf7, monkeypatch):
+    calls = _mock_api_v2(monkeypatch, accepted=None)
+    creates, notes, writes = [], [], []
+    stage = {'id':301,'pipeline_id':10593102,'status_id':86794354}
+    async def create(**kwargs):
+        creates.append(kwargs)
+        return {'lead_id':301,'uid':'U-301'}
+    async def read(lid):
+        assert lid == 301
+        return dict(stage)
+    async def patch(method, url, **kwargs):
+        writes.append((method, kwargs['body']))
+        return {'id':301}
+    async def note(lid, text, **kwargs):
+        notes.append((lid,text))
+        return True
+    monkeypatch.setattr(api, 'create_unsorted_lead_ex', create)
+    monkeypatch.setattr(api, 'get_lead_by_id', read)
+    monkeypatch.setattr(api, '_request_json', patch)
+    monkeypatch.setattr(api, 'add_note_to_lead', note)
+    p = _v2_payload(form='cf7-preorder', form_type='preorder')
+    asyncio.run(sf.accept_v2(p))
+    asyncio.run(sf.run_due())
+    assert store.get(SID)['status'] == 'created'
+    assert store.get(SID)['payload'] is not None
+    assert not notes
+    stage['status_id'] = 83537714
+    with store._connect() as db:
+        db.execute('UPDATE site_form_submissions SET next_try_at=0 WHERE submission_id=?',(SID,))
+    asyncio.run(sf.run_due())
+    asyncio.run(sf.run_due())
+    assert len(creates) == len(notes) == 1
+    assert SID in notes[0][1]
+    assert calls['rename'] == (301, 'Заказ №301')
+    assert store.get(SID)['status'] == 'done'
+    assert store.get(SID)['payload'] is None
+    assert all('status_id' not in body for _, body in writes)
