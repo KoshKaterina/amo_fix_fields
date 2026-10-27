@@ -858,6 +858,7 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
     """Доводка сделки; строгий one-shot note только для unavailable."""
     lead_id = int(row["lead_id"])
     source = cfg["source"]
+    accepted_tags = []
     if p["form_type"] == "preorder":
         # Preserve both fields used by the previous CF7 integration. PATCH is
         # idempotent and may retry on the already recorded lead, never recreate it.
@@ -884,13 +885,20 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
                 current.get("id"), current.get("pipeline_id"), current.get("status_id")
             ) != (lead_id, cfg["pipeline_id"], cfg["status_id"]):
                 raise RuntimeError("cf7-route-not-confirmed")
+            accepted_tags = [tag["name"] for tag in (current.get("_embedded") or {}).get("tags", [])
+                             if tag.get("name")]
             logger.info("site_form[%s]: existing route confirmed for lead %s", p["form"], lead_id)
         elif miniapp_form_routes.is_miniapp(p):
             raise RuntimeError("miniapp-route-not-confirmed")
         else:
             logger.error("site_form[%s]: accept в этап %s не прошёл, сделка %s осталась в Неразобранном",
                          p["form"], cfg["status_id"], lead_id)
-    tagged = await api.set_lead_tags(lead_id, [source] + cfg["tags"])
+    tags = [source] + cfg["tags"]
+    if accepted_tags:
+        # The lead is already live: preserve routing and manual tags added
+        # while it waited for reconciliation with CRM automation.
+        tags = list(dict.fromkeys(tags + accepted_tags))
+    tagged = await api.set_lead_tags(lead_id, tags)
     if miniapp_form_routes.is_miniapp(p) and not tagged:
         raise RuntimeError("miniapp-tags-not-confirmed")
     if p["context"]["utm"]:

@@ -2140,7 +2140,9 @@ def test_cf7_failed_accept_does_not_confirm_wrong_or_unknown_route(cf7, monkeypa
 def test_cf7_preorder_accepted_by_automation_finishes_same_queued_lead(cf7, monkeypatch):
     calls = _mock_api_v2(monkeypatch, accepted=None)
     creates, notes, writes = [], [], []
-    stage = {'id':301,'pipeline_id':10593102,'status_id':86794354}
+    stage = {'id':301,'pipeline_id':10593102,'status_id':86794354,
+             'responsible_user_id':77,
+             '_embedded':{'tags':[{'name':'ОП Розница'},{'name':'Ручная пометка'}]}}
     async def create(**kwargs):
         creates.append(kwargs)
         return {'lead_id':301,'uid':'U-301'}
@@ -2171,6 +2173,7 @@ def test_cf7_preorder_accepted_by_automation_finishes_same_queued_lead(cf7, monk
     assert len(creates) == len(notes) == 1
     assert SID in notes[0][1]
     assert calls['rename'] == (301, 'Заказ №301')
+    assert calls['tags'] == (301, ['Форма: предзаказ', 'ОП Розница', 'Ручная пометка'])
     assert store.get(SID)['status'] == 'done'
     assert store.get(SID)['payload'] is None
-    assert all('status_id' not in body for _, body in writes)
+    assert all('status_id' not in body and 'responsible_user_id' not in body for _, body in writes)
