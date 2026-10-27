@@ -112,7 +112,23 @@ FORM_TYPES = {
     "callback": "Обратный звонок или вопрос",
     "consultation": "Запись на консультацию",
     "unavailable": "Нет в наличии",
+    "preorder": "Предзаказ",
+    "newsletter": "Подписка на новости",
 }
+CF7_ROUTES = {
+    "cf7-question": ("callback", "Форма: вопрос на сайте"),
+    "cf7-product-consultation": ("callback", "Форма: консультация по товару"),
+    "cf7-preorder": ("preorder", "Форма: предзаказ"),
+    "cf7-newsletter": ("newsletter", "Форма: подписка блога"),
+}
+
+def is_cf7_intake(p: dict) -> bool:
+    slug = p.get("form", "")
+    return slug in CF7_ROUTES or (slug.startswith("test-") and slug[5:] in CF7_ROUTES)
+
+def strict_delivery(p: dict) -> bool:
+    return p.get("form_type") == "unavailable" or miniapp_form_routes.is_miniapp(p) or is_cf7_intake(p)
+
 FORMATS = {
     "online": "Онлайн",
     "showroom": "В шоуруме в Москве",
@@ -158,6 +174,15 @@ def _load_map() -> dict:
             "form_type": form_type,
         }
         out[str(slug)] = entry
+    # Migrated CF7 forms share the existing callback destination, with explicit
+    # types/sources. No CRM credential or new destination is supplied by WordPress.
+    for prefix in ("", "test-"):
+        base = out.get(prefix + "callback")
+        if not base:
+            continue
+        for slug, (kind, source) in CF7_ROUTES.items():
+            out.setdefault(prefix + slug, {**base, "form_type": kind,
+                                          "source": source, "tags": list(base["tags"])})
     return out
 
 
@@ -548,11 +573,23 @@ def clean_v2(payload: dict) -> dict:
 
     contact_in = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
     name = _s(contact_in.get("name"), 80)
-    if not name:
-        raise PayloadError("no-name")
-    phone = normalize_phone_v2(_s(contact_in.get("phone"), 32))
-    if not phone:
-        raise PayloadError("bad-phone")
+    email = ""
+    if form_type == "newsletter":
+        if declared_type != "newsletter":
+            raise PayloadError("form-type-mismatch")
+        email = _s(contact_in.get("email"), 254).lower()
+        if not re.fullmatch(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", email):
+            raise PayloadError("bad-email")
+        name = name or "Подписчик блога"
+        phone = ""
+    else:
+        if not name:
+            raise PayloadError("no-name")
+        phone = normalize_phone_v2(_s(contact_in.get("phone"), 32))
+        if not phone:
+            raise PayloadError("bad-phone")
+    if form_type == "preorder" and declared_type != "preorder":
+        raise PayloadError("form-type-mismatch")
 
     ctx_in = payload.get("context") if isinstance(payload.get("context"), dict) else {}
     fmt_in = ctx_in.get("format") if isinstance(ctx_in.get("format"), dict) else {}
@@ -569,6 +606,8 @@ def clean_v2(payload: dict) -> dict:
 
     page_url = _url(ctx_in.get("page_url")) or _url(payload.get("page_url"))
     product = _clean_ref(ctx_in.get("product"), with_sku=True)
+    if form_type == "preorder" and (not product or not product["name"]):
+        raise PayloadError("no-product")
     if form_type == "unavailable":
         # Не подменяем конкретный товар общим вопросом: идентификатор, название
         # и карточка товара нужны менеджеру и для проверки источника обращения.
@@ -585,6 +624,7 @@ def clean_v2(payload: dict) -> dict:
         "contact": {
             "name": name,
             "phone": phone,
+            **({"email": email} if email else {}),
             "telegram": _s(contact_in.get("telegram"), 64),
         },
         "comment": _s(payload.get("comment"), 2000),
@@ -706,7 +746,7 @@ def note_text_v2(p: dict, source: str) -> str:
 
     heading = "ЗАЯВКА — ТЕЛЕГРАМ ПРИЛОЖЕНИЕ" if miniapp_form_routes.is_miniapp(p) else "ЗАЯВКА С САЙТА"
     head = [f"✉️ {heading}: {FORM_TYPES[p['form_type']].upper()}"]
-    if p["form_type"] == "unavailable":
+    if strict_delivery(p):
         # Даже если длинное примечание обрежется до MAX_NOTE_LEN, полный ключ
         # остаётся в начале для сопоставления с локальной очередью.
         head.append(f"ID заявки: {p['submission_id']}")
@@ -727,7 +767,11 @@ def note_text_v2(p: dict, source: str) -> str:
     if p["comment"]:
         head.append(f"{'Запрос' if consultation or p['form_type'] == 'unavailable' else 'Вопрос'}: {p['comment']}")
 
-    person = ["☎️ КОНТАКТ", f"Имя: {contact['name']}", f"Телефон: {contact['phone']}"]
+    person = ["☎️ КОНТАКТ", f"Имя: {contact['name']}"]
+    if contact["phone"]:
+        person.append(f"Телефон: {contact['phone']}")
+    if contact.get("email"):
+        person.append(f"Email: {contact['email']}")
     if contact["telegram"]:
         person.append(f"Telegram: {contact['telegram']}")
 
@@ -771,22 +815,23 @@ async def _create_lead_v2(p: dict, cfg: dict, attempt: dict) -> tuple[int | None
     contact_in = p["contact"]
     source = cfg["source"]
     lead_name = f"{source}: {contact_in['name']}"
-    if p["form_type"] == "unavailable" or miniapp_form_routes.is_miniapp(p):
+    if strict_delivery(p):
         # Уникальный ключ должен попасть именно в первичный POST: после timeout
         # примечание может не существовать, а source_uid/form_id остаются slug.
         suffix = f" [ID заявки: {p['submission_id']}]"
         lead_name = f"{lead_name[:MAX_NAME_LEN - len(suffix)]}{suffix}"
-    contact_id = await api.find_contact_id(contact_in["phone"])
+    contact_id = await api.find_contact_id(contact_in["phone"] or contact_in.get("email", ""))
     if contact_id:
         contact = {"id": int(contact_id)}
     else:
-        fields = [{"field_code": "PHONE", "values": [{"value": contact_in["phone"], "enum_code": "WORK"}]}]
+        code, value = ("PHONE", contact_in["phone"]) if contact_in["phone"] else ("EMAIL", contact_in["email"])
+        fields = [{"field_code": code, "values": [{"value": value, "enum_code": "WORK"}]}]
         if contact_in["telegram"] and SITE_FORM_TELEGRAM_FIELD_ID:
             fields.append({"field_id": SITE_FORM_TELEGRAM_FIELD_ID, "values": [{"value": contact_in["telegram"]}]})
         contact = {"name": contact_in["name"], "custom_fields_values": fields}
     # С этого момента timeout/отмена не доказывают, что amo не создала сделку.
     attempt["remote_create_started"] = True
-    create_options = {"max_attempts": 1} if p["form_type"] == "unavailable" or miniapp_form_routes.is_miniapp(p) else {}
+    create_options = {"max_attempts": 1} if strict_delivery(p) else {}
     res = await api.create_unsorted_lead_ex(
         lead_name=lead_name,
         pipeline_id=cfg["pipeline_id"],
@@ -813,6 +858,15 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
     """Доводка сделки; строгий one-shot note только для unavailable."""
     lead_id = int(row["lead_id"])
     source = cfg["source"]
+    if p["form_type"] == "preorder":
+        # Preserve both fields used by the previous CF7 integration. PATCH is
+        # idempotent and may retry on the already recorded lead, never recreate it.
+        values = [{"field_id": 570641, "values": [{"value": p["context"]["product"]["name"]}]},
+                  {"field_id": 577671, "values": [{"enum_id": 1041239}]}]
+        result = await api._request_json("PATCH", f"{api.BASE_URL}/api/v4/leads/{lead_id}",
+                                         body={"custom_fields_values": values}, what="cf7-preorder-fields")
+        if result is None:
+            raise RuntimeError("cf7-preorder-fields-not-confirmed")
     if cfg["status_id"] and row.get("unsorted_uid"):
         # Ответственного ставим тем же accept: воронки вне розничного хаба распределение
         # лидов не слушает, и без этого сделка осталась бы на пользователе токена.
@@ -821,8 +875,8 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
         )
         if accepted:
             lead_id = int(accepted)
-        elif miniapp_form_routes.is_miniapp(p):
-            raise RuntimeError("miniapp-route-not-confirmed")
+        elif miniapp_form_routes.is_miniapp(p) or is_cf7_intake(p):
+            raise RuntimeError("miniapp-route-not-confirmed" if miniapp_form_routes.is_miniapp(p) else "cf7-route-not-confirmed")
         else:
             logger.error("site_form[%s]: accept в этап %s не прошёл, сделка %s осталась в Неразобранном",
                          p["form"], cfg["status_id"], lead_id)
@@ -834,7 +888,7 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
             logger.warning("site_form[%s]: UTM в поля сделки %s не записались, остались в примечании",
                            p["form"], lead_id)
     note = note_text_v2(p, source)
-    if p["form_type"] == "unavailable" or miniapp_form_routes.is_miniapp(p):
+    if strict_delivery(p):
         # Если ответ на добавление примечания потерян, повтор может его удвоить.
         attempt["note_started"] = True
         if not await api.add_note_to_lead(lead_id, note, max_attempts=1):
@@ -843,7 +897,7 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
         # Прежняя политика callback/consultation: API сам повторяет POST,
         # отрицательный ответ note не препятствует завершению заявки.
         await api.add_note_to_lead(lead_id, note)
-    readable_name = miniapp_form_routes.miniapp_lead_name(p)
+    readable_name = f"Заказ №{lead_id}" if p["form_type"] == "preorder" else miniapp_form_routes.miniapp_lead_name(p)
     if readable_name:
         # Initial POST retains the UUID for unknown create outcomes. Only remove
         # it after durable lead_id and confirmed note containing the full UUID.
@@ -919,7 +973,7 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         logger.error("site_form[%s]: заявка %s испорчена в очереди", row["form"], submission_id[:8])
         return
     is_unavailable = payload.get("form_type") == "unavailable"
-    strict_write = is_unavailable or miniapp_form_routes.is_miniapp(payload)
+    strict_write = strict_delivery(payload)
     attempt["is_unavailable"] = strict_write
     if is_unavailable and not SITE_FORM_UNAVAILABLE_ENABLED:
         # Убираем из due, сохраняя строку/попытки до восстановления gate.
