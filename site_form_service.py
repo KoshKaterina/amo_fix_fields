@@ -875,8 +875,18 @@ async def _finish_lead_v2(p: dict, cfg: dict, row: dict, attempt: dict) -> int:
         )
         if accepted:
             lead_id = int(accepted)
-        elif miniapp_form_routes.is_miniapp(p) or is_cf7_intake(p):
-            raise RuntimeError("miniapp-route-not-confirmed" if miniapp_form_routes.is_miniapp(p) else "cf7-route-not-confirmed")
+        elif is_cf7_intake(p):
+            # CRM automation can accept this exact lead before our accept call.
+            # An absent unsorted item is not proof of delivery: verify the saved
+            # lead in the configured pipeline/stage, without moving it again.
+            current = await api.get_lead_by_id(lead_id)
+            if not isinstance(current, dict) or (
+                current.get("id"), current.get("pipeline_id"), current.get("status_id")
+            ) != (lead_id, cfg["pipeline_id"], cfg["status_id"]):
+                raise RuntimeError("cf7-route-not-confirmed")
+            logger.info("site_form[%s]: existing route confirmed for lead %s", p["form"], lead_id)
+        elif miniapp_form_routes.is_miniapp(p):
+            raise RuntimeError("miniapp-route-not-confirmed")
         else:
             logger.error("site_form[%s]: accept в этап %s не прошёл, сделка %s осталась в Неразобранном",
                          p["form"], cfg["status_id"], lead_id)
