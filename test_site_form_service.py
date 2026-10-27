@@ -69,7 +69,7 @@ def test_load_map_keeps_explicit_unavailable_type(monkeypatch):
         "SITE_FORM_MAP",
         '{"out-of-stock": {"source": "Форма: нет в наличии", "pipeline_id": 1, '
         '"form_type": "unavailable"}, "wrong": {"source": "S", "pipeline_id": 1, '
-        '"form_type": "preorder"}, "broken": {"source": "S", "pipeline_id": 1, '
+        '"form_type": "unknown-form-type"}, "broken": {"source": "S", "pipeline_id": 1, '
         '"form_type": []}}',
     )
     m = sf._load_map()
@@ -903,7 +903,7 @@ def test_unavailable_source_not_registered_when_disabled(v2, monkeypatch):
 @pytest.mark.parametrize("mutate, error", [
     (lambda p: p.update(form="left-form"), "unknown-form"),
     (lambda p: p.update(submission_id="<script>"), "bad-submission-id"),
-    (lambda p: p.update(form_type="preorder"), "bad-form-type"),
+    (lambda p: p.update(form_type="not-a-type"), "bad-form-type"),
     (lambda p: p["contact"].update(name="  "), "no-name"),
     (lambda p: p["contact"].update(phone="12345"), "bad-phone"),
 ])
@@ -2034,3 +2034,85 @@ def test_readable_title_patch_changes_only_name(monkeypatch):
     assert calls[0][0] == 'PATCH'
     assert calls[0][1].endswith('/api/v4/leads/301')
     assert calls[0][2]['body'] == {'name': 'Подбор кошелька — Анна'}
+
+# Migrated public CF7 forms: email-only subscriptions, preorder context and
+# at-most-once remote creation through the existing durable queue.
+@pytest.fixture
+def cf7(v2, monkeypatch):
+    monkeypatch.setenv('SITE_FORM_MAP', '{"callback":{"source":"Callback","pipeline_id":10593102,"status_id":83537714,"tags":[]},"test-callback":{"source":"Test","pipeline_id":8642414,"tags":["тест"]}}')
+    monkeypatch.setattr(sf, 'FORM_MAP', sf._load_map())
+    return v2
+
+
+def test_cf7_maps_are_derived_from_configured_callback_only(cf7):
+    for slug, (kind, source) in sf.CF7_ROUTES.items():
+        assert sf.FORM_MAP[slug]['pipeline_id'] == 10593102
+        assert sf.FORM_MAP[slug]['form_type'] == kind
+        assert sf.FORM_MAP['test-' + slug]['pipeline_id'] == 8642414
+        assert sf.FORM_MAP['test-' + slug]['tags'] == ['тест']
+
+
+def test_cf7_newsletter_email_only(cf7):
+    p = sf.clean_v2(_v2_payload(form='cf7-newsletter', form_type='newsletter', contact={'email':'Reader@example.invalid'}))
+    assert p['contact']['email'] == 'reader@example.invalid'
+    assert p['contact']['phone'] == ''
+    assert 'reader@example.invalid' in sf.note_text_v2(p, 'Blog')
+    assert 'Телефон:' not in sf.note_text_v2(p, 'Blog')
+
+
+@pytest.mark.parametrize('email', ['', 'wrong', 'x\n@example.invalid', 'x@'])
+def test_cf7_newsletter_bad_email_rejected(cf7, email):
+    with pytest.raises(sf.PayloadError, match='bad-email'):
+        sf.clean_v2(_v2_payload(form='cf7-newsletter', form_type='newsletter', contact={'email': email}))
+
+
+def test_cf7_cannot_retype_callback_as_newsletter(cf7):
+    with pytest.raises(sf.PayloadError, match='form-type-mismatch'):
+        sf.clean_v2(_v2_payload(form='callback', form_type='newsletter', contact={'email':'x@example.invalid'}))
+
+
+def test_cf7_preorder_requires_product(cf7):
+    raw = _v2_payload(form='cf7-preorder', form_type='preorder')
+    raw['context']['product'] = None
+    with pytest.raises(sf.PayloadError, match='no-product'):
+        sf.clean_v2(raw)
+
+
+def test_cf7_newsletter_creates_email_contact_once(cf7, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    p = sf.clean_v2(_v2_payload(form='cf7-newsletter', form_type='newsletter', contact={'email':'reader@example.invalid'}))
+    captured = {}
+    async def create(**kwargs):
+        captured.update(kwargs)
+        return {'lead_id':301, 'uid':'U-301'}
+    monkeypatch.setattr(api, 'create_unsorted_lead_ex', create)
+    asyncio.run(sf._create_lead_v2(p, sf.FORM_MAP[p['form']], {}))
+    assert captured['max_attempts'] == 1
+    assert SID in captured['lead_name']
+    assert captured['contact']['custom_fields_values'] == [{'field_code':'EMAIL','values':[{'value':'reader@example.invalid','enum_code':'WORK'}]}]
+
+
+def test_cf7_preorder_retains_crm_fields(cf7, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    captured = []
+    async def patch(method, url, **kwargs):
+        captured.append((method, kwargs['body']))
+        return {'id':301}
+    async def note(*args, **kwargs):
+        assert kwargs['max_attempts'] == 1
+        return True
+    monkeypatch.setattr(api, '_request_json', patch)
+    monkeypatch.setattr(api, 'add_note_to_lead', note)
+    p = sf.clean_v2(_v2_payload(form='cf7-preorder', form_type='preorder'))
+    asyncio.run(sf._finish_lead_v2(p, sf.FORM_MAP[p['form']], {'lead_id':301}, {}))
+    assert captured == [('PATCH', {'custom_fields_values':[
+        {'field_id':570641,'values':[{'value':'Keystone 3 Pro'}]},
+        {'field_id':577671,'values':[{'enum_id':1041239}]}]})]
+    assert calls['rename'] == (301, 'Заказ №301')
+
+
+def test_cf7_same_submission_is_queued_once(cf7, monkeypatch):
+    monkeypatch.setattr(sf, '_kick', lambda: None)
+    p = _v2_payload(form='cf7-question')
+    assert asyncio.run(sf.accept_v2(p))[1]['status'] == 'accepted'
+    assert asyncio.run(sf.accept_v2(p))[1]['status'] == 'duplicate'
