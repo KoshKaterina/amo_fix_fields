@@ -765,14 +765,20 @@ def test_result_failed_retries_after_30_and_120_seconds_then_human(env):
     run(go())
 
 
-def test_turn_without_result_is_treated_as_failed(env):
+def test_turn_without_result_is_closed_without_retry_and_alerts(env):
+    """Потерянный итог чаще всего значит, что ИИ уже ответил: повтор написал бы клиенту второй раз."""
     async def go():
         turn = await env.start_turn()
         env.t += cfg.TURN_TIMEOUT_S + 5
         await E._expire_turns()
-        assert store.get_turn(turn["turn_id"])["outcome"] == "failed"
-        await env.advance(31)
-        assert len(env.turn_requests) == 2 and env.turn_requests[1]["reason"] == "retry"
+        assert store.get_turn(turn["turn_id"])["outcome"] == "timeout"
+        await env.advance(300)
+        assert len(env.turn_requests) == 1                    # никакого повтора
+        assert store.get_owner(DEAL)["owner"] == "ai" and store.get_session(CHAT_KEY)["state"] == "ai"
+        assert any("не прислал итог" in a for a in env.alerts)
+        await env.say(env.msg("новое", mid="n1"))
+        await env.advance(11)
+        assert len(env.turn_requests) == 2                    # а следующее сообщение клиента идёт в работу
     run(go())
 
 

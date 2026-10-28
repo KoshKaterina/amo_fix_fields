@@ -66,6 +66,8 @@ _ai_down_alerted = False
 _off_alerted = False
 _alert_seen: dict[str, float] = {}      # дедуп алертов в памяти: ключ -> когда слали
 _rule_c_seen: dict[int, float] = {}     # сделка -> когда проверяли правило C
+_rule_c_reads: list[float] = []         # когда читали сделки под правило C (для потолка в минуту)
+RULE_C_READS_PER_MIN = 30
 _last_housekeeping = 0.0
 _last_expire = 0.0
 _last_off_sweep = 0.0
@@ -217,14 +219,13 @@ def extract_lead_event(lead_id: int, pipeline_id: Any, status_id: Any, nested: A
             enum = first.get("enum") or first.get("enum_id")
             if str(enum or "") == str(cfg.ENUM_PAYMENT_STATE_PAID) or str(first.get("value") or "").strip() == "Оплачен":
                 paid = True
-    price_touched = body.get("price") not in (None, "", "0", 0)
     return {
         "lead_id": lead_id,
         "pipeline_id": _int_or_none(pipeline_id),
         "status_id": _int_or_none(status_id),
         "added": added,
         "paid": paid,
-        "work_touched": order_touched or price_touched,
+        "work_touched": order_touched,
     }
 
 
@@ -239,11 +240,11 @@ async def _ingest_loop() -> None:
     while True:
         kind, item = await _queue.get()
         try:
-            async with _get_lock():
-                if kind == "wazzup":
+            if kind == "wazzup":
+                async with _get_lock():
                     await _handle_payload(item)
-                elif kind == "lead":
-                    await _handle_lead_event(item)
+            elif kind == "lead":
+                await _handle_lead_event(item)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -434,15 +435,14 @@ async def tick_once() -> None:
     ходы без итога; раз в час уборка. Вынесено из цикла, чтобы тесты гоняли ровно тот же код."""
     global _last_housekeeping, _last_expire, _last_off_sweep
     now = _now()
-    async with _get_lock():
-        for s in await _db(store.due_sessions, now):
-            try:
-                await _process_collecting(s)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("ai_engine: ошибка обработки чата %s", s.get("chat_key"))
-                await _db(store.put_session, s["chat_key"], next_at=_now() + cfg.RESOLVE_RETRY_S)
+    for s in await _db(store.due_sessions, now):
+        try:
+            await _process_collecting(s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ai_engine: ошибка обработки чата %s", s.get("chat_key"))
+            await _db(store.put_session, s["chat_key"], next_at=_now() + cfg.RESOLVE_RETRY_S)
     if now - _last_off_sweep >= 10:
         _last_off_sweep = now
         async with _get_lock():
@@ -457,26 +457,33 @@ async def tick_once() -> None:
 
 
 async def _process_collecting(s: dict) -> None:
+    """Чат дозрел. Сначала сеть (поиск сделок в amo) БЕЗ общего замка: пока amo думает, должны проходить
+    итоги ходов и вебхуки (итог, не принятый за 10 секунд, сервис считает недоставленным). Решение принимается
+    под замком и по свежей строке чата: если пока мы ходили в amo, чат сменил состояние, это решение устарело."""
     chat_key = s["chat_key"]
-    now = _now()
     mode = settings.effective_mode()
     if mode == "off":
-        await _db(store.drop_session, chat_key)
+        async with _get_lock():
+            await _db(store.drop_session, chat_key)
         return
-
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
-    if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]:
-        known = int(s["deal_id"])
-    else:
-        known = None
-        if owner is not None and owner["owner"] == store.OWNER_HUMAN:
-            await _db(store.put_session, chat_key, state=store.S_HUMAN, next_at=None)
-            await _db(store.discard_pending, chat_key)
-            return
-
-    # Событие без новых сообщений (оплата, возврат диалога) идёт тем же путём, но выбор сделки не нужен:
-    # сделка уже наша, правило C проверяется отдельно (вебхуком сделки и перед ходом).
+    known = int(s["deal_id"]) if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] else None
     res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known)
+    async with _get_lock():
+        fresh = await _db(store.get_session, chat_key)
+        if fresh is None or fresh["state"] != store.S_COLLECTING or (fresh["next_at"] or 0) > _now():
+            return
+        await _apply_resolution(fresh, res, mode)
+
+
+async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
+    chat_key = s["chat_key"]
+    now = _now()
+    owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
+    if owner is not None and owner["owner"] == store.OWNER_HUMAN:
+        await _db(store.put_session, chat_key, state=store.S_HUMAN, next_at=None)
+        await _db(store.discard_pending, chat_key)
+        return
 
     if res.kind == dedup.K_ERROR:
         if now < (s["resolve_deadline"] or 0):
@@ -798,8 +805,8 @@ async def _expire_turns() -> None:
     now = _now()
     for t in await _db(store.turns_in_state, store.T_ACCEPTED):
         if t["accepted_at"] and now - t["accepted_at"] > cfg.TURN_TIMEOUT_S:
-            logger.error("ai_engine: ход %s без итога %s с - считаю сорвавшимся", t["turn_id"], cfg.TURN_TIMEOUT_S)
-            await _on_turn_failed(t, "timeout")
+            logger.error("ai_engine: ход %s без итога %s с", t["turn_id"], cfg.TURN_TIMEOUT_S)
+            await _on_turn_timeout(t)
 
 
 # =============================================================================================
@@ -935,6 +942,20 @@ async def _after_turn(s: dict | None) -> None:
         await _db(store.put_session, chat_key, state=store.S_AI, next_at=None, current_turn=None)
 
 
+async def _on_turn_timeout(turn: dict) -> None:
+    """Итог хода так и не пришёл. Автоповтора НЕТ, и это осознанно: чаще всего потерян не ход, а доставка итога
+    (движок пересобирали, пока сервис слал `result`), то есть клиенту ИИ уже ответил, и повтор написал бы ему
+    второй раз. Ход закрывается, ИИ остаётся владельцем и ждёт следующего сообщения, а клиента без ответа
+    подхватит SLA-таймер. Алерт зовёт человека посмотреть."""
+    await _db(store.update_turn, turn["turn_id"], state=store.T_DONE, finished_at=_now(), outcome="timeout")
+    s = await _db(store.get_session, turn["chat_key"])
+    await _after_turn(s)
+    await _alert("turn_timeout", [
+        "ИИ-сервис не прислал итог хода. Повтор не делаю: клиенту ИИ мог уже ответить.",
+        _client_line(s), _link(int(turn["deal_id"])),
+    ], dedupe=f"turn_timeout:{turn['deal_id']}")
+
+
 async def _on_turn_failed(turn: dict, why: str) -> None:
     """Сбой модели или провайдера: до двух повторов с паузой 30 и 120 с, потом человек."""
     await _db(store.update_turn, turn["turn_id"], state=store.T_DONE, finished_at=_now(), outcome="failed",
@@ -1001,9 +1022,9 @@ async def _handoff_by_rule(s: dict, res: dedup.Resolution, owner: dict | None) -
             _client_line(s), "Сделка чата: " + _link(deal_id), "Новая: " + " ".join(links),
         ])
         try:
-            await amo_service.add_note(
+            await asyncio.wait_for(amo_service.add_note(
                 deal_id, f"У клиента появилась сделка {others[0]['id']} с заказом, ИИ остановлен. Диалог передан менеджеру.",
-            )
+            ), timeout=15)
         except Exception:  # noqa: BLE001
             logger.exception("ai_engine: не записал заметку правила C в сделку %s", deal_id)
         return
@@ -1042,25 +1063,32 @@ async def _deal_closed(deal_id: int, why: str) -> None:
 
 async def _handle_lead_event(ev: dict) -> None:
     lead_id = ev["lead_id"]
-    mode = settings.effective_mode()
-    if mode == "off":
+    if settings.effective_mode() == "off":
         return
+    async with _get_lock():
+        if await _lead_event_under_lock(ev):
+            return
+    if ev["added"] or ev["work_touched"]:
+        await _rule_c_check(lead_id)
+
+
+async def _lead_event_under_lock(ev: dict) -> bool:
+    """Закрытие, уход из воронки, оплата: всё на базе, без сети. True - событие разобрано, правило C не нужно
+    (сделка уже в нашей базе: закрыта, ведётся ИИ или лежит у человека)."""
+    lead_id = ev["lead_id"]
     owner = await _db(store.get_owner, lead_id)
     if owner is not None and not owner["closed"] and ev["status_id"] in cfg.CLOSED_STATUS_IDS:
         await _deal_closed(lead_id, "deal_closed")
-        return
+        return True
     if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]:
         if ev["pipeline_id"] is not None and ev["pipeline_id"] not in settings.allowed_pipelines():
             await _deal_closed(lead_id, "left_pipeline")
-            return
+            return True
         if _is_payment_event(ev, owner) and await _db(store.claim_event, lead_id, "payment_received"):
             logger.info("ai_engine: сделка %s оплачена - служебное событие payment_received", lead_id)
             await _queue_event(owner, "payment_received")
-        return
-    if owner is not None:
-        return
-    if ev["added"] or ev["work_touched"]:
-        await _rule_c_check(lead_id)
+        return True
+    return owner is not None
 
 
 def _is_payment_event(ev: dict, owner: dict) -> bool:
@@ -1082,20 +1110,29 @@ async def _rule_c_check(lead_id: int) -> None:
     _rule_c_seen[lead_id] = now
     if len(_rule_c_seen) > 5000:
         _rule_c_seen.clear()
+    # Потолок чтений amo под правило C: массовая правка сделок не должна превратиться в шквал запросов.
+    window = [t for t in _rule_c_reads if now - t < 60]
+    _rule_c_reads[:] = window
+    if len(window) >= RULE_C_READS_PER_MIN:
+        logger.warning("ai_engine: правило C: достигнут потолок чтений amo в минуту, сделка %s пропущена", lead_id)
+        return
+    _rule_c_reads.append(now)
     lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
     if not lead or not dedup.is_open(lead) or not dedup.has_work_signs(lead):
         return
     theirs = set(dedup.contact_ids_of(lead))
-    for row in owned:
-        mine = {int(c) for c in json.loads(row["contact_ids"] or "[]")}
-        if not (mine & theirs) or int(row["deal_id"]) == lead_id:
-            continue
-        s = await _db(store.session_for_deal, int(row["deal_id"]))
-        res = dedup.Resolution(dedup.K_HUMAN, rule="C", others=[lead])
-        if s is None:
-            s = {"chat_key": row["chat_key"], "deal_id": row["deal_id"], "chat_id": row["chat_id"] or "",
-                 "contact_name": "", "phone": "", "chat_type": row["chat_type"] or "", "channel_id": row["channel_id"] or ""}
-        await _handoff_by_rule(s, res, row)
+    async with _get_lock():
+        for row in await _db(store.list_owned, store.OWNER_AI):
+            mine = {int(c) for c in json.loads(row["contact_ids"] or "[]")}
+            if not (mine & theirs) or int(row["deal_id"]) == lead_id:
+                continue
+            s = await _db(store.session_for_deal, int(row["deal_id"]))
+            res = dedup.Resolution(dedup.K_HUMAN, rule="C", others=[lead])
+            if s is None:
+                s = {"chat_key": row["chat_key"], "deal_id": row["deal_id"], "chat_id": row["chat_id"] or "",
+                     "contact_name": "", "phone": "", "chat_type": row["chat_type"] or "",
+                     "channel_id": row["channel_id"] or ""}
+            await _handoff_by_rule(s, res, row)
 
 
 async def return_dialog(deal_id: int) -> tuple[int, dict]:
@@ -1158,7 +1195,8 @@ async def _alert(key: str, lines: list[str], *, dedupe: str | None = None) -> No
         )
         if d is None:
             return
-        await _deliver_alert(d)
+        # Алерт зовётся под общим замком: зависший Телеграм не должен держать итоги ходов дольше 8 секунд.
+        await asyncio.wait_for(_deliver_alert(d), timeout=8)
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: алерт «%s» не ушёл", key)
 
