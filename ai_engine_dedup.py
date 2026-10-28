@@ -116,7 +116,8 @@ async def find_leads(chat_id: str, phone: str) -> list[dict] | None:
     """Все сделки по чату (union по chat_id и телефону). None - amo не ответила хотя бы на один запрос."""
     merged: dict[int, dict] = {}
     for q in _queries(chat_id, phone):
-        found = await amo_service.find_leads_by_query(q, with_=("contacts",), limit=50)
+        # По всем страницам: у контакта с историей новая сделка не на первой (find_leads_by_query_all).
+        found = await amo_service.find_leads_by_query_all(q, with_=("contacts",))
         if found is None:
             return None
         for lead in found:

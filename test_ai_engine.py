@@ -86,7 +86,7 @@ class Env:
 
         mp.setattr(E, "_deliver_alert", deliver)
 
-        async def find(query, with_=(), limit=50):
+        async def find(query, with_=(), page_limit=250, max_pages=5):
             return None if self.amo_down else list(self.leads)
 
         async def get_full(lead_id, with_=()):
@@ -96,7 +96,7 @@ class Env:
             self.notes.append((int(lead_id), text))
             return {}
 
-        mp.setattr(amo_service, "find_leads_by_query", find)
+        mp.setattr(amo_service, "find_leads_by_query_all", find)
         mp.setattr(amo_service, "get_lead_full", get_full)
         mp.setattr(amo_service, "add_note", add_note)
         mp.setattr(amo_service, "get_status_sort", lambda status, pipeline: None)
@@ -462,7 +462,7 @@ def test_chat_whose_phone_is_not_in_list_never_reaches_amo(env):
             looked.append(q)
             return []
 
-        env.mp.setattr(amo_service, "find_leads_by_query", find)
+        env.mp.setattr(amo_service, "find_leads_by_query_all", find)
         m = env.msg("слово")
         m["contact"]["phone"] = "79990000000"
         m["chatId"] = "777"

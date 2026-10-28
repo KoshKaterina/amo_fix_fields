@@ -24,6 +24,8 @@ import ai_engine_api as API
 import ai_engine_config as cfg
 import ai_engine_settings as settings
 import ai_engine_store as store
+import ai_engine_dedup as dedup
+import amo_service
 import autopilot
 import retail_lead_guard
 import wazzup_sla
@@ -373,3 +375,81 @@ def test_flag_off_means_no_loops_no_db_and_no_hooks(tmp_path, monkeypatch):
     E.on_wazzup({"messages": [{"chatId": "1"}]})              # ничего не делает и не падает
     E.on_lead_change(1, None, None, {})
     assert E.status() == {"enabled": False}
+
+
+# =============================================================================================
+# поиск сделок по всем страницам (боевой тест 28.10.2026: у контакта 52 сделки, новая на второй странице)
+# =============================================================================================
+
+def _paged_amo(monkeypatch, leads, fail_page=None):
+    """Подставной amo: /api/v4/leads отдаёт срез по `page` и `limit`, как настоящий (по возрастанию номера)."""
+    calls = []
+
+    async def fake_get(path, params=None):
+        q = dict(params or [])
+        page, limit = int(q.get("page", 1)), int(q.get("limit", 50))
+        calls.append((page, limit, q.get("query")))
+        if fail_page == page:
+            return None
+        chunk = leads[(page - 1) * limit: page * limit]
+        return {"_embedded": {"leads": chunk}} if chunk else {}
+
+    monkeypatch.setattr(amo_service, "_do_get", fake_get)
+    return calls
+
+
+def _lead(i, status=142, pipeline=8642414, contact=555):
+    return {"id": i, "status_id": status, "pipeline_id": pipeline, "price": 0,
+            "_embedded": {"contacts": [{"id": contact, "is_main": True}]}}
+
+
+def test_find_leads_by_query_all_walks_every_page(monkeypatch):
+    old = [_lead(i) for i in range(1, 256)]                   # 255 старых закрытых
+    leads = old + [_lead(900, status=1000)]                    # и одна новая открытая на второй странице
+    calls = _paged_amo(monkeypatch, leads)
+    got = asyncio.run(amo_service.find_leads_by_query_all("1920391385", with_=("contacts",)))
+    assert [c[:2] for c in calls] == [(1, 250), (2, 250)]
+    assert len(got) == 256 and got[-1]["id"] == 900
+
+
+def test_find_leads_by_query_all_one_short_page_is_one_request(monkeypatch):
+    calls = _paged_amo(monkeypatch, [_lead(1), _lead(2)])
+    assert len(asyncio.run(amo_service.find_leads_by_query_all("x"))) == 2 and len(calls) == 1
+    calls = _paged_amo(monkeypatch, [])
+    assert asyncio.run(amo_service.find_leads_by_query_all("x")) == []     # пустая выдача (204): «не нашлось»
+
+
+def test_find_leads_by_query_all_missing_page_is_none_not_a_partial_answer(monkeypatch):
+    leads = [_lead(i) for i in range(1, 300)]
+    _paged_amo(monkeypatch, leads, fail_page=2)
+    assert asyncio.run(amo_service.find_leads_by_query_all("x")) is None   # вторая страница не пришла
+
+
+def test_find_leads_by_query_all_ceiling_is_none(monkeypatch):
+    leads = [_lead(i) for i in range(1, 1500)]                 # больше 5 страниц по 250
+    calls = _paged_amo(monkeypatch, leads)
+    assert asyncio.run(amo_service.find_leads_by_query_all("x")) is None
+    assert len(calls) == 5
+
+
+def test_resolve_finds_new_open_deal_behind_a_long_history(db, monkeypatch):
+    """Ровно случай боевого теста: у контакта 52 закрытые и одна новая открытая в «Тест» на второй странице."""
+    settings.set_document(DOC)
+    leads = [_lead(i) for i in range(1, 53)] + [_lead(36588789, status=1000)]
+    leads = leads[:49] + leads[49:]                            # новая последняя по номеру, как в amo
+    calls = _paged_amo(monkeypatch, leads)
+    res = asyncio.run(dedup.resolve("1920391385", "79260000001"))
+    assert res.kind == dedup.K_AI and res.deal["id"] == 36588789
+    assert all(limit == 250 for _, limit, _ in calls)
+
+
+def test_resolve_treats_a_broken_second_page_as_amo_silence(db, monkeypatch):
+    settings.set_document(DOC)
+    _paged_amo(monkeypatch, [_lead(i) for i in range(1, 300)], fail_page=2)
+    assert asyncio.run(dedup.resolve("1920391385", "79260000001")).kind == dedup.K_ERROR
+
+
+def test_old_single_page_search_is_untouched():
+    """Сторож розницы и протез amgroup зовут прежнюю функцию: у неё прежняя сигнатура."""
+    import inspect
+    assert "limit" in inspect.signature(amo_service.find_leads_by_query).parameters
