@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.status import HTTP_200_OK
 
+import ai_engine
+import ai_engine_api
 import amgroup_contact_heal
 import amgroup_duplicate_watch
 import amgroup_fallback
@@ -241,6 +243,12 @@ async def lifespan(app):
     # смотрит флаг AUTOPILOT_ENABLED и без него не поднимает ни хранилища, ни опроса
     # панели, ни фонового цикла.
     await autopilot.init()
+    # ИИ-менеджер (движок для ИИ-сервиса): без AI_ENGINE_ENABLED=1 не делает ничего. Ошибка запуска
+    # не должна ронять остальной контур, поэтому отдельный try.
+    try:
+        await ai_engine.init()
+    except Exception:
+        logger.exception("ai_engine: запуск не удался, остальной контур работает без ИИ")
     academy_invite_delivery.start()
     # Вступление в чат практикума двигает сделку на «Вступил в чат». Слушает
     # Telegram длинным опросом и сам проверяет ACADEMY_CHAT_JOIN_ENABLED: без
@@ -267,6 +275,10 @@ async def lifespan(app):
     await amgroup_duplicate_watch.shutdown()
     await amgroup_contact_heal.shutdown()
     await autopilot.shutdown()
+    try:
+        await ai_engine.shutdown()
+    except Exception:
+        logger.exception("ai_engine: остановка не прошла чисто")
     await academy_invite_delivery.stop()
     await academy_chat_join.stop()
     await office_transfer.stop_reconcile()
@@ -288,6 +300,8 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(lead_distribution_router)
+# Внутренний API для ИИ-сервиса (permit, result): под токеном и флагом, подробности в ai_engine_api.py.
+app.include_router(ai_engine_api.router)
 
 logger = logging.getLogger("uvicorn")
 
@@ -315,6 +329,8 @@ async def health():
             # плейсхолдеру, а не по графику — 25.09.2026 так прошло 2.5 часа, и
             # узналось это только задним числом из логов nginx.
             "team_panel": team_panel_client.stats(),
+            # ИИ-менеджер: режим из панели, живы ли циклы, сколько сделок у ИИ. Выключен - enabled=false.
+            "ai_engine": ai_engine.status(),
             **queue_stats()}
 
 
@@ -494,6 +510,12 @@ async def wazzup_webhook(secret: str, request: Request):
         retail_lead_guard.on_wazzup(payload)
     except Exception:
         logger.exception("Wazzup webhook: ошибка сторожа розничных лидов")
+    # Шестой потребитель - ИИ-менеджер: клиентские сообщения для ходов, сообщения менеджеров
+    # снимают диалог с ИИ. Только кладёт тело в очередь; без AI_ENGINE_ENABLED=1 не делает ничего.
+    try:
+        ai_engine.on_wazzup(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка ИИ-менеджера")
     return {"ok": True}
 
 
@@ -694,6 +716,13 @@ async def lead_change(request: Request):
     # сделки, и лишний запрос в amo отсюда стоил бы дорого. Проверка и отправка — в
     # собственном цикле new_lead_watch.
     new_lead_watch.note_lead(lead_id, incoming_pipeline, incoming_status)
+
+    # ИИ-менеджер: закрытие сделки, «оплата получена», правило C (у клиента появилась другая сделка с
+    # заказом). Только кладёт событие в очередь, без сети; без AI_ENGINE_ENABLED=1 не делает ничего.
+    try:
+        ai_engine.on_lead_change(lead_id, incoming_pipeline, incoming_status, nested)
+    except Exception:
+        logger.exception("lead_change: ошибка ИИ-менеджера")
 
     # Новый лид в Академии (Катя 08.09.2026): сделка встала на «Входящий лид» воронки
     # Академии → уведомление Гладкову в топик УВЕДОМЛЕНИЯ. Здесь только сравнение

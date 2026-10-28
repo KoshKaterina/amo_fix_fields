@@ -65,6 +65,7 @@ import httpx
 
 import amo_service
 import autopilot_settings_client as settings_client
+import ai_engine_store
 import autopilot_store as store
 import sales_sheet_feed
 import ms_client
@@ -1869,6 +1870,18 @@ async def guarded(coro, *, what: str, lead_id=None) -> None:
                     lead=lead, lead_id=lead_id, dedupe=what)
 
 
+async def _ai_owns_deal(lead_id: int) -> bool:
+    """Сделкой сейчас владеет ИИ-менеджер. Любой сбой читается как «нет»: развязка не должна останавливать
+    авто-режим, когда ИИ выключен или его база недоступна."""
+    try:
+        if not ai_engine_store.cfg.ENABLED:
+            return False
+        return await asyncio.to_thread(ai_engine_store.is_ai_owned, lead_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("autopilot: не смог спросить, владеет ли сделкой ИИ - считаю, что нет")
+        return False
+
+
 def on_lead_change(lead_id) -> None:
     """Врезка в вебхук `/lead_change`. Синхронная и мгновенная: amoCRM ждёт быстрый ответ,
     а при задержке повторяет вебхук - и повтор стоил бы клиенту второго сообщения."""
@@ -1891,6 +1904,11 @@ async def handle_lead_change(lead_id: int) -> None:
         return
     lead = await load_lead(lead_id)
     if not lead:
+        return
+    # Сделкой владеет ИИ-менеджер: его боты и наши не работают в одной сделке одновременно
+    # (контракт ИИ, раздел «Владелец сделки»). Проверка только на чтении собственной базы ИИ.
+    if await _ai_owns_deal(lead_id):
+        logger.info("autopilot: сделкой %s владеет ИИ-менеджер, не трогаю", lead_id)
         return
     pipeline_id = int(lead.get("pipeline_id") or 0)
     status_id = int(lead.get("status_id") or 0)
