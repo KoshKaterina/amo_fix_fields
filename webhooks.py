@@ -3,6 +3,7 @@ import datetime
 import json
 import logging
 import re
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -50,6 +51,7 @@ import showroom_alert
 import showroom_store
 import showroom_tag
 import site_form_service
+import sipuni_events
 import getcourse_service
 import team_panel_client
 import telegram_bot
@@ -84,6 +86,7 @@ from waybill_config import (
     PIPELINE_ACADEMY,
     STATUS_ACADEMY_RECORDED_PRACTICUM,
     OFFICE_TRANSFER_ENABLED,
+    SIPUNI_WEBHOOK_SECRET,
     STATUS_CLOSED_LOST,
     STATUS_CREATE_WAYBILL,
     STATUS_SUCCESS,
@@ -97,7 +100,7 @@ from waybill_config import (
 # перенос в заголовки требует перенастройки на стороне Jivo, UIS, Wazzup и BotHelp), путь
 # нельзя писать в журнал целиком.
 SECRET_PATH_PREFIXES = ("/jivo/", "/uis/", "/wazzup/", "/bothelp/academy/",
-                        "/admin/lead-distribution/", "/getcourse/")
+                        "/admin/lead-distribution/", "/getcourse/", "/sipuni/")
 
 
 def mask_secret_path(path: str) -> str:
@@ -440,6 +443,33 @@ async def uis_missed_call_webhook(secret: str, request: Request):
         return Response("forbidden", status_code=403)
     uis_missed_call.notify_bg(dict(request.query_params))
     return {"ok": True}
+
+
+# Потолок тела события Sipuni: настоящее событие весит сотни байт, больше - не наше.
+_SIPUNI_MAX_BODY = 256 * 1024
+
+
+@app.api_route("/sipuni/{secret}", methods=["GET", "POST"])
+async def sipuni_events_webhook(secret: str, request: Request):
+    """Sipuni «События на АТС» (28.10.2026) → учёт звонков по call_id и, в режиме live,
+    алерт о пропущенном. Рядом с /uis/, UIS-маршрут не тронут. Секрет в пути (маскируется в
+    журналах). Принимаем GET и POST, параметры в адресе, форму и JSON: формат тела POST в
+    описании Sipuni не указан. Ответ ВСЕГДА быстрый JSON {"success": true}: без него Sipuni
+    приостанавливает отправку событий. Разбор идёт в фоне. Режим SIPUNI_EVENTS_MODE=log
+    (по умолчанию) только пишет строку журнала по событию: ни Telegram, ни amo."""
+    if not SIPUNI_WEBHOOK_SECRET or not secrets.compare_digest(
+            secret.encode("utf-8"), SIPUNI_WEBHOOK_SECRET.encode("utf-8")):
+        logger.warning("Sipuni webhook: неверный секрет в пути")
+        return Response("forbidden", status_code=403)
+    try:
+        body = await request.body() if request.method == "POST" else b""
+        if len(body) > _SIPUNI_MAX_BODY:
+            logger.warning("Sipuni webhook: тело %s байт больше потолка - отбрасываю", len(body))
+            body = b""
+        uis_missed_call.sipuni_notify_bg(sipuni_events.collect_payload(dict(request.query_params), body))
+    except Exception:
+        logger.exception("Sipuni webhook: событие не принято в разбор")
+    return {"success": True}
 
 
 @app.post("/wazzup/{secret}")

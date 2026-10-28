@@ -30,7 +30,10 @@
 
 Секрет или токен проверяют только `/jivo/{token}`, `/uis/{secret}`, `/wazzup/{secret}`,
 `/site_form`, `/bothelp/academy/{secret}`, `/getcourse/{secret}` (с 21.10.2026, заказы
-GetCourse → сделки Академии, `getcourse_service.py`). **Признаков проверки нет у трёх вебхуков** —
+GetCourse → сделки Академии, `getcourse_service.py`) и `/sipuni/{secret}` (с 28.10.2026, «События на
+АТС» Sipuni рядом с UIS, `sipuni_events.py`; пустой `SIPUNI_WEBHOOK_SECRET` — 403, режим
+`SIPUNI_EVENTS_MODE=log` по умолчанию только пишет журнал; перед включением маршрута в nginx добавить
+`/amo/sipuni/` в `00-log-sanitize.conf`). **Признаков проверки нет у трёх вебхуков** —
 `/cdek_status`, `/contact_change`, `/lead_change` — **и у прокси штрихкодов
 `/barcode/{ident}`** (корневой `/` отдаёт состояние). То есть любой, кто
 знает адрес, может прислать событие сделки.
