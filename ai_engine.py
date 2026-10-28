@@ -576,7 +576,10 @@ async def _give_up_resolving(s: dict, why: str) -> None:
     amo разбирает сам, а сторож розничных лидов зовёт людей там, где открытая сделка лежит в чужой воронке."""
     await _db(store.put_session, s["chat_key"], state=store.S_SKIP, skip_until=_now() + cfg.SKIP_TTL_S, next_at=None)
     await _db(store.discard_pending, s["chat_key"])
-    if settings.contacts_restricted():
+    # Сделки нет, поэтому контакт по id неизвестен: чат считается «из списка» только по телефону или chat_id
+    # (WhatsApp: chat_id и есть телефон). Иначе алерт получал бы КАЖДЫЙ живой клиент канала, у которого нет
+    # сделки в воронке режима (боевой тест 28.10.2026: клиенты «ТГ ОП» с сделками в «ОП розница»).
+    if settings.contacts_restricted() and settings.contact_allowed([], [s["phone"], s["chat_id"]]):
         await _alert("deal_not_found", [f"Клиент написал, но {why}.", _client_line(s)],
                      dedupe=f"deal_not_found:{s['chat_key']}")
 

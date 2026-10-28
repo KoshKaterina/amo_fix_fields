@@ -1055,3 +1055,90 @@ def test_unreachable_panel_at_boot_does_not_dump_deals(env):
         await E._sweep_if_off()
         assert store.get_owner(DEAL)["owner"] == "ai"         # настроек ещё нет: это не «выключили»
     run(go())
+
+
+# =============================================================================================
+# алерт «сделка так и не появилась»: только для чатов из списка режима (боевой тест 28.10.2026)
+# =============================================================================================
+
+TEST_PHONE_ITEM = {"contact_id": 48595431, "phone_norm": "79956109902", "name": "Тиана"}
+NO_PHONE_ITEM = {"contact_id": 555, "phone_norm": "", "name": "Без телефона"}
+
+
+def _chat_msg(env, chat_id, phone, mid):
+    m = env.msg("слово", mid=mid)
+    name = "Тиана" if mid == "own" else "Чужой клиент"
+    m["chatId"], m["contact"] = chat_id, {"name": name, "phone": phone}
+    return m
+
+
+async def _wait_out_resolving(env):
+    for _ in range(12):
+        await env.advance(60)
+
+
+def test_deal_not_found_alert_goes_only_to_chats_from_the_list_by_phone(env):
+    async def go():
+        # в списке запись с телефоном и запись без телефона: до amo доходят ВСЕ чаты (телефон второй неизвестен)
+        env.set_settings(contacts={"scope": "test", "restricted": True, "items": [TEST_PHONE_ITEM, NO_PHONE_ITEM]})
+        await env.say(_chat_msg(env, "1920391385", "79956109902", "own"))          # телеграм из списка
+        await env.say(_chat_msg(env, "5550001", "79261112233", "stranger"))        # живой клиент канала
+        await _wait_out_resolving(env)
+        texts = "\n".join(env.alerts)
+        assert len(env.alerts) == 1 and "Тиана" in texts and "Чужой клиент" not in texts
+        assert store.get_session(f"{CHAN}:1920391385")["state"] == "skip"
+        assert store.get_session(f"{CHAN}:5550001")["state"] == "skip"             # ИИ по нему не работает, как и задумано
+        assert env.turn_requests == []
+    run(go())
+
+
+def test_deal_not_found_alert_silent_for_stranger_even_when_no_list_item_has_a_phone(env):
+    async def go():
+        env.set_settings(contacts={"scope": "test", "restricted": True, "items": [NO_PHONE_ITEM]})
+        await env.say(_chat_msg(env, "5550001", "79261112233", "stranger"))
+        await _wait_out_resolving(env)
+        assert env.alerts == []
+    run(go())
+
+
+def test_deal_not_found_alert_matches_whatsapp_chat_id_with_the_phone(env):
+    async def go():
+        env.set_settings(contacts={"scope": "test", "restricted": True, "items": [TEST_PHONE_ITEM, NO_PHONE_ITEM]})
+        await env.say(_chat_msg(env, "79956109902", "", "wa"))                     # WhatsApp: chat_id и есть телефон
+        await _wait_out_resolving(env)
+        assert len(env.alerts) == 1
+    run(go())
+
+
+def test_deal_not_found_alert_pilot_list_works_the_same(env):
+    async def go():
+        env.set_settings(mode="prod", pipelines=[PIPE_RETAIL, 9822330],
+                         contacts={"scope": "pilot", "restricted": True, "items": [TEST_PHONE_ITEM, NO_PHONE_ITEM]})
+        await env.say(_chat_msg(env, "1920391385", "79956109902", "own"))
+        await env.say(_chat_msg(env, "5550001", "79261112233", "stranger"))
+        await _wait_out_resolving(env)
+        assert len(env.alerts) == 1
+    run(go())
+
+
+def test_deal_not_found_silent_in_open_prod(env):
+    async def go():
+        env.set_settings(mode="prod", pipelines=[PIPE_RETAIL, 9822330],
+                         contacts={"scope": "pilot", "restricted": False, "items": []})
+        await env.say(_chat_msg(env, "1920391385", "79956109902", "own"))
+        await _wait_out_resolving(env)
+        assert env.alerts == []
+    run(go())
+
+
+def test_phone_helpers_on_the_real_numbers_from_the_live_test():
+    env_doc = {"mode": "test", "pipelines": [PIPE_TEST],
+               "contacts": {"scope": "test", "restricted": True, "items": [TEST_PHONE_ITEM]}}
+    settings.set_document(env_doc)
+    assert settings.phone_key("79956109902") == "79956109902"
+    assert settings.phone_key("+7 (995) 610-99-02") == "79956109902"
+    assert settings.phone_key("89956109902") == "79956109902"
+    assert settings._same_phone("79956109902", "89956109902"[-11:].replace("8", "7", 1))
+    assert settings.contact_allowed([], ["79956109902", "1920391385"]) is True
+    assert settings.contact_allowed([], ["79261112233", "5550001"]) is False
+    assert settings.contact_allowed([], ["", "1920391385"]) is False        # telegram chat_id 1920391385 - не телефон из списка
