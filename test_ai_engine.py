@@ -46,6 +46,9 @@ class Env:
         self.mp = monkeypatch
         self.t = time.time()
         self.alerts: list[str] = []
+        self.alert_ids: list[tuple[int, int | None, int]] = []     # (чат, тема, message_id) отправленных алертов
+        self.reactions: list[tuple[int, int, str]] = []            # (чат, message_id, эмодзи) бота
+        self.bot_messages: list[dict] = []                         # прочие сообщения бота (ответы об отказе)
         self.notes: list[tuple[int, str]] = []
         self.leads: list[dict] = []
         self.amo_down = False
@@ -80,11 +83,25 @@ class Env:
         mp.setattr(E, "_rule_c_seen", {})
         mp.setattr(E, "_autopilot_busy", lambda *a, **k: False)
 
-        async def deliver(d):
+        async def deliver(d, on_sent=None):
             self.alerts.append(d.text)
+            if on_sent is not None:
+                mid = 9000 + len(self.alerts)
+                self.alert_ids.append((-1003680811996, 10479, mid))
+                on_sent(-1003680811996, 10479, mid)
+            return True
+
+        async def set_reaction(chat_id, message_id, emoji):
+            self.reactions.append((chat_id, message_id, emoji))
+            return True
+
+        async def send_alert(text, parse_mode=None, chat_id=None, message_thread_id=None, on_sent=None):
+            self.bot_messages.append({"text": text, "chat_id": chat_id, "thread_id": message_thread_id})
             return True
 
         mp.setattr(E, "_deliver_alert", deliver)
+        mp.setattr(E.telegram_bot, "set_reaction", set_reaction)
+        mp.setattr(E.telegram_bot, "send_alert", send_alert)
 
         async def find(query, with_=(), page_limit=250, max_pages=5):
             return None if self.amo_down else list(self.leads)

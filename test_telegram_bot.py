@@ -410,3 +410,63 @@ def test_adresa_chatov_naruzhu_ne_uhodyat():
     assert health["chat_remapped"] == 1
     assert "chat_remap" not in health
     assert "5358037627" not in str(health)
+
+
+# --- реакции: возврат диалога ИИ (ai_engine_return) -------------------------
+
+
+def test_on_sent_poluchaet_adres_i_id_soobshcheniya():
+    class _Sent:
+        message_id = 4242
+
+    class _Bot(_FakeBot):
+        async def send_message(self, chat_id, text, parse_mode=None, message_thread_id=None):
+            await super().send_message(chat_id, text, parse_mode, message_thread_id)
+            return _Sent()
+
+    _reset(bot=_Bot())
+    got = []
+    ok = asyncio.run(telegram_bot.send_alert(
+        "алерт", chat_id=CHAT, message_thread_id=10479, on_sent=lambda chat, thread, mid: got.append((chat, thread, mid))))
+    assert ok and got == [(CHAT, 10479, 4242)]
+
+
+def test_set_reaction_stavit_odnu_reaktsiyu_i_ne_padaet_bez_bota():
+    class _Bot:
+        def __init__(self):
+            self.calls = []
+
+        async def set_message_reaction(self, chat_id, message_id, reaction):
+            self.calls.append((chat_id, message_id, [r.emoji for r in reaction]))
+
+    bot = _Bot()
+    _reset(bot=bot)
+    assert asyncio.run(telegram_bot.set_reaction(CHAT, 7, "\U0001F44D")) is True
+    assert bot.calls == [(CHAT, 7, ["\U0001F44D"])]
+    _reset(bot=None)
+    assert asyncio.run(telegram_bot.set_reaction(CHAT, 7, "\U0001F44D")) is False
+
+
+def test_dispatcher_prinimaet_reaktsii_i_peredayot_ih_obrabotchiku():
+    import datetime
+
+    from aiogram import Bot
+    from aiogram.types import Chat, MessageReactionUpdated, ReactionTypeEmoji, Update, User
+
+    seen = []
+
+    async def handler(ev):
+        seen.append(ev)
+
+    telegram_bot.set_reaction_handler(handler)
+    dp = telegram_bot._build_dispatcher()
+    assert "message_reaction" in dp.resolve_used_update_types()
+    update = Update(update_id=1, message_reaction=MessageReactionUpdated(
+        chat=Chat(id=CHAT, type="supergroup"), message_id=5,
+        user=User(id=7, is_bot=False, first_name="Егор", username="EgorKonsss"),
+        date=datetime.datetime.now(datetime.timezone.utc),
+        old_reaction=[], new_reaction=[ReactionTypeEmoji(emoji="\U0001F44D")]))
+    asyncio.run(dp.feed_update(Bot("123:test-token"), update))
+    telegram_bot.set_reaction_handler(None)
+    assert seen == [{"chat_id": CHAT, "message_id": 5, "user_id": 7, "username": "EgorKonsss", "is_bot": False,
+                     "new": ["\U0001F44D"], "old": []}]

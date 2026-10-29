@@ -37,6 +37,7 @@ from typing import Any
 import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
+import ai_engine_return
 import ai_engine_settings as settings
 import ai_engine_store as store
 import alerts
@@ -106,6 +107,7 @@ async def init() -> None:
         logger.info("ai_engine: ВЫКЛЮЧЕН (AI_ENGINE_ENABLED не 1) - ни цикла, ни базы, ни опроса панели")
         return
     await _db(store.init)
+    ai_engine_return.install(return_dialog)
     settings.start()
     _queue = asyncio.Queue(maxsize=2000)
     _tasks = [
@@ -538,7 +540,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
         )
         await _db(store.put_session, chat_key, state=store.S_HUMAN, deal_id=deal_id, next_at=None, has_media=0)
         await _db(store.discard_pending, chat_key)
-        await _alert("media", _media_lines(media_types, s, deal_id), dedupe=f"media:{chat_key}")
+        await _alert("media", _media_lines(media_types, s, deal_id), dedupe=f"media:{chat_key}", return_deal=deal_id)
         return
 
     if not await _ai_is_up():
@@ -1006,7 +1008,8 @@ async def _to_human(
                   **({} if deal_id is not None else {"skip_until": _now() + cfg.HUMAN_CHAT_TTL_S}))
         await _db(store.discard_pending, s["chat_key"])
     if alert:
-        await _alert(reason, [line for line in alert if line], dedupe=f"{reason}:{deal_id}")
+        await _alert(reason, [line for line in alert if line], dedupe=f"{reason}:{deal_id}",
+                     return_deal=None if deal_id is None else int(deal_id))
 
 
 async def _handoff_media(s: dict, owner: dict, mtype: str) -> None:
@@ -1042,7 +1045,7 @@ async def _handoff_by_rule(s: dict, res: dedup.Resolution, owner: dict | None) -
     head = ("У клиента несколько подходящих сделок, выбрать сам ИИ не берётся." if res.rule == "D"
             else "У клиента уже есть другая сделка с заказом или бюджетом, ИИ не входит.")
     await _alert(f"rule_{res.rule}", [head, _client_line(s), "Сделки: " + " ".join(links)],
-                 dedupe=f"rule_{res.rule}:{s['chat_key']}")
+                 dedupe=f"rule_{res.rule}:{s['chat_key']}", return_deal=deal_id)
 
 
 async def _deal_closed(deal_id: int, why: str) -> None:
@@ -1180,8 +1183,10 @@ def _media_lines(types: list[str], s: dict, deal_id: int) -> list[str]:
     return [f"Клиент прислал {words}, ИИ такое не читает. Диалог передан менеджеру.", _client_line(s), _link(deal_id)]
 
 
-async def _alert(key: str, lines: list[str], *, dedupe: str | None = None) -> None:
-    """Алерт в чат ОП. Сбой отправки не должен ломать разбор: пишем в лог и живём дальше."""
+async def _alert(key: str, lines: list[str], *, dedupe: str | None = None, return_deal: int | None = None) -> None:
+    """Алерт в чат ОП. Сбой отправки не должен ломать разбор: пишем в лог и живём дальше.
+    `return_deal` - алерт о передаче диалога по этой сделке: под ним бот ставит метку, и реакция тегнутого менеджера
+    возвращает диалог ИИ (`ai_engine_return`)."""
     try:
         now = _now()
         if dedupe:
@@ -1199,13 +1204,17 @@ async def _alert(key: str, lines: list[str], *, dedupe: str | None = None) -> No
         if d is None:
             return
         # Алерт зовётся под общим замком: зависший Телеграм не должен держать итоги ходов дольше 8 секунд.
-        await asyncio.wait_for(_deliver_alert(d), timeout=8)
+        sent_to: list[tuple] = []
+        await asyncio.wait_for(_deliver_alert(d, lambda chat, thread, mid: sent_to.append((chat, thread, mid))), timeout=8)
+        if return_deal is not None and sent_to:
+            chat, thread, mid = sent_to[-1]
+            _spawn(ai_engine_return.remember(chat, thread, mid, return_deal, d.text))
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: алерт «%s» не ушёл", key)
 
 
-async def _deliver_alert(d) -> bool:
-    return await telegram_bot.send_alert(d.text, **d.send_kwargs())
+async def _deliver_alert(d, on_sent=None) -> bool:
+    return await telegram_bot.send_alert(d.text, on_sent=on_sent, **d.send_kwargs())
 
 
 # =============================================================================================
@@ -1226,4 +1235,5 @@ def status() -> dict[str, Any]:
         out["counts"] = store.counts()
     except Exception:  # noqa: BLE001
         out["counts"] = "ошибка чтения базы"
+    out["return_by_reaction"] = ai_engine_return.stats()
     return out

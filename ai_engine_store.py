@@ -154,6 +154,18 @@ def init() -> None:
                 at REAL NOT NULL,
                 PRIMARY KEY (deal_id, event_type)
             );
+
+            -- алерт передачи диалога человеку: под ним менеджер реакцией возвращает диалог ИИ (ai_engine_return)
+            CREATE TABLE IF NOT EXISTS alert_return (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                thread_id INTEGER,
+                deal_id INTEGER NOT NULL,
+                tags TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            );
             """
         )
         # Семя номеров ходов (см. шапку): только на пустой таблице, иначе сдвинули бы живые номера.
@@ -166,6 +178,54 @@ def init() -> None:
 
 def _dict(row) -> dict | None:
     return dict(row) if row is not None else None
+
+
+# ---------------------------------------------------------------------------------------------
+# алерты, которые можно закрыть реакцией (возврат диалога ИИ)
+# ---------------------------------------------------------------------------------------------
+
+ALERT_WAITING, ALERT_BUSY, ALERT_RETURNED, ALERT_CLOSED = "waiting", "busy", "returned", "closed"
+
+
+def put_alert_return(chat_id: int, message_id: int, thread_id: int | None, deal_id: int, tags: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO alert_return (chat_id, message_id, thread_id, deal_id, tags, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, message_id, thread_id, deal_id, tags, ALERT_WAITING, _now()),
+        )
+
+
+def get_alert_return(chat_id: int, message_id: int) -> dict | None:
+    with _connect() as conn:
+        return _dict(conn.execute(
+            "SELECT * FROM alert_return WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)).fetchone())
+
+
+def claim_alert_return(chat_id: int, message_id: int) -> bool:
+    """waiting -> busy одним шагом: две реакции подряд вернут диалог один раз."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE alert_return SET state = ? WHERE chat_id = ? AND message_id = ? AND state = ?",
+            (ALERT_BUSY, chat_id, message_id, ALERT_WAITING))
+        return cur.rowcount == 1
+
+
+def set_alert_return_state(chat_id: int, message_id: int, state: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE alert_return SET state = ? WHERE chat_id = ? AND message_id = ?", (state, chat_id, message_id))
+
+
+def close_alerts_of_deal(deal_id: int) -> None:
+    """Диалог вернулся: остальные ждущие алерты этой сделки больше не действуют."""
+    with _connect() as conn:
+        conn.execute("UPDATE alert_return SET state = ? WHERE deal_id = ? AND state = ?",
+                     (ALERT_CLOSED, deal_id, ALERT_WAITING))
+
+
+def purge_alert_return(older_than_s: float) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM alert_return WHERE created_at < ?", (_now() - older_than_s,))
 
 
 # ---------------------------------------------------------------------------------------------

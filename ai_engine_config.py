@@ -88,3 +88,8 @@ TURN_TIMEOUT_S = int(os.getenv("AI_ENGINE_TURN_TIMEOUT_S", "900"))
 HUMAN_CHAT_TTL_S = 24 * 3600
 SKIP_TTL_S = 600
 RETENTION_DAYS = int(os.getenv("AI_ENGINE_RETENTION_DAYS", "30"))
+# Возврат диалога ИИ реакцией менеджера на алерт: бот ставит RETURN_EMOJI под алертом передачи, тегнутый менеджер
+# ставит такую же - ИИ получает диалог обратно (`dialog_returned`). Нужен бот-администратор чата алертов.
+RETURN_BY_REACTION = os.getenv("AI_RETURN_BY_REACTION", "1").strip() == "1"
+RETURN_EMOJI = os.getenv("AI_RETURN_EMOJI", "👍").strip()            # 👍 метка «ждёт возврата» и нужная реакция
+RETURNED_EMOJI = os.getenv("AI_RETURNED_EMOJI", "👌").strip()        # 👌 бот меняет метку, когда ИИ вернулся
