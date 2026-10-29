@@ -12,6 +12,7 @@ from starlette.status import HTTP_200_OK
 import ai_engine
 import ai_engine_api
 import amgroup_contact_heal
+import site_order_note
 import amgroup_duplicate_watch
 import amgroup_fallback
 import amgroup_lead_builder
@@ -239,6 +240,9 @@ async def lifespan(app):
     # Самоисцеление сделок amgroup без контакта (21.10.2026): сам смотрит
     # AMGROUP_CONTACT_HEAL_ENABLED и без него не поднимает цикл.
     await amgroup_contact_heal.init()
+    # Заметка в сделку с данными клиента с сайта (29.10.2026): сам смотрит
+    # SITE_ORDER_NOTE_ENABLED и без него цикл не поднимает.
+    await site_order_note.init()
     # Авто-режим ОП розница: ведёт сделку по этапам вместо менеджера. Сам первым делом
     # смотрит флаг AUTOPILOT_ENABLED и без него не поднимает ни хранилища, ни опроса
     # панели, ни фонового цикла.
@@ -274,6 +278,7 @@ async def lifespan(app):
     await amgroup_shipment.shutdown()
     await amgroup_duplicate_watch.shutdown()
     await amgroup_contact_heal.shutdown()
+    await site_order_note.shutdown()
     await autopilot.shutdown()
     try:
         await ai_engine.shutdown()
