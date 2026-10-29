@@ -622,6 +622,19 @@ AMGROUP_CONTACT_HEAL_MIN_AGE_MIN = int(os.getenv("AMGROUP_CONTACT_HEAL_MIN_AGE_M
 # Окно фонового прохода по времени создания сделки.
 AMGROUP_CONTACT_HEAL_LOOKBACK_H = int(os.getenv("AMGROUP_CONTACT_HEAL_LOOKBACK_H", "24"))
 
+# Заметка в сделку с данными клиента с сайта (29.10.2026, site_order_note.py): контакт amo
+# может называться иначе (телефония завела «Новый контакт по звонку»), а amgroup имя из МС
+# не переписывает. Текст берётся из доп.поля заказа МС «Клиент с сайта», его пишет
+# woocommerce-sklad. Оба умолчания безопасные: выключен и в сухом режиме (только лог).
+SITE_ORDER_NOTE_ENABLED = os.getenv("SITE_ORDER_NOTE_ENABLED", "0") == "1"
+SITE_ORDER_NOTE_DRY_RUN = os.getenv("SITE_ORDER_NOTE_DRY_RUN", "1") == "1"
+SITE_ORDER_NOTE_INTERVAL_SEC = int(os.getenv("SITE_ORDER_NOTE_INTERVAL_SEC", "120"))
+# Ждём после создания сделки, чтобы amgroup успел привязать контакт (в норме 2-5 с).
+SITE_ORDER_NOTE_MIN_AGE_SEC = int(os.getenv("SITE_ORDER_NOTE_MIN_AGE_SEC", "90"))
+SITE_ORDER_NOTE_LOOKBACK_H = int(os.getenv("SITE_ORDER_NOTE_LOOKBACK_H", "12"))
+# UUID доп.поля заказа МС «Клиент с сайта» (text, создано 29.10.2026); пусто - модуль не работает.
+SITE_ORDER_NOTE_MS_ATTR = os.getenv("SITE_ORDER_NOTE_MS_ATTR", "51533fa0-d36d-11f1-0a80-0e48001ce0ed")
+
 # ---------------------------------------------------------------------------
 # Склад шоурума (задача Кати 06.08.2026). Кирилл отгружает из отдельного склада
 # «Sunscrypt Шоурум», заведённого в МойСкладе 03.08.
