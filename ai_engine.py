@@ -31,6 +31,7 @@ import datetime
 import html
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -38,6 +39,7 @@ import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
 import ai_engine_return
+import ai_engine_tasks
 import ai_engine_settings as settings
 import ai_engine_store as store
 import alerts
@@ -541,6 +543,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
         await _db(store.put_session, chat_key, state=store.S_HUMAN, deal_id=deal_id, next_at=None, has_media=0)
         await _db(store.discard_pending, chat_key)
         await _alert("media", _media_lines(media_types, s, deal_id), dedupe=f"media:{chat_key}", return_deal=deal_id)
+        _contact_task(deal_id, "media", _media_lines(media_types, s, deal_id))
         return
 
     if not await _ai_is_up():
@@ -1010,6 +1013,7 @@ async def _to_human(
     if alert:
         await _alert(reason, [line for line in alert if line], dedupe=f"{reason}:{deal_id}",
                      return_deal=None if deal_id is None else int(deal_id))
+        _contact_task(None if deal_id is None else int(deal_id), reason, [line for line in alert if line])
 
 
 async def _handoff_media(s: dict, owner: dict, mtype: str) -> None:
@@ -1046,6 +1050,7 @@ async def _handoff_by_rule(s: dict, res: dedup.Resolution, owner: dict | None) -
             else "У клиента уже есть другая сделка с заказом или бюджетом, ИИ не входит.")
     await _alert(f"rule_{res.rule}", [head, _client_line(s), "Сделки: " + " ".join(links)],
                  dedupe=f"rule_{res.rule}:{s['chat_key']}", return_deal=deal_id)
+    _contact_task(deal_id, f"rule_{res.rule}", [head])
 
 
 async def _deal_closed(deal_id: int, why: str) -> None:
@@ -1156,6 +1161,7 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
             return 503, {"detail": "ai_unavailable"}
         owner = await _db(store.set_owner, deal_id, store.OWNER_AI, reason="dialog_returned", mode=mode)
         await _queue_event(owner, "dialog_returned")
+        _spawn(ai_engine_tasks.release(deal_id))      # ИИ снова ведёт диалог: задачи «Связаться» по передаче закрываем
         return 200, {"ok": True, "epoch": owner["epoch"]}
 
 
@@ -1181,6 +1187,22 @@ def _clean(text: Any) -> str:
 def _media_lines(types: list[str], s: dict, deal_id: int) -> list[str]:
     words = ", ".join(sorted({MEDIA_WORDS.get(t, "вложение") for t in types})) or "вложение"
     return [f"Клиент прислал {words}, ИИ такое не читает. Диалог передан менеджеру.", _client_line(s), _link(deal_id)]
+
+
+def _plain(text: str) -> str:
+    """Строка алерта без тегов и сущностей: для текста задачи в amo."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
+
+
+# Передачи, после которых ставится задача «Связаться»: тихие (alert=None) и передача самим ИИ (`ai_handoff`: задачу уже поставила
+# тулза handoff сервиса) сюда не попадают, `mode_mismatch` это не обращение клиента.
+_NO_TASK_REASONS = frozenset({"ai_handoff", "mode_mismatch"})
+
+
+def _contact_task(deal_id: int | None, reason: str, why_lines: list[str]) -> None:
+    if deal_id is None or reason in _NO_TASK_REASONS or not why_lines:
+        return
+    _spawn(ai_engine_tasks.create_contact_task(int(deal_id), reason, _plain(why_lines[0])))
 
 
 async def _alert(key: str, lines: list[str], *, dedupe: str | None = None, return_deal: int | None = None) -> None:

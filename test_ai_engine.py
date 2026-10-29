@@ -49,6 +49,9 @@ class Env:
         self.alert_ids: list[tuple[int, int | None, int]] = []     # (чат, тема, message_id) отправленных алертов
         self.reactions: list[tuple[int, int, str]] = []            # (чат, message_id, эмодзи) бота
         self.bot_messages: list[dict] = []                         # прочие сообщения бота (ответы об отказе)
+        self.tasks_open: list[dict] = []                           # задачи amo по сделке (подставные)
+        self.task_responsible: int | None = 7
+        self.tasks_down = False
         self.notes: list[tuple[int, str]] = []
         self.leads: list[dict] = []
         self.amo_down = False
@@ -99,6 +102,28 @@ class Env:
             self.bot_messages.append({"text": text, "chat_id": chat_id, "thread_id": message_thread_id})
             return True
 
+        async def tasks_get_open(deal_id):
+            return None if self.tasks_down else [t for t in self.tasks_open if not t.get("is_completed")]
+
+        async def tasks_responsible(deal_id):
+            return self.task_responsible
+
+        async def tasks_create(deal_id, text, uid, due_ts):
+            self.tasks_open.append({"id": 100 + len(self.tasks_open), "text": text, "responsible_user_id": uid, "complete_till": due_ts,
+                                    "deal_id": deal_id})
+            return True
+
+        async def tasks_complete(task_ids, result):
+            for t in self.tasks_open:
+                if t["id"] in task_ids:
+                    t["is_completed"] = True
+                    t["result"] = result
+            return True
+
+        mp.setattr(E.ai_engine_tasks, "_get_open", tasks_get_open)
+        mp.setattr(E.ai_engine_tasks, "_responsible", tasks_responsible)
+        mp.setattr(E.ai_engine_tasks, "_create", tasks_create)
+        mp.setattr(E.ai_engine_tasks, "_complete", tasks_complete)
         mp.setattr(E, "_deliver_alert", deliver)
         mp.setattr(E.telegram_bot, "set_reaction", set_reaction)
         mp.setattr(E.telegram_bot, "send_alert", send_alert)

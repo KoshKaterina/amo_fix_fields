@@ -90,6 +90,8 @@ SKIP_TTL_S = 600
 RETENTION_DAYS = int(os.getenv("AI_ENGINE_RETENTION_DAYS", "30"))
 # Возврат диалога ИИ реакцией менеджера на алерт: бот ставит RETURN_EMOJI под алертом передачи, тегнутый менеджер
 # ставит такую же - ИИ получает диалог обратно (`dialog_returned`). Нужен бот-администратор чата алертов.
+# Задача «Связаться с клиентом, срочно» на ответственного при передаче человеку, которую делает движок, и её закрытие при возврате диалога ИИ.
+HANDOFF_TASKS = os.getenv("AI_HANDOFF_TASKS", "1").strip() == "1"
 RETURN_BY_REACTION = os.getenv("AI_RETURN_BY_REACTION", "1").strip() == "1"
 RETURN_EMOJI = os.getenv("AI_RETURN_EMOJI", "👍").strip()            # 👍 метка «ждёт возврата» и нужная реакция
 def _parse_also(raw: str) -> frozenset:
