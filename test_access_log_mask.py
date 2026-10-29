@@ -25,6 +25,8 @@ import webhooks
     ("/bothelp/academy/sss", "/bothelp/academy/HIDDEN"),
     ("/admin/lead-distribution/sss/sources", "/admin/lead-distribution/HIDDEN/sources"),
     ("/getcourse/gcSECRET", "/getcourse/HIDDEN"),
+    ("/sipuni/spSECRET", "/sipuni/HIDDEN"),
+    ("/sipuni/spSECRET?event=1&call_id=1.1", "/sipuni/HIDDEN"),
 ])
 def test_sekret_iz_puti_pryachetsya(path, expected):
     assert webhooks.mask_secret_path(path) == expected

@@ -37,6 +37,7 @@ from collections import deque
 import amo_service
 import telegram_bot
 import alerts
+import sipuni_events
 from api import BASE_URL
 from tg_recipients import (
     NOTIFY_CHAT_ID,
@@ -50,6 +51,7 @@ from waybill_config import (
     MISSED_CALLBACK_POLL_INTERVAL_S,
     MISSED_CALLBACK_WINDOW_END_H,
     MISSED_CALLBACK_WINDOW_START_H,
+    SIPUNI_EVENTS_MODE,
     TAG_MISSED_NAME,
     TAG_SUCCESS_CALL_NAME,
 )
@@ -104,37 +106,53 @@ async def _apply(params: dict) -> None:
             logger.info("UIS пропущенный: дубль call_session_id=%s — пропускаю", call_id)
             return
 
-        # Сделку (+ответственного) добираем с таймаутом 5с: не ответил amo вовремя
-        # (медленный API / завал очереди) → шлём БЕЗ ссылки и тегаем всю смену,
-        # не задерживая «срочно».
-        try:
-            lead_id, responsible_id = await asyncio.wait_for(_find_lead(phone), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.warning("UIS пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", call_id)
-            lead_id, responsible_id = None, None
-        mentions = missed_call_mentions(responsible_id)
-        text = _build_message(phone, name, lead_id, mentions)
-        d = alerts.decide(
-            "missed_call", legacy_text=text, parse_mode="HTML",
-            chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID, responsible_id=responsible_id,
-            values={
-                "теги": mentions,
-                "телефон": phone,
-                "клиент": name if name and name != phone else "",
-                "ссылка_на_сделку": alerts.lead_link(lead_id),
-            },
-        )
-        if d is None:
-            logger.info("UIS пропущенный: событие выключено в панели (call=%s)", call_id or "—")
-        else:
-            ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
-            logger.info(
-                "UIS пропущенный: алерт %s (тел=%s lead=%s call=%s)",
-                "отправлен" if ok else "НЕ отправлен", phone or "—", lead_id or "—", call_id or "—",
-            )
-        _watch_callback(lead_id, phone, name, responsible_id)
+        await _notify_missed(phone, name, call_id)
     except Exception:
         logger.exception("UIS пропущенный: ошибка обработки (call=%s)", params.get("call_session_id"))
+
+
+# Как называем источник звонка в журнале. Ключ - provider из _notify_missed.
+_PROVIDER_LABELS = {"uis": "UIS", "sipuni": "Sipuni"}
+
+
+async def _notify_missed(phone: str, name: str, call_id: str, *, provider: str = "uis") -> None:
+    """Общая часть алерта о пропущенном звонке: сделка по телефону, текст, алерт, счётчик
+    перезвона. Её зовут и вход UIS (_apply), и вход Sipuni (_sipuni_on_missed).
+
+    provider нужен для журнала и для способа проверки «перезвонили»: у uis это теги amo,
+    у sipuni поток событий звонков (sipuni_events). Дедуп по id звонка делает вызывающий:
+    у UIS это _is_new, у Sipuni - сам учёт звонков по call_id.
+    """
+    label = _PROVIDER_LABELS.get(provider, provider)
+    # Сделку (+ответственного) добираем с таймаутом 5с: не ответил amo вовремя
+    # (медленный API / завал очереди) → шлём БЕЗ ссылки и тегаем всю смену,
+    # не задерживая «срочно».
+    try:
+        lead_id, responsible_id = await asyncio.wait_for(_find_lead(phone), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("%s пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", label, call_id)
+        lead_id, responsible_id = None, None
+    mentions = missed_call_mentions(responsible_id)
+    text = _build_message(phone, name, lead_id, mentions)
+    d = alerts.decide(
+        "missed_call", legacy_text=text, parse_mode="HTML",
+        chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID, responsible_id=responsible_id,
+        values={
+            "теги": mentions,
+            "телефон": phone,
+            "клиент": name if name and name != phone else "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+        },
+    )
+    if d is None:
+        logger.info("%s пропущенный: событие выключено в панели (call=%s)", label, call_id or "—")
+    else:
+        ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
+        logger.info(
+            "%s пропущенный: алерт %s (тел=%s lead=%s call=%s)",
+            label, "отправлен" if ok else "НЕ отправлен", phone or "—", lead_id or "—", call_id or "—",
+        )
+    _watch_callback(lead_id, phone, name, responsible_id, provider=provider)
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +174,14 @@ async def _apply(params: dict) -> None:
 # перезвон»). Здесь источник другой, поэтому баг витрины на эти алерты не переносится.
 
 
-def _watch_callback(lead_id, phone: str, name: str, responsible_id) -> None:
+def _watch_callback(lead_id, phone: str, name: str, responsible_id, provider: str = "uis") -> None:
     """Ставит сделку на счётчик «перезвонят или нет».
 
     Без сделки не сторожим ВООБЩЕ: проверить перезвон не по чему, а гадать нельзя -
     ложная эскалация в чат руководства дороже пропущенной.
+
+    provider выбирает способ проверки «перезвонили» (см. _check_called_back): у uis это теги
+    сделки, у sipuni - поток событий звонков.
     """
     if not lead_id or ROP_CHAT_ID is None:
         return
@@ -171,6 +192,7 @@ def _watch_callback(lead_id, phone: str, name: str, responsible_id) -> None:
         "phone": phone,
         "name": name,
         "responsible_id": responsible_id,
+        "provider": provider,
     }
 
 
@@ -197,6 +219,27 @@ async def _called_back(lead_id: int) -> bool | None:
     return not amo_service.has_tag(lead, TAG_MISSED_NAME)
 
 
+def _called_back_sipuni(st: dict) -> bool | None:
+    """Перезвонили ли по пропущенному Sipuni: по ПОТОКУ ЗВОНКОВ, а не по тегам.
+
+    True - после пропущенного от этого номера был отвеченный звонок с его участием
+    (исходящий на номер или входящий от него). False - пропущенный есть, перезвона нет.
+    None - записи о пропущенном нет (рестарт, истёк срок): проверить нечем, а ложная
+    эскалация дороже пропущенной, поэтому, как и при молчании amo, вердикта не выносим.
+    """
+    record = sipuni_events.tracker.missed_record(st.get("phone") or "")
+    if record is None:
+        return None
+    return record["called_back_at"] is not None
+
+
+async def _check_called_back(lead_id: int, st: dict) -> bool | None:
+    """Выбор способа проверки перезвона по источнику звонка. У UIS всё как раньше."""
+    if st.get("provider") == "sipuni":
+        return _called_back_sipuni(st)
+    return await _called_back(lead_id)
+
+
 async def _sweep_callbacks() -> None:
     now = time.monotonic()
     threshold = MISSED_CALLBACK_ESCALATE_MINUTES * 60
@@ -216,8 +259,9 @@ async def _sweep_callbacks() -> None:
         return
 
     for lead_id, st, age in due:
+        label = _PROVIDER_LABELS.get(st.get("provider", "uis"), "UIS")
         try:
-            back = await _called_back(lead_id)
+            back = await _check_called_back(lead_id, st)
             if back is None:
                 continue  # amo не ответил - попробуем на следующем проходе
             _callback_pending.pop(lead_id, None)
@@ -238,15 +282,15 @@ async def _sweep_callbacks() -> None:
                 },
             )
             if d is None:
-                logger.info("UIS перезвон: эскалация выключена в панели (сделка %s)", lead_id)
+                logger.info("%s перезвон: эскалация выключена в панели (сделка %s)", label, lead_id)
                 continue
             ok = await telegram_bot.send_alert(d.text, **d.send_kwargs())
             logger.info(
-                "UIS перезвон: эскалация %s (сделка %s, %s мин без перезвона)",
-                "отправлена" if ok else "НЕ отправлена", lead_id, int(age // 60),
+                "%s перезвон: эскалация %s (сделка %s, %s мин без перезвона)",
+                label, "отправлена" if ok else "НЕ отправлена", lead_id, int(age // 60),
             )
         except Exception:
-            logger.exception("UIS перезвон: ошибка проверки сделки %s", lead_id)
+            logger.exception("%s перезвон: ошибка проверки сделки %s", label, lead_id)
 
 
 def _waited_words(waited_min: int) -> str:
@@ -286,6 +330,7 @@ async def _watch_loop() -> None:
 async def init() -> None:
     """Поднимает счётчик перезвонов. Чат руководства не задан → цикл не нужен."""
     global _watch_task
+    _sipuni_start()
     if ROP_CHAT_ID is None:
         logger.info("UIS перезвон: ROP_ALERT_CHAT_ID не задан - счётчик перезвонов выключен")
         return
@@ -300,6 +345,7 @@ async def init() -> None:
 
 async def shutdown() -> None:
     global _watch_task
+    sipuni_events.tracker.reset()
     if _watch_task is not None:
         _watch_task.cancel()
         try:
@@ -307,6 +353,63 @@ async def shutdown() -> None:
         except asyncio.CancelledError:
             pass
         _watch_task = None
+
+
+# ---------------------------------------------------------------------------
+# Вход Sipuni: «События на АТС» (28.10.2026). Рядом с UIS, UIS-вход выше не тронут
+# ---------------------------------------------------------------------------
+#
+# У UIS есть готовое уведомление «Потерянный звонок». У Sipuni его НЕТ: приходят события
+# начала, ответа и завершения каждой ноги звонка, а «пропущенный» решает sipuni_events по
+# итогу всего call_id (тихое окно, см. его шапку). Дальше работает та же общая часть, что и
+# у UIS: _notify_missed (сделка по телефону, текст, alerts.decide, счётчик перезвона).
+#
+# Режим SIPUNI_EVENTS_MODE: log (по умолчанию) - только строка журнала по каждому событию и
+# по каждому решению, ни Telegram, ни amo; live - алерт и счётчик перезвона. Учёт звонков в
+# памяти идёт в обоих режимах: так по журналу режима log видно, что БЫЛО БЫ отправлено.
+
+
+def _sipuni_start() -> None:
+    """Подключает решение «пропущенный» к алерту. Зовётся из init() и вместе с событием."""
+    sipuni_events.tracker.on_missed = _sipuni_on_missed
+
+
+def sipuni_notify_bg(payload: list) -> None:
+    """Планирует разбор событий Sipuni в фоне и сразу возвращает: Sipuni нужен быстрый ответ
+    {"success": true}, иначе он приостановит отправку событий."""
+    task = asyncio.create_task(_sipuni_apply(payload))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _sipuni_apply(payload: list) -> None:
+    _sipuni_start()
+    for raw in payload or []:
+        try:
+            ev = sipuni_events.parse_event(raw)
+            st, duplicate = sipuni_events.tracker.ingest(ev)
+            logger.info("%s%s", sipuni_events.log_line(ev, st), " dup=1" if duplicate else "")
+        except Exception:
+            logger.exception("Sipuni событие: ошибка обработки")
+
+
+async def _sipuni_on_missed(missed) -> None:
+    """Решение «пропущенный» принято (тихое окно истекло, ни одна нога не отвечена)."""
+    if SIPUNI_EVENTS_MODE != "live":
+        logger.info(
+            "Sipuni пропущенный: call=%s тел=%s ног=%s статусы=%s - режим log, алерт НЕ шлём",
+            missed.call_id, missed.phone or "—", missed.legs, ",".join(missed.statuses) or "—",
+        )
+        return
+    try:
+        if not _is_new("sipuni:" + missed.call_id):
+            logger.info("Sipuni пропущенный: дубль call_id=%s — пропускаю", missed.call_id)
+            return
+        # Цифры без плюса: так телефон приходит от UIS, и поиск сделки в amo проверен именно на
+        # этом виде. Имени клиента у Sipuni в событиях нет, ищем только по телефону.
+        await _notify_missed(missed.phone.lstrip("+"), "", missed.call_id, provider="sipuni")
+    except Exception:
+        logger.exception("Sipuni пропущенный: ошибка обработки (call=%s)", missed.call_id)
 
 
 # Закрытые = системные статусы «успех»/«отказ», общие для ВСЕХ воронок
