@@ -561,10 +561,13 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
             await _db(store.put_session, chat_key, next_at=now + cfg.HEALTH_POLL_S)
         return
 
+    first_entry = owner is None      # ИИ входит в сделку впервые (а не после возврата диалога)
     owner = await _db(
         store.set_owner, deal_id, store.OWNER_AI, reason="client_message", chat=chat,
         pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode,
     )
+    if first_entry:
+        _spawn(ai_engine_tasks.release_intake(deal_id))     # системные «Связаться»/«Новый заказ с сайта»: теперь клиентом занят ИИ
     await _db(store.put_session, chat_key, deal_id=deal_id)
     s = await _db(store.get_session, chat_key)
     await _enqueue_turn(s, owner, mode)

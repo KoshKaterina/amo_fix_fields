@@ -78,3 +78,38 @@ def test_feature_flag_off_makes_tasks_inert(env, monkeypatch):
         await media_handoff(env)
         assert env.tasks_open == []
     run(go())
+
+
+def test_first_entry_closes_only_system_intake_tasks_once(env):
+    async def go():
+        env.tasks_open += [
+            {"id": 1, "task_type_id": 1, "text": "Связаться с клиентом (онлайн-чат Jivo)", "created_by": 0},       # закрыть
+            {"id": 2, "task_type_id": 4232862, "text": "Новый заказ с сайта", "created_by": 0},                    # закрыть
+            {"id": 3, "task_type_id": 4150438, "text": "Новый заказ с самовывозом", "created_by": 0},              # офису: не трогать
+            {"id": 4, "task_type_id": 1, "text": "сообщения клиенту не доставлены, позвонить", "created_by": 0},    # сбой доставки: не трогать
+            {"id": 5, "task_type_id": 1, "text": "Связаться с клиентом (онлайн-чат Jivo)", "created_by": 17},      # поставил человек: не трогать
+            {"id": 6, "task_type_id": 1, "text": "Не получилось связаться с клиентом по квизу", "created_by": 0},   # решение Кати не принято
+            {"id": 7, "task_type_id": 1, "text": "пуш", "created_by": 17},
+        ]
+        await env.start_turn()
+        await drain()
+        done = {t["id"]: bool(t.get("is_completed")) for t in env.tasks_open}
+        assert done == {1: True, 2: True, 3: False, 4: False, 5: False, 6: False, 7: False}
+        assert env.tasks_open[0]["result"] == "ИИ взял сделку в работу"
+        # второе сообщение клиента: ИИ уже владеет сделкой, закрывать нечего и новых вызовов быть не должно
+        env.tasks_open.append({"id": 8, "task_type_id": 1, "text": "Связаться с клиентом (онлайн-чат Jivo)", "created_by": 0})
+        await env.say(env.msg("ещё вопрос", mid="m-second"))
+        await env.advance(120)
+        await drain()
+        assert not [t for t in env.tasks_open if t["id"] == 8][0].get("is_completed")
+    run(go())
+
+
+def test_intake_close_flag_off(env, monkeypatch):
+    async def go():
+        monkeypatch.setattr(cfg, "INTAKE_TASKS_CLOSE", False)
+        env.tasks_open.append({"id": 1, "task_type_id": 1, "text": "Связаться с клиентом (онлайн-чат Jivo)", "created_by": 0})
+        await env.start_turn()
+        await drain()
+        assert not env.tasks_open[0].get("is_completed")
+    run(go())

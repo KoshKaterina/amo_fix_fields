@@ -5,6 +5,10 @@
 тулза `handoff` ИИ-сервиса). Когда менеджер возвращает диалог ИИ (реакция на алерт или ручка `return_dialog`), открытые задачи передачи
 закрываются: ИИ снова ведёт диалог, и менеджеру незачем «связываться».
 
+Первый вход ИИ в сделку (решение Кати 29.10.2026): закрываются системные задачи приёма лида, которые ИИ делает сам, список `INTAKE_TASKS`
+(тип задачи и начало текста; поставила система, а не человек). Остальные задачи нового лида (офис, самовывоз, сбой доставки, подтверждённый
+заказ, личные задачи менеджеров) не трогаем: их делает человек независимо от ИИ.
+
 Что считается задачей передачи: открытая задача сделки, текст которой начинается с `[handoff:` (так помечают и ИИ-сервис, и движок). Чужие
 задачи не трогаем. Любой сбой amo здесь не должен ломать разбор: пишем в лог и живём дальше (алерт в чат ОП уже ушёл).
 Тесты: test_ai_engine_tasks.py.
@@ -23,6 +27,12 @@ logger = logging.getLogger("uvicorn")
 MARKER = "[handoff:"
 TASK_URGENT = 4239498          # тип задачи «Срочно» в amo (тот же, что у передачи самим ИИ)
 DUE_S = 3600                   # срок: час
+# Задачи приёма лида, которые закрываются при первом входе ИИ: (тип задачи amo, начало текста). Тип «Связаться» = 1, «Горячий» = 4232862.
+# Разбор задач на новых лидах за 5 суток (29.10.2026): «Связаться с клиентом (онлайн-чат Jivo)» 91, «Новый заказ с сайта» 136.
+INTAKE_TASKS = (
+    (1, "Связаться с клиентом (онлайн-чат Jivo)"),
+    (4232862, "Новый заказ с сайта"),
+)
 
 
 async def _get_open(deal_id: int) -> list[dict] | None:
@@ -54,6 +64,14 @@ def _is_handoff(task: dict[str, Any]) -> bool:
     return str(task.get("text") or "").startswith(MARKER)
 
 
+def _is_intake(task: dict[str, Any]) -> bool:
+    """Системная задача приёма лида из `INTAKE_TASKS`. Поставленная человеком (`created_by` не 0) не считается."""
+    if task.get("created_by"):
+        return False
+    text = str(task.get("text") or "").strip()
+    return any(task.get("task_type_id") == type_id and text.startswith(prefix) for type_id, prefix in INTAKE_TASKS)
+
+
 async def create_contact_task(deal_id: int, reason: str, why: str) -> bool:
     """Срочная задача «Связаться с клиентом» на ответственного. Не ставит вторую по той же причине. True - поставлена."""
     if not cfg.HANDOFF_TASKS:
@@ -75,6 +93,20 @@ async def create_contact_task(deal_id: int, reason: str, why: str) -> bool:
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine_tasks: задача передачи по сделке %s не поставилась", deal_id)
         return False
+
+
+async def release_intake(deal_id: int) -> int:
+    """ИИ первый раз взял сделку: закрыть системные задачи приёма лида. Возвращает, сколько закрыто."""
+    if not cfg.INTAKE_TASKS_CLOSE:
+        return 0
+    try:
+        open_tasks = await _get_open(deal_id)
+        mine = [int(t["id"]) for t in (open_tasks or []) if _is_intake(t)]
+        if mine and await _complete(mine, "ИИ взял сделку в работу"):
+            return len(mine)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine_tasks: задачи приёма лида по сделке %s не закрылись", deal_id)
+    return 0
 
 
 async def release(deal_id: int) -> int:
