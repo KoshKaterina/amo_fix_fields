@@ -7,7 +7,7 @@
 Что считается чем:
   • «подходящая» - открытая сделка воронки текущего режима (тест: «Тест»; прод: «ОП розница», TangemShop);
   • «признак работы» - бюджет больше нуля, заказ (UUID, номер или состав), этап дальше «Взят в работу» в
-    розничной воронке, либо сделкой уже владеет человек.
+    «ОП розница» или TangemShop, либо сделкой уже владеет человек.
 
 Первая версия, упрощённо (решение Кати 28.10.2026, правило B вынесено):
   • подходящей сделки нет                                              -> `none`, ИИ не входит;
@@ -33,10 +33,16 @@ from shared.phones import digits_only
 from waybill_config import (
     FIELD_MOYSKLAD_ORDER_UUID,
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_TANGEMSHOP,
     STATUS_CLEVER_IN_PROGRESS,
+    STATUS_TANGEM_IN_PROGRESS,
 )
 
 logger = logging.getLogger("uvicorn")
+
+# Этап «Взят в работу» розничных воронок: всё, что дальше по порядку, считается работой над сделкой.
+IN_PROGRESS_STATUS = {int(PIPELINE_CLEVER_MAIN): int(STATUS_CLEVER_IN_PROGRESS),
+                      int(PIPELINE_TANGEMSHOP): int(STATUS_TANGEM_IN_PROGRESS)}
 
 FIELD_ORDER_NUMBER = 576697      # «№ Заказа»
 FIELD_ORDER_COMPOSITION = 576703  # «Состав заказа»
@@ -90,9 +96,9 @@ def has_work_signs(lead: dict) -> bool:
         status = int(lead.get("status_id") or 0)
     except (TypeError, ValueError):
         pipeline = status = 0
-    if pipeline == int(PIPELINE_CLEVER_MAIN):
+    if pipeline in IN_PROGRESS_STATUS:
         now_sort = amo_service.get_status_sort(status, pipeline)
-        base_sort = amo_service.get_status_sort(int(STATUS_CLEVER_IN_PROGRESS), pipeline)
+        base_sort = amo_service.get_status_sort(IN_PROGRESS_STATUS[pipeline], pipeline)
         if now_sort is not None and base_sort is not None and now_sort > base_sort:
             return True
     try:

@@ -19,6 +19,7 @@ from waybill_config import (
     STATUS_CLOSED_LOST,
     STATUS_PAYMENT_RECEIVED,
     STATUS_SUCCESS,
+    STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED,
     TEAM_PANEL_BASE_URL,
 )
 
@@ -69,7 +70,8 @@ MODE_PIPELINES: dict[str, frozenset[int]] = {
 CLOSED_STATUS_IDS = frozenset({int(STATUS_SUCCESS), int(STATUS_CLOSED_LOST)})
 
 # --- служебные события ----------------------------------------------------------------------
-PAYMENT_RECEIVED_STATUS = int(STATUS_PAYMENT_RECEIVED)   # «Оплата получена», «ОП розница»
+# «Оплата получена» в «ОП розница» и в TangemShop (id этапов в amo уникальны на весь аккаунт, воронку сверять не нужно)
+PAYMENT_RECEIVED_STATUSES = frozenset({int(STATUS_PAYMENT_RECEIVED), int(STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED)})
 FIELD_PAYMENT_STATE = 576669                              # «Статус оплаты»
 ENUM_PAYMENT_STATE_PAID = 1040151                         # значение «Оплачен»
 

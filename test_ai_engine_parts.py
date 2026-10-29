@@ -453,3 +453,23 @@ def test_old_single_page_search_is_untouched():
     """Сторож розницы и протез amgroup зовут прежнюю функцию: у неё прежняя сигнатура."""
     import inspect
     assert "limit" in inspect.signature(amo_service.find_leads_by_query).parameters
+
+
+def test_has_work_signs_counts_a_stage_after_in_progress_in_both_retail_pipelines(db, monkeypatch):
+    """«Этап дальше Взят в работу» это признак работы и в «ОП розница», и в TangemShop (раньше только в рознице)."""
+    sorts = {(10593102, 83537714): 20, (10593102, 83537718): 30, (10593102, 83537862): 70,
+             (9822330, 78157066): 20, (9822330, 78157070): 30, (9822330, 88981214): 70}
+    monkeypatch.setattr(amo_service, "get_status_sort", lambda status, pipeline: sorts.get((pipeline, status)))
+
+    def lead(pipeline, status):
+        return {"id": 1, "pipeline_id": pipeline, "status_id": status, "price": 0}
+
+    for pipe, new, work, later in ((10593102, 83537714, 83537718, 83537862), (9822330, 78157066, 78157070, 88981214)):
+        assert dedup.has_work_signs(lead(pipe, new)) is False
+        assert dedup.has_work_signs(lead(pipe, work)) is False
+        assert dedup.has_work_signs(lead(pipe, later)) is True
+
+
+def test_has_work_signs_ignores_the_stage_in_other_pipelines(db, monkeypatch):
+    monkeypatch.setattr(amo_service, "get_status_sort", lambda status, pipeline: 99)
+    assert dedup.has_work_signs({"id": 1, "pipeline_id": 8642414, "status_id": 1000, "price": 0}) is False

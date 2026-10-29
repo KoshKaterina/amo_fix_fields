@@ -876,6 +876,37 @@ def test_payment_received_event_in_retail_by_stage(env):
     run(go())
 
 
+def test_payment_received_event_in_tangemshop_by_stage(env):
+    """В TangemShop «Оплата получена» это свой этап (86477050), не розничный: событие должно прийти и оттуда."""
+    async def go():
+        env.set_settings(mode="prod", pipelines=[PIPE_RETAIL, 9822330],
+                         contacts={"scope": "pilot", "restricted": False, "items": []})
+        env.lead(pipeline=9822330)
+        turn = await env.start_turn()
+        await E.handle_result(turn["turn_id"], DEAL, 1, "continue", None, None)
+        ev = E.extract_lead_event(DEAL, 9822330, 86477050, {"leads": {"update": {"0": {"id": str(DEAL)}}}})
+        await E._handle_lead_event(ev)
+        await env.advance(1)
+        assert env.turn_requests[-1]["event"]["type"] == "payment_received"
+        assert env.turn_requests[-1]["mode"] == "prod"
+    run(go())
+
+
+def test_tangemshop_stage_before_payment_is_not_a_payment_event(env):
+    async def go():
+        env.set_settings(mode="prod", pipelines=[PIPE_RETAIL, 9822330],
+                         contacts={"scope": "pilot", "restricted": False, "items": []})
+        env.lead(pipeline=9822330)
+        turn = await env.start_turn()
+        await E.handle_result(turn["turn_id"], DEAL, 1, "continue", None, None)
+        for status in (87521846, 86477046):   # «Ссылка отправлена», «Оплата запрошена»
+            ev = E.extract_lead_event(DEAL, 9822330, status, {"leads": {"update": {"0": {"id": str(DEAL)}}}})
+            await E._handle_lead_event(ev)
+        await env.advance(5)
+        assert all(r.get("event") is None or r["event"]["type"] != "payment_received" for r in env.turn_requests)
+    run(go())
+
+
 def test_paystatus_in_retail_pipeline_does_not_fire(env):
     async def go():
         env.set_settings(mode="prod", pipelines=[PIPE_RETAIL, 9822330],

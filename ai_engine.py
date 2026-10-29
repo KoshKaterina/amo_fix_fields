@@ -1106,8 +1106,8 @@ async def _lead_event_under_lock(ev: dict) -> bool:
 
 
 def _is_payment_event(ev: dict, owner: dict) -> bool:
-    """«Оплата получена» в «ОП розница» либо «Статус оплаты = Оплачен» в «Тест» (там нет автоматики счёта)."""
-    if ev["status_id"] == cfg.PAYMENT_RECEIVED_STATUS:
+    """«Оплата получена» в «ОП розница» и TangemShop либо «Статус оплаты = Оплачен» в «Тест» (там нет автоматики счёта)."""
+    if ev["status_id"] in cfg.PAYMENT_RECEIVED_STATUSES:
         return True
     return bool(ev["paid"]) and owner.get("pipeline_id") == cfg.PIPELINE_TEST
 
