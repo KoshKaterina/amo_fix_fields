@@ -513,6 +513,36 @@ async def find_leads_by_query(query: str, with_: tuple[str, ...] = (), limit: in
     return (data.get("_embedded") or {}).get("leads") or []
 
 
+async def find_leads_by_query_all(
+    query: str, with_: tuple[str, ...] = (), page_limit: int = 250, max_pages: int = 5,
+) -> list[dict] | None:
+    """Полнотекстовый поиск сделок по ВСЕМ страницам выдачи (ИИ-менеджер, 28.10.2026).
+
+    ⚠️ Зачем рядом с `find_leads_by_query`, которую не трогаем. Та берёт одну страницу в `limit` штук, а amo
+    отдаёт по возрастанию номера: у контакта с десятками старых закрытых сделок новая открытая оказывается на
+    второй странице и поиск её не видит (боевой тест 28.10.2026: 52 сделки у контакта, первые 50 старые).
+    Для сторожа розницы и протеза amgroup одного запроса в `limit` достаточно, их поведение менять нельзя.
+
+    Возвращает None, если НЕ получена любая страница или выдача длиннее `max_pages` страниц: обрезанный ответ
+    нельзя выдавать за полный, иначе баг вернётся молча. Пустой список - честное «не нашлось».
+    """
+    leads: list[dict] = []
+    for page in range(1, max_pages + 1):
+        params: list[tuple[str, str]] = [("query", query), ("limit", str(page_limit)), ("page", str(page))]
+        if with_:
+            params.append(("with", ",".join(with_)))
+        data = await _do_get("/api/v4/leads", params)
+        if data is None:
+            return None
+        batch = (data.get("_embedded") or {}).get("leads") or []
+        leads.extend(batch)
+        if len(batch) < page_limit:
+            return leads
+    logger.warning("find_leads_by_query_all: по запросу больше %s сделок, выдача обрезана - ответ не считаю полным",
+                   page_limit * max_pages)
+    return None
+
+
 async def get_talks_by_contact(contact_id: int | str) -> list[dict]:
     """Беседы (talks) контакта. У беседы: status in_work/closed, is_in_work,
     origin (com.wazzup24* — каналы Wazzup), updated_at. Закрытие беседы в amo

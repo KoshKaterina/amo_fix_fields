@@ -43,6 +43,7 @@ import logging
 import os
 import time
 
+import ai_engine_store
 import alerts
 import amo_service
 import telegram_bot
@@ -209,6 +210,9 @@ def on_wazzup(payload: dict) -> None:
             continue
         if not _check_is_due(chat_id, now_mono):
             continue
+        # Чат ведёт ИИ-менеджер: его сделка, возможно, лежит в воронке «Тест», и это не повод звать людей.
+        if _ai_owns_chat(channel_id, chat_id):
+            continue
         contact = m.get("contact") if isinstance(m.get("contact"), dict) else {}
         st = {
             "chat_id": chat_id,
@@ -221,6 +225,17 @@ def on_wazzup(payload: dict) -> None:
         task = asyncio.create_task(_apply(st))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
+
+
+def _ai_owns_chat(channel_id: str, chat_id: str) -> bool:
+    """Чат сейчас у ИИ-менеджера. Любой сбой читается как «нет»: сторож не должен молчать из-за чужой базы."""
+    try:
+        if not ai_engine_store.cfg.ENABLED:
+            return False
+        return ai_engine_store.chat_is_ai_owned(f"{channel_id}:{chat_id}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Сторож розничных лидов: не смог спросить базу ИИ - считаю, что чат не его")
+        return False
 
 
 def _snippet(text, limit: int = 160) -> str:

@@ -18,7 +18,7 @@ from aiogram.exceptions import (
     TelegramUnauthorizedError,
 )
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, Message, MessageReactionUpdated, ReactionTypeEmoji
 
 import waybill_service
 from shared.timez import now_msk
@@ -78,8 +78,40 @@ def _ts() -> str:
     return now_msk().strftime("%d.%m.%y_%H-%M")
 
 
+# Обработчик реакций людей на сообщения бота (ИИ-менеджер: «вернуть диалог ИИ»). Ставит ai_engine_return.
+_reaction_handler = None
+
+
+def set_reaction_handler(handler) -> None:
+    """handler(event: dict) - корутина; event: chat_id, message_id, user_id, username, is_bot, new, old (списки эмодзи)."""
+    global _reaction_handler
+    _reaction_handler = handler
+
+
+def _emojis(items) -> list[str]:
+    return [r.emoji for r in (items or []) if getattr(r, "type", "") == "emoji"]
+
+
 def _build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
+
+    # Реакции приходят боту только если он администратор чата. Появление этого обработчика
+    # само добавляет message_reaction в allowed_updates опроса (aiogram берёт их из хендлеров).
+    @dp.message_reaction()
+    async def on_reaction(event: MessageReactionUpdated) -> None:
+        handler = _reaction_handler
+        if handler is None:
+            return
+        user = event.user
+        try:
+            await handler({
+                "chat_id": event.chat.id, "message_id": event.message_id,
+                "user_id": user.id if user else None, "username": (user.username if user else None),
+                "is_bot": bool(user.is_bot) if user else False,
+                "new": _emojis(event.new_reaction), "old": _emojis(event.old_reaction),
+            })
+        except Exception:
+            logger.exception("Обработчик реакции упал")
 
     @dp.message(Command("print"), F.chat.id == TG_ALLOWED_CHAT_ID)
     async def on_print(message: Message) -> None:
@@ -463,11 +495,25 @@ def _record_sent(target, thread_id, sent, text: str) -> None:
         logger.debug("запись ответа Telegram не удалась", exc_info=True)
 
 
+async def set_reaction(chat_id: int, message_id: int, emoji: str) -> bool:
+    """Реакция бота на сообщение (у бота она одна, прежняя заменяется). Ошибку не бросает: метка не повод ронять алерт."""
+    bot = _bot
+    if bot is None:
+        return False
+    try:
+        await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Реакция %s на сообщение %s не поставилась: %s", emoji, message_id, _redact(str(exc)))
+        return False
+
+
 async def _send_with_retry(
     target: int,
     text: str,
     parse_mode: str | None,
     thread_id: int | None,
+    on_sent=None,
 ) -> bool:
     """Отправка с повторами. Разбирает ИМЕННО те отказы, на которых контур молчал:
     переезд группы в супергруппу, пропавший топик, сеть, флуд-лимит, битый токен."""
@@ -490,6 +536,11 @@ async def _send_with_retry(
                 message_thread_id=thread_id,
             )
             _record_sent(target, thread_id, sent, text)
+            if on_sent is not None:
+                try:
+                    on_sent(target, thread_id, getattr(sent, "message_id", None))
+                except Exception:  # noqa: BLE001
+                    logger.exception("on_sent отправки алерта упал")
             _state["sent"] += 1
             _state["last_ok_ts"] = time.time()
             _state["last_error"] = None
@@ -591,8 +642,10 @@ async def send_alert(
     parse_mode: str | None = None,
     chat_id: int | None = None,
     message_thread_id: int | None = None,
+    on_sent=None,
 ) -> bool:
     """Шлёт текст в Telegram. Возвращает True при успехе.
+    on_sent(chat_id, thread_id, message_id) - вызывается после успешной отправки (адрес уже с учётом переездов).
     chat_id — куда слать; None → дефолтный TG_ALLOWED_CHAT_ID (чат /print).
     message_thread_id — топик супергруппы-форума (None → General).
     parse_mode="HTML" — для кликабельных ссылок (uis_missed_call)."""
@@ -605,4 +658,4 @@ async def send_alert(
     if _bot is None:
         return _suppress(text, "бот выключен")
     target = _state["chat_remap"].get(str(target), target)
-    return await _send_with_retry(target, text, parse_mode, message_thread_id)
+    return await _send_with_retry(target, text, parse_mode, message_thread_id, on_sent)
