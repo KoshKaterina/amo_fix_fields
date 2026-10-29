@@ -30,12 +30,25 @@ fi
 nginx -s reload
 echo "nginx перечитал конфиг, копия прежнего: $BK"
 
-# Проверка маски: безопасный запрос с выдуманным путём, затем смотрим запись в журнале.
-curl -sk -o /dev/null --resolve team.sunscrypt.ru:443:127.0.0.1 "https://team.sunscrypt.ru/amo/sipuni/maskcheck-$TS" || true
-sleep 1
-LINE=$(tail -n 20 /var/log/nginx/access.log | grep '/amo/sipuni/' | tail -n 1 || true)
-case "$LINE" in
-  *"/amo/sipuni/HIDDEN"*) echo "проверка маски: ok (в журнале /amo/sipuni/HIDDEN)";;
-  *"maskcheck-$TS"*) cp -p "$BK" "$CONF"; nginx -s reload; echo "СТОП: секрет попал в журнал, конфиг возвращён"; exit 4;;
+# Проверка маски. Перезагрузка nginx асинхронная: пока старые рабочие процессы не ушли, запрос может
+# обслужить старый процесс со старым конфигом и записать путь без маски. Поэтому ждём и повторяем до трёх раз,
+# и только если маска не сработала ни разу, возвращаем конфиг.
+sleep 3
+i=0
+RESULT=""
+while [ "$i" -lt 3 ]; do
+  i=$((i+1))
+  curl -sk -o /dev/null --resolve team.sunscrypt.ru:443:127.0.0.1 "https://team.sunscrypt.ru/amo/sipuni/maskcheck-$TS-$i" || true
+  sleep 2
+  LINE=$(tail -n 30 /var/log/nginx/access.log | grep "/amo/sipuni/" | grep -E "maskcheck-$TS-$i|/amo/sipuni/HIDDEN" | tail -n 1 || true)
+  case "$LINE" in
+    *"/amo/sipuni/HIDDEN"*) RESULT=ok; break;;
+    *"maskcheck-$TS-$i"*) RESULT=raw; sleep 3;;
+    *) RESULT=none; sleep 2;;
+  esac
+done
+case "$RESULT" in
+  ok) echo "проверка маски: ok (в журнале /amo/sipuni/HIDDEN, попытка $i)";;
+  raw) cp -p "$BK" "$CONF"; nginx -s reload; echo "СТОП: путь попал в журнал без маски трижды, конфиг возвращён"; exit 4;;
   *) echo "проверка маски: запись в журнале не найдена, проверить руками: tail /var/log/nginx/access.log";;
 esac
