@@ -103,6 +103,23 @@ def test_reaction_is_ignored_unless_it_is_the_tagged_manager_setting_the_right_e
     run(go())
 
 
+def test_user_from_return_also_can_return_without_being_tagged(env, monkeypatch):
+    async def go():
+        monkeypatch.setattr(cfg, "RETURN_ALSO", frozenset({"teanochk"}))
+        mid = await handoff(env)
+        await R.on_reaction(react(mid, username="stranger"))
+        assert store.get_owner(DEAL)["owner"] == "human"
+        await R.on_reaction(react(mid, username="TeaNochk"))              # регистр ника не важен
+        assert store.get_owner(DEAL)["owner"] == "ai"
+        assert any(d == DEAL and "@teanochk" in t for d, t in env.notes)
+    run(go())
+
+
+def test_return_also_is_parsed_from_the_environment_string():
+    assert cfg._parse_also("@TeaNochk  second_user @") == frozenset({"teanochk", "second_user"})
+    assert cfg._parse_also("") == frozenset()
+
+
 def test_second_reaction_does_not_return_twice(env):
     async def go():
         mid = await handoff(env)

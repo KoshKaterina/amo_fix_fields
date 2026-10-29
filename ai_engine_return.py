@@ -6,8 +6,8 @@
 
 Правила, чтобы реакция не была случайным нажатием:
   • считается только установка нужной реакции (раньше её у этого человека не было), снятие и чужие эмодзи игнорируются;
-  • реагировать должен тегнутый в этом алерте: `@ник` из текста алерта сверяется с ником автора реакции (без ника в
-    Telegram или анонимный админ - игнор);
+  • реагировать должен тегнутый в этом алерте (`@ник` из текста алерта сверяется с ником автора реакции) или человек из
+    `AI_RETURN_ALSO` (например руководитель проекта, которого в алертах нет); без ника в Telegram или анонимный админ - игнор;
   • один алерт возвращает диалог один раз (`waiting` -> `busy` одним шагом); если ИИ вернуться не может (режим off, ИИ-сервис
     недоступен, сделка закрыта или уже у ИИ), бот отвечает в ту же тему причиной словами; при временной причине алерт остаётся
     рабочим, при постоянной закрывается;
@@ -54,7 +54,7 @@ def install(return_dialog: Callable[[int], Awaitable[tuple[int, dict]]]) -> None
 
 
 def stats() -> dict:
-    return {"enabled": cfg.RETURN_BY_REACTION, "emoji": cfg.RETURN_EMOJI, **_stats}
+    return {"enabled": cfg.RETURN_BY_REACTION, "emoji": cfg.RETURN_EMOJI, "also": len(cfg.RETURN_ALSO), **_stats}
 
 
 def tags_of(text: str) -> str:
@@ -89,9 +89,10 @@ async def on_reaction(ev: dict) -> None:
     if row is None or row["state"] != store.ALERT_WAITING:
         return
     username = (ev.get("username") or "").lower()
-    if not username or username not in row["tags"].split():
+    if not username or (username not in row["tags"].split() and username not in cfg.RETURN_ALSO):
         _stats["ignored"] += 1
-        logger.info("ai_engine_return: реакция не от тегнутого (%s), сделка %s", username or "без ника", row["deal_id"])
+        logger.info("ai_engine_return: реакция не от тегнутого и не из AI_RETURN_ALSO (%s), сделка %s",
+                    username or "без ника", row["deal_id"])
         return
     if not await asyncio.to_thread(store.claim_alert_return, chat_id, message_id):
         return

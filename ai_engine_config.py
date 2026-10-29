@@ -92,4 +92,11 @@ RETENTION_DAYS = int(os.getenv("AI_ENGINE_RETENTION_DAYS", "30"))
 # ставит такую же - ИИ получает диалог обратно (`dialog_returned`). Нужен бот-администратор чата алертов.
 RETURN_BY_REACTION = os.getenv("AI_RETURN_BY_REACTION", "1").strip() == "1"
 RETURN_EMOJI = os.getenv("AI_RETURN_EMOJI", "👍").strip()            # 👍 метка «ждёт возврата» и нужная реакция
+def _parse_also(raw: str) -> frozenset:
+    return frozenset(x.lstrip("@").lower() for x in raw.split() if x.strip("@"))
+
+
+# Ники Telegram (через пробел, без @), чья реакция возвращает диалог ИИ ВСЕГДА, даже если человека нет среди тегнутых в алерте
+# (решение Кати 29.10.2026: её аккаунт может возвращать ИИ). Тегнутые в алерте менеджеры могут и без этого списка.
+RETURN_ALSO = _parse_also(os.getenv("AI_RETURN_ALSO", ""))
 RETURNED_EMOJI = os.getenv("AI_RETURNED_EMOJI", "👌").strip()        # 👌 бот меняет метку, когда ИИ вернулся
