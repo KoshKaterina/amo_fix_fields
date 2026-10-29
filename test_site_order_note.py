@@ -1,7 +1,8 @@
 """Тесты заметки в сделку с данными клиента с сайта (site_order_note).
 
 Повод: контакт amo назван «Новый контакт по звонку …», а клиент ввёл на сайте настоящее имя.
-Развилки: имя расходится / совпадает / контакта нет, заказ не с сайта, повтор не пишет второй
+Развилки: в заметке только данные с сайта (имя контакта не читаем, пометок «совпадает»
+и «отличается» нет, решение Кати 29.10), заказ не с сайта, повтор не пишет второй
 заметки, сухой режим ничего не пишет, а сбой МС или amo читается как «не знаю» (повторим).
 
 Подмены - только через monkeypatch на объектах, которые держит код под тестом.
@@ -52,6 +53,7 @@ class World:
         self.contact_name = contact_name
         self.notes_in_amo = list(notes)
         self.add_result = add_result or {"ok": True, "status_code": 200, "retryable": False}
+        self.contact_reads = 0
         self.written: list[str] = []
         self.ms_calls: list[str] = []
 
@@ -59,6 +61,7 @@ class World:
             return self.lead
 
         async def get_contact_by_id(contact_id, with_=()):
+            self.contact_reads += 1
             return {"id": contact_id, "name": self.contact_name} if self.contact_name is not None else None
 
         async def get_lead_notes(lead_id, limit=100):
@@ -96,27 +99,24 @@ def _clean(monkeypatch, tmp_path):
     son._in_flight.clear()
 
 
-def test_different_name_writes_note_with_warning(monkeypatch):
+def test_note_is_only_what_the_client_typed(monkeypatch):
     w = World(monkeypatch)
     assert w.run() == son.WRITTEN
-    assert len(w.written) == 1
-    note = w.written[0]
-    assert note.startswith("Данные клиента с сайта (заказ МС 09150):\nИмя: Ирина Фролова")
-    assert "Имя в карточке контакта: Новый контакт по звонку" in note
-    assert "отличается" in note
+    assert w.written == ["Данные клиента с сайта (заказ МС 09150):\n" + SITE_TEXT]
 
 
-def test_same_name_says_so(monkeypatch):
-    w = World(monkeypatch, contact_name="ирина  фролова")
+@pytest.mark.parametrize("contact_name", ["ирина  фролова", "Новый контакт по звонку", None])
+def test_contact_name_never_changes_note_or_is_read(monkeypatch, contact_name):
+    w = World(monkeypatch, contact_name=contact_name)
     assert w.run() == son.WRITTEN
-    assert "совпадает с сайтом" in w.written[0]
-    assert "отличается" not in w.written[0]
+    assert w.written == ["Данные клиента с сайта (заказ МС 09150):\n" + SITE_TEXT]
+    assert w.contact_reads == 0
 
 
 def test_lead_without_contact_still_gets_note(monkeypatch):
     w = World(monkeypatch, lead=_lead(contacts=()))
     assert w.run() == son.WRITTEN
-    assert "не привязан" in w.written[0]
+    assert w.written == ["Данные клиента с сайта (заказ МС 09150):\n" + SITE_TEXT]
 
 
 def test_second_call_does_not_write_again(monkeypatch):
@@ -175,11 +175,6 @@ def test_amo_lead_read_failure_is_unknown(monkeypatch):
     monkeypatch.setattr(son.amo_service, "get_lead_full", lambda *a, **k: asyncio.sleep(0, result=None))
     assert w.run() == son.UNKNOWN_LEAD
 
-
-def test_contact_read_failure_is_unknown(monkeypatch):
-    w = World(monkeypatch, contact_name=None)
-    assert w.run() == son.UNKNOWN_LEAD
-    assert w.written == []
 
 
 def test_failed_write_is_retried(monkeypatch):

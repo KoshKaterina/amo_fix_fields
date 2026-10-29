@@ -11,8 +11,8 @@
 2. Заказ МС -> доп.поле «Клиент с сайта» (его пишет woocommerce-sklad при создании
    заказа: имя, телефон, почта, телеграм, адрес, комментарий). Нет поля - заказ не с
    сайта или создан до этой доработки: молча пропускаем.
-3. Контакт сделки -> его имя в карточке. Заметка: данные с сайта и имя в карточке; если
-   они расходятся, просим менеджера поправить.
+3. Примечание в сделку: только данные с сайта (решение Кати 29.10: сравнивать с карточкой
+   контакта менеджер будет сам, пометок «совпадает» и «отличается» нет).
 
 ⚠️ Молчание - не ответ. МойСклад или amo не ответили (None) - исход «не знаю»: ничего не
 пишем, повторим на следующем проходе. Заметка пишется ровно один раз на сделку: отметка
@@ -149,35 +149,10 @@ def site_client_text(order: dict) -> str | None:
     return None
 
 
-def _site_name(text: str) -> str:
-    for line in text.splitlines():
-        if line.startswith("Имя:"):
-            return line[len("Имя:"):].strip()
-    return ""
-
-
-def _same_name(a: str, b: str) -> bool:
-    def norm(x: str) -> str:
-        return " ".join(re.sub(r"[^\w\s]", " ", x.casefold()).split())
-    return bool(norm(a)) and norm(a) == norm(b)
-
-
-def build_note(site_text: str, contact_name: str | None, order_number: str) -> str:
-    head = f"{NOTE_MARKER}" + (f" (заказ МС {order_number})" if order_number else "")
-    lines = [f"{head}:", site_text]
-    site_name = _site_name(site_text)
-    if contact_name is None:
-        lines.append("\nКонтакт к сделке не привязан - проверьте карточку клиента вручную.")
-    elif not site_name:
-        lines.append(f"\nИмя в карточке контакта: {contact_name}.")
-    elif _same_name(site_name, contact_name):
-        lines.append("\nИмя в карточке контакта совпадает с сайтом.")
-    else:
-        lines.append(
-            f"\n⚠️ Имя в карточке контакта: {contact_name}. Оно отличается от того, что клиент "
-            "ввёл на сайте, - проверьте и при необходимости поправьте контакт."
-        )
-    return "\n".join(lines)
+def build_note(site_text: str, order_number: str) -> str:
+    """Только то, что клиент ввёл на сайте: сверять с карточкой менеджер будет сам."""
+    head = NOTE_MARKER + (f" (заказ МС {order_number})" if order_number else "")
+    return f"{head}:\n{site_text}"
 
 
 # ════════════════ одна сделка ════════════════
@@ -203,7 +178,7 @@ async def note_lead(lead_id: int | str, *, source: str = "scan") -> str:
 
 
 async def _note(lid: int) -> str:
-    lead = await amo_service.get_lead_full(lid, with_=("contacts",))
+    lead = await amo_service.get_lead_full(lid, with_=())
     if not lead or not lead.get("id"):
         return UNKNOWN_LEAD
     if _is_closed(lead):
@@ -223,17 +198,8 @@ async def _note(lid: int) -> str:
         _settle(lid, NO_DATA)
         return NO_DATA
 
-    contacts = (lead.get("_embedded") or {}).get("contacts") or []
-    contact_name: str | None = None
-    if contacts:
-        main = next((c for c in contacts if c.get("is_main")), contacts[0])
-        contact = await amo_service.get_contact_by_id(main["id"])
-        if not contact:
-            return UNKNOWN_LEAD
-        contact_name = str(contact.get("name") or "").strip()
-
     number = str(amo_service.get_custom_field_value(lead, FIELD_ORDER_NUMBER) or "").strip()
-    note = build_note(site_text, contact_name, number)
+    note = build_note(site_text, number)
 
     if SITE_ORDER_NOTE_DRY_RUN:
         logger.info("site_order_note %s: записали бы заметку (%s симв.)", lid, len(note))
