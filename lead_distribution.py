@@ -25,6 +25,11 @@ team-panel) — это же свойство гарантирует, что сч
 обычно. Тот же приём, что для контакта: тега на входе обычно ещё нет (UIS
 ставит его позже), активное ожидание — см. _uis_tag_wait_loop.
 
+Источник Sipuni (28.10.2026, SIPUNI_SOURCE_IDS, режим SIPUNI_EVENTS_MODE=live): тот же смысл,
+но по потоку событий АТС (sipuni_events), а не по тегам. Ответ по телефону клиента уже был —
+пул мимо (исход тот же uis_connected: словарь исходов лежит в другом репозитории); звонок
+идёт сейчас — ждём в фоне, _sipuni_wait_loop; иначе распределяем как обычно. UIS не тронут.
+
 Надёжность — тот же приём, что в office_transfer.py: вебхук (быстрый путь) +
 периодическая reconciliation по окну времени (без ретроактивности) как
 страховка от сбоев API/пропущенных вебхуков. В отличие от office_transfer,
@@ -54,6 +59,7 @@ import alerts
 import lead_distribution_log_client
 import lead_distribution_routed_store as routed_store
 import lead_distribution_profiles_client
+import sipuni_events
 import team_panel_client
 import telegram_bot
 import tg_recipients
@@ -75,6 +81,10 @@ from waybill_config import (
     RESPONSIBLE_OFFICE_MANAGER_USER_ID,
     LEAD_DISTRIBUTION_UIS_TAG_POLL_S,
     LEAD_DISTRIBUTION_UIS_TAG_WAIT_S,
+    SIPUNI_CONNECT_POLL_S,
+    SIPUNI_CONNECT_WAIT_S,
+    SIPUNI_EVENTS_MODE,
+    SIPUNI_SOURCE_IDS,
     TAG_LEAD_DISTRIBUTION_ERROR,
     TAG_LEAD_DISTRIBUTION_ROUTED,
     TAG_MISSED_NAME,
@@ -1277,13 +1287,16 @@ async def _assign_office_manager(
 
 async def process_lead_distribution(
     lead_id, source: str = "webhook", *, uis_tag_wait_expired: bool = False,
+    sipuni_wait_expired: bool = False,
 ) -> str:
     """Обработчик очереди (LANE_AMO) / reconciliation / хвоста активного
-    ожидания контакта или тега UIS. Всегда дочитывает сделку заново.
+    ожидания контакта, тега UIS или звонка Sipuni. Всегда дочитывает сделку заново.
 
     uis_tag_wait_expired: True только из _uis_tag_wait_loop по истечении её
     бюджета ожидания — говорит «не жди тег снова, реши как обычно» (иначе с
-    источника UIS без тега решение никогда бы не принималось)."""
+    источника UIS без тега решение никогда бы не принималось).
+
+    sipuni_wait_expired: то же для _sipuni_wait_loop (источник Sipuni)."""
     if not LEAD_DISTRIBUTION_ENABLED:
         return "disabled"
 
@@ -1386,6 +1399,15 @@ async def process_lead_distribution(
         # вообще, ротация/счётчики не расходуются. См. _contact_wait_loop.
         _spawn_contact_wait(lid, source)
         return "waiting-for-contact"
+
+    if SIPUNI_EVENTS_MODE == "live" and source_id in SIPUNI_SOURCE_IDS:
+        # Источник Sipuni (28.10.2026): тот же смысл, что у гейта UIS выше, но по потоку
+        # событий АТС. Гейт стоит ПОСЛЕ проверки контакта: телефон клиента берётся из
+        # контакта, а сделку без контакта всё равно держит _contact_wait_loop.
+        sipuni_verdict = await _sipuni_gate(
+            lead, profile, lid, source, prev_responsible_user_id, expired=sipuni_wait_expired)
+        if sipuni_verdict is not None:
+            return sipuni_verdict
 
     if lid in _in_flight:
         # Пересекающийся по времени повторный заход (другой вебхук того же
@@ -1541,6 +1563,89 @@ async def _uis_tag_wait_loop(lead_id: int, source: str) -> None:
         logger.exception("lead_distribution %s: ошибка активного ожидания тега UIS", lead_id)
     finally:
         _uis_tag_wait_pending.discard(lead_id)
+
+
+# ── источник Sipuni: гейт по потоку событий АТС (28.10.2026) ──────────────────
+
+_sipuni_wait_pending: set[int] = set()
+# Ответ на звонок считается «по этой сделке», если звонок закончился не раньше, чем за столько
+# секунд до создания сделки: ответ вчерашнего звонка не должен считаться дозвоном до сегодняшнего.
+_SIPUNI_LOOKBACK_S = 600
+
+
+async def _sipuni_gate(
+    lead: dict, profile: "Profile", lid: int, source: str, prev_responsible_user_id: int | None,
+    *, expired: bool,
+) -> str | None:
+    """Гейт источника Sipuni. Возвращает итог process_lead_distribution либо None - тогда
+    распределяем как обычно.
+
+    Телефон клиента берём из первого контакта сделки (_contact_brief, как для журнала), по
+    нему спрашиваем у sipuni_events, что было со звонком:
+      connected - по номеру уже был ОТВЕЧЕННЫЙ звонок: ответственного не трогаем, пул мимо,
+                  исход тот же OUTCOME_UIS_CONNECTED (новое значение завести нельзя: словарь
+                  исходов лежит в другом репозитории);
+      active    - звонок идёт: ждём в фоне до SIPUNI_CONNECT_WAIT_S с шагом SIPUNI_CONNECT_POLL_S;
+      missed / unknown - обычное распределение сразу.
+    Сбой гейта не должен блокировать распределение: любое исключение - как «обычно».
+    """
+    try:
+        _cid, _name, phone = await _contact_brief(lead, None)
+        phone = phone or ""
+        since = _sipuni_since(lead)
+        status = sipuni_events.tracker.phone_status(phone, since=since)
+        if status == sipuni_events.PHONE_CONNECTED:
+            _spawn(_log_decision(lead, profile, outcome=OUTCOME_UIS_CONNECTED,
+                                 prev_responsible_user_id=prev_responsible_user_id,
+                                 extra_detail={"call_provider": "sipuni"}))
+            return "skipped-sipuni-connected"
+        if status == sipuni_events.PHONE_ACTIVE and not expired:
+            _spawn_sipuni_wait(lid, source, phone, since)
+            return "waiting-for-sipuni-call"
+    except Exception:
+        logger.exception("lead_distribution %s: гейт Sipuni не отработал, решаю как обычно", lid)
+    return None
+
+
+def _sipuni_since(lead: dict) -> float:
+    """Нижняя граница по времени для звонков, которые относим к сделке."""
+    try:
+        created = float(lead.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created = 0.0
+    return (created or time.time()) - _SIPUNI_LOOKBACK_S
+
+
+def _spawn_sipuni_wait(lead_id: int, source: str, phone: str, since: float) -> None:
+    if lead_id in _sipuni_wait_pending:
+        return
+    _sipuni_wait_pending.add(lead_id)
+    _spawn(_sipuni_wait_loop(lead_id, source, phone, since))
+
+
+async def _sipuni_wait_loop(lead_id: int, source: str, phone: str, since: float) -> None:
+    """Звонок с номера клиента ещё идёт: ждём в фоне, как _uis_tag_wait_loop, но по памяти, без
+    обращений к amo, поэтому шаг короткий. Звонок закончился (ответ или нет) - обычный повторный
+    заход через process_lead_distribution решит по итогу. Не закончился за бюджет - не алерт, а
+    обычное решение (sipuni_wait_expired): тот же выбор, что у UIS (решение Тианы 24.08.2026)."""
+    try:
+        deadline = time.monotonic() + SIPUNI_CONNECT_WAIT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(SIPUNI_CONNECT_POLL_S)
+            if sipuni_events.tracker.phone_status(phone, since=since) != sipuni_events.PHONE_ACTIVE:
+                await process_lead_distribution(lead_id, source=source)
+                return
+        logger.info(
+            "lead_distribution %s: звонок Sipuni не закончился за %sс — решаю как обычно",
+            lead_id, SIPUNI_CONNECT_WAIT_S,
+        )
+        await process_lead_distribution(lead_id, source=source, sipuni_wait_expired=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("lead_distribution %s: ошибка активного ожидания звонка Sipuni", lead_id)
+    finally:
+        _sipuni_wait_pending.discard(lead_id)
 
 
 # ════════════════ reconciliation (окно по времени, НЕ «текущий статус») ════════════════
