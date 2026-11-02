@@ -472,6 +472,12 @@ INSALES_STATUS_SYNC_ENABLED = os.getenv("INSALES_STATUS_SYNC_ENABLED", "").strip
 # Код (permalink) пользовательского статуса InSales. «dostavlen» = «Доставлен» (сверено
 # по справочнику магазина 02.11.2026). Заведёт Катя свой статус — поменять здесь.
 INSALES_DELIVERED_STATUS = os.getenv("INSALES_DELIVERED_STATUS", "dostavlen").strip()
+# Вместе со статусом отмечать заказ оплаченным (financial_status=paid). Нужно рефералке:
+# предоплату мимо InSales она иначе не начисляет. ⚠️ woo-sklad по оплаченному заказу создаёт
+# входящий платёж в МойСкладе, если оплат там ещё нет. Пусто/false → оплату не трогаем.
+INSALES_MARK_PAID_ENABLED = os.getenv("INSALES_MARK_PAID_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 # Гард по дате ЗАКРЫТИЯ сделки: закрытые раньше не трогаем. Формат YYYY-MM-DD по МСК,
 # пусто → гард выключен. Догнать старые заказы — поставить дату раньше.
 INSALES_STATUS_SINCE_TS: int | None = _parse_since_ts(
