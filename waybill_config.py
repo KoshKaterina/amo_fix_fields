@@ -458,6 +458,29 @@ WOO_STATUS_SINCE_TS: int | None = _parse_since_ts(
 )
 
 # ---------------------------------------------------------------------------
+# InSales (tangemshop.ru) — статус заказа «Доставлен», когда сделка Tangemshop
+# закрылась в Офисе как успешная (insales_status_sync, решение Кати 02.11.2026).
+# Ключ API — свой, с правом записи заказов: ключ woo-sklad только читает.
+# ---------------------------------------------------------------------------
+INSALES_SHOP_URL = os.getenv("INSALES_SHOP_URL", "tangemshop.ru").strip().rstrip("/")
+INSALES_API_KEY = os.getenv("INSALES_API_KEY", "").strip()
+INSALES_API_PASSWORD = os.getenv("INSALES_API_PASSWORD", "").strip()
+# Боевой флаг записи в InSales. Пусто/false → синк ВЫКЛЮЧЕН даже при заданных ключах.
+INSALES_STATUS_SYNC_ENABLED = os.getenv("INSALES_STATUS_SYNC_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# Код (permalink) пользовательского статуса InSales. «dostavlen» = «Доставлен» (сверено
+# по справочнику магазина 02.11.2026). Заведёт Катя свой статус — поменять здесь.
+INSALES_DELIVERED_STATUS = os.getenv("INSALES_DELIVERED_STATUS", "dostavlen").strip()
+# Гард по дате ЗАКРЫТИЯ сделки: закрытые раньше не трогаем. Формат YYYY-MM-DD по МСК,
+# пусто → гард выключен. Догнать старые заказы — поставить дату раньше.
+INSALES_STATUS_SINCE_TS: int | None = _parse_since_ts(
+    os.getenv("INSALES_STATUS_SINCE", "2026-11-03").strip()
+)
+# Какие номера мы уже перевели (дедуп между рестартами).
+INSALES_STATUS_SENT_PATH = os.getenv("INSALES_STATUS_SENT_PATH", "/app/var/insales_status_sent.json")
+
+# ---------------------------------------------------------------------------
 # МойСклад API — счёт Ozon (ozon_invoice) читает суммы заказа.
 # Только чтение. MS_TOKEN — Bearer-токен главного админа МС (тот же, что в
 # проекте woocommerce-sklad).

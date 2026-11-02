@@ -77,6 +77,7 @@ VALUES_BY_EVENT = {
     "metrika_sync_counter_ambiguous": {"сколько"},
     "metrika_order_load_failed": {"номер", "ошибка"},
     "woo_status_sync_error": {"номер", "номер_сделки", "ошибка"},
+    "insales_status_sync_error": {"номер", "номер_сделки", "ошибка"},
     "queue_lane_depth": {"дорожка", "глубина", "порог", "подробности"},
     "queue_api_depth": {"глубина", "порог", "подробности"},
     "queue_task_waited": {"задача", "номер_сделки", "дорожка", "сколько_ждали", "порог"},

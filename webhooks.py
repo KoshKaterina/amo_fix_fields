@@ -31,6 +31,7 @@ import budget_mismatch_watch
 import cdek_client
 import cdek_status_sync
 import dup_autoclose
+import insales_status_sync
 import jivo_service
 import lead_distribution
 import lead_distribution_profiles_client
@@ -186,6 +187,7 @@ async def lifespan(app):
     await cdek_status_sync.init()
     await metrika_sync.init()
     await woo_status_sync.init()
+    await insales_status_sync.init()
     # Клиент МойСклада поднимаем здесь: его читает ozon_invoice (суммы заказа для
     # СБП-счёта) и reserve_service (позиции заказа). Раньше клиент вставал внутри
     # синка Фулфилмента — когда тот выключили 05.08, счета молча перестали
@@ -297,6 +299,7 @@ async def lifespan(app):
     await ozon_invoice.aclose()
     await reserve_service.shutdown()
     await ms_client.aclose()
+    await insales_status_sync.shutdown()
     await woo_status_sync.shutdown()
     await metrika_sync.shutdown()
     await cdek_status_sync.shutdown()
@@ -860,6 +863,12 @@ async def lead_change(request: Request):
                 lead_id, incoming_status, incoming_pipeline,
             )
             enqueue_office_transfer(lead_id, source="webhook")
+
+    # InSales: заказ Tangemshop закрылся в Офисе → статус «Доставлен» в магазине
+    # (insales_status_sync, решение Кати 02.11.2026). Тот же гейт по ФАКТУ перехода,
+    # что у переноса выше: правка давно закрытой сделки задачу не ставит. Сеть и
+    # проверки — в фоне; потерянный вебхук доберёт сверка metrika_sync.
+    insales_status_sync.on_lead_change(lead_id, incoming_pipeline, incoming_status, status_changed)
 
     # Lead Distribution: сделка вошла в точку входа (pipeline_id/status_id)
     # какого-то ВКЛЮЧЁННОГО профиля конструктора (lead_distribution.py) —
