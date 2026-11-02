@@ -48,6 +48,17 @@ class ReturnIn(BaseModel):
     deal_id: int
 
 
+class FollowupIn(BaseModel):
+    """Отложенное касание, о котором клиент попросил сам (`ai_engine_followup`). `due_at_ts` это unix-секунды."""
+    deal_id: int
+    epoch: int
+    turn_id: int
+    up_to_message_id: str = ""
+    due_at_ts: float
+    reason: str = ""
+    draft: str = ""
+
+
 OUTCOMES = {"continue", "handoff_to_human", "release_to_engine", "aborted", "failed"}
 
 
@@ -101,6 +112,20 @@ async def result(body: ResultIn, x_service_token: str = Header(default=""), x_co
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: итог хода %s не обработан", body.turn_id)
         return _deny(500, "engine_error")
+    return JSONResponse(out, status_code=code)
+
+
+@router.post("/followup")
+async def followup(body: FollowupIn, x_service_token: str = Header(default=""), x_contract: str = Header(default="")):
+    bad = _check_service(x_service_token, x_contract)
+    if bad is not None:
+        return bad
+    try:
+        code, out = await ai_engine.schedule_followup(
+            body.deal_id, body.epoch, body.turn_id, body.up_to_message_id, body.due_at_ts, body.reason, body.draft)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: отложенное касание по сделке %s не зарегистрировано", body.deal_id)
+        return JSONResponse({"allowed": False, "reason": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
 
 
