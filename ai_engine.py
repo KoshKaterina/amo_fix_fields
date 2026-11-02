@@ -5,8 +5,9 @@
 
 Что здесь происходит, по порядку:
 
-  1. `on_wazzup(payload)` - врезка в вебхук. Синхронная и мгновенная: кладёт тело в очередь и возвращает.
-     Вебхук Wazzup обязан получить 200 сразу, а разбор идёт в фоновом цикле `_ingest_loop`.
+  1. `on_wazzup(payload)` - врезка в вебхук. Синхронная и дешёвая: пишет тело в журнал приёма (`intake`) и
+     возвращает. Вебхук Wazzup обязан получить 200 сразу, а разбор идёт в фоновом цикле `_ingest_loop`. Строка
+     журнала получает `done_at` после разбора; необработанные после рестарта разбираются заново по порядку `id`.
   2. Сообщение клиента попадает в `inbox` и двигает таймер чата (`chat_session`). Сообщение менеджера
      (автор - ФИО или `Phone`) снимает таймер и отдаёт сделку человеку; эхо автоматики и самого ИИ
      (`Admin`, пусто) за менеджера не считается. Любое не текстовое сообщение - сразу человеку.
@@ -18,7 +19,13 @@
      (`ai_engine_api.py`). Итог двигает владельца сделки и назначает следующий ход.
 
 ⚠️ Всё состояние - в sqlite (`ai_engine_store`), память процесса только кэширует. Рестарт контейнера
-ничего не теряет, кроме тел вебхуков, которые пришли в окно 502 при пересборке.
+ничего не теряет, кроме тел вебхуков, которые пришли в окно 502 при пересборке (приёмника в этот момент нет вовсе).
+Принятое тело до рестарта лежит в `intake`; если запись не удалась (диск, слишком большое тело), вебхук всё равно
+получает 200, а тело идёт старым путём, через очередь в памяти (и в этом случае рестарт его теряет).
+
+⚠️ Правило устаревших строк журнала (`cfg.INTAKE_STALE_*`): сообщение клиента старше трёх часов после рестарта в ход
+не берётся (его ответ уже не ответ), событие сделки - старше суток. Такие строки закрываются пометкой `stale` и
+одним алертом «входящее без ответа» (без текстов): человек посмотрит чат сам.
 
 ⚠️ Любая ошибка здесь не должна дойти до соседних потребителей вебхука: врезки в `webhooks.py`
 обёрнуты `try/except`, а циклы ловят исключения на каждой итерации и пишут в лог.
@@ -58,7 +65,12 @@ MEDIA_WORDS = {
     "geo": "геометку", "sticker": "стикер", "missing_call": "пропущенный звонок",
 }
 
+# Очередь в памяти теперь два вида записей: `_WAKE` - «в журнале приёма новая строка, загляни» (само тело лежит на
+# диске, при переполнении жетон просто не ставится) и `(kind, тело)` - запасной путь, когда записать в журнал не вышло.
 _queue: asyncio.Queue | None = None
+_WAKE = ("wake", None)
+_started_at = 0.0                       # когда init() поднял модуль: окно ожидания настроек панели
+_replayed: asyncio.Event | None = None  # первый разбор журнала закончен (таймеры ждут его, чтобы не обогнать менеджера)
 _tasks: list[asyncio.Task] = []
 _lock: asyncio.Lock | None = None
 _bg: set[asyncio.Task] = set()
@@ -104,14 +116,25 @@ def is_enabled() -> bool:
 # =============================================================================================
 
 async def init() -> None:
-    global _queue, _tasks
+    global _queue, _tasks, _started_at, _replayed
     if not cfg.ENABLED:
         logger.info("ai_engine: ВЫКЛЮЧЕН (AI_ENGINE_ENABLED не 1) - ни цикла, ни базы, ни опроса панели")
         return
     await _db(store.init)
     ai_engine_return.install(return_dialog)
     settings.start()
+    _started_at = _now()
+    _replayed = asyncio.Event()
     _queue = asyncio.Queue(maxsize=2000)
+    # Что не успели разобрать до рестарта: цикл приёма возьмёт это первым, по порядку `id`, раньше любого нового
+    # вебхука (новые строки получают бóльшие `id`). Сам разбор не здесь: он может ходить в amo, а старт держать нельзя.
+    try:
+        left = await _db(store.intake_stats, _now())
+        if left["pending"]:
+            logger.warning("ai_engine: после рестарта необработанных входящих %s (самое старое %s с) - разберу по порядку",
+                           left["pending"], left["oldest_age_s"])
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: не прочитал журнал приёма при старте")
     _tasks = [
         asyncio.create_task(_guarded_loop(_ingest_loop, "приём вебхука")),
         asyncio.create_task(_guarded_loop(_tick_loop, "таймеры")),
@@ -166,21 +189,25 @@ def _spawn(coro) -> None:
 # =============================================================================================
 
 def on_wazzup(payload: Any) -> None:
-    """Врезка в `POST /wazzup/{secret}`. Не блокирует и не бросает."""
+    """Врезка в `POST /wazzup/{secret}`. Не бросает; пишет в журнал приёма синхронно, ДО ответа вебхуку 200:
+    Wazzup повторов не шлёт и историю не отдаёт, так что принятое и не записанное при рестарте теряется."""
     if not cfg.ENABLED or _queue is None or not isinstance(payload, dict):
         return
-    if not isinstance(payload.get("messages"), list):
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
         return
     if settings.effective_mode() == "off":
         return
-    try:
-        _queue.put_nowait(("wazzup", payload))
-    except asyncio.QueueFull:
-        logger.error("ai_engine: очередь приёма полна - тело вебхука отброшено")
+    # Чужие каналы и сообщения без чата разбор всё равно отбросил бы (`_handle_message`): на диск их не пишем,
+    # иначе каждое сообщение компании в Wazzup стоило бы строки журнала и записи на диск прямо в вебхуке.
+    ours = [m for m in messages if isinstance(m, dict) and m.get("chatId") and str(m.get("channelId") or "") in cfg.CHANNELS]
+    if not ours:
+        return
+    _take("wazzup", {"messages": ours}, "тело вебхука Wazzup")
 
 
 def on_lead_change(lead_id: Any, pipeline_id: Any, status_id: Any, nested: Any) -> None:
-    """Врезка в `POST /lead_change`. Из тела берёт только то, что нужно, и кладёт в очередь."""
+    """Врезка в `POST /lead_change`. Из тела берёт только то, что нужно, и пишет в журнал приёма."""
     if not cfg.ENABLED or _queue is None:
         return
     try:
@@ -191,11 +218,47 @@ def on_lead_change(lead_id: Any, pipeline_id: Any, status_id: Any, nested: Any) 
         return
     try:
         event = extract_lead_event(lead_id, pipeline_id, status_id, nested)
-        _queue.put_nowait(("lead", event))
-    except asyncio.QueueFull:
-        logger.error("ai_engine: очередь приёма полна - событие сделки %s отброшено", lead_id)
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: не разобрал событие сделки %s", lead_id)
+        return
+    if not _lead_event_matters(event):
+        return
+    _take("lead", event, f"событие сделки {lead_id}")
+
+
+def _lead_event_matters(event: dict[str, Any]) -> bool:
+    """Вебхук сделки приходит на любую правку любой сделки. Разбор что-то делает только для сделок, которые мы
+    знаем (закрытие, уход из воронки, оплата), и для новых/с правкой полей заказа (правило C); остальное писать
+    в журнал незачем. Не смогли прочитать базу - пишем: лишняя строка дешевле потерянного события."""
+    if event["added"] or event["work_touched"]:
+        return True
+    try:
+        return store.has_owner_quick(event["lead_id"])
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _take(kind: str, body: dict[str, Any], what: str) -> None:
+    """Принять тело: на диск, потом разбудить цикл. Не записалось - запасной путь, очередь в памяти (как было до
+    журнала): ошибка записи не должна ломать вебхук и не должна терять сообщение там, где диск ещё не отказал
+    для остальных."""
+    try:
+        raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        if len(raw.encode("utf-8")) > cfg.INTAKE_MAX_BODY_BYTES:
+            raise ValueError(f"тело больше потолка {cfg.INTAKE_MAX_BODY_BYTES} байт")
+        store.add_intake(kind, raw, _now())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("ai_engine: %s не записано в журнал приёма (%s: %s) - иду через память, рестарт его потеряет",
+                     what, type(exc).__name__, exc)
+        try:
+            _queue.put_nowait((kind, body))
+        except asyncio.QueueFull:
+            logger.error("ai_engine: очередь приёма полна - %s отброшено", what)
+        return
+    try:
+        _queue.put_nowait(_WAKE)
+    except asyncio.QueueFull:
+        pass        # строка уже на диске: цикл заглянет в журнал сам, раз в INTAKE_POLL_S
 
 
 def extract_lead_event(lead_id: int, pipeline_id: Any, status_id: Any, nested: Any) -> dict[str, Any]:
@@ -241,30 +304,120 @@ def _int_or_none(value: Any) -> int | None:
 
 
 async def _ingest_loop() -> None:
+    """Единственный потребитель журнала приёма: берёт строки по `id`, так что порядок вебхуков сохраняется, а
+    после рестарта старые строки идут раньше новых. Первый проход (`drain_intake` до ожидания очереди) и есть
+    воспроизведение после рестарта."""
+    getter: asyncio.Future | None = None
+    try:
+        while True:
+            try:
+                if await drain_intake() and _replayed is not None:
+                    _replayed.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("ai_engine: ошибка разбора журнала приёма")
+            # Ждём жетон или запасной элемент; не `wait_for`: отмена по таймауту может съесть уже полученный элемент.
+            if getter is None:
+                getter = asyncio.ensure_future(_queue.get())
+            done, _ = await asyncio.wait({getter}, timeout=cfg.INTAKE_POLL_S)
+            if not done:
+                continue
+            kind, item = getter.result()
+            getter = None
+            if kind != _WAKE[0]:
+                await _handle_memory_item(kind, item)
+    finally:
+        if getter is not None:
+            getter.cancel()
+
+
+async def _handle_memory_item(kind: str, item: Any) -> None:
+    """Запасной путь: тело, которое не удалось записать в журнал. Как было до журнала."""
+    try:
+        await _dispatch_intake(kind, item)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("ai_engine: ошибка разбора входящего (%s)", kind)
+
+
+async def _dispatch_intake(kind: str, body: Any, *, at: float | None = None, replay: bool = False) -> None:
+    if kind == "wazzup":
+        async with _get_lock():
+            await _handle_payload(body, at=at, replay=replay)
+    elif kind == "lead":
+        await _handle_lead_event(body)
+
+
+async def drain_intake() -> bool:
+    """Разобрать все необработанные строки журнала по порядку `id`. True - журнал пуст, False - ждём настроек
+    панели (см. `INTAKE_SETTINGS_WAIT_S`). Вынесено из цикла, чтобы тесты гоняли ровно тот же код."""
+    seen: set[int] = set()
     while True:
-        kind, item = await _queue.get()
+        rows = await _db(store.open_intake, 50)
+        if not rows:
+            return True
+        if any(r["id"] in seen for r in rows):
+            # Строку разобрали, а закрыться она не смогла (отметка в базе не легла): не крутимся вхолостую.
+            logger.error("ai_engine: строка журнала приёма не закрывается - останавливаю проход")
+            return False
+        seen.update(r["id"] for r in rows)
+        # Сразу после старта `off` может значить «панель ещё не ответила»: такие строки не сбрасываем, а ждём.
+        if settings.effective_mode() == "off" and _now() - _started_at < cfg.INTAKE_SETTINGS_WAIT_S:
+            return False
+        stale = 0
+        for row in rows:
+            stale += await _replay_row(row)
+        if stale:
+            await _alert("intake_stale", [
+                f"После перезапуска остались необработанные входящие старше порога: {stale}. В ход они не берутся "
+                "(ответ ИИ на такое уже не ответ), посмотрите чаты клиентов в Wazzup.",
+            ], dedupe="intake_stale")
+
+
+async def _replay_row(row: dict) -> int:
+    """Одна строка журнала: разобрать (или пропустить как устаревшую / при выключенном режиме) и отметить `done_at`.
+    Отмечается ПОСЛЕ разбора, значит упасть между «разобрано» и «отмечено» можно: строка разберётся второй раз,
+    это безопасно (`inbox.message_id` уникален, события сделки идемпотентны через `claim_event`). Возвращает 1 для
+    устаревшей строки с сообщением клиента (о них просят посмотреть чат человеком)."""
+    kind, now = row["kind"], _now()
+    age = now - row["received_at"]
+    limit = cfg.INTAKE_STALE_WAZZUP_S if kind == "wazzup" else cfg.INTAKE_STALE_LEAD_S
+    note, was_stale = "ok", 0
+    if settings.effective_mode() == "off":
+        note = "mode_off"
+    elif age > limit:
+        note = "stale"
+        was_stale = 1 if kind == "wazzup" else 0
+        logger.warning("ai_engine: строка журнала %s (%s) старше %s с - в разбор не беру", row["id"], kind, limit)
+    else:
         try:
-            if kind == "wazzup":
-                async with _get_lock():
-                    await _handle_payload(item)
-            elif kind == "lead":
-                await _handle_lead_event(item)
+            body = json.loads(row["payload"])
+            # Строки прошлого запуска могли дойти до разбора наполовину: повтор сообщения, лежащего в inbox без
+            # хода, не отбрасывается, а заново двигает таймер чата (`replay`).
+            await _dispatch_intake(kind, body, at=row["received_at"], replay=row["received_at"] < _started_at)
         except asyncio.CancelledError:
-            raise
+            raise                       # SIGTERM посреди разбора: строка остаётся открытой, разберётся после рестарта
         except Exception:
-            logger.exception("ai_engine: ошибка разбора входящего (%s)", kind)
+            logger.exception("ai_engine: ошибка разбора строки журнала %s (%s)", row["id"], kind)
+            note = "error"              # битую строку не крутим по кругу: как и раньше, ошибка разбора пишется в лог
+    await _db(store.finish_intake, row["id"], note, now)
+    return was_stale
 
 
 # =============================================================================================
 # разбор сообщений
 # =============================================================================================
 
-async def _handle_payload(payload: dict) -> None:
+async def _handle_payload(payload: dict, *, at: float | None = None, replay: bool = False) -> None:
+    """`at` - когда вебхук был принят (из журнала): таймеры чата считаются от него, клиент ждёт с тех пор;
+    `replay` - строка пришла из прошлого запуска и могла быть разобрана наполовину."""
     for m in payload.get("messages") or []:
         if not isinstance(m, dict):
             continue
         try:
-            await _handle_message(m)
+            await _handle_message(m, at=at, replay=replay)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -302,7 +455,7 @@ def _autopilot_busy(chat_id: str, phone: str, deal_id: int | None = None) -> boo
     return False
 
 
-async def _handle_message(m: dict) -> None:
+async def _handle_message(m: dict, *, at: float | None = None, replay: bool = False) -> None:
     channel_id = str(m.get("channelId") or "")
     chat_id = str(m.get("chatId") or "")
     if not chat_id or channel_id not in cfg.CHANNELS:
@@ -312,7 +465,7 @@ async def _handle_message(m: dict) -> None:
     if wazzup_sla._is_outbound(m):
         await _on_outbound(chat_key, m)
     else:
-        await _on_inbound(chat_key, channel_id, chat_id, m)
+        await _on_inbound(chat_key, channel_id, chat_id, m, at=at, replay=replay)
 
 
 async def _on_outbound(chat_key: str, m: dict) -> None:
@@ -327,8 +480,13 @@ async def _on_outbound(chat_key: str, m: dict) -> None:
     await _to_human(s, "manager_message", alert=None)
 
 
-async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> None:
+async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict, *, at: float | None = None,
+                      replay: bool = False) -> None:
     now = _now()
+    # Таймеры пачки идут от момента, когда вебхук принят (`at`), а не от разбора: после рестарта клиент уже ждал, и
+    # лишний «первый ожидание 60 с» сверху ему не нужен. Срок поиска сделки считается от `now`: пока контейнер
+    # лежал, сделку никто не искал.
+    t0 = min(at, now) if at is not None else now
     contact = m.get("contact") if isinstance(m.get("contact"), dict) else {}
     phone = str((contact or {}).get("phone") or "")
     message_id = str(m.get("messageId") or "")
@@ -361,23 +519,27 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
     timers = settings.timers()
     sent_at = _sent_at(m, now)
     seq = await _db(store.add_inbox, message_id, chat_key, "" if is_media else text, mtype if is_media else "text",
-                    sent_at, now)
+                    sent_at, t0)
     if seq is None:
-        return                                          # повтор вебхука
+        # Повтор вебхука. Исключение одно: строка журнала из прошлого запуска, которую могли разобрать наполовину
+        # (сообщение в `inbox` уже есть, а таймер чата ещё не сдвинут) - сообщение без хода двигает таймер заново.
+        row = await _db(store.inbox_row, message_id) if replay else None
+        if row is None or row["consumed_turn"] is not None:
+            return
 
     if s is None:
         s = await _db(
             store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id,
             chat_type=str(m.get("chatType") or ""), phone=phone, contact_name=str((contact or {}).get("name") or ""),
-            state=store.S_COLLECTING, deal_id=None, batch_start=now, first_batch=1, last_client_at=now,
-            next_at=now + timers["first_reply_wait_s"], resolve_deadline=now + timers["deal_resolve_timeout_s"],
+            state=store.S_COLLECTING, deal_id=None, batch_start=t0, first_batch=1, last_client_at=t0,
+            next_at=t0 + timers["first_reply_wait_s"], resolve_deadline=now + timers["deal_resolve_timeout_s"],
             has_media=0, last_message_id=message_id,
         )
     else:
-        fields: dict[str, Any] = {"last_client_at": now, "last_message_id": message_id}
+        fields: dict[str, Any] = {"last_client_at": t0, "last_message_id": message_id}
         if s["state"] == store.S_AI:
             # Следующая пачка при ИИ-владельце: ждём только тишину, первое ожидание давно прошло.
-            fields.update(state=store.S_COLLECTING, batch_start=now, first_batch=0)
+            fields.update(state=store.S_COLLECTING, batch_start=t0, first_batch=0)
         if is_media:
             fields["has_media"] = 1
         s = await _db(store.put_session, chat_key, **fields)
@@ -392,7 +554,7 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
 
     if s["state"] == store.S_COLLECTING:
         next_at = next_turn_at(
-            first=bool(s["first_batch"]), batch_start=s["batch_start"], last=now, timers=timers,
+            first=bool(s["first_batch"]), batch_start=s["batch_start"], last=t0, timers=timers,
         )
         await _db(store.put_session, chat_key, next_at=next_at if not s["has_media"] else now)
 
@@ -424,6 +586,14 @@ def next_turn_at(*, first: bool, batch_start: float, last: float, timers: dict[s
 # =============================================================================================
 
 async def _tick_loop() -> None:
+    # Таймеры стартуют после первого разбора журнала: иначе чат, где менеджер уже ответил (строка с большим `id`
+    # ещё не разобрана), мог бы получить ход ИИ раньше, чем движок увидит ответ менеджера. Ждём не дольше
+    # `INTAKE_SETTINGS_WAIT_S` + запас: застрявший разбор не должен останавливать таймеры насовсем.
+    if _replayed is not None:
+        try:
+            await asyncio.wait_for(_replayed.wait(), cfg.INTAKE_SETTINGS_WAIT_S + 30)
+        except asyncio.TimeoutError:
+            logger.error("ai_engine: журнал приёма не разобран за положенное время - запускаю таймеры без него")
     while True:
         await asyncio.sleep(cfg.TICK_S)
         try:
@@ -458,6 +628,7 @@ async def tick_once() -> None:
     if now - _last_housekeeping >= 3600:
         _last_housekeeping = now
         await _db(store.prune, cfg.RETENTION_DAYS * 86400)
+        await _db(store.prune_intake, cfg.INTAKE_KEEP_DONE_S, now)
 
 
 async def _process_collecting(s: dict) -> None:
@@ -1258,6 +1429,7 @@ def status() -> dict[str, Any]:
     )
     try:
         out["counts"] = store.counts()
+        out["counts"]["intake"] = store.intake_stats(_now())      # возраст по часам движка; без тел сообщений
     except Exception:  # noqa: BLE001
         out["counts"] = "ошибка чтения базы"
     out["return_by_reaction"] = ai_engine_return.stats()

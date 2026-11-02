@@ -13,6 +13,8 @@
                 писал ли клиент что-то после хода
   turn          ходы: полезная нагрузка, состояние отправки, итог
   event_sent    «служебное событие уже отправлено» (оплата приходит из вебхука сделки по много раз)
+  intake        журнал приёма: тело вебхука Wazzup / событие сделки, записанное ДО ответа 200; разобранные
+                строки получают `done_at`, необработанные после рестарта разбираются заново по порядку `id`
 
 ⚠️ Идентификаторы ходов начинаются не с единицы, а с текущих секунд эпохи. Сервис отсекает повтор
 по `turn_id` (`200 duplicate`), и если базу движка потеряют, ходы с нуля совпали бы с уже виденными,
@@ -57,8 +59,8 @@ def _now() -> float:
 
 
 @contextmanager
-def _connect():
-    conn = sqlite3.connect(cfg.DB_PATH, timeout=10)
+def _connect(timeout: float = 10):
+    conn = sqlite3.connect(cfg.DB_PATH, timeout=timeout)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -154,6 +156,17 @@ def init() -> None:
                 at REAL NOT NULL,
                 PRIMARY KEY (deal_id, event_type)
             );
+
+            -- журнал приёма: тело вебхука ложится сюда ДО ответа 200, а фоновый разбор отмечает `done_at`
+            CREATE TABLE IF NOT EXISTS intake (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                received_at REAL NOT NULL,
+                done_at REAL,
+                note TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS ix_intake_open ON intake (done_at, id);
 
             -- алерт передачи диалога человеку: под ним менеджер реакцией возвращает диалог ИИ (ai_engine_return)
             CREATE TABLE IF NOT EXISTS alert_return (
@@ -416,6 +429,65 @@ def seq_of(message_id: str) -> int | None:
         return row[0] if row else None
 
 
+def inbox_row(message_id: str) -> dict | None:
+    with _connect() as conn:
+        return _dict(conn.execute("SELECT * FROM inbox WHERE message_id=?", (message_id,)).fetchone())
+
+
+# ---------------------------------------------------------------------------------------------
+# журнал приёма
+# ---------------------------------------------------------------------------------------------
+
+INTAKE_WRITE_TIMEOUT_S = 2.0
+
+
+def has_owner_quick(deal_id: int) -> bool:
+    """Есть ли у сделки строка владельца. Для врезки в вебхук (см. `add_intake` про короткий таймаут)."""
+    with _connect(timeout=INTAKE_WRITE_TIMEOUT_S) as conn:
+        return conn.execute("SELECT 1 FROM deal_owner WHERE deal_id=?", (int(deal_id),)).fetchone() is not None
+
+
+def add_intake(kind: str, payload_json: str, received_at: float) -> int:
+    """Записать принятое тело ДО ответа вебхуку. Синхронно: вызывается из обработчика вебхука, ошибку наружу
+    не прячет (решает вызывающий: откат на очередь в памяти). Ждать замок базы дольше пары секунд нельзя:
+    пока вебхук ждёт, стоит весь цикл событий приложения, поэтому таймаут короткий, а не обычные 10 с."""
+    with _connect(timeout=INTAKE_WRITE_TIMEOUT_S) as conn:
+        return conn.execute(
+            "INSERT INTO intake (kind, payload, received_at) VALUES (?,?,?)", (kind, payload_json, float(received_at)),
+        ).lastrowid
+
+
+def open_intake(limit: int = 50) -> list[dict]:
+    """Необработанные строки по порядку `id`: именно в этом порядке пришли вебхуки."""
+    with _connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM intake WHERE done_at IS NULL ORDER BY id LIMIT ?", (int(limit),),
+        ).fetchall()]
+
+
+def finish_intake(intake_id: int, note: str = "ok", now: float | None = None) -> None:
+    """Отметить строку разобранной (`ok`, `stale`, `mode_off`, `error`, ...). Повтор безвреден."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE intake SET done_at=?, note=? WHERE id=? AND done_at IS NULL",
+            (_now() if now is None else now, note, int(intake_id)),
+        )
+
+
+def intake_stats(now: float | None = None) -> dict:
+    """Сколько строк ждёт разбора и сколько секунд самой старой; без тела."""
+    with _connect() as conn:
+        n, oldest = conn.execute("SELECT COUNT(*), MIN(received_at) FROM intake WHERE done_at IS NULL").fetchone()
+    return {"pending": n, "oldest_age_s": None if oldest is None else max(0, int((now or _now()) - oldest))}
+
+
+def prune_intake(keep_done_s: float, now: float | None = None) -> int:
+    """Убрать разобранные строки старше `keep_done_s`. Необработанные не трогает: их закрывает только разбор."""
+    edge = (_now() if now is None else now) - keep_done_s
+    with _connect() as conn:
+        return conn.execute("DELETE FROM intake WHERE done_at IS NOT NULL AND done_at<?", (edge,)).rowcount
+
+
 # ---------------------------------------------------------------------------------------------
 # ходы
 # ---------------------------------------------------------------------------------------------
@@ -555,7 +627,8 @@ def counts() -> dict:
             out["turns"][r[0]] = r[1]
         for r in conn.execute("SELECT state, COUNT(*) FROM chat_session GROUP BY state"):
             out["sessions"][r[0]] = r[1]
-        return out
+    out["intake"] = intake_stats()
+    return out
 
 
 def _iso(ts: float) -> str:
