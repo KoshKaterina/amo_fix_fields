@@ -192,14 +192,23 @@ def on_lead_change(lead_id, pipeline_id, status_id, status_changed: bool) -> Non
         return
     if pipeline_id is not None and str(pipeline_id) != str(PIPELINE_OFFICE):
         return
-    task = asyncio.create_task(_process_bg(lead_id))
+    schedule(lead_id, "webhook")
+
+
+def schedule(lead_id, source: str) -> None:
+    """Прогнать одну сделку в фоне. Кроме вебхука зовёт office_transfer: самовывоз он кладёт
+    из УР воронки-источника сразу в УР Офиса, этап не меняется (142 → 142), и вебхук такую
+    сделку за переход не считает. Без этого её подбирала бы только сверка, через часы."""
+    if not _enabled or lead_id is None:
+        return
+    task = asyncio.create_task(_process_bg(lead_id, source))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
 
-async def _process_bg(lead_id) -> None:
+async def _process_bg(lead_id, source: str = "webhook") -> None:
     try:
-        await process_lead(lead_id, source="webhook")
+        await process_lead(lead_id, source=source)
     except Exception:
         logger.exception("InSales: ошибка по сделке %s", lead_id)
 

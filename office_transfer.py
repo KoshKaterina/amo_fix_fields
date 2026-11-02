@@ -738,6 +738,13 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         if any((t.get("name") or "") == _tag for t in amo_service.get_tags(lead)):
             await amo_service.remove_tag(lead_id, _tag, lead=lead)
 
+    # Статус заказа в InSales (02.11.2026): перенос сразу в УР Офиса (самовывоз) не меняет
+    # этап, и вебхук его за переход не считает — запускаем синк сами. Сделки не Tangemshop
+    # модуль отсеет. Импорт ленивый — по образцу Метрики и Woo выше.
+    if (target_pipeline_id, target_status_id) == (PIPELINE_OFFICE, STATUS_SUCCESS):
+        import insales_status_sync
+        insales_status_sync.schedule(lead_id, "office_transfer")
+
     return "moved"
 
 

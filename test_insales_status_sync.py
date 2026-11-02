@@ -312,6 +312,27 @@ def test_webhook_gate(env, monkeypatch, pipeline, status, changed, expected):
     assert calls == ([(36600001, "webhook")] if expected else [])
 
 
+@pytest.mark.parametrize("enabled,expected", [(True, [(36600001, "office_transfer")]), (False, [])])
+def test_schedule_from_office_transfer(env, monkeypatch, enabled, expected):
+    # Самовывоз перенос кладёт сразу в УР Офиса (142 → 142): вебхук молчит, синк ставит сам перенос
+    calls = []
+
+    async def _process(lead_id, lead=None, source="reconcile"):
+        calls.append((lead_id, source))
+        return "set"
+
+    monkeypatch.setattr(sync, "process_lead", _process)
+    monkeypatch.setattr(sync, "_enabled", enabled)
+
+    async def _go():
+        sync.schedule(36600001, "office_transfer")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(_go())
+    assert calls == expected
+
+
 # ── клиент InSales ────────────────────────────────────────────────────────────
 
 def _client(handler):

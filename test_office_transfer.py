@@ -1336,6 +1336,12 @@ def test_metrika_kartoteku_ne_vidit_a_roznicu_otpravlyaet_geyt_voro():
     assert office_transfer.is_source_pipeline(PIPELINE_TANGEMSHOP) is False
     office_transfer.OFFICE_TRANSFER_SOURCE_TANGEMSHOP = True
     assert office_transfer.is_source_pipeline(PIPELINE_TANGEMSHOP) is True
+    # Синк статуса InSales (02.11.2026): перенос сразу в УР Офиса сам ставит задачу, потому что
+    # этап не меняется (142 → 142) и вебхук такую сделку не узнаёт. Перенос не в УР — не ставит.
+    import insales_status_sync
+    _ins_calls = []
+    _ins_saved = insales_status_sync.schedule
+    insales_status_sync.schedule = lambda lid, source: _ins_calls.append((lid, source))
     # УР со СДЭКом: тот же этап Офиса, что у розницы с такой же доставкой
     _reset()
     lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, application_type=APPLICATION_TYPE_ORDER,
@@ -1349,6 +1355,7 @@ def test_metrika_kartoteku_ne_vidit_a_roznicu_otpravlyaet_geyt_voro():
         "заказ Tangemshop обязан ехать в тот же этап, что розничный с той же доставкой")
     assert _patches[0]["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
     assert _patches[0]["custom_fields"][FIELD_FORMER_RESPONSIBLE] == "Иван Иванов"
+    assert _ins_calls == [], ("перенос не в УР Офиса синк InSales не ставит", _ins_calls)
     # УР с самовывозом: в УР Офиса, тоже как розница
     _reset()
     lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, application_type=APPLICATION_TYPE_ORDER,
@@ -1358,6 +1365,8 @@ def test_metrika_kartoteku_ne_vidit_a_roznicu_otpravlyaet_geyt_voro():
     res = run(office_transfer.process_office_transfer(42))
     assert res == "moved", res
     assert (_patches[0]["pipeline_id"], _patches[0]["status_id"]) == (PIPELINE_OFFICE, STATUS_SUCCESS), _patches[0]
+    assert _ins_calls == [(42, "office_transfer")], ("самовывоз в УР Офиса обязан запустить синк InSales", _ins_calls)
+    insales_status_sync.schedule = _ins_saved
     # ⚠️ ГЛАВНЫЙ тест задачи: ЗИН закрывает сделку НА МЕСТЕ
     _reset()
     lead = _lead(pipeline_id=PIPELINE_TANGEMSHOP, status_id=STATUS_CLOSED_LOST,
