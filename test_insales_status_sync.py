@@ -51,9 +51,10 @@ def _lead(number="18858 Tangemshop", name="Заказ №18858 Tangemshop", pipe
             "created_at": _CREATED, "closed_at": closed, "custom_fields_values": fields}
 
 
-def _order(permalink="novyy", system="new", number=18858, oid=1660000001, financial="pending"):
+def _order(permalink="novyy", system="new", number=18858, oid=1660000001, financial="pending",
+           pay="Оплата онлайн"):
     return {"id": oid, "number": number, "fulfillment_status": system, "financial_status": financial,
-            "custom_status": {"permalink": permalink}}
+            "payment_title": pay, "custom_status": {"permalink": permalink}}
 
 
 class _InSales:
@@ -164,9 +165,9 @@ def test_already_delivered_is_not_rewritten(env):
     ("vozvrat", "returned"),
     ("v-protsesse-vozvrata", "returning"),
 ])
-@pytest.mark.parametrize("mark_paid", [False, True])
-def test_cancelled_and_returns_are_not_touched_at_all(env, monkeypatch, permalink, system, mark_paid):
-    monkeypatch.setattr(sync, "INSALES_MARK_PAID_ENABLED", mark_paid)
+@pytest.mark.parametrize("mode", ["", "prepaid", "all"])
+def test_cancelled_and_returns_are_not_touched_at_all(env, monkeypatch, permalink, system, mode):
+    monkeypatch.setattr(sync, "INSALES_MARK_PAID", mode)
     env.order = _order(permalink=permalink, system=system)
     assert _run(_lead()) == "hands_off"
     assert env.sets == [] and env.paid == []
@@ -180,12 +181,26 @@ def test_human_delivered_status_is_kept(env):
     assert env.sets == [] and env.paid == []
 
 
-# ── отметка оплаты (INSALES_MARK_PAID_ENABLED) ───────────────────────────────
+# ── отметка оплаты (INSALES_MARK_PAID) ───────────────────────────────────────
 
 @pytest.fixture
 def paid_on(env, monkeypatch):
-    monkeypatch.setattr(sync, "INSALES_MARK_PAID_ENABLED", True)
+    monkeypatch.setattr(sync, "INSALES_MARK_PAID", "all")
     return env
+
+
+@pytest.mark.parametrize("pay,marked", [
+    ("Оплата онлайн", True),
+    ("Оплата картой", True),
+    ("Оплата при получении", False),   # наложку рефералка считает по «Доставлен»
+])
+def test_prepaid_mode_marks_only_prepayment(env, monkeypatch, pay, marked):
+    monkeypatch.setattr(sync, "INSALES_MARK_PAID", "prepaid")
+    env.order = _order(pay=pay)
+    assert _run(_lead()) == "set"
+    assert env.sets == [(1660000001, "dostavlen")]
+    assert env.paid == ([1660000001] if marked else [])
+    assert sync._sent == {"18858": "dostavlen+paid"}
 
 
 def test_mark_paid_goes_in_the_same_put_as_status(paid_on):

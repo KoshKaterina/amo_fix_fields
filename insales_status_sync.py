@@ -5,11 +5,12 @@
 поэтому код статуса в настройке INSALES_DELIVERED_STATUS). До этого обратной записи в
 InSales не было вовсе: ТЗ 29.09.2026 прямо говорило «InSales для нас — только источник».
 
-Отметка оплаты (решение Кати 02.11.2026, флаг INSALES_MARK_PAID_ENABLED): УР в Офисе значит,
+Отметка оплаты (решение Кати 02.11.2026, настройка INSALES_MARK_PAID): УР в Офисе значит,
 что деньги получены, поэтому тем же PUT заказ отмечается оплаченным. Иначе рефералка Tangemshop
 не начисляет партнёрам за предоплату, прошедшую мимо InSales (счёт Ozon из amo, перевод, карта в
 шоуруме): для неё предоплата «оплачена» только по financial_status=paid. ⚠️ Оплаченный заказ
-woo-sklad проводит в МойСклад входящим платежом, если оплат по заказу там ещё нет.
+woo-sklad проводит в МойСклад входящим платежом, если оплат по заказу там ещё нет. Режим
+«prepaid» отмечает только предоплату (наложку рефералка считает по «Доставлен»), «all» — все.
 
 Принципы:
   - передаём ТОЛЬКО статус заказа и отметку оплаты; состав, адрес и остальное не трогаем;
@@ -47,12 +48,13 @@ from shared.timez import MSK
 from waybill_config import (
     FIELD_SITE_ORDER_NUMBER,
     INSALES_DELIVERED_STATUS,
-    INSALES_MARK_PAID_ENABLED,
+    INSALES_MARK_PAID,
     INSALES_STATUS_SENT_PATH,
     INSALES_STATUS_SINCE_TS,
     INSALES_STATUS_SYNC_ENABLED,
     PIPELINE_OFFICE,
     STATUS_SUCCESS,
+    is_cod_payment,
     is_tangemshop_lead,
 )
 
@@ -104,7 +106,7 @@ async def init() -> None:
     logger.info(
         "InSales status sync включён (статус=%s, оплата=%s, since=%s, в дедупе %s)",
         INSALES_DELIVERED_STATUS,
-        "отмечаем" if INSALES_MARK_PAID_ENABLED else "не трогаем",
+        {"prepaid": "отмечаем у предоплаты", "all": "отмечаем у всех"}.get(INSALES_MARK_PAID, "не трогаем"),
         "выкл" if INSALES_STATUS_SINCE_TS is None else f"unix {INSALES_STATUS_SINCE_TS}",
         len(_sent),
     )
@@ -112,7 +114,14 @@ async def init() -> None:
 
 def _done_token() -> str:
     """Что считается доведённым заказом при текущих настройках (значение в дедупе)."""
-    return INSALES_DELIVERED_STATUS + ("+paid" if INSALES_MARK_PAID_ENABLED else "")
+    return INSALES_DELIVERED_STATUS + ("+paid" if INSALES_MARK_PAID else "")
+
+
+def _should_mark_paid(order: dict) -> bool:
+    """Отмечать ли оплату этому заказу при текущем режиме INSALES_MARK_PAID."""
+    if not INSALES_MARK_PAID or order.get("financial_status") == "paid":
+        return False
+    return INSALES_MARK_PAID == "all" or not is_cod_payment(order.get("payment_title"))
 
 
 async def shutdown() -> None:
@@ -245,7 +254,7 @@ async def process_lead(lead_id, lead: dict | None = None, source: str = "reconci
                 )
                 return "hands_off"
             need_status = current != target and system not in _HANDS_OFF_STATUSES
-            need_paid = INSALES_MARK_PAID_ENABLED and not paid
+            need_paid = _should_mark_paid(order)
             if not need_status and not need_paid:
                 _remember(key, done)
                 logger.info("InSales: заказ №%s уже «%s»%s — пропуск", number, current,
