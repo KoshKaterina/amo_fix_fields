@@ -17,7 +17,7 @@ import logging
 
 import httpx
 
-from waybill_config import METRIKA_API_URL, METRIKA_TOKEN
+from waybill_config import METRIKA_API_URL, METRIKA_TOKEN, METRIKA_ULOGIN
 
 logger = logging.getLogger("uvicorn")
 
@@ -58,9 +58,10 @@ def build_simple_orders_csv(rows: list[dict]) -> bytes:
 
 
 class MetrikaClient:
-    def __init__(self, base_url: str, token: str):
+    def __init__(self, base_url: str, token: str, ulogin: str = ""):
         self._base_url = base_url
         self._token = token
+        self._ulogin = ulogin.strip()
         self._client: httpx.AsyncClient | None = None
 
     async def init(self) -> None:
@@ -76,13 +77,19 @@ class MetrikaClient:
     def _headers(self) -> dict:
         return {"Authorization": f"OAuth {self._token}"}
 
+    def _params(self, **params) -> dict:
+        """Use the represented account without changing the token owner."""
+        if self._ulogin:
+            params["ulogin"] = self._ulogin
+        return params
+
     async def get_counters(self) -> list[dict]:
         if self._client is None:
             raise MetrikaError("MetrikaClient not initialized")
         resp = await self._client.get(
             f"{self._base_url}/management/v1/counters",
             headers=self._headers(),
-            params={"per_page": 100},
+            params=self._params(per_page=100),
         )
         if resp.status_code != 200:
             raise MetrikaError(
@@ -101,7 +108,7 @@ class MetrikaClient:
         # состояния (IN_PROGRESS → PAID → возможно CANCELLED), и нам нужно, чтобы
         # последняя загрузка перезаписывала статус и revenue по id, а не «прилипала»
         # к первому значению. См. metrika_sync: revenue шлём всегда явно.
-        params = {"merge_mode": "UPDATE", "delimiter_type": "COMMA"}
+        params = self._params(merge_mode="UPDATE", delimiter_type="COMMA")
         files = {"file": ("orders.csv", data, "text/csv")}
 
         last_err: Exception | None = None
@@ -136,7 +143,7 @@ _client: MetrikaClient | None = None
 
 async def init() -> None:
     global _client
-    _client = MetrikaClient(METRIKA_API_URL, METRIKA_TOKEN)
+    _client = MetrikaClient(METRIKA_API_URL, METRIKA_TOKEN, METRIKA_ULOGIN)
     await _client.init()
 
 

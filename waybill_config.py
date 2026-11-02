@@ -216,6 +216,8 @@ WAYBILL_ZERO_COST_PLACEHOLDER = int(os.getenv("WAYBILL_ZERO_COST_PLACEHOLDER", "
 # ---------------------------------------------------------------------------
 METRIKA_API_URL = os.getenv("METRIKA_API_URL", "https://api-metrika.yandex.net").rstrip("/")
 METRIKA_TOKEN = os.getenv("METRIKA_TOKEN", "").strip()
+# Optional represented Metrica account; empty keeps direct account access.
+METRIKA_ULOGIN = os.getenv("METRIKA_ULOGIN", "").strip()
 # Номер счётчика. Пусто → если в аккаунте один счётчик, подхватим по токену.
 _raw_counter = os.getenv("METRIKA_COUNTER_ID", "").strip()
 METRIKA_COUNTER_ID: int | None = int(_raw_counter) if _raw_counter.isdigit() else None
