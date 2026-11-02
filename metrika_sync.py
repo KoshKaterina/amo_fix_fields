@@ -21,7 +21,8 @@
   - интрадей: в METRIKA_INTRADAY_HOURS (МСК, по умолчанию 3,9,15,21),
     окно — с прошлого успешного прохода с перехлёстом 15 мин;
   - ночная (01:00 МСК): полное окно RECONCILE_DAYS — источник истины.
-Оба прохода гонят Метрику И Woo одним набором сделок (reconcile_window).
+Оба прохода гонят Метрику И Woo одним набором сделок (reconcile_window). Тем же
+проходом идёт страховка статусов InSales для Tangemshop (insales_status_sync).
 """
 
 import asyncio
@@ -476,6 +477,7 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
         # Ленивый импорт: woo_status_sync импортирует metrika_sync на уровне модуля,
         # поэтому здесь — внутри функции, чтобы не было кольцевого импорта.
         import woo_status_sync
+        import insales_status_sync
         ok = 0
         for lid, ld in leads_by_id.items():
             try:
@@ -490,6 +492,13 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
                     await woo_status_sync.process_sync({"lead_id": lid}, lead=ld)
                 except Exception:
                     logger.exception("Woo reconcile: ошибка по сделке %s", lid)
+            # InSales — страховка вебхука: заказ Tangemshop, чья сделка закрылась в
+            # Офисе, пока контейнер пересобирался. Сделки не наши модуль отсеет сам.
+            if insales_status_sync.is_enabled():
+                try:
+                    await insales_status_sync.process_lead(lid, lead=ld, source="reconcile")
+                except Exception:
+                    logger.exception("InSales reconcile: ошибка по сделке %s", lid)
         logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
         # Двигаем метку только если выборка прошла по всем воронкам: упавшая
         # воронка не должна выпасть из следующего окна.
