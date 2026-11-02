@@ -397,19 +397,19 @@ def test_echo_of_automation_and_ai_is_not_a_manager(env, author):
 def test_media_first_message_goes_to_human_without_turn(env):
     async def go():
         env.lead()
-        await env.say(env.msg("", typ="image", mid="img-1"))
+        await env.say(env.msg("", typ="geo", mid="geo-1"))
         await env.advance(1)
         owner = store.get_owner(DEAL)
         assert (owner["owner"], owner["epoch"]) == ("human", 1)
         assert env.turn_requests == []
-        assert any("картинку" in a for a in env.alerts)
+        assert any("геометку" in a for a in env.alerts)
     run(go())
 
 
 def test_media_in_pack_with_text_sends_whole_pack_to_human(env):
     async def go():
         env.lead()
-        await env.say(env.msg("вот скрин", mid="t-1"), env.msg("", typ="image", mid="img-2"))
+        await env.say(env.msg("вот скрин", mid="t-1"), env.msg("", typ="vcard", mid="vc-2"))
         await env.advance(1)
         await env.advance(120)
         assert store.get_owner(DEAL)["owner"] == "human"
@@ -421,14 +421,75 @@ def test_media_in_pack_with_text_sends_whole_pack_to_human(env):
 def test_media_while_ai_owns_is_immediate_and_cancels_turn(env):
     async def go():
         turn = await env.start_turn()
-        await env.say(env.msg("", typ="audio", mid="voice-1"))
+        await env.say(env.msg("", typ="missing_call", mid="call-1"))
         owner = store.get_owner(DEAL)
         assert (owner["owner"], owner["epoch"]) == ("human", 2)
         await asyncio.sleep(0.05)
         assert env.cancels == [turn["turn_id"]]
-        assert any("голосовое" in a for a in env.alerts)
+        assert any("пропущенный звонок" in a for a in env.alerts)
         code, body = E.decide_permit(DEAL, 2, turn["turn_id"], turn["up_to_message_id"])
         assert body["allowed"] is False
+    run(go())
+
+
+def test_attachment_first_message_goes_to_the_ai_with_a_marker_line(env):
+    """02.11.2026: картинка, видео, голосовое, документ и неподдерживаемый формат идут ИИ строкой-пометкой, человеку не зовём."""
+    async def go():
+        env.lead()
+        await env.say(env.msg("", typ="image", mid="img-1"))
+        await env.advance(1)
+        await env.advance(120)
+        assert store.get_owner(DEAL)["owner"] == "ai"
+        assert len(env.turn_requests) == 1 and env.alerts == []
+        text = env.turn_requests[0]["messages"][0]["text"]
+        assert text.startswith("[Клиент прислал картинку") and "не видит" in text and "Подпись" not in text
+    run(go())
+
+
+def test_attachment_caption_goes_next_to_the_marker_and_text_keeps_its_order(env):
+    async def go():
+        env.lead()
+        await env.say(env.msg("Здравствуйте, вот чек", mid="t-1"), env.msg("вот что пришло", typ="document", mid="doc-2"))
+        await env.advance(1)
+        await env.advance(120)
+        texts = [m["text"] for m in env.turn_requests[0]["messages"]]
+        assert texts[0] == "Здравствуйте, вот чек"
+        assert texts[1].startswith("[Клиент прислал файл") and texts[1].endswith("Подпись клиента: вот что пришло")
+    run(go())
+
+
+def test_unsupported_attachment_ignores_wazzup_placeholder_text(env):
+    async def go():
+        env.lead()
+        await env.say(env.msg("Вам что-то прислали. Такой формат сообщений пока не поддерживается.", typ="unsupported", mid="un-1"))
+        await env.advance(1)
+        await env.advance(120)
+        text = env.turn_requests[0]["messages"][0]["text"]
+        assert "не поддерживает" in text and "Вам что-то прислали" not in text and "Подпись" not in text
+    run(go())
+
+
+def test_attachment_while_ai_owns_does_not_hand_off_and_next_turn_sees_it(env):
+    async def go():
+        turn = await env.start_turn()
+        await E.handle_result(turn["turn_id"], DEAL, 1, "continue", None, None)
+        await env.say(env.msg("", typ="audio", mid="voice-1"))
+        assert store.get_owner(DEAL)["owner"] == "ai"
+        await env.advance(60)
+        await env.advance(60)
+        assert env.alerts == []
+        assert any(m["text"].startswith("[Клиент прислал голосовое сообщение") for r in env.turn_requests[1:] for m in r["messages"])
+    run(go())
+
+
+def test_attachment_together_with_a_human_media_type_still_goes_to_the_human(env):
+    async def go():
+        env.lead()
+        await env.say(env.msg("", typ="image", mid="img-1"), env.msg("", typ="vcard", mid="vc-2"))
+        await env.advance(1)
+        await env.advance(120)
+        assert store.get_owner(DEAL)["owner"] == "human" and env.turn_requests == []
+        assert any("контакт" in a for a in env.alerts) and not any("картинку" in a for a in env.alerts)
     run(go())
 
 

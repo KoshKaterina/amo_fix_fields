@@ -18,7 +18,7 @@ async def drain():
 
 async def media_handoff(env):
     env.lead()
-    await env.say(env.msg("", typ="image", mid="img-1"))
+    await env.say(env.msg("", typ="vcard", mid="vc-1"))
     await env.advance(1)
     await drain()
 
@@ -28,7 +28,7 @@ def test_media_handoff_creates_an_urgent_contact_task_for_the_responsible(env):
         await media_handoff(env)
         assert len(env.tasks_open) == 1
         t = env.tasks_open[0]
-        assert t["text"].startswith("[handoff:media] Связаться с клиентом, срочно: Клиент прислал картинку")
+        assert t["text"].startswith("[handoff:media] Связаться с клиентом, срочно: Клиент прислал контакт")
         assert t["responsible_user_id"] == 7 and t["deal_id"] == DEAL
         assert 3000 < t["complete_till"] - time.time() < 3700                           # срок около часа
     run(go())

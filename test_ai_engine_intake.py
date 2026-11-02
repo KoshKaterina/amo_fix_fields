@@ -99,6 +99,21 @@ def test_crash_before_parsing_then_restart_creates_the_turn(env, monkeypatch):
     run(go())
 
 
+def test_attachment_survives_restart_and_reaches_the_ai_as_a_note(env, monkeypatch):
+    """Стык с правкой «вложения идут ИИ строкой-пометкой» (81a7ddd): картинка с подписью тоже переживает рестарт."""
+    async def go():
+        env.lead()
+        boot(env, monkeypatch)
+        E.on_wazzup({"messages": [env.msg("вот чек", mid="m-img", typ="image")]})
+        boot(env, monkeypatch)
+        await E.drain_intake()
+        await env.advance(61)
+        [turn] = env.turn_requests
+        assert [m["message_id"] for m in turn["messages"]] == ["m-img"]
+        assert "Клиент прислал картинку" in turn["messages"][0]["text"] and "вот чек" in turn["messages"][0]["text"]
+    run(go())
+
+
 def test_timers_count_from_receipt_not_from_replay(env, monkeypatch):
     """Клиент уже ждал 100 секунд: первое ожидание (60 с) не начинается заново, ход идёт на первом же тике."""
     async def go():

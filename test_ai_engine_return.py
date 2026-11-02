@@ -60,7 +60,7 @@ def test_handoff_alert_gets_the_bot_marker_and_is_remembered(env):
 def test_media_alert_is_returnable_too(env):
     async def go():
         env.lead()
-        await env.say(env.msg("", typ="image", mid="img-1"))
+        await env.say(env.msg("", typ="vcard", mid="vc-1"))
         await env.advance(1)
         await drain()
         mid = env.alert_ids[-1][2]
