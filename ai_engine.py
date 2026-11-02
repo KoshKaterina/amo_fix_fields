@@ -58,6 +58,23 @@ MEDIA_WORDS = {
     "geo": "геометку", "sticker": "стикер", "missing_call": "пропущенный звонок",
 }
 
+# Вложения клиента, о которых ИИ узнаёт строкой-пометкой (02.11.2026, решение Кати): сам файл ему не показывают, он вежливо
+# просит описать суть текстом (негатив и жалобы по контексту зовут менеджера, это правило в промпте). Остальные виды
+# (контакт, геометка, пропущенный звонок, системные) по-прежнему сразу уходят человеку.
+ATTACHMENT_TYPES = frozenset({"image", "video", "audio", "document", "sticker", "unsupported"})
+ATTACHMENT_WORDS = {"image": "картинку", "video": "видео", "audio": "голосовое сообщение", "document": "файл", "sticker": "стикер"}
+
+
+def attachment_text(mtype: str, caption: str = "") -> str:
+    """Строка для ИИ вместо вложения. Подпись клиента (text у картинки, видео, документа) идёт следом как его слова."""
+    if mtype == "unsupported":
+        base = "[Клиент прислал вложение в формате, который наша система не поддерживает (стикер, реакция или другое); содержимого ИИ не видит]"
+    else:
+        base = f"[Клиент прислал {ATTACHMENT_WORDS.get(mtype, 'вложение')}; содержимого ИИ не видит]"
+    caption = (caption or "").strip()
+    return f"{base} Подпись клиента: {caption}" if caption else base
+
+
 _queue: asyncio.Queue | None = None
 _tasks: list[asyncio.Task] = []
 _lock: asyncio.Lock | None = None
@@ -334,7 +351,9 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
     message_id = str(m.get("messageId") or "")
     mtype = str(m.get("type") or "text").strip().lower()
     text = str(m.get("text") or "")
-    is_media = mtype != "text" or not text.strip()
+    is_attachment = mtype in ATTACHMENT_TYPES
+    is_media = not is_attachment and (mtype != "text" or not text.strip())
+    caption = "" if mtype == "unsupported" else text    # у unsupported text это заглушка самого Wazzup, не слова клиента
     if not message_id:
         message_id = f"noid:{chat_key}:{m.get('dateTime')}:{abs(hash(text))}"
 
@@ -360,8 +379,8 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
 
     timers = settings.timers()
     sent_at = _sent_at(m, now)
-    seq = await _db(store.add_inbox, message_id, chat_key, "" if is_media else text, mtype if is_media else "text",
-                    sent_at, now)
+    seq = await _db(store.add_inbox, message_id, chat_key, caption if is_attachment else ("" if is_media else text),
+                    mtype if (is_media or is_attachment) else "text", sent_at, now)
     if seq is None:
         return                                          # повтор вебхука
 
@@ -535,7 +554,8 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
 
     if s["has_media"]:
         # Медиа от клиента: ИИ не получает ничего, сделка сразу человеку (даже если ИИ ещё не владел).
-        media_types = [r["msg_type"] for r in await _db(store.pending_inbox, chat_key) if r["msg_type"] != "text"]
+        media_types = [r["msg_type"] for r in await _db(store.pending_inbox, chat_key)
+                       if r["msg_type"] != "text" and r["msg_type"] not in ATTACHMENT_TYPES]
         owner = await _db(
             store.set_owner, deal_id, store.OWNER_HUMAN, reason="media", chat=chat,
             pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode,
@@ -598,7 +618,8 @@ async def _give_up_resolving(s: dict, why: str) -> None:
 
 async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None = None) -> None:
     chat_key = s["chat_key"]
-    pending = [r for r in await _db(store.pending_inbox, chat_key) if r["msg_type"] == "text" and r["text"].strip()]
+    pending = [r for r in await _db(store.pending_inbox, chat_key)
+               if (r["msg_type"] == "text" and r["text"].strip()) or r["msg_type"] in ATTACHMENT_TYPES]
     pending_event = None
     if event is None and s.get("pending_event"):
         try:
@@ -626,7 +647,9 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
         body: dict[str, Any] = {
             "turn_id": turn_id, "deal_id": deal_id, "epoch": int(owner["epoch"]), "mode": mode, "reason": reason,
             "chat": {"chat_id": s["chat_id"], "chat_type": s["chat_type"], "channel_id": s["channel_id"]},
-            "messages": [{"message_id": r["message_id"], "text": r["text"], "sent_at": r["sent_at"]} for r in pending],
+            "messages": [{"message_id": r["message_id"],
+                          "text": r["text"] if r["msg_type"] == "text" else attachment_text(r["msg_type"], r["text"]),
+                          "sent_at": r["sent_at"]} for r in pending],
             "up_to_message_id": up_to_id, "now": _iso(_now()), "send_window": window,
             "returning": None, "client_memory": None,
         }
