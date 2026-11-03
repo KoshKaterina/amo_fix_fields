@@ -751,6 +751,20 @@ async def patch_contact(contact_id: int | str, *, tags: list[dict] | None = None
     return await _do_patch(f"/api/v4/contacts/{contact_id}", body)
 
 
+async def add_contact_tag(
+    contact_id: int | str, tag_name: str, *, contact: dict | None = None
+) -> dict[str, Any]:
+    """Поставить тег на контакт (идемпотентно). Теги заменяются целиком, поэтому
+    сохраняем текущие плюс новый."""
+    if contact is None:
+        contact = await get_contact_by_id(contact_id)
+    if not contact:
+        return {"ok": False, "status_code": None, "retryable": True}
+    if has_tag(contact, tag_name):
+        return {"ok": True, "status_code": 200, "retryable": False}
+    return await patch_contact(contact_id, tags=list(get_tags(contact)) + [{"name": tag_name}])
+
+
 async def remove_contact_tag(
     contact_id: int | str, tag_name: str, *, contact: dict | None = None
 ) -> dict[str, Any]:

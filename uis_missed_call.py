@@ -52,6 +52,7 @@ from waybill_config import (
     MISSED_CALLBACK_WINDOW_END_H,
     MISSED_CALLBACK_WINDOW_START_H,
     SIPUNI_EVENTS_MODE,
+    SIPUNI_SET_TAGS,
     TAG_MISSED_NAME,
     TAG_SUCCESS_CALL_NAME,
 )
@@ -384,6 +385,7 @@ async def shutdown() -> None:
 def _sipuni_start() -> None:
     """Подключает решение «пропущенный» к алерту. Зовётся из init() и вместе с событием."""
     sipuni_events.tracker.on_missed = _sipuni_on_missed
+    sipuni_events.tracker.on_answered = _sipuni_on_answered
 
 
 def sipuni_notify_bg(payload: list) -> None:
@@ -417,10 +419,10 @@ async def _sipuni_on_missed(missed) -> None:
             ",".join(missed.statuses) or "—",
         )
         return
+    if not _is_new("sipuni:" + missed.call_id):
+        logger.info("Sipuni пропущенный: дубль call_id=%s — пропускаю", missed.call_id)
+        return
     try:
-        if not _is_new("sipuni:" + missed.call_id):
-            logger.info("Sipuni пропущенный: дубль call_id=%s — пропускаю", missed.call_id)
-            return
         # Цифры без плюса: так телефон приходит от UIS, и поиск сделки в amo проверен именно на
         # этом виде. Имени клиента у Sipuni в событиях нет, ищем только по телефону.
         await _notify_missed(
@@ -429,6 +431,86 @@ async def _sipuni_on_missed(missed) -> None:
         )
     except Exception:
         logger.exception("Sipuni пропущенный: ошибка обработки (call=%s)", missed.call_id)
+    # Теги после алерта: «срочно» не ждёт amo, а сбой алерта не отменяет теги.
+    await _sipuni_tag_missed(missed)
+
+
+async def _sipuni_on_answered(call) -> None:
+    """Звонок ответили (входящий или исходящий), тихое окно прошло: «Успешный звонок»."""
+    if SIPUNI_EVENTS_MODE != "live" or not SIPUNI_SET_TAGS:
+        logger.info(
+            "Sipuni отвеченный: call=%s напр=%s тел=%s - %s, тег НЕ ставлю",
+            call.call_id, call.direction, call.phone or "—",
+            "режим log" if SIPUNI_EVENTS_MODE != "live" else "SIPUNI_SET_TAGS выключен",
+        )
+        return
+    if not _is_new("sipuni-ok:" + call.call_id):
+        return
+    try:
+        lead_id, _resp = await _find_lead(call.phone.lstrip("+"))
+        if not lead_id:
+            logger.info("Sipuni отвеченный: нет открытой сделки по номеру, «%s» не ставлю (call=%s)",
+                        TAG_SUCCESS_CALL_NAME, call.call_id)
+            return
+        # add_tag идемпотентен (тег уже есть - запись не делает). «пропущенный» снимет
+        # unmiss_tag.py по эху правки сделки.
+        result = await amo_service.add_tag(lead_id, TAG_SUCCESS_CALL_NAME)
+        logger.info(
+            "Sipuni отвеченный: тег «%s» на сделке %s %s (call=%s напр=%s)",
+            TAG_SUCCESS_CALL_NAME, lead_id, "поставлен" if result.get("ok") else
+            f"НЕ поставлен (status={result.get('status_code')})", call.call_id, call.direction,
+        )
+    except Exception:
+        logger.exception("Sipuni отвеченный: ошибка постановки тега (call=%s)", call.call_id)
+
+
+async def _sipuni_tag_missed(missed) -> None:
+    """«пропущенный» на открытую сделку по телефону и на её контакты.
+
+    Тегаем только когда сделка есть: контакт без сделки получил бы тег, который некому снять
+    (unmiss_tag.py работает от правок сделки). Свежий пропуск сбрасывает «Успешный звонок»
+    сделки: иначе тег от прошлого разговора заставил бы unmiss_tag снять «пропущенный»
+    сразу после постановки. Возвращает «Успешный звонок» следующий отвеченный звонок.
+    """
+    if SIPUNI_EVENTS_MODE != "live" or not SIPUNI_SET_TAGS or not missed.phone:
+        return
+    try:
+        lead_id, _resp = await _find_lead(missed.phone.lstrip("+"))
+        if not lead_id:
+            logger.info("Sipuni пропущенный: нет открытой сделки по номеру, «%s» не ставлю (call=%s)",
+                        TAG_MISSED_NAME, missed.call_id)
+            return
+        lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
+        if not lead:
+            logger.warning("Sipuni пропущенный: сделка %s не прочиталась, теги не ставлю (call=%s)",
+                           lead_id, missed.call_id)
+            return
+        had_missed = amo_service.has_tag(lead, TAG_MISSED_NAME)
+        had_success = amo_service.has_tag(lead, TAG_SUCCESS_CALL_NAME)
+        if had_missed and not had_success:
+            logger.info("Sipuni пропущенный: «%s» на сделке %s уже есть (call=%s)",
+                        TAG_MISSED_NAME, lead_id, missed.call_id)
+        else:
+            tags = amo_service.filter_tags_excluding(amo_service.get_tags(lead), TAG_SUCCESS_CALL_NAME)
+            if not had_missed:
+                tags.append({"name": TAG_MISSED_NAME})
+            result = await amo_service.patch_lead(lead_id, tags=tags)
+            logger.info(
+                "Sipuni пропущенный: тег «%s» на сделке %s %s%s (call=%s)",
+                TAG_MISSED_NAME, lead_id,
+                "поставлен" if result.get("ok") else f"НЕ поставлен (status={result.get('status_code')})",
+                f", «{TAG_SUCCESS_CALL_NAME}» снят" if had_success else "", missed.call_id,
+            )
+        for contact in (lead.get("_embedded") or {}).get("contacts") or []:
+            cid = contact.get("id")
+            if cid is None:
+                continue
+            result = await amo_service.add_contact_tag(cid, TAG_MISSED_NAME)
+            if not result.get("ok"):
+                logger.warning("Sipuni пропущенный: тег на контакт %s НЕ поставлен (status=%s, call=%s)",
+                               cid, result.get("status_code"), missed.call_id)
+    except Exception:
+        logger.exception("Sipuni пропущенный: ошибка постановки тега (call=%s)", missed.call_id)
 
 
 # Закрытые = системные статусы «успех»/«отказ», общие для ВСЕХ воронок

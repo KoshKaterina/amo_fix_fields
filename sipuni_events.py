@@ -47,6 +47,11 @@ aiogram, без amoCRM. Всё, что требует Telegram и amo, лежи�
     трубку в приветствии или в меню). Решение Кати 03.11.2026: такой звонок тоже пропущенный,
     и пингуем всех из пула пинга по звонку (теги смены и @thebarsa1), а не одного ответственного.
 
+Отвеченный звонок (входящий и исходящий, не внутренний) тоже отдаётся наружу: on_answered, один
+раз на call_id, после того же тихого окна. Это нужно, чтобы поставить тег «Успешный звонок»
+(uis_missed_call, SIPUNI_SET_TAGS): к этому времени сделка Sipuni в amo уже создана и находится
+поиском по телефону.
+
 Тихое окно перевзводится на КАЖДОМ событии звонка (asyncio.call_later), поэтому очередь с
 несколькими ногами и перевод между очередями не дают раннего ложного алерта. Всё состояние
 живёт в памяти процесса с TTL и ограничением размера, как у соседних счётчиков: рестарт
@@ -382,6 +387,17 @@ class CallState:
 
 
 @dataclasses.dataclass(frozen=True)
+class AnsweredCall:
+    """Итог по звонку, который ответили (входящий или исходящий), после тихого окна."""
+
+    call_id: str
+    direction: str        # DIR_IN или DIR_OUT
+    phone: str            # нормализованный +7... клиента
+    first_ts: int | None
+    last_ts: int | None
+
+
+@dataclasses.dataclass(frozen=True)
 class MissedCall:
     """Итог по звонку, который тихое окно признало пропущенным."""
 
@@ -410,6 +426,7 @@ class SipuniCallTracker:
         max_calls: int = CALL_MAX, stuck_s: float = STUCK_LEG_S,
         clock: Callable[[], float] = time.time,
         on_missed: Callable[[MissedCall], Any] | None = None,
+        on_answered: Callable[[AnsweredCall], Any] | None = None,
     ) -> None:
         self._quiet_override = quiet_s
         self.ttl_s = ttl_s
@@ -417,8 +434,10 @@ class SipuniCallTracker:
         self.stuck_s = stuck_s
         self.clock = clock
         self.on_missed = on_missed
+        self.on_answered = on_answered
         self._calls: collections.OrderedDict[str, CallState] = collections.OrderedDict()
         self._alerted: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._answered_done: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._missed: collections.OrderedDict[str, dict] = collections.OrderedDict()
         self._bg: set = set()
 
@@ -434,6 +453,7 @@ class SipuniCallTracker:
             self._cancel_timer(st)
         self._calls.clear()
         self._alerted.clear()
+        self._answered_done.clear()
         self._missed.clear()
 
     # -- приём события ---------------------------------------------------
@@ -504,6 +524,9 @@ class SipuniCallTracker:
                 logger.warning(
                     "Sipuni: ответ ПОСЛЕ решения «пропущенный» (call=%s) - тихое окно %.0f с "
                     "может быть коротким", st.call_id, self.quiet_s())
+                # Звонок всё же ответили: отдаём как отвеченный, чтобы тег «Успешный звонок»
+                # снял уже поставленный «пропущенный».
+                self._emit_answered(st)
         self._after_update(st, now)
         if not st.finalized:
             self._arm(st)
@@ -567,7 +590,10 @@ class SipuniCallTracker:
             return None
         self._cancel_timer(st)
         st.finalized = True
-        if st.direction != DIR_IN or st.answered:
+        if st.answered:
+            self._emit_answered(st)
+            return None
+        if st.direction != DIR_IN:
             return None
         if st.call_id in self._alerted:
             return None  # этот call_id уже давал алерт (повтор после вытеснения состояния)
@@ -587,30 +613,50 @@ class SipuniCallTracker:
         return missed
 
     def _emit(self, missed: MissedCall) -> None:
-        handler = self.on_missed
+        self._dispatch(self.on_missed, missed, missed.call_id, "пропущенного")
+
+    def _emit_answered(self, st: CallState) -> None:
+        """Отдать отвеченный звонок (один раз на call_id). Внутренние и звонки без номера
+        клиента не отдаём: тегать по ним нечего."""
+        if st.direction not in (DIR_IN, DIR_OUT) or not st.client_phone:
+            return
+        if st.call_id in self._answered_done:
+            return
+        self._answered_done[st.call_id] = None
+        while len(self._answered_done) > ALERTED_MAX:
+            self._answered_done.popitem(last=False)
+        self._dispatch(
+            self.on_answered,
+            AnsweredCall(call_id=st.call_id, direction=st.direction, phone=st.client_phone,
+                         first_ts=st.first_ts, last_ts=st.last_ts),
+            st.call_id, "отвеченного",
+        )
+
+    def _dispatch(self, handler: Callable[[Any], Any] | None, payload: Any,
+                  call_id: str, what: str) -> None:
         if handler is None:
             return
         try:
-            result = handler(missed)
+            result = handler(payload)
             if inspect.isawaitable(result):
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
                     if inspect.iscoroutine(result):
                         result.close()
-                    logger.warning("Sipuni: обработчик пропущенного не запущен - нет цикла событий")
+                    logger.warning("Sipuni: обработчик %s не запущен - нет цикла событий", what)
                     return
                 task = loop.create_task(result) if inspect.iscoroutine(result) \
                     else asyncio.ensure_future(result, loop=loop)
                 self._bg.add(task)
                 task.add_done_callback(self._bg_done)
         except Exception:  # noqa: BLE001 - сбой обработчика не должен ронять учёт звонков
-            logger.exception("Sipuni: ошибка обработчика пропущенного (call=%s)", missed.call_id)
+            logger.exception("Sipuni: ошибка обработчика %s (call=%s)", what, call_id)
 
     def _bg_done(self, task: Any) -> None:
         self._bg.discard(task)
         if not task.cancelled() and task.exception() is not None:
-            logger.error("Sipuni: обработчик пропущенного упал (%r)", task.exception())
+            logger.error("Sipuni: обработчик события звонка упал (%r)", task.exception())
 
     # -- «перезвонили» по потоку звонков --------------------------------------
 
