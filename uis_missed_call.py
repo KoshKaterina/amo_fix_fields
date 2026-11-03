@@ -53,6 +53,7 @@ from waybill_config import (
     MISSED_CALLBACK_WINDOW_START_H,
     SIPUNI_EVENTS_MODE,
     SIPUNI_SET_TAGS,
+    STATUS_NEW_LEAD_ALL,
     TAG_MISSED_NAME,
     TAG_SUCCESS_CALL_NAME,
 )
@@ -447,10 +448,10 @@ async def _sipuni_on_answered(call) -> None:
     if not _is_new("sipuni-ok:" + call.call_id):
         return
     try:
-        lead_id, _resp = await _find_lead(call.phone.lstrip("+"))
+        lead_id, _resp = await _find_lead(call.phone.lstrip("+"), statuses=STATUS_NEW_LEAD_ALL)
         if not lead_id:
-            logger.info("Sipuni отвеченный: нет открытой сделки по номеру, «%s» не ставлю (call=%s)",
-                        TAG_SUCCESS_CALL_NAME, call.call_id)
+            logger.info("Sipuni отвеченный: нет новой сделки (этап «Новый лид») по номеру, «%s» не ставлю "
+                        "(call=%s)", TAG_SUCCESS_CALL_NAME, call.call_id)
             return
         # add_tag идемпотентен (тег уже есть - запись не делает). «пропущенный» снимет
         # unmiss_tag.py по эху правки сделки.
@@ -465,20 +466,21 @@ async def _sipuni_on_answered(call) -> None:
 
 
 async def _sipuni_tag_missed(missed) -> None:
-    """«пропущенный» на открытую сделку по телефону и на её контакты.
+    """«пропущенный» на НОВУЮ сделку по телефону (открытая, этап «Новый лид» или его буфер) и на
+    её контакты. Сделка уже в работе или на другом этапе - не тегаем (решение Кати 03.11.2026).
 
-    Тегаем только когда сделка есть: контакт без сделки получил бы тег, который некому снять
-    (unmiss_tag.py работает от правок сделки). Свежий пропуск сбрасывает «Успешный звонок»
+    Тегаем только когда такая сделка есть: контакт без сделки получил бы тег, который некому
+    снять (unmiss_tag.py работает от правок сделки). Свежий пропуск сбрасывает «Успешный звонок»
     сделки: иначе тег от прошлого разговора заставил бы unmiss_tag снять «пропущенный»
     сразу после постановки. Возвращает «Успешный звонок» следующий отвеченный звонок.
     """
     if SIPUNI_EVENTS_MODE != "live" or not SIPUNI_SET_TAGS or not missed.phone:
         return
     try:
-        lead_id, _resp = await _find_lead(missed.phone.lstrip("+"))
+        lead_id, _resp = await _find_lead(missed.phone.lstrip("+"), statuses=STATUS_NEW_LEAD_ALL)
         if not lead_id:
-            logger.info("Sipuni пропущенный: нет открытой сделки по номеру, «%s» не ставлю (call=%s)",
-                        TAG_MISSED_NAME, missed.call_id)
+            logger.info("Sipuni пропущенный: нет новой сделки (этап «Новый лид») по номеру, «%s» не ставлю "
+                        "(call=%s)", TAG_MISSED_NAME, missed.call_id)
             return
         lead = await amo_service.get_lead_full(lead_id, with_=("contacts",))
         if not lead:
@@ -519,12 +521,15 @@ async def _sipuni_tag_missed(missed) -> None:
 _CLOSED_STATUS_IDS = {142, 143}
 
 
-async def _find_lead(phone: str):
+async def _find_lead(phone: str, statuses=None):
     """(lead_id, responsible_user_id) ОТКРЫТОЙ сделки по телефону (не закрытую и не
     случайную — жалоба МОП: ссылка вела на рандомную/старую сделку). Открытая =
     status_id не из 142/143. Несколько открытых → самую свежую ПО РАБОТЕ (max
     updated_at, тай-брейк по id). Открытых нет → (None, None) (лучше без ссылки и
-    тег смены, чем ссылка на закрытую)."""
+    тег смены, чем ссылка на закрытую).
+
+    statuses: если задан, берём только сделки на этих этапах (теги Sipuni ставим лишь новой
+    сделке, см. STATUS_NEW_LEAD_ALL)."""
     if not phone:
         return None, None
     try:
@@ -535,6 +540,8 @@ async def _find_lead(phone: str):
             logger.warning("uis_missed_call: amoCRM не ответила на поиск по телефону")
             return None, None
         open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
+        if statuses is not None:
+            open_leads = [ld for ld in open_leads if ld.get("status_id") in statuses]
         if not open_leads:
             return None, None
         best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))

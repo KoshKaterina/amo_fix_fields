@@ -6,8 +6,9 @@
 
 Что защищаем:
   * по умолчанию выключено, и в режиме log запись в amo не идёт вообще (ни при каком флаге);
-  * «пропущенный» ставится на открытую сделку и её контакты, один раз на звонок; сделки нет -
-    тегов нет (контакт без сделки получил бы тег, который некому снять);
+  * тегаем только НОВУЮ сделку (этап «Новый лид» или его буфер; решение Кати 03.11.2026);
+    «пропущенный» ставится на неё и её контакты, один раз на звонок; такой сделки нет - тегов
+    нет (контакт без сделки получил бы тег, который некому снять);
   * свежий пропуск сбрасывает «Успешный звонок» сделки, иначе unmiss_tag снял бы «пропущенный» сразу;
   * «Успешный звонок» ставится на отвеченный звонок, входящий и исходящий, один раз на call_id;
   * цепочка с unmiss_tag: после отвеченного звонка «пропущенный» снимается, «Успешный звонок» остаётся;
@@ -31,8 +32,11 @@ from test_sipuni_events import (  # noqa: F401 - glue: фикстура, её н
 )
 from waybill_config import TAG_MISSED_NAME, TAG_SUCCESS_CALL_NAME
 
-LEAD_ID = 36500001      # сделку отдаёт поиск в фикстуре glue
+LEAD_ID = 36500001      # сделку отдаёт поиск по телефону
 CONTACT_ID = 7001
+NEW_LEAD = 83537714     # этап «Новый лид»
+NEW_LEAD_BUFFER = 83915186
+IN_WORK = 83537718      # любой другой этап: сделка уже в работе
 
 
 def out_call(cid, ts=500, *, client=CALLER_DIGITS, answered=True):
@@ -146,6 +150,8 @@ class FakeAmo:
         self.lead_patches = []
         self.contact_patches = []
         self.fail_patch = False
+        self.lead_status = NEW_LEAD       # этап сделки, которую отдаёт поиск по телефону
+        self.extra_leads = []             # другие открытые сделки клиента
 
     def lead_tags(self):
         return sorted(t["name"] for t in self.leads[LEAD_ID]["_embedded"]["tags"])
@@ -182,6 +188,12 @@ def amo(glue, monkeypatch):
         fake.contacts[int(contact_id)]["_embedded"]["tags"] = [dict(t) for t in tags]
         return {"ok": True, "status_code": 200, "retryable": False}
 
+    async def find_leads_by_query(query, *a, **k):
+        found = [{"id": LEAD_ID, "status_id": fake.lead_status, "responsible_user_id": 13929334,
+                  "updated_at": 5}]
+        return found + list(fake.extra_leads)
+
+    monkeypatch.setattr(amo_service, "find_leads_by_query", find_leads_by_query)
     monkeypatch.setattr(amo_service, "get_lead_full", get_lead_full)
     monkeypatch.setattr(amo_service, "patch_lead", patch_lead)
     monkeypatch.setattr(amo_service, "get_contact_by_id", get_contact_by_id)
@@ -262,6 +274,43 @@ def test_missed_without_open_deal_writes_nothing(amo, glue, monkeypatch):
     run(go())
     assert len(glue.sends) == 1
     assert amo.lead_patches == [] and amo.contact_patches == []
+
+
+@pytest.mark.parametrize("stage, tagged", [
+    (NEW_LEAD, True), (NEW_LEAD_BUFFER, True), (IN_WORK, False), (142, False), (143, False),
+])
+def test_only_a_new_lead_deal_is_tagged(amo, glue, monkeypatch, stage, tagged):
+    """Решение Кати 03.11.2026: тегаем новую сделку (этап «Новый лид» или его буфер), остальным всё равно."""
+    live(monkeypatch)
+    amo.lead_status = stage
+
+    async def go():
+        await U._sipuni_apply(r_not_taken("tg.70", legs=2))
+        await U._sipuni_apply(r_taken("tg.71", client="79555555556"))
+        await idle(S.tracker)
+
+    run(go())
+    assert len(glue.sends) == 1, "алерт не зависит от этапа сделки"
+    if tagged:
+        assert amo.lead_tags() == sorted([TAG_MISSED_NAME, TAG_SUCCESS_CALL_NAME])
+        assert amo.contact_tags() == [TAG_MISSED_NAME]
+    else:
+        assert amo.lead_tags() == [] and amo.contact_tags() == []
+        assert amo.lead_patches == [] and amo.contact_patches == []
+
+
+def test_new_deal_is_chosen_over_a_fresher_deal_in_work(amo, glue, monkeypatch):
+    """У клиента две открытые сделки: тег ложится на новую, даже если сделка в работе обновлялась позже."""
+    live(monkeypatch)
+    amo.extra_leads = [{"id": 36500002, "status_id": IN_WORK, "responsible_user_id": 1,
+                        "updated_at": 99}]
+
+    async def go():
+        await U._sipuni_apply(r_not_taken("tg.72", legs=2))
+        await idle(S.tracker)
+
+    run(go())
+    assert amo.lead_tags() == [TAG_MISSED_NAME]
 
 
 def test_missed_with_hidden_number_writes_nothing(amo, glue, monkeypatch):
