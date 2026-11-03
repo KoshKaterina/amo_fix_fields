@@ -5,10 +5,23 @@
 aiogram, без amoCRM. Всё, что требует Telegram и amo, лежит в uis_missed_call.py, а сюда
 приходит только поток событий.
 
-⚠️ ФОРМАТ СОБЫТИЙ ВЗЯТ ИЗ ОПИСАНИЯ, А НЕ ИЗ РЕАЛЬНЫХ ОБРАЗЦОВ. Интеграция Sipuni с нами ещё не
-подключена, звонков не было. Всё, что ниже помечено «ПРЕДПОЛОЖЕНИЕ», проверяется на первом
-тестовом звонке по строкам журнала режима log (см. log_line). Разбор поэтому терпимый: любой
-мусор даёт событие с kind=None, а не исключение.
+⚠️ 03.11.2026 ФОРМАТ СВЕРЕН С РЕАЛЬНЫМИ СОБЫТИЯМИ (журнал режима log, тестовые звонки на 905).
+Первая версия правила «пропущенный» была написана по описанию и для реального входящего
+решения не принимала. Как входящий выглядит НА САМОМ ДЕЛЕ:
+  * клиент положил трубку в приветствии: ev=1 «клиент(тип 1) -> наш номер(тип 1)», затем
+    ev=2 NOANSWER. Ног к сотрудникам нет;
+  * очередь звонила сотруднику, он не взял: тот же ev=1, затем много (в замере 33, по одному
+    в секунду) ev=1 «клиент(тип 1) -> сотрудник(тип 2)» с флагом is_inner_call=1, затем ОДИН
+    ev=2 NOANSWER «клиент -> наш номер»;
+  * сотрудник взял: то же, плюс ev=3 на ноге к сотруднику, затем ОДИН ev=2 ANSWER.
+Итого: ev=2 приходит один раз на весь звонок (число закрытых ног никогда не равно числу
+открытых), флаг is_inner_call стоит на ногах входящего, а не только на внутренних звонках,
+схема (treeNumber) у входящего и исходящего разная. Поэтому: направление ставит первое событие
+(внешний -> внешний это входящий), конец ВСЕГО звонка это ev=2 с той же парой номеров, что у
+первого ev=1, а есть ли вообще ноги к сотрудникам, считаем отдельно (клиент бросил трубку в
+приветствии). Не проверено на живом звонке: перевод между очередями (ev=4), переадресация
+на мобильный, внутренний звонок. Всё, что ниже помечено «ПРЕДПОЛОЖЕНИЕ», - допущение под них.
+Разбор терпимый: любой мусор даёт событие с kind=None, а не исключение.
 
 Что известно из описания «События на АТС» (HTTP, метод GET или POST):
   event      1 начало вызова или перевода ноги, 2 завершение, 3 ответ,
@@ -20,13 +33,19 @@ aiogram, без amoCRM. Всё, что требует Telegram и amo, лежи�
   is_inner_call=1 у события 1 внутреннего звонка; treeName, treeNumber (схема)
 
 Отдельного события «пропущенный звонок» у Sipuni НЕТ. Решение (принято 28.10.2026):
-  * входящий звонок: есть событие 1 с внешним звонящим (src_type=1) и внутренним адресатом
-    (dst_type=2); внутренний звонок и исходящий в счёт пропущенных не идут;
+  * входящий звонок: первое событие 1 с внешним звонящим (src_type=1) и адресатом: нашей
+    линией (dst_type=1), сотрудником (dst_type=2) или не указанным. Ноги к сотрудникам с
+    флагом is_inner_call=1 внутренними НЕ считаются. Внутренний (оба типа 2) и исходящий
+    (src_type=2, dst_type=1) в счёт пропущенных не идут;
   * ответ: событие 3, ИЛИ событие 2/4 со status=ANSWER, ИЛИ call_answer_timestamp > 0;
-  * пропущенным звонок считается, когда по call_id ни одна нога не отвечена, число событий 2
-    и 4 покрывает число событий 1 (нет открытых ног) и после последнего события прошло тихое
-    окно SIPUNI_MISSED_QUIET_S. Нога без ответа при последующем ответе другой ноги пропущенным
-    НЕ считается. Один алерт на call_id.
+  * пропущенным звонок считается, когда по call_id ни одна нога не отвечена, звонок закончился
+    (пришло ev=2 с той же парой номеров, что у первого ev=1; для событий без такой пары число
+    событий 2 и 4 покрывает число событий 1) и после последнего события прошло тихое окно
+    SIPUNI_MISSED_QUIET_S. Нога без ответа при последующем ответе другой ноги пропущенным НЕ
+    считается. Один алерт на call_id.
+  * dropped_in_menu: у пропущенного звонка не было ни одной ноги к сотруднику (клиент бросил
+    трубку в приветствии или в меню). Решение Кати 03.11.2026: такой звонок тоже пропущенный,
+    и пингуем всех из пула пинга по звонку (теги смены и @thebarsa1), а не одного ответственного.
 
 Тихое окно перевзводится на КАЖДОМ событии звонка (asyncio.call_later), поэтому очередь с
 несколькими ногами и перевод между очередями не дают раннего ложного алерта. Всё состояние
@@ -86,6 +105,8 @@ STUCK_LEG_S = 300.0
 _STATUS_KEEP = 8
 # Сколько ключей событий держим на звонок для отсева повторов доставки.
 _SEEN_PER_CALL = 64
+# Сколько разных пар «откуда -> куда» держим на звонок.
+_PAIRS_KEEP = 64
 
 
 # ---------------------------------------------------------------------------
@@ -284,14 +305,21 @@ def collect_payload(
 def classify_start(ev: SipuniEvent) -> str:
     """Направление звонка по событию 1: DIR_IN, DIR_OUT, DIR_INNER или пустая строка.
 
-    Пустая строка - нога, по которой направление не определить: внешний на внешний
-    (переадресация на мобильный: это нога входящего звонка, но сама по себе она не
-    говорит, что звонок входящий) или события без типов и без разборчивых номеров.
+    Порядок проверок важен (сверено с реальными событиями 03.11.2026):
+      * оба конца внутренние: внутренний звонок;
+      * ЗВОНЯЩИЙ ВНЕШНИЙ: входящий, даже если Sipuni поставил на событие is_inner_call=1 (так
+        он помечает ногу очереди к сотруднику, а не внутренний звонок). Адресат: наша линия
+        (тип 1, главная нога «клиент -> наш номер»), сотрудник (тип 2) или не указан;
+      * иначе is_inner_call=1: внутренний звонок;
+      * внутренний звонит наружу: исходящий.
+    Направление звонка ставится по ПЕРВОМУ событию (см. ingest): последующие ноги его не меняют.
     """
-    if ev.is_inner or (ev.src_type == 2 and ev.dst_type == 2):
+    if ev.src_type == 2 and ev.dst_type == 2:
         return DIR_INNER
-    if ev.src_type == 1 and ev.dst_type in (2, None):
+    if ev.src_type == 1 and ev.dst_type in (1, 2, None):
         return DIR_IN
+    if ev.is_inner:
+        return DIR_INNER
     if ev.src_type == 2 and ev.dst_type == 1:
         return DIR_OUT
     if ev.src_type is None and ev.dst_type is None:
@@ -321,6 +349,10 @@ class CallState:
     last_ts: int | None = None
     starts: int = 0          # событий 1: сколько ног открыли
     ends: int = 0            # событий 2 и 4: сколько ног закрыли
+    # Пары (src, dst) событий 1: из них видно, дошёл ли звонок до сотрудников.
+    start_pairs: dict = dataclasses.field(default_factory=dict)
+    main_key: tuple | None = None   # (src, dst) главной ноги входящего: «клиент -> наш номер»
+    main_ended: bool = False        # пришло ev=2 по главной ноге: закончился ВЕСЬ звонок
     answered: bool = False
     answered_wall: float | None = None
     finalized: bool = False  # звонок считаем законченным, решение принято
@@ -335,6 +367,19 @@ class CallState:
     def open_legs(self) -> int:
         return max(0, self.starts - self.ends)
 
+    @property
+    def staff_legs(self) -> int:
+        """Сколько событий 1 ушло НЕ на главную ногу: то есть звонок дошёл до людей."""
+        if self.main_key is None:
+            return 0
+        return sum(n for pair, n in self.start_pairs.items() if pair != self.main_key)
+
+    @property
+    def dropped_in_menu(self) -> bool:
+        """Входящий, у которого есть главная нога, но ни одной ноги к сотруднику: клиент
+        бросил трубку в приветствии или в меню. Не знаем главной ноги - не утверждаем."""
+        return self.direction == DIR_IN and self.main_key is not None and self.staff_legs == 0
+
 
 @dataclasses.dataclass(frozen=True)
 class MissedCall:
@@ -348,6 +393,8 @@ class MissedCall:
     last_ts: int | None
     legs: int
     statuses: tuple
+    staff_legs: int = 0
+    dropped_in_menu: bool = False  # до сотрудников звонок не дошёл (приветствие, меню)
 
 
 class SipuniCallTracker:
@@ -431,8 +478,17 @@ class SipuniCallTracker:
             direction = classify_start(ev)
             if direction and not st.direction:
                 st.direction = direction
+            pair = (ev.src_num, ev.dst_num)
+            if pair in st.start_pairs or len(st.start_pairs) < _PAIRS_KEEP:
+                st.start_pairs[pair] = st.start_pairs.get(pair, 0) + 1
+            if (st.main_key is None and direction == DIR_IN
+                    and ev.src_type == 1 and ev.dst_type == 1):
+                st.main_key = pair
         elif ev.kind in (EVENT_END, EVENT_TRANSFER):
             st.ends += 1
+            if (ev.kind == EVENT_END and st.main_key is not None
+                    and (ev.src_num, ev.dst_num) == st.main_key):
+                st.main_ended = True
 
         # Клиент: у входящего это звонящий, у исходящего - тот, кому звонят.
         if not st.client_phone:
@@ -462,9 +518,17 @@ class SipuniCallTracker:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        need = self.quiet_s() if st.open_legs <= 0 else max(self.stuck_s, self.quiet_s())
+        need = self._need(st)
         st.token += 1
         st.timer = loop.call_later(need, self._timer_fired, st.call_id, st.token)
+
+    def _need(self, st: CallState) -> float:
+        """Сколько тишины ждать до решения. Главная нога закрыта или открытых ног нет: тихое
+        окно. Иначе ждём потерянное событие 2 до stuck_s. У реального входящего ev=2 один на
+        весь звонок, поэтому счёт открытых ног там не сходится, и решает main_ended."""
+        if st.main_ended or st.open_legs <= 0:
+            return self.quiet_s()
+        return max(self.stuck_s, self.quiet_s())
 
     @staticmethod
     def _cancel_timer(st: CallState) -> None:
@@ -490,7 +554,7 @@ class SipuniCallTracker:
         for st in list(self._calls.values()):
             if st.finalized:
                 continue
-            need = self.quiet_s() if st.open_legs <= 0 else max(self.stuck_s, self.quiet_s())
+            need = self._need(st)
             if now - st.last_wall < need:
                 continue
             missed = self._finalize(st, now)
@@ -515,6 +579,7 @@ class SipuniCallTracker:
             call_id=st.call_id, phone=st.client_phone, tree_name=st.tree_name,
             tree_number=st.tree_number, first_ts=st.first_ts, last_ts=st.last_ts,
             legs=st.starts, statuses=tuple(st.statuses),
+            staff_legs=st.staff_legs, dropped_in_menu=st.dropped_in_menu,
         )
         if st.client_phone:
             self._register_missed(st, now)
@@ -652,12 +717,14 @@ def log_line(ev: SipuniEvent, st: CallState | None) -> str:
         return (f"Sipuni событие: не распознано (event={ev.kind} call={ev.call_id or '-'} "
                 f"src={ev.src_num or '-'} dst={ev.dst_num or '-'})")
     legs = f"{st.starts}/{st.ends}" if st is not None else "-"
+    staff = st.staff_legs if st is not None else "-"
+    main_end = "1" if (st is not None and st.main_ended) else "0"
     return (
         f"Sipuni событие: ev={ev.kind} call={ev.call_id} dir={(st.direction if st else '') or '-'} "
         f"src={ev.src_num or '-'}({ev.src_type if ev.src_type is not None else '-'}) "
         f"dst={ev.dst_num or '-'}({ev.dst_type if ev.dst_type is not None else '-'}) "
         f"status={ev.status or '-'} ans={'1' if ev.answered else '0'} "
-        f"inner={'1' if ev.is_inner else '0'} legs={legs} "
+        f"inner={'1' if ev.is_inner else '0'} legs={legs} staff={staff} main_end={main_end} "
         f"tree={ev.tree_number or ev.tree_name or '-'} rec={'1' if ev.has_record else '0'} "
         f"ts={ev.timestamp if ev.timestamp is not None else '-'}"
     )

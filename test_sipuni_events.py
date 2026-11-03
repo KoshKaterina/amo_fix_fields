@@ -1,11 +1,14 @@
 """Sipuni рядом с UIS: события АТС, решение «пропущенный», перезвон, гейт распределения.
 
-⚠️ ВСЕ СОБЫТИЯ В ЭТОМ ФАЙЛЕ СИНТЕТИЧЕСКИЕ. Они собраны по описанию «События на АТС» из
-кабинета Sipuni (поля event, call_id, src_num, dst_num, src_type, dst_type, status,
-call_start_timestamp, call_answer_timestamp, is_inner_call, treeName). Реальных образцов у нас
-нет: интеграция не подключена, звонков не было. Тест зелёный = код делает то, что написано в
-заметке с принятыми решениями, а не то, что делает настоящий Sipuni. Первый тестовый звонок
-обязан сверить фикстуры с журналом режима log и поправить этот файл.
+⚠️ СОБЫТИЯ В ЭТОМ ФАЙЛЕ СИНТЕТИЧЕСКИЕ, кроме раздела «РЕАЛЬНЫЕ события входящих» в конце. Они
+собраны по описанию «События на АТС» из кабинета Sipuni (поля event, call_id, src_num, dst_num,
+src_type, dst_type, status, call_start_timestamp, call_answer_timestamp, is_inner_call,
+treeName). Тест на синтетике зелёный = код делает то, что написано в заметке с принятыми
+решениями, а не то, что делает настоящий Sipuni. 03.11.2026 первые тестовые звонки показали,
+что настоящие входящие устроены иначе (один ev=2 на звонок, флаг is_inner_call на ногах
+очереди, главная нога «клиент -> наш номер»): последовательности из замера лежат в последнем
+разделе и обязаны оставаться зелёными. Перевод между очередями (ev=4) на живом звонке не
+проверен.
 
 Что защищаем:
   * пропущенный = ВЕСЬ звонок без ответа (все ноги), а не одна нога очереди; один алерт на call_id;
@@ -1120,3 +1123,332 @@ def test_uis_source_with_sipuni_events_present_ignores_the_tracker(dist):
         return out
 
     assert run(go()) == "routed"
+
+
+# ═══════════════════════ РЕАЛЬНЫЕ события входящих (замер 03.11.2026) ═══════════════════════
+#
+# Последовательности ниже повторяют журнал приёмника за 03.11.2026 (режим log), а не описание
+# Sipuni: схема 000-4221010 у входящего и 000-4215210 у исходящего, главная нога
+# «клиент(1) -> наш номер(1)», ноги очереди «клиент(1) -> сотрудник(2)» с is_inner_call=1,
+# ОДИН ev=2 на весь звонок. Клиентский номер заменён синтетическим, остальное как в замере.
+# Первая версия правила на этих последовательностях решения не принимала.
+
+OUR_LINE = "9056063678"
+STAFF_207 = "028878207"
+IN_TREE = "000-4221010"
+OUT_TREE = "000-4215210"
+
+
+def r_start(cid, ts, *, client=CALLER_DIGITS):
+    """Главная нога: приходит первой, клиент(1) -> наш номер(1)."""
+    return e(1, cid, src=client, src_type=1, dst=OUR_LINE, dst_type=1, ts=ts, tree=IN_TREE)
+
+
+def r_staff(cid, ts, *, client=CALLER_DIGITS, staff=STAFF_207):
+    """Нога очереди к сотруднику: клиент(1) -> сотрудник(2) с is_inner_call=1."""
+    return e(1, cid, src=client, src_type=1, dst=staff, dst_type=2, ts=ts, tree=IN_TREE,
+             is_inner_call="1")
+
+
+def r_answer(cid, ts, *, client=CALLER_DIGITS, staff=STAFF_207):
+    return e(3, cid, src=client, src_type=1, dst=staff, dst_type=2, ts=ts, tree=IN_TREE)
+
+
+def r_end(cid, ts, status, *, client=CALLER_DIGITS, answer_ts=None):
+    """Единственный ev=2 на весь звонок: клиент(1) -> наш номер(1), с записью."""
+    return e(2, cid, src=client, src_type=1, dst=OUR_LINE, dst_type=1, ts=ts, status=status,
+             answer_ts=answer_ts, tree=IN_TREE, call_record_link="https://sipuni.invalid/rec")
+
+
+def r_greeting_drop(cid, ts=1000, *, client=CALLER_DIGITS):
+    """21:14 и 21:15: трубку положили в приветствии, ног к сотрудникам нет."""
+    return [r_start(cid, ts, client=client), r_end(cid, ts + 2, "NOANSWER", client=client)]
+
+
+def r_not_taken(cid, ts=2000, legs=33, *, client=CALLER_DIGITS):
+    """17:08: 207 не взяла, очередь звонила по кругу (в замере 33 ноги, по одной в секунду)."""
+    return ([r_start(cid, ts, client=client)]
+            + [r_staff(cid, ts + 8 + i, client=client) for i in range(legs)]
+            + [r_end(cid, ts + 50, "NOANSWER", client=client)])
+
+
+def r_taken(cid, ts=3000, *, client=CALLER_DIGITS):
+    """17:10, 18:06, 18:11: 207 ответила."""
+    return [r_start(cid, ts, client=client), r_staff(cid, ts + 8, client=client),
+            r_answer(cid, ts + 14, client=client),
+            r_end(cid, ts + 25, "ANSWER", client=client, answer_ts=ts + 14)]
+
+
+def test_real_first_event_is_incoming_and_staff_leg_flag_is_not_internal():
+    start = S.parse_event(r_start("r.0", 100))
+    staff = S.parse_event(r_staff("r.0", 108))
+    assert staff.is_inner, "Sipuni ставит is_inner_call=1 на ногу очереди входящего"
+    assert S.classify_start(start) == S.DIR_IN
+    assert S.classify_start(staff) == S.DIR_IN
+    inner = S.parse_event(e(1, src="012345102", src_type=2, dst="012345101", dst_type=2,
+                            is_inner_call="1"))
+    assert S.classify_start(inner) == S.DIR_INNER
+    out = S.parse_event(e(1, src=STAFF_207, src_type=2, dst=PHONE_RAW, dst_type=1, tree=OUT_TREE))
+    assert S.classify_start(out) == S.DIR_OUT
+
+
+def test_real_greeting_drop_is_incoming_and_missed(tr):
+    cid = "r.1"
+
+    async def go():
+        feed(tr, r_greeting_drop(cid))
+        await idle(tr)
+
+    run(go())
+    assert len(tr.got) == 1
+    m = tr.got[0]
+    assert m.call_id == cid and m.phone == PHONE_NORM
+    assert m.dropped_in_menu is True and m.staff_legs == 0 and m.legs == 1
+    st = tr.get_call(cid)
+    assert st.direction == S.DIR_IN and st.main_ended and st.client_phone == PHONE_NORM
+
+
+def test_real_unanswered_queue_is_missed_after_quiet_window_not_stuck_limit(tr):
+    """Ног открыто 33 из 34, ev=2 один: по счёту ног звонок «не закончился» никогда, решает
+    закрытие главной ноги."""
+    cid = "r.2"
+
+    async def go():
+        feed(tr, r_not_taken(cid))
+        st = tr.get_call(cid)
+        assert st.starts == 34 and st.ends == 1 and st.open_legs == 33
+        assert st.main_ended and st.staff_legs == 33
+        assert tr._need(st) == tr.quiet_s(), "ждём тихое окно, а не потерянное событие 2"
+        await idle(tr)
+
+    run(go())
+    assert len(tr.got) == 1
+    m = tr.got[0]
+    assert m.phone == PHONE_NORM and m.staff_legs == 33 and m.dropped_in_menu is False
+
+
+def test_real_taken_call_is_not_missed(tr):
+    cid = "r.3"
+
+    async def go():
+        feed(tr, r_taken(cid))
+        await idle(tr)
+
+    run(go())
+    assert tr.got == []
+    assert tr.get_call(cid).answered
+    assert tr.phone_status(PHONE_NORM) == S.PHONE_CONNECTED
+
+
+def test_real_taken_by_second_employee_after_rings_is_not_missed(tr):
+    cid = "r.4"
+    events = ([r_start(cid, 100)]
+              + [r_staff(cid, 108 + i) for i in range(5)]
+              + [r_staff(cid, 120, staff="028878208"),
+                 r_answer(cid, 125, staff="028878208"),
+                 r_end(cid, 160, "ANSWER", answer_ts=125)])
+
+    async def go():
+        feed(tr, events)
+        await idle(tr)
+
+    run(go())
+    assert tr.got == []
+
+
+def test_real_outgoing_call_is_never_an_alert(tr):
+    """Исходящий 03.11: сотрудник(2) -> клиент(1), два ev=1 и один ev=2, схема 000-4215210."""
+    cid = "r.5"
+
+    def out(kind, ts, **kw):
+        return e(kind, cid, src=STAFF_207, src_type=2, dst=CALLER_DIGITS, dst_type=1, ts=ts,
+                 tree=OUT_TREE, **kw)
+
+    async def go():
+        feed(tr, [out(1, 100), out(1, 101), out(2, 120, status="NOANSWER")])
+        await idle(tr)
+
+    run(go())
+    assert tr.got == []
+    st = tr.get_call(cid)
+    assert st.direction == S.DIR_OUT and st.main_key is None and st.client_phone == PHONE_NORM
+
+
+def test_real_repeated_delivery_gives_one_alert(tr):
+    events = r_not_taken("r.6", legs=5)
+
+    async def go():
+        feed(tr, events)
+        feed(tr, events)
+        await idle(tr)
+        assert tr.get_call("r.6").starts == 6 and tr.get_call("r.6").ends == 1
+
+    run(go())
+    assert len(tr.got) == 1
+
+
+def test_real_sweep_decides_after_quiet_window_even_with_open_legs():
+    clock = {"t": 5000.0}
+    tracker = S.SipuniCallTracker(quiet_s=20, stuck_s=300, clock=lambda: clock["t"])
+    feed(tracker, r_not_taken("r.7"))
+    clock["t"] += 10
+    assert tracker.sweep() == [], "тихое окно ещё не прошло"
+    clock["t"] += 15
+    got = tracker.sweep()
+    assert [m.call_id for m in got] == ["r.7"]
+
+
+def test_real_call_without_final_event_waits_for_stuck_limit():
+    """Главной ноги закрытой нет (потеряли ev=2): ждём STUCK, как раньше."""
+    clock = {"t": 5000.0}
+    tracker = S.SipuniCallTracker(quiet_s=20, stuck_s=300, clock=lambda: clock["t"])
+    cid = "r.8"
+    feed(tracker, [r_start(cid, 100)] + [r_staff(cid, 108 + i) for i in range(3)])
+    clock["t"] += 100
+    assert tracker.sweep() == [], "звонок мог идти до сих пор"
+    clock["t"] += 250
+    got = tracker.sweep()
+    assert [m.call_id for m in got] == [cid] and got[0].dropped_in_menu is False
+
+
+def test_real_greeting_drop_gate_goes_active_then_missed_then_called_back():
+    clock = {"t": 7000.0}
+    tracker = S.SipuniCallTracker(quiet_s=20, stuck_s=300, clock=lambda: clock["t"])
+    cid = "r.9"
+    start, end = r_greeting_drop(cid, 100)
+    feed(tracker, [start])
+    assert tracker.phone_status(PHONE_NORM) == S.PHONE_ACTIVE
+    feed(tracker, [end])
+    assert tracker.phone_status(PHONE_NORM) == S.PHONE_ACTIVE, "тихое окно ещё идёт"
+    clock["t"] += 25
+    assert [m.call_id for m in tracker.sweep()] == [cid]
+    assert tracker.phone_status(PHONE_NORM) == S.PHONE_MISSED
+    # клиент перезвонил, сотрудник взял: «перезвонили» видно по потоку звонков
+    clock["t"] += 60
+    feed(tracker, r_taken("r.10", 400))
+    assert tracker.phone_status(PHONE_NORM) == S.PHONE_CONNECTED
+    assert tracker.missed_record(PHONE_NORM)["called_back_at"] is not None
+
+
+def test_real_log_line_shows_staff_legs_and_main_end():
+    tracker = S.SipuniCallTracker(quiet_s=20, clock=lambda: 1.0)
+    line = ""
+    for raw in r_not_taken("r.11", legs=2):
+        ev = S.parse_event(raw)
+        st, _dup = tracker.ingest(ev)
+        line = S.log_line(ev, st)
+    assert "ev=2" in line and "dir=in" in line
+    assert "staff=2" in line and "main_end=1" in line and "legs=3/1" in line
+
+
+# --- алерт: пинг всех при сбросе на приветствии (решение Кати 03.11.2026) ---
+
+
+def _spy_mentions(monkeypatch):
+    """Записывает, для кого просили теги; возвращает признак в тексте вместо настоящих @."""
+    asked = []
+
+    def fake(responsible_id):
+        asked.append(responsible_id)
+        return "@pool-ping" if responsible_id is None else "@only-responsible"
+
+    monkeypatch.setattr(U, "missed_call_mentions", fake)
+    return asked
+
+
+def _spy_decide_responsible(monkeypatch):
+    seen = []
+    inner = U.alerts.decide
+
+    def rec(event_key, **kw):
+        seen.append(kw.get("responsible_id"))
+        return inner(event_key, **kw)
+
+    monkeypatch.setattr(U.alerts, "decide", rec)
+    return seen
+
+
+def test_live_greeting_drop_pings_whole_pool_and_explains(glue, monkeypatch):
+    monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "live")
+    asked = _spy_mentions(monkeypatch)
+    routed = _spy_decide_responsible(monkeypatch)
+
+    async def go():
+        await U._sipuni_apply(r_greeting_drop("r.20"))
+        await idle(S.tracker)
+
+    run(go())
+    assert len(glue.sends) == 1
+    text = glue.sends[0][0]
+    assert asked == [None], "теги пула, а не одного ответственного"
+    assert routed == [None], "адрес в панели тоже без ответственного"
+    assert "@pool-ping" in text and "@only-responsible" not in text
+    assert U._DROPPED_IN_MENU_NOTE in text and "на приветствии" in text
+    assert "ПРОПУЩЕННЫЙ звонок" in text and CALLER_DIGITS in text and "·" not in text
+    assert 36500001 in U._callback_pending, "сделка найдена: перезвон сторожим как обычно"
+
+
+def test_live_greeting_drop_mentions_are_the_real_pool(glue, monkeypatch):
+    """Без подмены: в тексте вся смена и запасной тег, как у пропущенного без ответственного."""
+    import tg_recipients as TG
+    monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "live")
+
+    async def go():
+        await U._sipuni_apply(r_greeting_drop("r.21"))
+        await idle(S.tracker)
+
+    run(go())
+    text = glue.sends[0][0]
+    assert TG.missed_call_mentions(None) in text
+    assert TG.MANAGERS_ON_SHIFT in text and TG.MISSED_CALL_FALLBACK_TAG in text
+
+
+def test_live_unanswered_queue_goes_to_responsible_without_note(glue, monkeypatch):
+    """Звонок дошёл до сотрудника и не был взят: как раньше, ответственному, без пометки."""
+    monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "live")
+    asked = _spy_mentions(monkeypatch)
+    routed = _spy_decide_responsible(monkeypatch)
+
+    async def go():
+        await U._sipuni_apply(r_not_taken("r.22", legs=4))
+        await idle(S.tracker)
+
+    run(go())
+    assert len(glue.sends) == 1
+    text = glue.sends[0][0]
+    assert asked == [13929334] and routed == [13929334]
+    assert "@only-responsible" in text and U._DROPPED_IN_MENU_NOTE not in text
+
+
+def test_live_taken_real_call_sends_nothing(glue, monkeypatch):
+    monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "live")
+
+    async def go():
+        await U._sipuni_apply(r_taken("r.23"))
+        await idle(S.tracker)
+
+    run(go())
+    assert glue.sends == [] and U._callback_pending == {}
+
+
+def test_log_mode_reports_greeting_drop_but_sends_nothing(glue, monkeypatch, caplog):
+    monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "log")
+    caplog.set_level(logging.INFO, logger="uvicorn")
+
+    async def go():
+        await U._sipuni_apply(r_greeting_drop("r.24"))
+        await idle(S.tracker)
+
+    run(go())
+    assert glue.sends == [] and glue.amo_queries == [] and U._callback_pending == {}
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Sipuni пропущенный: call=r.24" in text and "на_приветствии=да" in text
+    assert "режим log, алерт НЕ шлём" in text
+
+
+def test_build_message_note_sits_under_the_tags():
+    plain = U._build_message("79555555555", "", None, "@a")
+    noted = U._build_message("79555555555", "", None, "@a", note="заметка")
+    assert "заметка" not in plain
+    lines = noted.split("\n")
+    assert lines[1] == "@a" and lines[2] == "заметка" and lines[3].startswith("📞")

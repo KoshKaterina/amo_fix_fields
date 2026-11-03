@@ -114,14 +114,25 @@ async def _apply(params: dict) -> None:
 # Как называем источник звонка в журнале. Ключ - provider из _notify_missed.
 _PROVIDER_LABELS = {"uis": "UIS", "sipuni": "Sipuni"}
 
+# Пометка в алерте, когда клиент бросил трубку до сотрудников (решение Кати 03.11.2026).
+_DROPPED_IN_MENU_NOTE = "ℹ️ Клиент бросил трубку на приветствии, до сотрудников звонок не дошёл"
 
-async def _notify_missed(phone: str, name: str, call_id: str, *, provider: str = "uis") -> None:
+
+async def _notify_missed(
+    phone: str, name: str, call_id: str, *, provider: str = "uis",
+    ping_all: bool = False, note: str = "",
+) -> None:
     """Общая часть алерта о пропущенном звонке: сделка по телефону, текст, алерт, счётчик
     перезвона. Её зовут и вход UIS (_apply), и вход Sipuni (_sipuni_on_missed).
 
     provider нужен для журнала и для способа проверки «перезвонили»: у uis это теги amo,
     у sipuni поток событий звонков (sipuni_events). Дедуп по id звонка делает вызывающий:
     у UIS это _is_new, у Sipuni - сам учёт звонков по call_id.
+
+    ping_all: тегаем весь пул пинга по звонку (смена + запасной тег), а не одного ответственного
+    по сделке, и адрес в панели тоже выбираем без ответственного. Так шлём звонок, брошенный
+    на приветствии: человека, который должен перезвонить, он ещё не выбрал. note: строка
+    пояснения в тексте алерта (она есть только в тексте кода, шаблон панели её не показывает).
     """
     label = _PROVIDER_LABELS.get(provider, provider)
     # Сделку (+ответственного) добираем с таймаутом 5с: не ответил amo вовремя
@@ -132,11 +143,12 @@ async def _notify_missed(phone: str, name: str, call_id: str, *, provider: str =
     except asyncio.TimeoutError:
         logger.warning("%s пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", label, call_id)
         lead_id, responsible_id = None, None
-    mentions = missed_call_mentions(responsible_id)
-    text = _build_message(phone, name, lead_id, mentions)
+    mentions = missed_call_mentions(None if ping_all else responsible_id)
+    text = _build_message(phone, name, lead_id, mentions, note=note)
     d = alerts.decide(
         "missed_call", legacy_text=text, parse_mode="HTML",
-        chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID, responsible_id=responsible_id,
+        chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+        responsible_id=None if ping_all else responsible_id,
         values={
             "теги": mentions,
             "телефон": phone,
@@ -395,10 +407,14 @@ async def _sipuni_apply(payload: list) -> None:
 
 async def _sipuni_on_missed(missed) -> None:
     """Решение «пропущенный» принято (тихое окно истекло, ни одна нога не отвечена)."""
+    dropped = bool(getattr(missed, "dropped_in_menu", False))
     if SIPUNI_EVENTS_MODE != "live":
         logger.info(
-            "Sipuni пропущенный: call=%s тел=%s ног=%s статусы=%s - режим log, алерт НЕ шлём",
-            missed.call_id, missed.phone or "—", missed.legs, ",".join(missed.statuses) or "—",
+            "Sipuni пропущенный: call=%s тел=%s ног=%s к_сотрудникам=%s на_приветствии=%s "
+            "статусы=%s - режим log, алерт НЕ шлём",
+            missed.call_id, missed.phone or "—", missed.legs,
+            getattr(missed, "staff_legs", "—"), "да" if dropped else "нет",
+            ",".join(missed.statuses) or "—",
         )
         return
     try:
@@ -407,7 +423,10 @@ async def _sipuni_on_missed(missed) -> None:
             return
         # Цифры без плюса: так телефон приходит от UIS, и поиск сделки в amo проверен именно на
         # этом виде. Имени клиента у Sipuni в событиях нет, ищем только по телефону.
-        await _notify_missed(missed.phone.lstrip("+"), "", missed.call_id, provider="sipuni")
+        await _notify_missed(
+            missed.phone.lstrip("+"), "", missed.call_id, provider="sipuni",
+            ping_all=dropped, note=_DROPPED_IN_MENU_NOTE if dropped else "",
+        )
     except Exception:
         logger.exception("Sipuni пропущенный: ошибка обработки (call=%s)", missed.call_id)
 
@@ -447,11 +466,13 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_message(phone: str, name: str, lead_id, mentions: str) -> str:
+def _build_message(phone: str, name: str, lead_id, mentions: str, note: str = "") -> str:
     lines = [
         "🔴 ПРОПУЩЕННЫЙ звонок — срочно связаться с клиентом",
         mentions,
     ]
+    if note:
+        lines.append(note)
     if phone:
         lines.append(f"📞 {_esc(phone)}")
     if name and name != phone:  # новый номер — без имени
