@@ -559,7 +559,7 @@ def glue(monkeypatch):
         return real_decide(event_key, **kw)
 
     monkeypatch.setattr(U.telegram_bot, "send_alert", fake_send)
-    monkeypatch.setattr(U.amo_service, "find_leads_by_query", fake_find)
+    monkeypatch.setattr(U.amo_service, "find_leads_by_query_all", fake_find)
     monkeypatch.setattr(U.alerts, "decide", spy_decide)
     yield spy
     sipuni_tracker.reset()
@@ -1384,7 +1384,7 @@ def _no_deal(monkeypatch):
     async def no_leads(query, *a, **k):
         return []
 
-    monkeypatch.setattr(U.amo_service, "find_leads_by_query", no_leads)
+    monkeypatch.setattr(U.amo_service, "find_leads_by_query_all", no_leads)
 
 
 def test_live_greeting_drop_without_a_deal_pings_whole_pool_and_explains(glue, monkeypatch):

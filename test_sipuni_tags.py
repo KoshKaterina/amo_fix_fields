@@ -193,7 +193,7 @@ def amo(glue, monkeypatch):
                   "updated_at": 5}]
         return found + list(fake.extra_leads)
 
-    monkeypatch.setattr(amo_service, "find_leads_by_query", find_leads_by_query)
+    monkeypatch.setattr(amo_service, "find_leads_by_query_all", find_leads_by_query)
     monkeypatch.setattr(amo_service, "get_lead_full", get_lead_full)
     monkeypatch.setattr(amo_service, "patch_lead", patch_lead)
     monkeypatch.setattr(amo_service, "get_contact_by_id", get_contact_by_id)
@@ -266,7 +266,7 @@ def test_missed_without_open_deal_writes_nothing(amo, glue, monkeypatch):
     async def no_leads(query, *a, **k):
         return []
 
-    monkeypatch.setattr(amo_service, "find_leads_by_query", no_leads)
+    monkeypatch.setattr(amo_service, "find_leads_by_query_all", no_leads)
 
     async def go():
         await U._sipuni_apply(r_greeting_drop("tg.24"))
@@ -385,7 +385,7 @@ def test_answered_without_open_deal_writes_nothing(amo, glue, monkeypatch):
     async def no_leads(query, *a, **k):
         return []
 
-    monkeypatch.setattr(amo_service, "find_leads_by_query", no_leads)
+    monkeypatch.setattr(amo_service, "find_leads_by_query_all", no_leads)
 
     async def go():
         await U._sipuni_apply(r_taken("tg.33"))

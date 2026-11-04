@@ -33,7 +33,7 @@ def deal(monkeypatch, *, status, responsible=DUTY):
     async def find(query, *a, **k):
         return [{"id": LEAD, "status_id": status, "responsible_user_id": responsible, "updated_at": 5}]
 
-    monkeypatch.setattr(U.amo_service, "find_leads_by_query", find)
+    monkeypatch.setattr(U.amo_service, "find_leads_by_query_all", find)
 
 
 def live(monkeypatch, *, wait=None):

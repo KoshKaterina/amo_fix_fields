@@ -611,10 +611,13 @@ async def _find_lead_row(phone: str, statuses=None) -> dict | None:
     if not phone:
         return None
     try:
-        leads = await amo_service.find_leads_by_query(phone)
+        # По ВСЕМ страницам: find_leads_by_query отдаёт одну страницу в 50 сделок по возрастанию
+        # номера, и у контакта с сотнями сделок открытая оказывается за её пределами (контакт
+        # 79259993699: 295 сделок, три открытые, 04.11.2026 алерт ушёл без ссылки и пингом пула).
+        leads = await amo_service.find_leads_by_query_all(phone)
         if leads is None:
-            # Молчание amoCRM - не «сделок нет». Привязывать пропущенный звонок
-            # наугад нельзя, выходим ни с чем.
+            # Молчание amoCRM (или выдача длиннее предела страниц) - не «сделок нет».
+            # Привязывать пропущенный звонок наугад нельзя, выходим ни с чем.
             logger.warning("uis_missed_call: amoCRM не ответила на поиск по телефону")
             return None
         open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
