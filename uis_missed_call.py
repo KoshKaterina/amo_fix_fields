@@ -180,7 +180,7 @@ async def _notify_missed(
             elif assigned:
                 responsible_id = assigned
     mentions = missed_call_mentions(None if ping_all else responsible_id)
-    text = _build_message(phone, name, lead_id, mentions, note=note)
+    text = _build_message(phone, name, lead_id, mentions, note=note, provider_label=label)
     d = alerts.decide(
         "missed_call", legacy_text=text, parse_mode="HTML",
         chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
@@ -191,6 +191,7 @@ async def _notify_missed(
             "клиент": name if name and name != phone else "",
             "ссылка_на_сделку": alerts.lead_link(lead_id),
             "пометка": note_text,
+            "телефония": label,
         },
     )
     if d is None:
@@ -373,6 +374,7 @@ async def _sweep_callbacks() -> None:
                     "ответственный": manager_name(st.get("responsible_id")),
                     "клиент": who if who and who != st.get("phone") else "",
                     "телефон": st.get("phone") or "",
+                    "телефония": label,
                     "ссылка_на_сделку": alerts.lead_link(lead_id),
                 },
             )
@@ -406,6 +408,7 @@ def _build_escalation(lead_id, st: dict, waited_min: int) -> str:
         lines.append(f"Клиент: {_esc(who)}")
     if st.get("phone"):
         lines.append(f"Телефон: {_esc(st['phone'])}")
+    lines.append(f"Телефония: {_PROVIDER_LABELS.get(st.get('provider', 'uis'), 'UIS')}")
     lines.append("")
     lines.append(f'<a href="{BASE_URL}/leads/detail/{lead_id}">Открыть сделку</a>')
     return "\n".join(lines)
@@ -651,7 +654,8 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _build_message(phone: str, name: str, lead_id, mentions: str, note: str = "") -> str:
+def _build_message(phone: str, name: str, lead_id, mentions: str, note: str = "",
+                   provider_label: str = "") -> str:
     lines = [
         "🔴 ПРОПУЩЕННЫЙ звонок — срочно связаться с клиентом",
         mentions,
@@ -660,6 +664,8 @@ def _build_message(phone: str, name: str, lead_id, mentions: str, note: str = ""
         lines.append(note)
     if phone:
         lines.append(f"📞 {_esc(phone)}")
+    if provider_label:
+        lines.append(f"☎️ {_esc(provider_label)}")     # какая АТС приняла звонок: UIS или Sipuni
     if name and name != phone:  # новый номер — без имени
         lines.append(f"👤 {_esc(name)}")
     if lead_id:

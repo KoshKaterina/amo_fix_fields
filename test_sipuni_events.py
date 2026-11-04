@@ -645,7 +645,9 @@ def test_live_mode_sends_the_same_alert_as_uis(glue, monkeypatch):
     run(go())
     assert len(glue.sends) == 2
     (uis_text, uis_kw), (sip_text, sip_kw) = glue.sends
-    assert sip_text == uis_text
+    # Единственное отличие текста - подпись телефонии (решение Кати 04.11.2026: видно, UIS это или Sipuni).
+    assert "☎️ UIS" in uis_text and "☎️ Sipuni" in sip_text
+    assert sip_text.replace("☎️ Sipuni", "☎️ UIS") == uis_text
     assert sip_kw == uis_kw
     assert sip_kw["chat_id"] == U.NOTIFY_CHAT_ID and sip_kw["message_thread_id"] == U.NOTIFY_THREAD_ID
     assert glue.decide_keys == ["missed_call", "missed_call"]
