@@ -120,8 +120,12 @@ async def _apply(params: dict) -> None:
 _PROVIDER_LABELS = {"uis": "UIS", "sipuni": "Sipuni"}
 
 # Пометки в алерте для звонка, брошенного до сотрудников (решения Кати 03.11 и 04.11.2026).
-_DROPPED_IN_MENU_NOTE = "ℹ️ Клиент бросил трубку на приветствии, до сотрудников звонок не дошёл"
-_ROUTING_TIMEOUT_NOTE = "ℹ️ Сделка не распределилась вовремя, поэтому пингуем всех"
+# Текст без значка идёт в шаблон панели переменной `{{пометка}}` (значок и строка живут в шаблоне,
+# у обычного пропущенного значение пустое, и строка выпадает); с значком - в текст кода.
+_DROPPED_TEXT = "Клиент бросил трубку на приветствии, до сотрудников звонок не дошёл"
+_ROUTING_TIMEOUT_TEXT = "Сделка не распределилась вовремя, поэтому пингуем всех"
+_DROPPED_IN_MENU_NOTE = "ℹ️ " + _DROPPED_TEXT
+_ROUTING_TIMEOUT_NOTE = "ℹ️ " + _ROUTING_TIMEOUT_TEXT
 # Запись о распределении, сделанная чуть раньше начала звонка, всё равно относится к нему.
 _ROUTING_SLACK_S = 60.0
 # Ожидания назначения ответственного, которые надо отпустить при остановке приложения.
@@ -161,8 +165,10 @@ async def _notify_missed(
     responsible_id = row.get("responsible_user_id") if row else None
     ping_all = False
     note = ""
+    note_text = ""     # то же без значка, для переменной шаблона панели `{{пометка}}`
     if dropped_in_menu:
         note = _DROPPED_IN_MENU_NOTE
+        note_text = _DROPPED_TEXT
         if lead_id is None:
             ping_all = True
         elif row.get("status_id") in STATUS_NEW_LEAD_ALL and SIPUNI_ROUTING_WAIT_S > 0:
@@ -170,6 +176,7 @@ async def _notify_missed(
             if assigned is None:
                 ping_all = True
                 note = note + "\n" + _ROUTING_TIMEOUT_NOTE
+                note_text = note_text + ". " + _ROUTING_TIMEOUT_TEXT
             elif assigned:
                 responsible_id = assigned
     mentions = missed_call_mentions(None if ping_all else responsible_id)
@@ -183,6 +190,7 @@ async def _notify_missed(
             "телефон": phone,
             "клиент": name if name and name != phone else "",
             "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "пометка": note_text,
         },
     )
     if d is None:
