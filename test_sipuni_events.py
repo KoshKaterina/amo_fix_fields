@@ -523,6 +523,10 @@ def glue(monkeypatch):
     monkeypatch.setattr(U, "_seen_order", __import__("collections").deque())
     monkeypatch.setattr(U, "ROP_CHAT_ID", -5358037627)
     monkeypatch.setattr(U, "_in_window", lambda now=None: True)
+    # Ожидание назначения ответственного новой сделке (звонок, брошенный на приветствии): короткое,
+    # а хранилище распределённых подменено (настоящее лежит в sqlite на диске).
+    monkeypatch.setattr(U, "SIPUNI_ROUTING_WAIT_S", 0.6)
+    monkeypatch.setattr(U, "SIPUNI_ROUTING_POLL_S", 0.02)
 
     class Spy:
         sends: list = []
@@ -531,6 +535,14 @@ def glue(monkeypatch):
 
     spy = Spy()
     spy.sends, spy.amo_queries, spy.decide_keys = [], [], []
+    spy.routed = {}      # lead_id -> запись хранилища распределённых
+
+    class FakeRouted:
+        @staticmethod
+        def get(lead_id):
+            return spy.routed.get(int(lead_id))
+
+    monkeypatch.setattr(U, "routed_store", FakeRouted)
 
     async def fake_send(text, **kw):
         spy.sends.append((text, kw))
@@ -1368,8 +1380,16 @@ def _spy_decide_responsible(monkeypatch):
     return seen
 
 
-def test_live_greeting_drop_pings_whole_pool_and_explains(glue, monkeypatch):
+def _no_deal(monkeypatch):
+    async def no_leads(query, *a, **k):
+        return []
+
+    monkeypatch.setattr(U.amo_service, "find_leads_by_query", no_leads)
+
+
+def test_live_greeting_drop_without_a_deal_pings_whole_pool_and_explains(glue, monkeypatch):
     monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "live")
+    _no_deal(monkeypatch)
     asked = _spy_mentions(monkeypatch)
     routed = _spy_decide_responsible(monkeypatch)
 
@@ -1385,13 +1405,14 @@ def test_live_greeting_drop_pings_whole_pool_and_explains(glue, monkeypatch):
     assert "@pool-ping" in text and "@only-responsible" not in text
     assert U._DROPPED_IN_MENU_NOTE in text and "на приветствии" in text
     assert "ПРОПУЩЕННЫЙ звонок" in text and CALLER_DIGITS in text and "·" not in text
-    assert 36500001 in U._callback_pending, "сделка найдена: перезвон сторожим как обычно"
+    assert U._callback_pending == {}, "сделки нет: сторожить перезвон нечем"
 
 
-def test_live_greeting_drop_mentions_are_the_real_pool(glue, monkeypatch):
+def test_live_greeting_drop_without_a_deal_mentions_are_the_real_pool(glue, monkeypatch):
     """Без подмены: в тексте вся смена и запасной тег, как у пропущенного без ответственного."""
     import tg_recipients as TG
     monkeypatch.setattr(U, "SIPUNI_EVENTS_MODE", "live")
+    _no_deal(monkeypatch)
 
     async def go():
         await U._sipuni_apply(r_greeting_drop("r.21"))

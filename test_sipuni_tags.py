@@ -199,6 +199,7 @@ def amo(glue, monkeypatch):
     monkeypatch.setattr(amo_service, "get_contact_by_id", get_contact_by_id)
     monkeypatch.setattr(amo_service, "patch_contact", patch_contact)
     monkeypatch.setattr(S.tracker, "on_answered", None)   # вернётся после теста
+    monkeypatch.setattr(U, "SIPUNI_ROUTING_WAIT_S", 0)    # здесь проверяем теги, а не ожидание
     monkeypatch.setattr(S.tracker, "_answered_done", S.collections.OrderedDict())
     return fake
 

@@ -37,6 +37,7 @@ from collections import deque
 import amo_service
 import telegram_bot
 import alerts
+import lead_distribution_routed_store as routed_store
 import sipuni_events
 from api import BASE_URL
 from tg_recipients import (
@@ -52,6 +53,8 @@ from waybill_config import (
     MISSED_CALLBACK_WINDOW_END_H,
     MISSED_CALLBACK_WINDOW_START_H,
     SIPUNI_EVENTS_MODE,
+    SIPUNI_ROUTING_POLL_S,
+    SIPUNI_ROUTING_WAIT_S,
     SIPUNI_SET_TAGS,
     STATUS_NEW_LEAD_ALL,
     TAG_MISSED_NAME,
@@ -116,13 +119,18 @@ async def _apply(params: dict) -> None:
 # Как называем источник звонка в журнале. Ключ - provider из _notify_missed.
 _PROVIDER_LABELS = {"uis": "UIS", "sipuni": "Sipuni"}
 
-# Пометка в алерте, когда клиент бросил трубку до сотрудников (решение Кати 03.11.2026).
+# Пометки в алерте для звонка, брошенного до сотрудников (решения Кати 03.11 и 04.11.2026).
 _DROPPED_IN_MENU_NOTE = "ℹ️ Клиент бросил трубку на приветствии, до сотрудников звонок не дошёл"
+_ROUTING_TIMEOUT_NOTE = "ℹ️ Сделка не распределилась вовремя, поэтому пингуем всех"
+# Запись о распределении, сделанная чуть раньше начала звонка, всё равно относится к нему.
+_ROUTING_SLACK_S = 60.0
+# Ожидания назначения ответственного, которые надо отпустить при остановке приложения.
+_routing_waiters: set = set()
 
 
 async def _notify_missed(
     phone: str, name: str, call_id: str, *, provider: str = "uis",
-    ping_all: bool = False, note: str = "",
+    dropped_in_menu: bool = False, call_started: float | None = None,
 ) -> None:
     """Общая часть алерта о пропущенном звонке: сделка по телефону, текст, алерт, счётчик
     перезвона. Её зовут и вход UIS (_apply), и вход Sipuni (_sipuni_on_missed).
@@ -131,20 +139,39 @@ async def _notify_missed(
     у sipuni поток событий звонков (sipuni_events). Дедуп по id звонка делает вызывающий:
     у UIS это _is_new, у Sipuni - сам учёт звонков по call_id.
 
-    ping_all: тегаем весь пул пинга по звонку (смена + запасной тег), а не одного ответственного
-    по сделке, и адрес в панели тоже выбираем без ответственного. Так шлём звонок, брошенный
-    на приветствии: человека, который должен перезвонить, он ещё не выбрал. note: строка
-    пояснения в тексте алерта (она есть только в тексте кода, шаблон панели её не показывает).
+    dropped_in_menu (только Sipuni): звонок не дошёл до сотрудников. Кого пинговать, решает сделка
+    (решение Кати 04.11.2026):
+      * сделки по телефону нет: пингуем весь пул пинга по звонку, ответственного ещё нет;
+      * сделка уже в работе (этап не «Новый лид»): пингуем её ответственного, как обычно;
+      * новая сделка, распределения ещё не было: ждём до SIPUNI_ROUTING_WAIT_S, пока распределение
+        назначит ответственного, и пингуем его; не дождались - весь пул.
+    В тексте кода к такому алерту добавлена пояснительная строка (шаблон панели её не показывает).
+    call_started: Unix-время начала звонка, чтобы отличить распределение этого звонка от старого.
     """
     label = _PROVIDER_LABELS.get(provider, provider)
     # Сделку (+ответственного) добираем с таймаутом 5с: не ответил amo вовремя
     # (медленный API / завал очереди) → шлём БЕЗ ссылки и тегаем всю смену,
     # не задерживая «срочно».
     try:
-        lead_id, responsible_id = await asyncio.wait_for(_find_lead(phone), timeout=5.0)
+        row = await asyncio.wait_for(_find_lead_row(phone), timeout=5.0)
     except asyncio.TimeoutError:
         logger.warning("%s пропущенный: поиск сделки >5с — без ссылки, тегаем смену (call=%s)", label, call_id)
-        lead_id, responsible_id = None, None
+        row = None
+    lead_id = row.get("id") if row else None
+    responsible_id = row.get("responsible_user_id") if row else None
+    ping_all = False
+    note = ""
+    if dropped_in_menu:
+        note = _DROPPED_IN_MENU_NOTE
+        if lead_id is None:
+            ping_all = True
+        elif row.get("status_id") in STATUS_NEW_LEAD_ALL and SIPUNI_ROUTING_WAIT_S > 0:
+            assigned = await _wait_for_routing(lead_id, call_id, call_started)
+            if assigned is None:
+                ping_all = True
+                note = note + "\n" + _ROUTING_TIMEOUT_NOTE
+            elif assigned:
+                responsible_id = assigned
     mentions = missed_call_mentions(None if ping_all else responsible_id)
     text = _build_message(phone, name, lead_id, mentions, note=note)
     d = alerts.decide(
@@ -167,6 +194,52 @@ async def _notify_missed(
             label, "отправлен" if ok else "НЕ отправлен", phone or "—", lead_id or "—", call_id or "—",
         )
     _watch_callback(lead_id, phone, name, responsible_id, provider=provider)
+
+
+async def _wait_for_routing(lead_id, call_id: str, call_started: float | None) -> int | None:
+    """Ждёт, пока распределение назначит ответственного новой сделке.
+
+    Возвращает user_id назначенного (запись «распределена» не старше начала звонка), 0 если ждать
+    нечего (сделка распределена раньше, ответственный у неё уже есть и берётся из amo), None если
+    не дождались за SIPUNI_ROUTING_WAIT_S или приложение останавливается.
+    """
+    since = (call_started or time.time()) - _ROUTING_SLACK_S
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SIPUNI_ROUTING_WAIT_S
+    stop = asyncio.Event()
+    _routing_waiters.add(stop)
+    logger.info("Sipuni пропущенный: сделка %s новая и ещё не распределена, жду назначения до %.0f с (call=%s)",
+                lead_id, SIPUNI_ROUTING_WAIT_S, call_id)
+    try:
+        while True:
+            try:
+                rec = await asyncio.to_thread(routed_store.get, lead_id)
+            except Exception:
+                logger.exception("Sipuni пропущенный: хранилище распределённых не ответило (сделка %s)", lead_id)
+                rec = None
+            if rec:
+                if (rec.get("routed_at") or 0) >= since:
+                    assigned = rec.get("assigned_user_id")
+                    logger.info("Sipuni пропущенный: сделка %s распределена на %s (call=%s)",
+                                lead_id, assigned or "—", call_id)
+                    return int(assigned) if assigned else 0
+                logger.info("Sipuni пропущенный: сделка %s распределена раньше этого звонка, ждать нечего (call=%s)",
+                            lead_id, call_id)
+                return 0
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning("Sipuni пропущенный: сделка %s не распределилась за %.0f с, пингуем всех (call=%s)",
+                               lead_id, SIPUNI_ROUTING_WAIT_S, call_id)
+                return None
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(SIPUNI_ROUTING_POLL_S, remaining))
+            except asyncio.TimeoutError:
+                continue
+            logger.info("Sipuni пропущенный: остановка приложения, не жду распределения сделки %s (call=%s)",
+                        lead_id, call_id)
+            return None
+    finally:
+        _routing_waiters.discard(stop)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +432,11 @@ async def init() -> None:
 
 async def shutdown() -> None:
     global _watch_task
+    # Алерты, которые ждут распределения сделки, уходят сейчас (пингуем всех): после остановки
+    # контейнера ожидание пропало бы вместе с алертом.
+    for stop in list(_routing_waiters):
+        stop.set()
+    await sipuni_events.tracker.drain(8.0)
     sipuni_events.tracker.reset()
     if _watch_task is not None:
         _watch_task.cancel()
@@ -428,7 +506,7 @@ async def _sipuni_on_missed(missed) -> None:
         # этом виде. Имени клиента у Sipuni в событиях нет, ищем только по телефону.
         await _notify_missed(
             missed.phone.lstrip("+"), "", missed.call_id, provider="sipuni",
-            ping_all=dropped, note=_DROPPED_IN_MENU_NOTE if dropped else "",
+            dropped_in_menu=dropped, call_started=missed.first_ts,
         )
     except Exception:
         logger.exception("Sipuni пропущенный: ошибка обработки (call=%s)", missed.call_id)
@@ -521,34 +599,41 @@ async def _sipuni_tag_missed(missed) -> None:
 _CLOSED_STATUS_IDS = {142, 143}
 
 
-async def _find_lead(phone: str, statuses=None):
-    """(lead_id, responsible_user_id) ОТКРЫТОЙ сделки по телефону (не закрытую и не
-    случайную — жалоба МОП: ссылка вела на рандомную/старую сделку). Открытая =
+async def _find_lead_row(phone: str, statuses=None) -> dict | None:
+    """ОТКРЫТАЯ сделка по телефону целиком (id, responsible_user_id, status_id…) или None (не
+    закрытую и не случайную — жалоба МОП: ссылка вела на рандомную/старую сделку). Открытая =
     status_id не из 142/143. Несколько открытых → самую свежую ПО РАБОТЕ (max
-    updated_at, тай-брейк по id). Открытых нет → (None, None) (лучше без ссылки и
-    тег смены, чем ссылка на закрытую).
+    updated_at, тай-брейк по id). Открытых нет → None (лучше без ссылки и тег смены, чем
+    ссылка на закрытую).
 
     statuses: если задан, берём только сделки на этих этапах (теги Sipuni ставим лишь новой
     сделке, см. STATUS_NEW_LEAD_ALL)."""
     if not phone:
-        return None, None
+        return None
     try:
         leads = await amo_service.find_leads_by_query(phone)
         if leads is None:
             # Молчание amoCRM - не «сделок нет». Привязывать пропущенный звонок
             # наугад нельзя, выходим ни с чем.
             logger.warning("uis_missed_call: amoCRM не ответила на поиск по телефону")
-            return None, None
+            return None
         open_leads = [ld for ld in leads if ld.get("status_id") not in _CLOSED_STATUS_IDS]
         if statuses is not None:
             open_leads = [ld for ld in open_leads if ld.get("status_id") in statuses]
         if not open_leads:
-            return None, None
-        best = max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
-        return best.get("id"), best.get("responsible_user_id")
+            return None
+        return max(open_leads, key=lambda ld: (ld.get("updated_at") or 0, ld.get("id") or 0))
     except Exception:
         logger.exception("UIS пропущенный: поиск сделки по телефону не удался")
+        return None
+
+
+async def _find_lead(phone: str, statuses=None):
+    """(lead_id, responsible_user_id) ОТКРЫТОЙ сделки по телефону или (None, None), см. _find_lead_row."""
+    row = await _find_lead_row(phone, statuses)
+    if not row:
         return None, None
+    return row.get("id"), row.get("responsible_user_id")
 
 
 def _esc(s: str) -> str:

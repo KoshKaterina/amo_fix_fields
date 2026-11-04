@@ -653,6 +653,12 @@ class SipuniCallTracker:
         except Exception:  # noqa: BLE001 - сбой обработчика не должен ронять учёт звонков
             logger.exception("Sipuni: ошибка обработчика %s (call=%s)", what, call_id)
 
+    async def drain(self, timeout: float = 8.0) -> None:
+        """Дождаться обработчиков, которые уже запущены (остановка приложения)."""
+        pending = [t for t in self._bg if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+
     def _bg_done(self, task: Any) -> None:
         self._bg.discard(task)
         if not task.cancelled() and task.exception() is not None:
