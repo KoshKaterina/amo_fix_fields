@@ -35,6 +35,7 @@ import alerts
 import amo_service
 import migration_freeze
 import metrika_client
+import metrika_payment_evidence
 from waybill_config import (
     FIELD_EMAIL,
     FIELD_MOYSKLAD_ORDER_UUID,
@@ -280,8 +281,10 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     cod = is_cod_payment(payment)
 
     order_status, need_resolve = _classify(pipeline_id, status_id, cod)
+    # An actual online receipt may precede the terminal CRM stage. Resolve the
+    # SAME canonical order even when the office stage has no status mapping.
     if not order_status:
-        return
+        need_resolve = pipeline_id != PIPELINE_CLEVER_MAIN
 
     # Каноническая сделка — всегда оригинал в CLEVER (источник id, ym, суммы, дат).
     if need_resolve:
@@ -311,6 +314,17 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
             )
             return
 
+    payment_evidence = (metrika_payment_evidence.cached(canonical)
+                        if order_status != "CANCELLED" else None)
+    if order_status != "CANCELLED" and (payment_evidence or order_status != "PAID"):
+        payment_evidence = await metrika_payment_evidence.for_lead(canonical)
+        if payment_evidence:
+            order_status = "PAID"
+            logger.info("Metrika: original order %s payment confirmed (%s)",
+                        metrika_order_id, payment_evidence.source)
+    if not order_status:
+        return
+
     ym = str(_cf(canonical, FIELD_YM_CLIENT_ID) or "").strip()
     contact_id, email, phone = await _contact_info(canonical)
     # Метрике нужен хотя бы один идентификатор клиента (client_uniq_id тоже годится).
@@ -328,6 +342,8 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     event_ts = lead.get("updated_at") or now
     if order_status in ("PAID", "CANCELLED") and lead.get("closed_at"):
         event_ts = lead["closed_at"]
+    if payment_evidence:
+        event_ts = payment_evidence.timestamp
     event_dt = _fmt_dt(event_ts)
 
     row: dict = {
@@ -352,6 +368,9 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     # merge_mode=UPDATE гарантированно перезаписывает прежнее значение, а не
     # оставляет «прилипшую» сумму от старого PAID.
     row["revenue"] = (canonical.get("price") or 0) if order_status == "PAID" else 0
+    if payment_evidence:
+        # Confirm the original order, not the manager's additional basket/sum.
+        row["revenue"] = payment_evidence.original_total
 
     # Дедуп: не шлём заказ повторно, если его значимое состояние не изменилось
     # с прошлой успешной отправки (гасит echo и перебор этапов → один IN_PROGRESS).
