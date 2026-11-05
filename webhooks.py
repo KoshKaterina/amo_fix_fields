@@ -48,6 +48,7 @@ import office_transfer
 import order_note
 import preorder_lead_name
 import order_watchdog
+import ms_payment_flow
 import ozon_invoice
 import retail_lead_guard
 import reserve_service
@@ -195,6 +196,7 @@ async def lifespan(app):
     ms_client.init()
     await reserve_service.init()
     ozon_invoice.init()
+    ms_payment_flow.start()
     await wazzup_sla.init()
     await wazzup_forward.init()
     await wazzup_delivery.init()
@@ -296,6 +298,7 @@ async def lifespan(app):
     await alert_settings_client.stop()
     await team_panel_client.stop()
     await lead_distribution_profiles_client.stop()
+    await ms_payment_flow.stop()
     await ozon_invoice.aclose()
     await reserve_service.shutdown()
     await ms_client.aclose()
@@ -923,6 +926,17 @@ async def lead_change(request: Request):
         logger.info("Lead %s вошла в тех-этап оплаты (pipeline %s) — enqueue ozon invoice",
                     lead_id, incoming_pipeline)
         enqueue_invoice(lead_id, source="webhook")
+
+    # Оплата при выдаче (05.11.2026): сделка вошла в «Успешно реализовано» воронки Офис -
+    # если это самовывоз из офиса или наложка, записываем в заказ МС платёж на остаток
+    # до суммы. Обработчик перечитывает сделку и сам решает (воронка, closed_at, тип).
+    # Флаги OFFICE_MS_PAYMENT_ENABLED / OFFICE_MS_PAYMENT_DRY_RUN в waybill_config.py.
+    if (
+        lead_id is not None
+        and incoming_status is not None
+        and ms_payment_flow.is_office_entry(incoming_pipeline, incoming_status)
+    ):
+        ms_payment_flow.office_payment_bg(lead_id)
 
     # Резерв товара в МойСклад (перенос с amGroup) — сделка сменила статус в
     # одной из отслеживаемых воронок (Основная/TangemShop/Офис). reserve_service
