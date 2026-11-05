@@ -1380,6 +1380,24 @@ OZON_MS_PAYMENT_ENABLED = os.getenv("OZON_MS_PAYMENT_ENABLED", "").strip() == "1
 # «Сухой прогон»: ПО УМОЛЧАНИЮ ВКЛЮЧЁН. Читаем МС и пишем в лог «создал бы платёж», но
 # платёж не создаём и в амо ничего не пишем. Боевая запись - только явное "0".
 OZON_MS_PAYMENT_DRY_RUN = os.getenv("OZON_MS_PAYMENT_DRY_RUN", "1").strip() != "0"
+# Оплата при выдаче (05.11.2026, ms_payment_flow): сделка вошла в «Успешно реализовано»
+# воронки Офис, и это самовывоз из офиса или наложка - клиент платит по факту, Ozon тут нет.
+# Заводим платёж на остаток до суммы заказа. Те же правила выключателей, что у Ozon выше:
+# флаг выкл. по умолчанию, сухой прогон вкл. по умолчанию.
+OFFICE_MS_PAYMENT_ENABLED = os.getenv("OFFICE_MS_PAYMENT_ENABLED", "").strip() == "1"
+OFFICE_MS_PAYMENT_DRY_RUN = os.getenv("OFFICE_MS_PAYMENT_DRY_RUN", "1").strip() != "0"
+# Без ретроактивности: вебхук update_lead приходит на ЛЮБУЮ правку сделки, а в УР Офиса
+# лежат тысячи старых сделок (замер 05.11.2026: на 90 свежих - правки по закрытым 09-07,
+# 10-21, 10-25). Сделка закрыта раньше, чем N часов назад (closed_at), - платёж не пишем.
+OFFICE_MS_PAYMENT_MAX_AGE_H = int(os.getenv("OFFICE_MS_PAYMENT_MAX_AGE_H", "24"))
+# Автоповтор записи платежа в МС при сбое МС (очередь на диске, переживает пересборку).
+# Тик цикла; через ALERT_AFTER секунд от первого сбоя - ОДИН технический алерт (30 минут:
+# короткие сбои МС не шумят, а человек узнаёт в тот же рабочий час); повторы идут дальше
+# с паузой до часа; через GIVE_UP секунд (24 часа) - финальный алерт и снятие с очереди.
+MS_PAYMENT_PENDING_PATH = os.getenv("MS_PAYMENT_PENDING_PATH", "/app/var/ms_payment_pending.json")
+MS_PAYMENT_RETRY_TICK_S = int(os.getenv("MS_PAYMENT_RETRY_TICK_S", "60"))
+MS_PAYMENT_RETRY_ALERT_AFTER_S = int(os.getenv("MS_PAYMENT_RETRY_ALERT_AFTER_S", "1800"))
+MS_PAYMENT_RETRY_GIVE_UP_S = int(os.getenv("MS_PAYMENT_RETRY_GIVE_UP_S", "86400"))
 # Пересылка вебхуков Wazzup в панель team.sunscrypt.ru (wazzup_forward.py, го Кати
 # 31.07.2026): тексты WA/TG сохраняет ПАНЕЛЬ (таблица wazzup_message), мы только
 # пересылаем. Пустой токен → пересылка выключена (в лог — предупреждение).
