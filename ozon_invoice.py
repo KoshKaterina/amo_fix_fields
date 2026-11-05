@@ -55,6 +55,7 @@ import httpx
 import amo_service
 import alerts
 import ms_client
+import ms_payment
 import telegram_bot
 import tg_recipients
 from waybill_config import (
@@ -66,6 +67,8 @@ from waybill_config import (
     OZON_INVOICE_ENABLED,
     OZON_INVOICE_REDIRECT_URL,
     OZON_INVOICE_TTL_S,
+    OZON_MS_PAYMENT_DRY_RUN,
+    OZON_MS_PAYMENT_ENABLED,
     OZON_PAY_ACCESS_KEY,
     OZON_PAY_API_URL,
     OZON_PAY_NOTIFICATION_SECRET_KEY,
@@ -778,7 +781,88 @@ def handle_notification_bg(payload: dict) -> None:
     task.add_done_callback(_notify_tasks.discard)
 
 
-async def _mark_paid(lead: dict, rub_str: str, marker: str, source: str) -> str:
+def _ms_payment_key(*exts) -> str:
+    """Устойчивый ключ оплаты для externalCode платежа МС. Вебхук и сверка видят один и
+    тот же платёж под разными extId (платежа «amo-…», заказа «ord-…» или «<номер МС>_amo-…»),
+    а ключ должен совпасть - иначе дубль не опознать. Берём «<сделка>-<время>» из первого
+    подходящего; чужой формат - как есть."""
+    lead_id, ts = _lead_and_ts_from_ext(*exts)
+    if lead_id is not None:
+        return f"{lead_id}-{ts}"
+    return next((str(v) for v in exts if v), "")
+
+
+async def _ms_payment_attention(lead: dict, outcome: str, detail: str) -> None:
+    """Запись оплаты в МС не вышла или упёрлась в сумму - сказать человеку (примечание +
+    алерт). Без тега «ошибка счёта»: деньги получены, счёт не при чём. Повтор той же
+    причины по сделке - не чаще раза в час, как в _fail."""
+    lead_id = lead.get("id")
+    now = time.time()
+    key = (int(lead_id or 0), f"ms:{outcome}")
+    if now - _failed_recent.get(key, 0.0) < _FAIL_REPEAT_GAP_S:
+        return
+    _failed_recent[key] = now
+    reason = "Оплата Ozon получена, но в заказ МС не записана - занесите платёж вручную"
+    await amo_service.add_note(lead_id, f"⚠️ {reason}\n{outcome}: {detail}")
+    mentions = tg_recipients.mentions_for(lead.get("responsible_user_id"))
+    d = alerts.decide(
+        "ozon_invoice_failed",
+        legacy_text=f"⚠️ {reason}\n{lead.get('name') or lead_id}\n{AMO_LEAD_URL.format(lead_id)}\n{mentions}",
+        chat_id=tg_recipients.NOTIFY_CHAT_ID, thread_id=tg_recipients.NOTIFY_THREAD_ID, lead=lead,
+        responsible_id=lead.get("responsible_user_id"),
+        values={
+            "причина": reason,
+            "сделка": lead.get("name") or "",
+            "ссылка_на_сделку": alerts.lead_link(lead_id),
+            "теги": mentions,
+        },
+    )
+    if d is not None:
+        await telegram_bot.send_alert(d.text, **d.send_kwargs())
+
+
+async def _record_ms_payment(lead: dict, kopecks, key: str) -> str:
+    """Оплата подтверждена -> входящий платёж в заказе МС (ms_payment). Никогда не бросает:
+    деньги клиента уже списаны, сбой МС не должен ронять перевод сделки."""
+    if not OZON_MS_PAYMENT_ENABLED:
+        return "disabled"
+    dry = OZON_MS_PAYMENT_DRY_RUN
+    lead_id = lead.get("id")
+    try:
+        uuid = amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID)
+        outcome, detail = await ms_payment.record_ozon_payment(uuid, kopecks, key, dry_run=dry)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("ms_payment: lead %s: необработанная ошибка записи оплаты в МС", lead_id)
+        return "failed-exception"
+    logger.info("ms_payment%s: lead %s -> %s (%s)", " DRY-RUN" if dry else "", lead_id, outcome, detail)
+    # В сухом прогоне людей не зовём: примечания и алерты - это уже запись в боевые системы.
+    if not dry and outcome in ms_payment.ATTENTION:
+        try:
+            await _ms_payment_attention(lead, outcome, detail)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ms_payment: lead %s: не удалось сообщить о сбое записи оплаты", lead_id)
+    return outcome
+
+
+async def _mark_paid(
+    lead: dict, rub_str: str, marker: str, source: str, *, kopecks=None, ext_key: str = "",
+) -> str:
+    """Оплата подтверждена (вебхук или сверка): перевести сделку и записать платёж в МС.
+
+    Порядок важен: сначала сделка (клиент ждёт «спасибо»), потом МС - он медленнее и может
+    ретраиться. Исход функции - исход перевода сделки, как и раньше; запись в МС на него не
+    влияет. kopecks/ext_key не заданы - в МС не пишем (старые вызовы без суммы)."""
+    result = await _move_deal_paid(lead, rub_str, marker, source)
+    if kopecks is not None and ext_key:
+        await _record_ms_payment(lead, kopecks, ext_key)
+    return result
+
+
+async def _move_deal_paid(lead: dict, rub_str: str, marker: str, source: str) -> str:
     """Общий путь «оплата подтверждена» для вебхука и сверки: перевести сделку
     в «Оплата получена» + примечание. Сделка уже дальше — только примечание.
 
@@ -859,9 +943,10 @@ async def _handle_notification(data: dict) -> str:
         return "skipped-duplicate"
 
     try:
-        rub = int(round(float(data.get("amount") or 0))) / 100
+        kopecks = int(round(float(data.get("amount") or 0)))
     except (TypeError, ValueError):
-        rub = 0
+        kopecks = 0
+    rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
 
     lead = await amo_service.get_lead_full(lead_id, with_=())
@@ -869,7 +954,10 @@ async def _handle_notification(data: dict) -> str:
         logger.error("ozon_notify: оплата Completed по %s, но сделка %s не прочиталась", ext_tx, lead_id)
         return "failed-lead-read"
 
-    return await _mark_paid(lead, rub_str, f"extId {ext_tx or ext_ord}", "вебхук")
+    return await _mark_paid(
+        lead, rub_str, f"extId {ext_tx or ext_ord}", "вебхук",
+        kopecks=kopecks, ext_key=_ms_payment_key(ext_tx, ext_ord),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1294,7 +1382,10 @@ async def _reconcile_once() -> str:
                 rub = (kopecks or 0) / 100
                 rub_str = f"{rub:.2f}".rstrip("0").rstrip(".") if kopecks else "?"
                 marker = f"extId {ext_id}" if ext_id else f"paymentId {payment_id}"
-                if await _mark_paid(lead, rub_str, marker, "сверка") == "moved":
+                if await _mark_paid(
+                    lead, rub_str, marker, "сверка",
+                    kopecks=kopecks or 0, ext_key=_ms_payment_key(ext_id, order_ext_id, payment_id),
+                ) == "moved":
                     moved += 1
                     _stale_alerted.pop(lead_id, None)
 
