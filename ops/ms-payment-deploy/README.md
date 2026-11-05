@@ -31,8 +31,9 @@
 
 Сервер `tiana@85.193.91.169`, каталог `/opt/integrations/amo_fix_fields`, контейнер `amo-fix-fields`.
 
-1. **Ветка.** `git fetch origin && git checkout claude/payment-status-sync-plan-6s4fa4`, убедиться, что
-   `git diff --stat origin/master...HEAD` показывает ровно: новые `ms_payment.py`, `ms_payment_flow.py`,
+1. **Код.** PR #25 слит в `master` (слияние `18d69b2`). `git fetch origin && git checkout master && git pull`.
+   Базой для сверки с продом служит коммит ДО слияния `366f795` (на нём стоит прод, если его не трогали
+   отдельно). Убедиться, что `git diff --stat 366f795 HEAD -- '*.py'` показывает ровно: новые `ms_payment.py`, `ms_payment_flow.py`,
    `test_ms_payment.py`, `test_ms_payment_flow.py`; изменённые `ozon_invoice.py`, `waybill_config.py`,
    `webhooks.py`, `AGENTS.md`, `ms_client.py`.
 2. **Тесты локально.** `python run_tests.py test_ms_payment.py test_ms_payment_flow.py test_ozon_invoice.py`:
@@ -41,12 +42,13 @@
 3. **Сверка с продом (стоп-условие).** Везём на сервер 6 файлов: `ms_payment.py`, `ms_payment_flow.py`
    (новые) и `ozon_invoice.py`, `waybill_config.py`, `webhooks.py`, `ms_client.py` (изменены).
    - Для каждого из четырёх изменённых: md5 файла на сервере (без `\r`) против md5
-     `git show origin/master:<файл>` (без `\r`). **Совпало** - можно заливать. **Не совпало** - прод впереди
-     master: СТОП, ничего не заливать, показать Кате `diff` и ждать решения.
+     `git show 366f795:<файл>` (без `\r`). Именно `366f795`, а НЕ `master`/`HEAD`: в них уже новый код.
+     **Совпало** - прод на старой версии, можно заливать версию из `master`. **Не совпало** - на проде есть
+     правки сверх `366f795`: СТОП, ничего не заливать, показать Кате `diff` и ждать решения.
    - Новых двух на сервере быть не должно (`ls`).
    - Проверить, что на сервере есть `shared/files.py` (новый модуль берёт из него `write_json_atomic`).
      Нет - довезти каталог `shared/` целиком: без него будет `ModuleNotFoundError` при первом вызове.
-   - Проверить, что в `ms_client.py` на проде нет правок сверх master (то же md5-правило).
+   - `ms_client.py` на проде проверяется тем же правилом (изменён только докстринг).
 4. **Бэкап на сервере.** `mkdir -p .bak-ms-payment-20261105` в каталоге проекта и `cp -a` туда четырёх
    изменяемых файлов (и `ms_client.py`).
 5. **Флаги в `.env` (без чтения файла).** Для каждой из четырёх переменных проверить наличие строки счётчиком
