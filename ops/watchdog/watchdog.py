@@ -70,6 +70,70 @@ def log(msg):
     print(f"[{datetime.now(MSK).strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ---------------------------------------------------------------- «Здоровье»
+# 09.11.2026: каждая проверка сторожа пишет в журнал ошибок панели Team: «лежит» - событие,
+# «поверили, что починилось» - закрытие. Сообщения в Телеграм это НЕ меняет. Падения служб
+# («Сервис · …») сюда не идут: их пишет агент systemd (OnFailure), иначе одна поломка
+# задвоилась бы. Настройки и токен - /etc/sunscrypt-errors/env агента. Любая ошибка
+# журнала проглатывается: сторож из-за него падать не должен.
+JOURNAL_ENV = "/etc/sunscrypt-errors/env"
+_JOURNAL = []
+_JOURNAL_MODE = ""
+
+
+def _journal_code(name):
+    rules = [
+        ("amoCRM", "amo.access_failed"), ("МойСклад", "ms.access_failed"),
+        ("WooCommerce", "woo.access_failed"), ("Wazzup", "wazzup.access_failed"),
+        ("СДЭК", "cdek.access_failed"), ("Метрика", "metrika.access_failed"),
+        ("DeFi", "defi.data_missing"), ("Контейнер", "container.down"),
+        ("Телеграм-бот", "tg.bot_down"), ("Бэкап", "backup.failed"),
+        ("Таймер", "timer.disabled"), ("Сторож", "watchdog.crash"),
+    ]
+    for needle, code in rules:
+        if needle in name:
+            return code
+    return "watchdog.check_failed"
+
+
+def journal_note(name, why="", *, urgent=False, resolved=False):
+    try:
+        if name.startswith("Сервис · "):
+            return
+        sev = "critical" if urgent else ("warning" if name.startswith("DeFi") else "error")
+        _JOURNAL.append({
+            "v": 1, "service": "watchdog", "component": _JOURNAL_MODE or None,
+            "code": _journal_code(name), "severity": sev, "fingerprint": "watchdog:" + name,
+            "title": "" if resolved else f"Сторож: {name}"[:200], "message": why[:2000],
+            "resolves": resolved, "host": "85.193.91.169", "env": "prod",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def journal_flush():
+    if not _JOURNAL:
+        return
+    try:
+        cfg = parse_env_file(JOURNAL_ENV)
+        url, token = cfg.get("ERRORS_INGEST_URL"), cfg.get("INGEST_TOKEN")
+        if not url or not token:
+            return
+        import urllib.request
+        for i in range(0, len(_JOURNAL), 100):
+            body = json.dumps({"events": _JOURNAL[i:i + 100]}, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Content-Type": "application/json", "X-Ingest-Token": token,
+                "User-Agent": "sunscrypt-watchdog/1"})
+            urllib.request.urlopen(req, timeout=15).close()
+        log(f"  журнал «Здоровье»: передано событий {len(_JOURNAL)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"  журнал «Здоровье» недоступен ({type(e).__name__}), события пропущены")
+    finally:
+        _JOURNAL.clear()
+
+
 # ------------------------------------------------------------------------ state
 def load_state():
     try:
@@ -170,6 +234,12 @@ def triage(prev, checks, now, *, fail_to_open=1, ok_to_close=1):
             if is_urgent(name):
                 urgent_fixed.append(f"• {name}")
             rec.update(ok=True, down_since=0, alerted=0, last_alert=0, why="")
+
+        # «Здоровье»: каждый сырой провал - повтор в журнале, поверили в починку - закрытие
+        if not ok:
+            journal_note(name, why, urgent=is_urgent(name))
+        elif not believed_ok and rec["ok"]:
+            journal_note(name, resolved=True)
 
         new_state[name] = rec
 
@@ -966,10 +1036,15 @@ if __name__ == "__main__":
         print(f"как запускать: watchdog.py [{' | '.join(CHECKS)}]")
         sys.exit(2)
     log(f"проверка: {what}")
+    _JOURNAL_MODE = what
     try:
-        sys.exit(CHECKS[what]())
+        rc = CHECKS[what]()
+        journal_flush()
+        sys.exit(rc)
     except Exception as e:  # noqa: BLE001
         log(f"ПАДЕНИЕ: {e}")
+        journal_note(f"Сторож · {what}", str(e))
+        journal_flush()
         # Без этого троттла сторож, упавший на пятиминутной проверке, шлёт 288
         # сообщений в сутки - ровно тот шум, от которого мы уходим. Само чтение
         # состояния тоже может не задаться (диск, битый json) - тогда шлём как
