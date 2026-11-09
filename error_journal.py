@@ -4,12 +4,14 @@
 (тот же, что у приёма Wazzup). Решения Кати 09.11.2026 -
 dev-workspace-and-journal/features/zhurnal-oshibok/PREDLOZHENIE-2026-11-09.md.
 
-Два источника событий:
+Источники событий:
 
-1. **Всё, что уходит в технический чат** (`telegram_bot.send_alert` без адресата или на
-   TG_ALLOWED_CHAT_ID) - зеркалом, `mirror_tech_chat`. Тип события узнаём по началу
+0. **Технические события каталога «Уведомлений»** - хук `alerts.decide` → `on_decision`,
+   разбор по ключу события (`EVENT_RULES`). Уведомления для людей в журнал не идут.
+1. **Остальное, что уходит в технический чат** (`telegram_bot.send_alert` без адресата
+   или на TG_ALLOWED_CHAT_ID) - зеркалом, `mirror_tech_chat`. Тип события узнаём по началу
    текста (`TECH_RULES`), незнакомое ложится в `tech_chat.other`. Отправка в Телеграм НЕ
-   меняется - журнал пока в теневом режиме.
+   меняется: интеграция пишет в чат сама, события идут с `notified`, журнал не дублирует.
 2. **Строки ERROR/CRITICAL лога** - обработчик `install_log_handler` на логгере `uvicorn`.
    Это ровно то, о чём сейчас никто не узнаёт: 09.11 в логе за неделю нашлось 708 ошибок
    «МойСклад не отдаёт позиции заказа» по двум заказам, в чат не ушло ни одной.
@@ -151,28 +153,70 @@ def _loop() -> None:
 
 # ─────────────────────────── техчат → журнал ───────────────────────────
 
+# Разведение с «Уведомлениями» (Катя 09.11.2026). В журнал идёт только техническое: сбой
+# сервера или запроса, наша настройка, справка для техспециалиста (сводки доставки,
+# автопочинка). Работа для людей - клиент не получил сообщение, письмо клиента, дубль
+# сделки, разобрать заказ руками, данные в сделке для накладной - это уведомление: оно
+# уходит как раньше, в журнал не пишется (критичность None ниже).
+# У события один отправитель в чат: всё, что журнал узнаёт отсюда, интеграция уже
+# отправила сама, поэтому события идут с `notified` - журнал записывает и молчит.
+
 # Начало текста → (компонент, критичность, код, название). Перечень снят с реального
-# техчата 10.10-09.11.2026 (alert_sent.jsonl). Первое совпадение выигрывает.
-TECH_RULES: list[tuple[str, str, str, str, str]] = [
+# техчата 10.10-09.11.2026 (alert_sent.jsonl). Первое совпадение выигрывает. Работает для
+# сообщений, отправленных мимо каталога «Уведомлений»; события каталога разбираются по
+# ключу события (`EVENT_RULES`).
+TECH_RULES: list[tuple[str, str, str | None, str, str]] = [
     ("Metrika: ошибка загрузки заказа", "metrika_sync", "error", "metrika.order_upload_failed", "Метрика не приняла заказ"),
-    ("🚫 Сообщение НЕ отправлено", "wazzup_delivery", "warning", "wazzup.undelivered", "Клиент не получил сообщение (Wazzup)"),
+    ("🚫 Сообщение НЕ отправлено", "wazzup_delivery", None, "wazzup.undelivered", "Клиент не получил сообщение (Wazzup)"),
     ("📊 <b>Доставка Wazzup за сутки", "wazzup_delivery", "info", "wazzup.daily_summary", "Сводка: доставка Wazzup за сутки"),
     ("⏱ <b>Отправлено, но в Wazzup не помечено", "wazzup_delivery", "info", "wazzup.not_marked_delivered", "Сводка: отправлено, но не помечено доставленным"),
     ("💰 Бюджет разошёлся", "budget_mismatch_watch", "info", "budget.auto_aligned", "Бюджет сделки разошёлся с заказом и выровнен автоматически"),
     ("⚠️ amo_fix_fields: очередь API-пайплайна", "queue_manager", "warning", "queue.api_depth", "Очередь запросов к amoCRM выше порога"),
     ("⚠️ amo_fix_fields: задача", "queue_manager", "warning", "queue.task_waited", "Задача долго ждала в очереди"),
     ("⚠️ amo_fix_fields: очередь", "queue_manager", "warning", "queue.lane_depth", "Дорожка очереди переполнена"),
-    ("СДЭК отклонил заказ", "waybill_service", "error", "cdek.order_rejected", "СДЭК отклонил заказ на накладную"),
-    ("не определён тариф СДЭК", "waybill_service", "error", "cdek.tariff_unknown", "Не определён тариф СДЭК"),
-    ("не распознан код ПВЗ", "waybill_service", "error", "cdek.pvz_unknown", "Не распознан код пункта выдачи СДЭК"),
-    ("📬 Письмо клиента", "mail_watch", "info", "mail.client_letter", "Письмо клиента по закрытой сделке"),
+    ("СДЭК отклонил заказ", "waybill_service", None, "cdek.order_rejected", "СДЭК отклонил заказ на накладную"),
+    ("не определён тариф СДЭК", "waybill_service", None, "cdek.tariff_unknown", "Не определён тариф СДЭК"),
+    ("не распознан код ПВЗ", "waybill_service", None, "cdek.pvz_unknown", "Не распознан код пункта выдачи СДЭК"),
+    ("📬 Письмо клиента", "mail_watch", None, "mail.client_letter", "Письмо клиента по закрытой сделке"),
     ("Woo: ошибка", "woo_status_sync", "error", "woo.request_failed", "Ошибка запроса к сайту"),
-    ("Похоже, задвоилась сделка", "amgroup_duplicate_watch", "warning", "amgroup.duplicate", "Похоже, задвоилась сделка по заказу"),
+    ("Похоже, задвоилась сделка", "amgroup_duplicate_watch", None, "amgroup.duplicate", "Похоже, задвоилась сделка по заказу"),
     ("🧪 Сухой режим", "amgroup_contact_heal", "info", "amgroup.dry_run", "Сухой прогон: в amo ничего не записано"),
-    ("GetCourse", "getcourse_service", "error", "getcourse.manual_review", "Заказ GetCourse нужно разобрать руками"),
+    ("GetCourse", "getcourse_service", None, "getcourse.manual_review", "Заказ GetCourse нужно разобрать руками"),
     ("Заявка с сайта не создалась", "site_form_service", "critical", "site_form.lead_not_created", "Заявка с сайта не создалась в amoCRM"),
     ("⚠️ Заказ с сайта не доехал", "order_watchdog", "critical", "order.site_order_lost", "Заказ с сайта не доехал до МойСклада"),
 ]
+
+# Событие каталога «Уведомлений» → (компонент, критичность, код, название). Только
+# технические события; любое другое событие каталога - уведомление для людей и в журнал
+# не идёт. Коды совпадают с прежними правилами по тексту, чтобы история не разъехалась.
+EVENT_RULES: dict[str, tuple[str, str, str, str]] = {
+    "metrika_order_load_failed": ("metrika_sync", "error", "metrika.order_upload_failed", "Метрика не приняла заказ"),
+    "metrika_sync_counters_failed": ("metrika_sync", "error", "metrika.counters_failed", "Метрика: не удалось получить счётчики"),
+    "metrika_sync_counter_ambiguous": ("metrika_sync", "warning", "metrika.counter_ambiguous", "Метрика: счётчиков несколько"),
+    "queue_api_depth": ("queue_manager", "warning", "queue.api_depth", "Очередь запросов к amoCRM выше порога"),
+    "queue_lane_depth": ("queue_manager", "warning", "queue.lane_depth", "Дорожка очереди переполнена"),
+    "queue_task_waited": ("queue_manager", "warning", "queue.task_waited", "Задача долго ждала в очереди"),
+    "woo_status_sync_error": ("woo_status_sync", "error", "woo.request_failed", "Ошибка запроса к сайту"),
+    "order_watchdog_digest": ("order_watchdog", "critical", "order.site_order_lost", "Заказ с сайта не доехал до МойСклада"),
+    "cdek_sync_no_pipeline": ("cdek_status_sync", "error", "cdek.sync_no_pipeline", "Синк СДЭК: воронка «Офис» не определена"),
+    "cdek_sync_stages_missing": ("cdek_status_sync", "error", "cdek.sync_stages_missing", "Синк СДЭК: не найдены этапы"),
+    "cdek_sync_webhook_failed": ("cdek_status_sync", "error", "cdek.webhook_subscribe_failed", "Синк СДЭК: не удалось подписаться на вебхуки"),
+    "office_transfer_targets_missing": ("office_transfer", "error", "office_transfer.targets_missing", "Перенос в Офис: целевые этапы не найдены"),
+    "office_transfer_no_since": ("office_transfer", "error", "office_transfer.no_since", "Перенос в Офис: сверка не запущена"),
+    "lead_distribution_no_since": ("lead_distribution", "error", "lead_distribution.no_since", "Распределение: сверка не запущена"),
+    "ms_payment_failed": ("ms_payment_flow", "error", "ms.payment_failed", "Платёж не записан в МойСклад: сбой"),
+    "autopilot_failure": ("autopilot", "error", "autopilot.failure", "Авто-режим: поломка"),
+    "waybill_amo_not_updated": ("waybill_service", "error", "waybill.amo_not_updated", "Накладная СДЭК создана, amoCRM не обновлён"),
+    "waybill_track_not_restored": ("waybill_service", "error", "waybill.track_not_restored", "Трек-номер пропал и не восстановился"),
+    "ozon_invoice_stages_missing": ("ozon_invoice", "error", "ozon_invoice.stages_missing", "Счета Ozon: этапы оплаты не найдены"),
+}
+
+# «Накладная СДЭК не создалась» бывает двух родов. Нет телефона, ПВЗ, город, тариф, СДЭК
+# отклонил данные - это поправить сделку, уведомление. Ответ СДЭК с кодом ошибки, пустой
+# ответ, исключение, amoCRM не отдал контакт - сбой, журнал.
+_WAYBILL_SERVER = re.compile(
+    r"СДЭК \d{3}|СДЭК не вернул UUID|СДЭК неожиданная ошибка|не удалось загрузить контакт"
+    r"|не удалось проверить город")
 
 _TAG = re.compile(r"<[^>]+>")
 _DEAL = re.compile(r"[Сс]делк[аи]\D{0,3}(\d{6,})")
@@ -186,13 +230,16 @@ def _first_line(text: str) -> str:
     return ""
 
 
-def classify_tech(text: str) -> dict:
-    """Текст сообщения техчата → поля события. Незнакомое - `tech_chat.other`, склейка по
-    первой строке без чисел, чтобы новые типы сообщений тоже собирались в группы."""
+def classify_tech(text: str) -> dict | None:
+    """Текст сообщения техчата → поля события; None - это уведомление для людей, в журнал
+    не идёт. Незнакомое - `tech_chat.other`, склейка по первой строке без чисел, чтобы
+    новые типы сообщений тоже собирались в группы."""
     head = _first_line(text)
     raw_head = (text or "").lstrip()
     for prefix, component, severity, code, title in TECH_RULES:
         if raw_head.startswith(prefix) or prefix in head:
+            if severity is None:
+                return None
             ev = {"component": component, "severity": severity, "code": code, "title": title}
             break
     else:
@@ -212,9 +259,79 @@ def classify_tech(text: str) -> dict:
     return ev
 
 
-def mirror_tech_chat(text: str) -> None:
+def classify_event(event_key: str, text: str) -> dict | None:
+    """Событие каталога «Уведомлений» → поля события журнала; None - уведомление для людей."""
+    rule = EVENT_RULES.get(event_key)
+    if rule is None and event_key == "waybill_create_failed" and _WAYBILL_SERVER.search(text or ""):
+        rule = ("waybill_service", "error", "cdek.request_failed",
+                "Накладная СДЭК не создалась: запрос к СДЭК или amoCRM не прошёл")
+    if rule is None:
+        return None
+    component, severity, code, title = rule
+    body = _TAG.sub("", text or "").strip()
+    ev = {"component": component, "severity": severity, "code": code, "title": title,
+          "message": body[:2000], "context": {"event": event_key}}
+    m = _DEAL.search(body)
+    if m:
+        ev["entity"] = {"type": "сделка", "id": m.group(1)}
+    return ev
+
+
+# Тексты, которые уже разобраны по ключу события в `alerts.decide`: когда они дойдут до
+# техчата, зеркало их пропускает, иначе событие записалось бы дважды. Хранятся по хешу
+# недолго - между решением и отправкой проходят секунды.
+_DECIDED_TTL_S = 900.0
+_DECIDED_MAX = 1000
+_decided: dict[str, float] = {}
+
+
+def _text_key(text: str) -> str:
+    return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
+
+
+def _mark_decided(*texts: str | None) -> None:
+    now = time.monotonic()
+    with _lock:
+        if len(_decided) >= _DECIDED_MAX:
+            for k, t in list(_decided.items()):
+                if now - t > _DECIDED_TTL_S or len(_decided) >= _DECIDED_MAX:
+                    _decided.pop(k, None)
+        for t in texts:
+            if t:
+                _decided[_text_key(t)] = now
+
+
+def _take_decided(text: str) -> bool:
+    with _lock:
+        t = _decided.pop(_text_key(text), None)
+    return t is not None and time.monotonic() - t <= _DECIDED_TTL_S
+
+
+def on_decision(event_key: str, legacy_text: str, sent_text: str | None) -> None:
+    """Хук `alerts.decide`: событие каталога решено. Техническое - в журнал; `notified`, если
+    каталог его отправляет (`sent_text` не None): тогда в чат пишет интеграция, журнал молчит.
+    Выключено в «Уведомлениях» - журнал записывает без `notified` и сам сообщает в техчат:
+    так отправка переезжает в журнал одним выключателем. Никогда не бросает."""
     try:
-        report(classify_tech(text))
+        _mark_decided(legacy_text, sent_text)
+        ev = classify_event(event_key, legacy_text)
+        if ev is not None:
+            ev["notified"] = sent_text is not None
+            report(ev)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def mirror_tech_chat(text: str) -> None:
+    """Сообщение ушло в техчат. Событие каталога уже записано в `on_decision`; остальное
+    разбираем по тексту. Интеграция отправила его сама - `notified`."""
+    try:
+        if _take_decided(text):
+            return
+        ev = classify_tech(text)
+        if ev is not None:
+            ev["notified"] = True
+            report(ev)
     except Exception:  # noqa: BLE001
         pass
 

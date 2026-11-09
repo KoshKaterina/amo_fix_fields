@@ -107,6 +107,8 @@ def journal_note(name, why="", *, urgent=False, resolved=False):
             "title": "" if resolved else f"Сторож: {name}"[:200], "message": why[:2000],
             "resolves": resolved, "host": "85.193.91.169", "env": "prod",
             "occurred_at": datetime.now(timezone.utc).isoformat(),
+            # в чат пишет сам сторож по своим тихим правилам, журнал только записывает
+            "notified": True,
         })
     except Exception:  # noqa: BLE001
         pass
