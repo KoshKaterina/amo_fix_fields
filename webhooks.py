@@ -31,6 +31,7 @@ import budget_mismatch_watch
 import cdek_client
 import cdek_status_sync
 import dup_autoclose
+import error_journal
 import insales_status_sync
 import jivo_service
 import lead_distribution
@@ -162,6 +163,8 @@ async def lifespan(app):
     if not any(isinstance(f, MaskSecretsInAccessLog) for f in access_logger.filters):
         access_logger.addFilter(MaskSecretsInAccessLog())
 
+    # «Здоровье» (09.11.2026): строки ERROR лога уходят в журнал ошибок панели.
+    error_journal.install_log_handler()
     init_api_pipeline()
     init_queue()
     # Память о прошлом этапе сделки: нужна гейту office_transfer, чтобы отличать
