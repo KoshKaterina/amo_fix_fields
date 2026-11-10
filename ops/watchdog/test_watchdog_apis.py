@@ -37,6 +37,7 @@ def fake_tokens(metrika_hours=24):
 
 w.check_tokens = fake_tokens
 w.check_telegram = lambda: ("Telegram Bot API", True, "")
+w.check_extra_apis = lambda: [("InSales", True, ""), ("GetCourse", False, "ключ отвергнут")]
 w.parse_env_file = lambda path: {"ERRORS_INGEST_URL": "https://panel.test/api/ingest/errors", "INGEST_TOKEN": "t"}
 
 
@@ -66,6 +67,7 @@ if posted:
     check(names["МойСклад"]["why"].startswith("HTTP 401") and not names["МойСклад"]["ok"], "склад")
     check(names["Яндекс.Метрика (загрузка заказов)"]["info"] == "за 3 ч отправлено заказов: 4", "метрика")
     check("Telegram Bot API" in names, "телеграм")
+    check(names["InSales"]["ok"] and names["GetCourse"]["why"] == "ключ отвергнут", "InSales и GetCourse")
     check(headers.get("X-ingest-token") == "t", "токен")
     check("TOKEN" not in json.dumps(body), "в теле не должно быть ключей")
 

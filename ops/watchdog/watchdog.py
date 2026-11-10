@@ -448,6 +448,34 @@ def check_telegram():
     return ("Telegram Bot API", ok, "" if ok else f"HTTP {c or 'нет ответа'}")
 
 
+def check_extra_apis():
+    """API с ключами интеграции, которых нет в часовом `tokens` (10.11.2026): только для
+    плашек «Здоровья», о поломке сторож по ним в Телеграм не пишет.
+    InSales - `GET /admin/account.json` (сведения о магазине). GetCourse - запрос статуса
+    несуществующей выгрузки: ключ проверяется, сама выгрузка не создаётся."""
+    out = []
+    shop, key, pwd = secret("INSALES_SHOP_URL"), secret("INSALES_API_KEY"), secret("INSALES_API_PASSWORD")
+    if shop and key and pwd:
+        import base64
+        auth = base64.b64encode(f"{key}:{pwd}".encode()).decode()
+        c, b = http(f"https://{shop.strip('/')}/admin/account.json", [f"Authorization: Basic {auth}"], timeout=20)
+        _TIMINGS["InSales"] = _LAST_MS
+        out.append(("InSales", c == 200, "" if c == 200 else f"HTTP {c or 'нет ответа'}"))
+    acc, gkey = secret("GETCOURSE_ACCOUNT_URL"), secret("GETCOURSE_API_KEY")
+    if acc and gkey:
+        c, b = http(f"{acc.rstrip('/')}/pl/api/account/exports/1?key={gkey}", timeout=20)
+        _TIMINGS["GetCourse"] = _LAST_MS
+        try:
+            data = json.loads(b)
+        except ValueError:
+            data = None
+        err = str((data or {}).get("error_message") or "").lower() if isinstance(data, dict) else ""
+        key_bad = any(w in err for w in ("ключ", "key", "доступ", "access"))
+        ok = c == 200 and isinstance(data, dict) and not key_bad
+        out.append(("GetCourse", ok, "" if ok else ("ключ отвергнут" if key_bad else f"HTTP {c or 'нет ответа'}")))
+    return out
+
+
 def run_apis():
     """Плашки «Сторонние API» на странице «Здоровье» панели Team (10.11.2026).
 
@@ -461,6 +489,7 @@ def run_apis():
     tg = check_telegram()
     if tg:
         checks.append(tg)
+    checks += check_extra_apis()
     items = []
     for name, ok, why in checks:
         log(f"  {name}: {'ок' if ok else 'СЛОМАНО'} {why}".rstrip())
