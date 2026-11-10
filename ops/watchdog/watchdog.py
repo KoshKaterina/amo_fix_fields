@@ -471,8 +471,11 @@ def check_extra_apis():
             data = json.loads(b)
         except ValueError:
             data = None
+        # Замер 10.11.2026: верный ключ - error_code 907 «Объект не найден» (выгрузки 1 нет),
+        # неверный - 901 «Неавторизованное API-обращение». Ответ 200 в обоих случаях.
         err = str((data or {}).get("error_message") or "").lower() if isinstance(data, dict) else ""
-        key_bad = any(w in err for w in ("ключ", "key", "доступ", "access"))
+        code_ = (data or {}).get("error_code") if isinstance(data, dict) else None
+        key_bad = code_ == 901 or "авториз" in err or any(w in err for w in ("ключ", "api key", "доступ запрещ"))
         ok = c == 200 and isinstance(data, dict) and not key_bad
         out.append(("GetCourse", ok, "" if ok else ("ключ отвергнут" if key_bad else f"HTTP {c or 'нет ответа'}")))
     return out
