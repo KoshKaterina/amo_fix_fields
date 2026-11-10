@@ -454,14 +454,16 @@ def check_extra_apis():
     InSales - `GET /admin/account.json` (сведения о магазине). GetCourse - запрос статуса
     несуществующей выгрузки: ключ проверяется, сама выгрузка не создаётся."""
     out = []
-    shop, key, pwd = secret("INSALES_SHOP_URL"), secret("INSALES_API_KEY"), secret("INSALES_API_PASSWORD")
+    # адреса по умолчанию - как в waybill_config.py интеграции: в её .env их нет
+    shop = secret("INSALES_SHOP_URL") or "tangemshop.ru"
+    key, pwd = secret("INSALES_API_KEY"), secret("INSALES_API_PASSWORD")
     if shop and key and pwd:
         import base64
         auth = base64.b64encode(f"{key}:{pwd}".encode()).decode()
         c, b = http(f"https://{shop.strip('/')}/admin/account.json", [f"Authorization: Basic {auth}"], timeout=20)
         _TIMINGS["InSales"] = _LAST_MS
         out.append(("InSales", c == 200, "" if c == 200 else f"HTTP {c or 'нет ответа'}"))
-    acc, gkey = secret("GETCOURSE_ACCOUNT_URL"), secret("GETCOURSE_API_KEY")
+    acc, gkey = secret("GETCOURSE_ACCOUNT_URL") or "https://edu.sunscrypt.ru", secret("GETCOURSE_API_KEY")
     if acc and gkey:
         c, b = http(f"{acc.rstrip('/')}/pl/api/account/exports/1?key={gkey}", timeout=20)
         _TIMINGS["GetCourse"] = _LAST_MS
