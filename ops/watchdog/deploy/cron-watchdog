@@ -22,6 +22,10 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # services - каждые 5 минут: упавший сервис сам не поднимается и наружу молчит.
 # 04.08.2026 tg-analytics пролежал 4 часа, нашли случайно глазами.
 */5 * * * * root /opt/watchdog/run.sh services
+# apis - раз в 10 минут: плашки «Сторонние API» на странице «Здоровье» панели Team
+# (10.11.2026). Только проверка и итог в панель, в Телеграм не пишет - это дело tokens.
+# По кнопке на странице запускает systemd: watchdog-apis.path.
+3-59/10 * * * * root /opt/watchdog/run.sh apis
 # digest - 09:00 МСК: одно сообщение в сутки. Что лежит и клиента не задевает,
 # задачи YouGile, домены и хостинг к продлению. Писать не о чем - молчит.
 0 6 * * *  root /opt/watchdog/run.sh digest

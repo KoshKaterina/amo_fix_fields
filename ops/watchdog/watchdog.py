@@ -299,21 +299,29 @@ def tg_send(text):
 
 
 # ------------------------------------------------------------------------- http
-def http(url, headers=None, method="GET", data=None, timeout=30):
+_LAST_MS = None  # время ответа последнего http(), мс - для плашек «Здоровья»
+
+
+def http(url, headers=None, method="GET", data=None, timeout=30, proxy=None):
     """Возвращает (код, тело). URL, заголовки и тело уходят в curl через stdin: токены
     живут во всех трёх (Bearer в заголовке, ключи Woo прямо в URL, секрет СДЭК в теле),
     а аргументы командной строки видны в `ps` всем. В лог они тоже не попадают."""
+    global _LAST_MS
     cfg = [curl_cfg("url", url)]
     for h in headers or []:
         cfg.append(curl_cfg("header", h))
     if data:
         cfg.append(curl_cfg("data", data))
+    if proxy:
+        cfg.append(curl_cfg("proxy", proxy))
     # --location нужен RDAP: rdap.org отвечает редиректом на сервер нужной зоны
     args = ["-s", "--globoff", "--compressed", "--location", "--max-time", str(timeout),
             "-w", "\n%{http_code}"]
     if method != "GET":
         args += ["-X", method]
+    t0 = time.monotonic()
     p = curl_run(cfg, args, timeout=timeout + 30)
+    _LAST_MS = int((time.monotonic() - t0) * 1000)
     out = p.stdout or ""
     nl = out.rfind("\n")
     body, code = (out[:nl], out[nl + 1:].strip()) if nl >= 0 else ("", out.strip())
@@ -321,7 +329,10 @@ def http(url, headers=None, method="GET", data=None, timeout=30):
 
 
 # ===================================================================== проверка 1
-def check_tokens():
+_TIMINGS = {}  # имя проверки → мс последнего ответа (плашки «Здоровья»)
+
+
+def check_tokens(metrika_hours=24):
     """Живы ли доступы. Возвращает список (имя, ok, пояснение)."""
     checks = []
 
@@ -332,6 +343,7 @@ def check_tokens():
             snippet = re.sub(r"\s+", " ", body)[:90]
             why += f" · {snippet}"
         checks.append((name, ok, why or hint))
+        _TIMINGS[name] = _LAST_MS
 
     amo_base = ENV.get("AMO_BASE", "https://new5a2e8ea7b16b4.amocrm.ru").rstrip("/")
     if secret("TOKEN"):
@@ -365,7 +377,7 @@ def check_tokens():
     # Метрику дёргать напрямую бесполезно: наш токен выписан только на загрузку
     # офлайн-заказов (CDP), а management и stat отвечают ему 403 - это норма, а не
     # поломка. Поэтому смотрим на факт: ругалась ли интеграция при отправке.
-    checks.append(check_metrika_by_logs())
+    checks.append(check_metrika_by_logs(metrika_hours))
 
     if secret("YOUGILE_API_KEY"):
         c, b = http("https://ru.yougile.com/api-v2/users?limit=1",
@@ -422,6 +434,56 @@ def run_tokens():
                 "\n\nКлиентов не задевает. Дальше скажу только в утренней сводке.")
     if not (broken or fixed or quiet):
         log("  новостей нет, письмо не отправляю")
+    return 0
+
+
+def check_telegram():
+    """Бот уведомлений жив: getMe через тот же шлюз, что и отправка."""
+    token = secret("TG_BOT_TOKEN")
+    if not token:
+        return None
+    c, b = http(f"https://api.telegram.org/bot{token}/getMe", proxy=secret("TG_PROXY_URL") or None, timeout=20)
+    ok = c == 200 and '"ok":true' in b.replace(" ", "")
+    _TIMINGS["Telegram Bot API"] = _LAST_MS
+    return ("Telegram Bot API", ok, "" if ok else f"HTTP {c or 'нет ответа'}")
+
+
+def run_apis():
+    """Плашки «Сторонние API» на странице «Здоровье» панели Team (10.11.2026).
+
+    Те же проверки ключей, что у `tokens`, плюс бот Telegram - и итог с временем ответа
+    в панель (`POST /api/ingest/health`). В Телеграм НЕ пишет и своё состояние НЕ трогает:
+    о поломках по-прежнему сообщает `tokens` раз в час. Запускается кроном раз в 10 минут
+    и по кнопке на странице (systemd path-юнит на файле-флаге панели).
+    Метрику смотрим по логу за 3 часа, а не за сутки: прогон частый, сутки лога тяжёлые."""
+    _TIMINGS.clear()
+    checks = check_tokens(metrika_hours=3)
+    tg = check_telegram()
+    if tg:
+        checks.append(tg)
+    items = []
+    for name, ok, why in checks:
+        log(f"  {name}: {'ок' if ok else 'СЛОМАНО'} {why}".rstrip())
+        item = {"name": name, "ok": bool(ok), "ms": _TIMINGS.get(name)}
+        if ok and why:
+            item["info"] = why  # например «за 3 ч отправлено заказов: 12»
+        elif not ok:
+            item["why"] = why
+        items.append(item)
+    cfg = parse_env_file(JOURNAL_ENV)
+    url, token = cfg.get("ERRORS_INGEST_URL", ""), cfg.get("INGEST_TOKEN")
+    if not url.endswith("/errors") or not token:
+        log("  панель не настроена, итог не отправлен")
+        return 0
+    try:
+        import urllib.request
+        body = json.dumps({"apis": items}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url[: -len("/errors")] + "/health", data=body, method="POST", headers={
+            "Content-Type": "application/json", "X-Ingest-Token": token, "User-Agent": "sunscrypt-watchdog/1"})
+        urllib.request.urlopen(req, timeout=15).close()
+        log(f"  в панель передано проверок: {len(items)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"  панель недоступна ({type(e).__name__}), итог не отправлен")
     return 0
 
 
@@ -1030,7 +1092,7 @@ def run_digest():
 
 # --------------------------------------------------------------------------- main
 CHECKS = {"tokens": run_tokens, "deadlines": run_deadlines, "renewals": run_renewals,
-          "defi": run_defi, "services": run_services, "digest": run_digest}
+          "defi": run_defi, "services": run_services, "digest": run_digest, "apis": run_apis}
 
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else ""
