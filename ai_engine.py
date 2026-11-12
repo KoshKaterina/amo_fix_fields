@@ -32,6 +32,7 @@ import html
 import json
 import logging
 import re
+import sys
 import time
 from typing import Any
 
@@ -40,7 +41,9 @@ import ai_engine_config as cfg
 import ai_engine_dedup as dedup
 import ai_engine_followup as followup
 import ai_engine_give as give
+import ai_engine_intercept as intercept
 import ai_engine_silence as silence
+import ai_engine_ur as ur_wave
 import ai_engine_return
 import ai_engine_tasks
 import ai_engine_settings as settings
@@ -325,14 +328,41 @@ def _autopilot_busy(chat_id: str, phone: str, deal_id: int | None = None) -> boo
 async def _handle_message(m: dict) -> None:
     channel_id = str(m.get("channelId") or "")
     chat_id = str(m.get("chatId") or "")
-    if not chat_id or channel_id not in cfg.CHANNELS:
+    if not chat_id:
         return
     chat_key = chat_key_of(channel_id, chat_id)
+    await _intercept_observe(m, channel_id, chat_id, chat_key)          # временный перехват: любой канал, только база
+    if channel_id not in cfg.CHANNELS and not await _db(intercept.is_tracked, chat_key):
+        return
     # Направление считает SLA-таймер: правило одно на весь контур (isEcho, запасной признак - статус).
     if wazzup_sla._is_outbound(m):
         await _on_outbound(chat_key, m)
     else:
         await _on_inbound(chat_key, channel_id, chat_id, m)
+
+
+async def _intercept_observe(m: dict, channel_id: str, chat_id: str, chat_key: str) -> None:
+    """Перехват сделок (`ai_engine_intercept`): учёт неотвеченных сообщений клиентов и сообщений менеджеров. Не бросает."""
+    try:
+        if str(m.get("chatType") or "").strip().lower() not in intercept.CHAT_TYPES:
+            return
+        now = _now()
+        if wazzup_sla._is_outbound(m):
+            if not is_robot_author(m.get("authorName")):
+                await _db(intercept.observe_human_out, chat_key, now)       # время получения: не раньше отправки, лучше лишний отказ ИИ
+            return
+        if not intercept.enabled():
+            return
+        contact = m.get("contact") if isinstance(m.get("contact"), dict) else {}
+        phone = str((contact or {}).get("phone") or "")
+        if not settings.phone_may_match(phone, chat_id):
+            return
+        await _db(intercept.observe_inbound, chat_key, channel_id, chat_id, str(m.get("chatType") or ""), phone,
+                  str((contact or {}).get("name") or ""), now)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: перехват не разобрал сообщение чата %s", chat_key)
 
 
 async def _on_outbound(chat_key: str, m: dict) -> None:
@@ -474,6 +504,8 @@ async def tick_once() -> None:
             await _db(store.put_session, s["chat_key"], next_at=_now() + cfg.RESOLVE_RETRY_S)
     await _followup_tick()
     await _silence_tick()
+    await _ur_tick()
+    await intercept.tick(sys.modules[__name__])
     if now - _last_off_sweep >= 10:
         _last_off_sweep = now
         async with _get_lock():
@@ -500,7 +532,8 @@ async def _process_collecting(s: dict) -> None:
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
     known = int(s["deal_id"]) if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] else None
     forced = known if known is not None and await _db(give.is_forced, known) else None
-    res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known, force_deal_id=forced)
+    taken = frozenset({known}) if known is not None and await _db(intercept.is_taken, known) else frozenset()   # перехваченная: любая воронка
+    res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known, force_deal_id=forced, any_pipeline_ids=taken)
     async with _get_lock():
         fresh = await _db(store.get_session, chat_key)
         if fresh is None or fresh["state"] != store.S_COLLECTING or (fresh["next_at"] or 0) > _now():
@@ -656,6 +689,7 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     cancelled_rows = await _db(followup.cancelled_notes, deal_id)
     manager_cutoff = await _db(give.cutoff_iso, deal_id)         # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
     given_forced = bool(await _db(give.is_forced, deal_id))      # отдали вопреки параллельной сделке: ИИ её не учитывает
+    intercepted = bool(await _db(intercept.is_taken, deal_id))   # перехвачена у менеджера: только консультация, воронка любая
 
     def build(turn_id: int) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -676,6 +710,8 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
             body["manager_cutoff"] = manager_cutoff
         if given_forced:
             body["given_forced"] = True
+        if intercepted:
+            body["intercepted"] = True
         return body
 
     turn = await _db(
@@ -788,7 +824,7 @@ async def _fire_followup(f: dict) -> None:
         why = "owner_changed"
     elif settings.effective_mode() == "off":
         why = "mode_off"
-    elif owner["pipeline_id"] not in settings.allowed_pipelines():
+    elif owner["pipeline_id"] not in settings.allowed_pipelines() and not await _db(intercept.is_taken, deal_id):
         why = "pipeline_not_allowed"
     else:
         ids = [int(c) for c in json.loads(owner.get("contact_ids") or "[]")]
@@ -992,6 +1028,8 @@ def decide_permit(deal_id: int, epoch: int, turn_id: int, up_to_message_id: str)
     if int(epoch) != int(owner["epoch"]):
         return 409, {"allowed": False, "reason": "stale_epoch"}
     if owner["owner"] != store.OWNER_AI:
+        return 200, {"allowed": False, "reason": "owner_changed"}
+    if intercept.manager_replied_after(deal_id):          # перехват: после заметки «ИИ взял сделку» менеджер написал клиенту
         return 200, {"allowed": False, "reason": "owner_changed"}
     turn = store.get_turn(turn_id)
     if turn is not None:
@@ -1253,7 +1291,8 @@ async def _lead_event_under_lock(ev: dict) -> bool:
         await _deal_closed(lead_id, "deal_closed")
         return True
     if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]:
-        if ev["pipeline_id"] is not None and ev["pipeline_id"] not in settings.allowed_pipelines():
+        if (ev["pipeline_id"] is not None and ev["pipeline_id"] not in settings.allowed_pipelines()
+                and not await _db(intercept.is_taken, lead_id)):
             await _deal_closed(lead_id, "left_pipeline")
             return True
         if _is_payment_event(ev, owner) and await _db(store.claim_event, lead_id, "payment_received"):
@@ -1316,7 +1355,7 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
         owner = await _db(store.get_owner, deal_id)
         if owner is None or owner["closed"] or owner["owner"] == store.OWNER_AI:
             return 409, {"detail": "not_returnable"}
-        if owner["pipeline_id"] not in settings.allowed_pipelines():
+        if owner["pipeline_id"] not in settings.allowed_pipelines() and not await _db(intercept.is_taken, deal_id):
             return 409, {"detail": "pipeline_not_allowed"}
         if not await _ai_is_up():
             return 503, {"detail": "ai_unavailable"}
@@ -1395,8 +1434,11 @@ async def silence_arm(deal_id: int) -> None:
     """ИИ получил разрешение написать клиенту: с этого момента идёт отсчёт тишины (первое сообщение отсчёт задаёт, остальные не сдвигают)."""
     try:
         owner = await _db(store.get_owner, int(deal_id))
+        if await _db(intercept.is_taken, int(deal_id)):
+            return                                          # перехваченная сделка: только консультация, лестницы тишины и окон УР нет
         if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] and owner.get("chat_key"):
             await _db(silence.arm, int(deal_id), owner["chat_key"], _now())
+            await _db(ur_wave.note_sent, int(deal_id), _now())
     except Exception:  # noqa: BLE001 - отсчёт тишины не должен ломать отправку
         logger.exception("ai_engine: отсчёт тишины по сделке %s не взведён", deal_id)
 
@@ -1433,6 +1475,56 @@ async def _silence_step(row: dict) -> None:
     await _alert("silent_alert", ["Клиент не отвечает на сообщения ИИ уже больше двух часов, другой канал пробовали.",
                                   "Нужно связаться с клиентом вручную.", _client_line(s), _link(deal_id)],
                  dedupe=f"silent_alert:{deal_id}")
+
+
+_MSK = datetime.timezone(datetime.timedelta(hours=3))
+
+
+def _msk_at(ts: float, hhmm: str) -> float:
+    """Время `hhmm` по Москве в тот же календарный день, что и момент `ts`."""
+    d = datetime.datetime.fromtimestamp(ts, _MSK)
+    h, m = (int(x) for x in hhmm.split(":"))
+    return d.replace(hour=h, minute=m, second=0, microsecond=0).timestamp()
+
+
+async def _ur_tick() -> None:
+    """Окна перевода в УР: событие `ur_wave` всем сделкам ИИ в 17:50, а тем, кому ИИ писал в 17:00 и позже, во втором окне в 18:45."""
+    if not cfg.UR_WAVE_1:
+        return                                              # окна выключены (пусто в AI_UR_WAVE_1)
+    now = _now()
+    day = datetime.datetime.fromtimestamp(now, _MSK).strftime("%Y-%m-%d")
+    first_at = cfg.UR_WAVE_1_BY_DAY.get(day) or cfg.UR_WAVE_1
+    t1, t2, late = _msk_at(now, first_at), _msk_at(now, cfg.UR_WAVE_2), _msk_at(now, cfg.UR_LATE_FROM)
+    if now < t1 or settings.effective_mode() == "off":
+        return
+    async with _get_lock():
+        for owner in await _db(store.list_owned, store.OWNER_AI):
+            deal_id = int(owner["deal_id"])
+            if await _db(intercept.is_taken, deal_id):
+                continue                                    # перехваченная сделка: окна УР не её дело
+            try:
+                w1 = await _db(ur_wave.state, day, deal_id, 1)
+                if w1 is None:
+                    last = await _db(ur_wave.last_sent, deal_id)
+                    if last is not None and last >= late:
+                        await _db(ur_wave.mark, day, deal_id, 1, "deferred", now)         # писали поздно: во второе окно
+                    elif await _fire_ur_wave(owner, 1, first_at):
+                        await _db(ur_wave.mark, day, deal_id, 1, "fired", now)
+                elif w1 == "deferred" and now >= t2 and await _db(ur_wave.state, day, deal_id, 2) is None:
+                    if await _fire_ur_wave(owner, 2, cfg.UR_WAVE_2):
+                        await _db(ur_wave.mark, day, deal_id, 2, "fired", now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("ai_engine: окно УР по сделке %s не отработало", deal_id)
+
+
+async def _fire_ur_wave(owner: dict, wave: int, hhmm: str) -> bool:
+    if not await _ai_is_up():
+        return False                                        # повторим на следующем проходе
+    await _queue_event(owner, "ur_wave", extra={"reason": f"окно перевода в УР, волна {wave} ({hhmm} МСК)"})
+    logger.info("ai_engine: сделка %s: окно УР, волна %s", owner["deal_id"], wave)
+    return True
 
 
 async def raise_alert(key: str, lines: list[str]) -> None:

@@ -10,6 +10,7 @@
   • Режим `off`/`test`/`prod` из панели (`GET /api/ingest/ai/settings`). Нет ответа панели,
     нет кэша или он протух - считаем `off`.
 """
+import json
 import os
 
 from waybill_config import (
@@ -102,6 +103,16 @@ ALERT_EXTRA_TAG = os.getenv("AI_ALERT_EXTRA_TAG", "@koshkatarina").strip()
 # ещё через SILENCE_ALERT_S алерт менеджерам.
 SILENCE_ALT_S = int(os.getenv("AI_SILENCE_ALT_S", "3600"))
 SILENCE_ALERT_S = int(os.getenv("AI_SILENCE_ALERT_S", "3600"))
+# Окна перевода в УР (решение Кати 12.11.2026), время МСК: первое окно, второе окно и граница «последнее сообщение ИИ было поздно»:
+# кому ИИ писал не раньше границы, те идут во второе окно.
+UR_WAVE_1 = os.getenv("AI_UR_WAVE_1", "17:50").strip()
+UR_WAVE_2 = os.getenv("AI_UR_WAVE_2", "18:45").strip()
+# Первое окно на отдельные даты (JSON {"ГГГГ-ММ-ДД": "ЧЧ:ММ"}): 12.11.2026 Катя велела провести его в 16:50. Дата прошла, и правило перестаёт действовать само.
+try:
+    UR_WAVE_1_BY_DAY = {str(k): str(v) for k, v in json.loads(os.getenv("AI_UR_WAVE_1_BY_DAY", '{"2026-11-12": "16:50"}')).items()}
+except ValueError:
+    UR_WAVE_1_BY_DAY = {}
+UR_LATE_FROM = os.getenv("AI_UR_LATE_FROM", "17:00").strip()
 RETURN_BY_REACTION = os.getenv("AI_RETURN_BY_REACTION", "1").strip() == "1"
 RETURN_EMOJI = os.getenv("AI_RETURN_EMOJI", "👍").strip()            # 👍 метка «ждёт возврата» и нужная реакция
 def _parse_also(raw: str) -> frozenset:

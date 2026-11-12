@@ -66,6 +66,7 @@ class Env:
         mp.setattr(cfg, "DB_PATH", str(tmp_path / "ai_engine.sqlite3"))
         mp.setattr(cfg, "SETTINGS_CACHE_PATH", str(tmp_path / "settings.json"))
         mp.setattr(cfg, "CHANNELS", {CHAN})
+        mp.setattr(cfg, "UR_WAVE_1", "")                       # окна УР зависят от часа суток: включаются только в test_ai_engine_ur.py
         mp.setattr(cfg, "SERVICE_URL", "http://ai.test")
         mp.setattr(cfg, "SERVICE_TOKEN", "svc-token")
         mp.setattr(cfg, "ENGINE_TOKEN", "engine-token")
