@@ -1421,7 +1421,10 @@ async def _alert(key: str, lines: list[str], *, dedupe: str | None = None, retur
             if len(_alert_seen) > 2000:
                 _alert_seen.clear()
         head = "🤖 ИИ-менеджер" + (" (тест)" if settings.effective_mode() == "test" else "")
-        text = "\n".join([head, mentions_for(None), *[line for line in lines if line]])
+        mention = mentions_for(None)
+        if cfg.ALERT_EXTRA_TAG and cfg.ALERT_EXTRA_TAG not in mention.split():
+            mention = f"{mention} {cfg.ALERT_EXTRA_TAG}"            # пинг Кати во всех алертах ИИ-менеджера
+        text = "\n".join([head, mention, *[line for line in lines if line]])
         d = alerts.decide(
             f"ai_{key}", legacy_text=text, parse_mode="HTML", chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
             values={"сообщение": text},

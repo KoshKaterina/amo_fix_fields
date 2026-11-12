@@ -170,3 +170,12 @@ def test_give_releases_the_intake_tasks(env):
         await drain()
         assert env.tasks_open[0].get("is_completed") is True            # первое вхождение ИИ закрывает задачи приёма, как при входе по сообщению
     run(go())
+
+
+def test_every_ai_alert_pings_the_extra_tag_besides_the_shift(env):
+    async def go():
+        await E._alert("deal_not_found", ["Клиент написал, но сделки нет."])
+        assert env.alerts and "@koshkatarina" in env.alerts[-1]
+        assert "@offf1cer" in env.alerts[-1]                         # смена по-прежнему в алерте
+        assert env.alerts[-1].count("@koshkatarina") == 1
+    run(go())
