@@ -531,7 +531,7 @@ async def _process_collecting(s: dict) -> None:
         return
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
     known = int(s["deal_id"]) if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] else None
-    forced = known if known is not None and await _db(give.is_forced, known) else None
+    forced = known if known is not None and (await _db(give.is_forced, known) or await _db(intercept.is_taken, known)) else None
     taken = frozenset({known}) if known is not None and await _db(intercept.is_taken, known) else frozenset()   # перехваченная: любая воронка
     res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known, force_deal_id=forced, any_pipeline_ids=taken)
     async with _get_lock():
@@ -687,9 +687,9 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     up_to_id = pending[-1]["message_id"] if pending else s["last_message_id"]
     window = settings.send_window()
     cancelled_rows = await _db(followup.cancelled_notes, deal_id)
-    manager_cutoff = await _db(give.cutoff_iso, deal_id)         # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
-    given_forced = bool(await _db(give.is_forced, deal_id))      # отдали вопреки параллельной сделке: ИИ её не учитывает
     intercepted = bool(await _db(intercept.is_taken, deal_id))   # перехвачена у менеджера: только консультация, воронка любая
+    manager_cutoff = (await _db(intercept.cutoff_iso, deal_id)) or await _db(give.cutoff_iso, deal_id)   # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
+    given_forced = bool(await _db(give.is_forced, deal_id)) or intercepted      # отдали вопреки параллельной сделке: ИИ её не учитывает
 
     def build(turn_id: int) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -1095,6 +1095,9 @@ async def handle_result(
             await _after_abort(turn, s, owner, reason)
         else:                                            # continue
             await _after_turn(s)
+        if outcome in ("continue", "handoff_to_human", "release_to_engine") or (
+                outcome == "aborted" and not (reason is None or reason == "newer_client_message" or str(reason).startswith("engine_unavailable"))):
+            await intercept.finish_reply(sys.modules[__name__], deal_id)     # перехват в режиме «ответить один раз»: сделка возвращается менеджеру
         return 200, {"ok": True}
 
 

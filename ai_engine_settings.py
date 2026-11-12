@@ -132,6 +132,37 @@ def intercept_enabled() -> bool:
     return isinstance(block, dict) and block.get("enabled") is True
 
 
+INTERCEPT_DEFAULT_MANAGERS = [{"id": 9291546, "name": "Оанча Игорь"}]          # Игорь Оанча: прежнее поведение, если панель ключей не прислала
+
+
+def intercept_config() -> dict[str, Any]:
+    """Настройки перехвата из панели с безопасными значениями по умолчанию (прежнее поведение): менеджеры, «Офис» (выкл), режим `take`,
+    минуты молчания (1-240), сделки со звонками (не трогаем). Мусор в значении заменяется умолчанием, а не ломает перехват."""
+    block = (_doc or {}).get("intercept")
+    block = block if isinstance(block, dict) else {}
+    managers: list[dict[str, Any]] = []
+    raw = block.get("managers")
+    for m in raw if isinstance(raw, list) else []:
+        try:
+            uid, name = int(m["id"]), str(m["name"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if uid > 0 and name:
+            managers.append({"id": uid, "name": name})
+    if not isinstance(raw, list):
+        managers = [dict(m) for m in INTERCEPT_DEFAULT_MANAGERS]
+    wait = block.get("wait_min", 15)
+    wait = wait if isinstance(wait, int) and not isinstance(wait, bool) and 1 <= wait <= 240 else 15
+    return {
+        "enabled": block.get("enabled") is True,
+        "managers": managers,
+        "office": block.get("office") is True,
+        "mode": "reply" if block.get("mode") == "reply" else "take",
+        "wait_min": wait,
+        "with_calls": block.get("with_calls") is True,
+    }
+
+
 def post_sale_window_days() -> int:
     try:
         return int((_doc or {}).get("post_sale_window_days", 7))
