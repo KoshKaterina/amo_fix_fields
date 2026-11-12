@@ -57,6 +57,7 @@ class GiveIn(BaseModel):
     phone: str = ""
     contact_name: str = ""
     force: bool = False         # вопреки правилам дублей A, C, D (решение человека)
+    retrigger: bool = False     # сделку ИИ уже ведёт: поставить ход-событие заново
 
 
 class FollowupIn(BaseModel):
@@ -157,7 +158,7 @@ async def give_deal(body: GiveIn, x_admin_token: str = Header(default="")):
     if bad is not None:
         return bad
     try:
-        code, out = await ai_engine.give_deal(body.deal_id, body.chat_id, body.chat_type, body.channel_id, body.phone, body.contact_name, body.force)
+        code, out = await ai_engine.give_deal(body.deal_id, body.chat_id, body.chat_type, body.channel_id, body.phone, body.contact_name, body.force, body.retrigger)
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: сделка %s не передана ИИ", body.deal_id)
         return JSONResponse({"detail": "engine_error"}, status_code=500)

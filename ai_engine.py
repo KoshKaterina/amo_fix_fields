@@ -1321,7 +1321,7 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
 
 
 async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str, phone: str = "",
-                    contact_name: str = "", force: bool = False) -> tuple[int, dict]:
+                    contact_name: str = "", force: bool = False, retrigger: bool = False) -> tuple[int, dict]:
     """Человек отдаёт ИИ существующую сделку (`deal_given`): `owner = ai`, `epoch + 1`, ход-событие сразу.
 
     Сделка выбирается тем же алгоритмом, что и при входе по сообщению клиента (`dedup.resolve`): чат клиента должен давать ровно эту
@@ -1333,7 +1333,8 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
     chat_id, channel_id = str(chat_id or "").strip(), str(channel_id or "").strip()
     if not chat_id or not channel_id:
         return 422, {"detail": "chat_required"}
-    res = await dedup.resolve(chat_id, phone, force_deal_id=deal_id if force else None)       # сеть без общего замка, как в `_process_collecting`
+    res = await dedup.resolve(chat_id, phone, known_deal_id=deal_id if retrigger else None,
+                              force_deal_id=deal_id if force else None)       # сеть без общего замка, как в `_process_collecting`
     if res.kind == dedup.K_ERROR:
         return 503, {"detail": "amo_unavailable"}
     if res.kind in (dedup.K_NONE, dedup.K_GONE):
@@ -1350,7 +1351,15 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
         if owner is not None and owner["closed"]:
             return 409, {"detail": "deal_closed"}
         if owner is not None and owner["owner"] == store.OWNER_AI:
-            return 409, {"detail": "already_ai"}
+            if not retrigger:
+                return 409, {"detail": "already_ai"}
+            # Перезапуск хода по сделке, которую ИИ уже ведёт (например, ответ клиента пришёл, пока канал не слушался): то же событие
+            # `deal_given`, владелец, эпоха и пометки передачи не меняются.
+            if not await _ai_is_up():
+                return 503, {"detail": "ai_unavailable"}
+            await _queue_event(owner, "deal_given")
+            logger.info("ai_engine: ход по сделке %s перезапущен вручную", deal_id)
+            return 200, {"ok": True, "retriggered": True, "epoch": owner["epoch"], "deal_id": int(deal_id)}
         if _autopilot_busy(chat_id, phone, deal_id):
             return 409, {"detail": "autopilot_busy"}
         if not await _ai_is_up():
