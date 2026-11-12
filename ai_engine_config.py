@@ -98,6 +98,10 @@ HANDOFF_TASKS = os.getenv("AI_HANDOFF_TASKS", "1").strip() == "1"
 INTAKE_TASKS_CLOSE = os.getenv("AI_INTAKE_TASKS_CLOSE", "1").strip() == "1"
 # Всегда пингуется в каждом алерте ИИ-менеджера, помимо смены (решение Кати 12.11.2026); пусто - без добавочного пинга.
 ALERT_EXTRA_TAG = os.getenv("AI_ALERT_EXTRA_TAG", "@koshkatarina").strip()
+# Лестница тишины (решение Кати 12.11.2026): через SILENCE_ALT_S после первого сообщения ИИ без ответа ИИ пробует другой канал,
+# ещё через SILENCE_ALERT_S алерт менеджерам.
+SILENCE_ALT_S = int(os.getenv("AI_SILENCE_ALT_S", "3600"))
+SILENCE_ALERT_S = int(os.getenv("AI_SILENCE_ALERT_S", "3600"))
 RETURN_BY_REACTION = os.getenv("AI_RETURN_BY_REACTION", "1").strip() == "1"
 RETURN_EMOJI = os.getenv("AI_RETURN_EMOJI", "👍").strip()            # 👍 метка «ждёт возврата» и нужная реакция
 def _parse_also(raw: str) -> frozenset:

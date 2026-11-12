@@ -107,6 +107,8 @@ async def permit(body: PermitIn, x_service_token: str = Header(default=""), x_co
         # Недоступное решение - отказ, а не разрешение: сервис читает не-200 как «нельзя».
         logger.exception("ai_engine: permit не посчитался")
         return JSONResponse({"allowed": False, "reason": "engine_error"}, status_code=500)
+    if out.get("allowed"):
+        await ai_engine.silence_arm(body.deal_id)          # ИИ сейчас напишет клиенту: идёт отсчёт тишины
     return JSONResponse(out, status_code=code)
 
 
@@ -163,6 +165,21 @@ async def give_deal(body: GiveIn, x_admin_token: str = Header(default="")):
         logger.exception("ai_engine: сделка %s не передана ИИ", body.deal_id)
         return JSONResponse({"detail": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
+
+
+class AlertIn(BaseModel):
+    key: str = "manual"
+    lines: list[str]
+
+
+@router.post("/alert")
+async def alert(body: AlertIn, x_admin_token: str = Header(default="")):
+    """Алерт ИИ-менеджера в чат ОП по требованию человека (шапка и пинги, как у обычных алертов). Закрыт админским токеном."""
+    bad = _check_admin(x_admin_token)
+    if bad is not None:
+        return bad
+    await ai_engine.raise_alert(body.key, body.lines[:8])
+    return {"ok": True}
 
 
 @router.get("/state/{deal_id}")
