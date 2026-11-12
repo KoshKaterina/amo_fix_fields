@@ -41,6 +41,7 @@ import ai_engine_dedup as dedup
 import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_silence as silence
+import ai_engine_ur as ur_wave
 import ai_engine_return
 import ai_engine_tasks
 import ai_engine_settings as settings
@@ -474,6 +475,7 @@ async def tick_once() -> None:
             await _db(store.put_session, s["chat_key"], next_at=_now() + cfg.RESOLVE_RETRY_S)
     await _followup_tick()
     await _silence_tick()
+    await _ur_tick()
     if now - _last_off_sweep >= 10:
         _last_off_sweep = now
         async with _get_lock():
@@ -1397,6 +1399,7 @@ async def silence_arm(deal_id: int) -> None:
         owner = await _db(store.get_owner, int(deal_id))
         if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] and owner.get("chat_key"):
             await _db(silence.arm, int(deal_id), owner["chat_key"], _now())
+            await _db(ur_wave.note_sent, int(deal_id), _now())
     except Exception:  # noqa: BLE001 - отсчёт тишины не должен ломать отправку
         logger.exception("ai_engine: отсчёт тишины по сделке %s не взведён", deal_id)
 
@@ -1433,6 +1436,53 @@ async def _silence_step(row: dict) -> None:
     await _alert("silent_alert", ["Клиент не отвечает на сообщения ИИ уже больше двух часов, другой канал пробовали.",
                                   "Нужно связаться с клиентом вручную.", _client_line(s), _link(deal_id)],
                  dedupe=f"silent_alert:{deal_id}")
+
+
+_MSK = datetime.timezone(datetime.timedelta(hours=3))
+
+
+def _msk_at(ts: float, hhmm: str) -> float:
+    """Время `hhmm` по Москве в тот же календарный день, что и момент `ts`."""
+    d = datetime.datetime.fromtimestamp(ts, _MSK)
+    h, m = (int(x) for x in hhmm.split(":"))
+    return d.replace(hour=h, minute=m, second=0, microsecond=0).timestamp()
+
+
+async def _ur_tick() -> None:
+    """Окна перевода в УР: событие `ur_wave` всем сделкам ИИ в 17:50, а тем, кому ИИ писал в 17:00 и позже, во втором окне в 18:45."""
+    if not cfg.UR_WAVE_1:
+        return                                              # окна выключены (пусто в AI_UR_WAVE_1)
+    now = _now()
+    t1, t2, late = _msk_at(now, cfg.UR_WAVE_1), _msk_at(now, cfg.UR_WAVE_2), _msk_at(now, cfg.UR_LATE_FROM)
+    if now < t1 or settings.effective_mode() == "off":
+        return
+    day = datetime.datetime.fromtimestamp(now, _MSK).strftime("%Y-%m-%d")
+    async with _get_lock():
+        for owner in await _db(store.list_owned, store.OWNER_AI):
+            deal_id = int(owner["deal_id"])
+            try:
+                w1 = await _db(ur_wave.state, day, deal_id, 1)
+                if w1 is None:
+                    last = await _db(ur_wave.last_sent, deal_id)
+                    if last is not None and last >= late:
+                        await _db(ur_wave.mark, day, deal_id, 1, "deferred", now)         # писали поздно: во второе окно
+                    elif await _fire_ur_wave(owner, 1, cfg.UR_WAVE_1):
+                        await _db(ur_wave.mark, day, deal_id, 1, "fired", now)
+                elif w1 == "deferred" and now >= t2 and await _db(ur_wave.state, day, deal_id, 2) is None:
+                    if await _fire_ur_wave(owner, 2, cfg.UR_WAVE_2):
+                        await _db(ur_wave.mark, day, deal_id, 2, "fired", now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("ai_engine: окно УР по сделке %s не отработало", deal_id)
+
+
+async def _fire_ur_wave(owner: dict, wave: int, hhmm: str) -> bool:
+    if not await _ai_is_up():
+        return False                                        # повторим на следующем проходе
+    await _queue_event(owner, "ur_wave", extra={"reason": f"окно перевода в УР, волна {wave} ({hhmm} МСК)"})
+    logger.info("ai_engine: сделка %s: окно УР, волна %s", owner["deal_id"], wave)
+    return True
 
 
 async def raise_alert(key: str, lines: list[str]) -> None:
