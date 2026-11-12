@@ -40,6 +40,7 @@ import ai_engine_config as cfg
 import ai_engine_dedup as dedup
 import ai_engine_followup as followup
 import ai_engine_give as give
+import ai_engine_silence as silence
 import ai_engine_return
 import ai_engine_tasks
 import ai_engine_settings as settings
@@ -472,6 +473,7 @@ async def tick_once() -> None:
             logger.exception("ai_engine: ошибка обработки чата %s", s.get("chat_key"))
             await _db(store.put_session, s["chat_key"], next_at=_now() + cfg.RESOLVE_RETRY_S)
     await _followup_tick()
+    await _silence_tick()
     if now - _last_off_sweep >= 10:
         _last_off_sweep = now
         async with _get_lock():
@@ -588,6 +590,8 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
             await _db(store.put_session, chat_key, next_at=now + cfg.HEALTH_POLL_S)
         return
 
+    if await _db(store.pending_inbox, chat_key):                # настоящее сообщение клиента (в любом канале), а не служебное событие:
+        await _db(silence.clear, deal_id)                      # лестница тишины сначала
     first_entry = owner is None      # ИИ входит в сделку впервые (а не после возврата диалога)
     owner = await _db(
         store.set_owner, deal_id, store.OWNER_AI, reason="client_message", chat=chat,
@@ -1151,6 +1155,7 @@ async def _to_human(
         deal_id = s["deal_id"]
     await _followup_cancel(chat_key=s["chat_key"] if s is not None else None, deal_id=deal_id, reason="handed_to_human")
     if deal_id is not None:
+        await _db(silence.clear, int(deal_id))
         owner = await _db(store.get_owner, int(deal_id))
         if owner is not None and owner["owner"] != store.OWNER_HUMAN:
             await _db(store.set_owner, int(deal_id), store.OWNER_HUMAN, reason=reason)
@@ -1210,6 +1215,7 @@ async def _handoff_by_rule(s: dict, res: dedup.Resolution, owner: dict | None) -
 async def _deal_closed(deal_id: int, why: str) -> None:
     """Сделка закрыта (или ушла из воронок режима, как после `complete_sale`): владелец снимается, ходы отменяются."""
     await _followup_cancel(deal_id=deal_id, reason="deal_closed")
+    await _db(silence.clear, int(deal_id))
     owner = await _db(store.get_owner, deal_id)
     if owner is not None and not owner["closed"]:
         if owner["owner"] == store.OWNER_AI:
@@ -1321,7 +1327,7 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
 
 
 async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str, phone: str = "",
-                    contact_name: str = "", force: bool = False) -> tuple[int, dict]:
+                    contact_name: str = "", force: bool = False, retrigger: bool = False) -> tuple[int, dict]:
     """Человек отдаёт ИИ существующую сделку (`deal_given`): `owner = ai`, `epoch + 1`, ход-событие сразу.
 
     Сделка выбирается тем же алгоритмом, что и при входе по сообщению клиента (`dedup.resolve`): чат клиента должен давать ровно эту
@@ -1333,7 +1339,8 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
     chat_id, channel_id = str(chat_id or "").strip(), str(channel_id or "").strip()
     if not chat_id or not channel_id:
         return 422, {"detail": "chat_required"}
-    res = await dedup.resolve(chat_id, phone, force_deal_id=deal_id if force else None)       # сеть без общего замка, как в `_process_collecting`
+    res = await dedup.resolve(chat_id, phone, known_deal_id=deal_id if retrigger else None,
+                              force_deal_id=deal_id if force else None)       # сеть без общего замка, как в `_process_collecting`
     if res.kind == dedup.K_ERROR:
         return 503, {"detail": "amo_unavailable"}
     if res.kind in (dedup.K_NONE, dedup.K_GONE):
@@ -1350,7 +1357,15 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
         if owner is not None and owner["closed"]:
             return 409, {"detail": "deal_closed"}
         if owner is not None and owner["owner"] == store.OWNER_AI:
-            return 409, {"detail": "already_ai"}
+            if not retrigger:
+                return 409, {"detail": "already_ai"}
+            # Перезапуск хода по сделке, которую ИИ уже ведёт (например, ответ клиента пришёл, пока канал не слушался): то же событие
+            # `deal_given`, владелец, эпоха и пометки передачи не меняются.
+            if not await _ai_is_up():
+                return 503, {"detail": "ai_unavailable"}
+            await _queue_event(owner, "deal_given")
+            logger.info("ai_engine: ход по сделке %s перезапущен вручную", deal_id)
+            return 200, {"ok": True, "retriggered": True, "epoch": owner["epoch"], "deal_id": int(deal_id)}
         if _autopilot_busy(chat_id, phone, deal_id):
             return 409, {"detail": "autopilot_busy"}
         if not await _ai_is_up():
@@ -1370,6 +1385,59 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
     _spawn(_followup_note(deal_id, "сделка передана ИИ-менеджеру, дальше переписку ведёт он"))
     logger.info("ai_engine: сделка %s передана ИИ (эпоха %s, режим %s)", deal_id, owner["epoch"], mode)
     return 200, {"ok": True, "epoch": owner["epoch"], "deal_id": int(deal_id)}
+
+
+# =============================================================================================
+# лестница тишины (ai_engine_silence)
+# =============================================================================================
+
+async def silence_arm(deal_id: int) -> None:
+    """ИИ получил разрешение написать клиенту: с этого момента идёт отсчёт тишины (первое сообщение отсчёт задаёт, остальные не сдвигают)."""
+    try:
+        owner = await _db(store.get_owner, int(deal_id))
+        if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] and owner.get("chat_key"):
+            await _db(silence.arm, int(deal_id), owner["chat_key"], _now())
+    except Exception:  # noqa: BLE001 - отсчёт тишины не должен ломать отправку
+        logger.exception("ai_engine: отсчёт тишины по сделке %s не взведён", deal_id)
+
+
+async def _silence_tick() -> None:
+    now = _now()
+    for row in await _db(silence.due, now, cfg.SILENCE_ALT_S, cfg.SILENCE_ALERT_S):
+        try:
+            async with _get_lock():
+                await _silence_step(row)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("ai_engine: ошибка лестницы тишины по сделке %s", row.get("deal_id"))
+
+
+async def _silence_step(row: dict) -> None:
+    now = _now()
+    deal_id = int(row["deal_id"])
+    owner = await _db(store.get_owner, deal_id)
+    if owner is None or owner["closed"] or owner["owner"] != store.OWNER_AI or settings.effective_mode() == "off":
+        await _db(silence.clear, deal_id)
+        return
+    if not settings.send_window()["open_now"]:
+        return                                              # вне рабочих часов ИИ отсчёт ждёт
+    if row["stage"] == 0:
+        await _db(silence.set_stage, deal_id, 1, now)
+        if await _ai_is_up():
+            await _queue_event(owner, "silent_alt", extra={"reason": "клиент молчит час после нашего сообщения"})
+            logger.info("ai_engine: сделка %s: клиент молчит час, ИИ пробует другой канал", deal_id)
+        return
+    await _db(silence.set_stage, deal_id, 2, now)
+    s = await _db(store.session_for_deal, deal_id)
+    await _alert("silent_alert", ["Клиент не отвечает на сообщения ИИ уже больше двух часов, другой канал пробовали.",
+                                  "Нужно связаться с клиентом вручную.", _client_line(s), _link(deal_id)],
+                 dedupe=f"silent_alert:{deal_id}")
+
+
+async def raise_alert(key: str, lines: list[str]) -> None:
+    """Алерт по требованию человека (админская ручка): тот же путь, что у алертов ИИ (шапка, пинги, дедупликации нет)."""
+    await _alert(key, lines)
 
 
 # =============================================================================================

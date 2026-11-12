@@ -222,3 +222,22 @@ def test_forced_give_marks_every_turn_with_given_forced(env):
         await env.advance(1)
         assert "given_forced" not in env.turn_requests[-1]
     run(go())
+
+
+def test_retrigger_restarts_the_turn_of_a_deal_the_ai_already_owns(env):
+    async def go():
+        env.lead()
+        await give()
+        await env.advance(1)
+        first = env.turn_requests[-1]
+        await E.handle_result(first["turn_id"], DEAL, first["epoch"], "continue", None, None)
+        env.turn_requests.clear()
+        code, out = await give()
+        assert (code, out["detail"]) == (409, "already_ai")                         # без retrigger повторная передача отказывает
+        code, out = await give(retrigger=True)
+        assert (code, out["retriggered"], out["epoch"]) == (200, True, 1)
+        await env.advance(1)
+        again = env.turn_requests[-1]
+        assert again["event"]["type"] == "deal_given" and again["epoch"] == 1 and again["turn_id"] != first["turn_id"]
+        assert store.get_owner(DEAL)["epoch"] == 1 and G.is_forced(DEAL) is False
+    run(go())

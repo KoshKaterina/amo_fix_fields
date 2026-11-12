@@ -57,6 +57,7 @@ class GiveIn(BaseModel):
     phone: str = ""
     contact_name: str = ""
     force: bool = False         # вопреки правилам дублей A, C, D (решение человека)
+    retrigger: bool = False     # сделку ИИ уже ведёт: поставить ход-событие заново
 
 
 class FollowupIn(BaseModel):
@@ -106,6 +107,8 @@ async def permit(body: PermitIn, x_service_token: str = Header(default=""), x_co
         # Недоступное решение - отказ, а не разрешение: сервис читает не-200 как «нельзя».
         logger.exception("ai_engine: permit не посчитался")
         return JSONResponse({"allowed": False, "reason": "engine_error"}, status_code=500)
+    if out.get("allowed"):
+        await ai_engine.silence_arm(body.deal_id)          # ИИ сейчас напишет клиенту: идёт отсчёт тишины
     return JSONResponse(out, status_code=code)
 
 
@@ -157,11 +160,26 @@ async def give_deal(body: GiveIn, x_admin_token: str = Header(default="")):
     if bad is not None:
         return bad
     try:
-        code, out = await ai_engine.give_deal(body.deal_id, body.chat_id, body.chat_type, body.channel_id, body.phone, body.contact_name, body.force)
+        code, out = await ai_engine.give_deal(body.deal_id, body.chat_id, body.chat_type, body.channel_id, body.phone, body.contact_name, body.force, body.retrigger)
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: сделка %s не передана ИИ", body.deal_id)
         return JSONResponse({"detail": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
+
+
+class AlertIn(BaseModel):
+    key: str = "manual"
+    lines: list[str]
+
+
+@router.post("/alert")
+async def alert(body: AlertIn, x_admin_token: str = Header(default="")):
+    """Алерт ИИ-менеджера в чат ОП по требованию человека (шапка и пинги, как у обычных алертов). Закрыт админским токеном."""
+    bad = _check_admin(x_admin_token)
+    if bad is not None:
+        return bad
+    await ai_engine.raise_alert(body.key, body.lines[:8])
+    return {"ok": True}
 
 
 @router.get("/state/{deal_id}")
