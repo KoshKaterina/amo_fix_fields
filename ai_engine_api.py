@@ -48,6 +48,17 @@ class ReturnIn(BaseModel):
     deal_id: int
 
 
+class GiveIn(BaseModel):
+    """Человек отдаёт ИИ существующую сделку (`ai_engine.give_deal`): чат клиента задаёт тот, кто отдаёт."""
+    deal_id: int
+    chat_id: str
+    chat_type: str
+    channel_id: str
+    phone: str = ""
+    contact_name: str = ""
+    force: bool = False         # вопреки правилам дублей A, C, D (решение человека)
+
+
 class FollowupIn(BaseModel):
     """Отложенное касание, о котором клиент попросил сам (`ai_engine_followup`). `due_at_ts` это unix-секунды."""
     deal_id: int
@@ -136,6 +147,20 @@ async def return_dialog(body: ReturnIn, x_admin_token: str = Header(default=""))
     if bad is not None:
         return bad
     code, out = await ai_engine.return_dialog(body.deal_id)
+    return JSONResponse(out, status_code=code)
+
+
+@router.post("/give_deal")
+async def give_deal(body: GiveIn, x_admin_token: str = Header(default="")):
+    """Человек отдал ИИ сделку: движок ставит `owner = ai` и шлёт ходом событие `deal_given`. Закрыта админским токеном, как `return_dialog`."""
+    bad = _check_admin(x_admin_token)
+    if bad is not None:
+        return bad
+    try:
+        code, out = await ai_engine.give_deal(body.deal_id, body.chat_id, body.chat_type, body.channel_id, body.phone, body.contact_name, body.force)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: сделка %s не передана ИИ", body.deal_id)
+        return JSONResponse({"detail": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
 
 
