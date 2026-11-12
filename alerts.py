@@ -60,6 +60,7 @@ import httpx
 
 import alert_settings_client as settings_client
 import alert_templates
+import error_journal
 import tg_recipients
 from waybill_config import (
     ACADEMY_PANEL_NOTIFY_ENABLED,
@@ -234,7 +235,15 @@ def _from_panel(
     return Decision(text, dest[0], dest[1], "HTML", "panel")
 
 
-def decide(
+def decide(event_key: str, *, legacy_text: str, **kw: Any) -> Decision | None:
+    """Решение (см. `_decide`) плюс запись технических событий в журнал ошибок «Здоровье»
+    (09.11.2026). Журнал на решение не влияет, его сбой сюда не долетает."""
+    d = _decide(event_key, legacy_text=legacy_text, **kw)
+    error_journal.on_decision(event_key, legacy_text, d.text if d is not None else None)
+    return d
+
+
+def _decide(
     event_key: str, *, legacy_text: str, values: dict[str, Any],
     chat_id: int | str | None = None, thread_id: int | None = None, parse_mode: str | None = None,
     lead: dict | None = None, keep_text: bool = False, responsible_id=None,

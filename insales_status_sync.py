@@ -5,8 +5,15 @@
 поэтому код статуса в настройке INSALES_DELIVERED_STATUS). До этого обратной записи в
 InSales не было вовсе: ТЗ 29.09.2026 прямо говорило «InSales для нас — только источник».
 
+Отметка оплаты (решение Кати 02.11.2026, настройка INSALES_MARK_PAID): УР в Офисе значит,
+что деньги получены, поэтому тем же PUT заказ отмечается оплаченным. Иначе рефералка Tangemshop
+не начисляет партнёрам за предоплату, прошедшую мимо InSales (счёт Ozon из amo, перевод, карта в
+шоуруме): для неё предоплата «оплачена» только по financial_status=paid. ⚠️ Оплаченный заказ
+woo-sklad проводит в МойСклад входящим платежом, если оплат по заказу там ещё нет. Режим
+«prepaid» отмечает только предоплату (наложку рефералка считает по «Доставлен»), «all» — все.
+
 Принципы:
-  - передаём ТОЛЬКО статус заказа; оплату, состав, адрес и остальное не трогаем;
+  - передаём ТОЛЬКО статус заказа и отметку оплаты; состав, адрес и остальное не трогаем;
   - только сделки Tangemshop (is_tangemshop_lead или имя «Заказ №… Tangemshop») и только
     Офис/142 — по состоянию сделки, ПЕРЕЧИТАННОМУ из API: вебхук /lead_change открыт без
     секрета (AGENTS.md), его телу не верим;
@@ -14,12 +21,14 @@ InSales не было вовсе: ТЗ 29.09.2026 прямо говорило «
     amgroup умеет затирать зеркальные поля (knowledge/zatiranie-zerkalnyh-atributov-ms.md);
   - фильтра по номеру в API InSales нет (см. insales_client): ищем заказ среди изменённых
     с даты создания сделки минус запас — сделка рождается через минуты после заказа;
-  - только вперёд: заказ уже в целевом статусе — ничего не делаем; отменён, в возврате или
-    уже в другом статусе группы «доставлен» (его поставил человек) — не трогаем;
+  - только вперёд: заказ уже в целевом статусе — статус не пишем; отменён или в возврате — не
+    трогаем ничего; в другом статусе группы «доставлен» (его поставил человек) — статус не
+    трогаем, но оплату отмечаем;
   - гард по дате ЗАКРЫТИЯ сделки (INSALES_STATUS_SINCE): закрытые раньше не трогаем — так
     включение не пройдётся задним числом по старым заказам, пока Катя не решит догонять;
-  - дедуп на диске: номер → статус, который мы уже поставили. Переживает рестарт, иначе
-    ночная сверка за 14 дней заново искала бы в InSales каждую закрытую сделку.
+  - дедуп на диске: номер → что мы уже довели («dostavlen» или «dostavlen+paid»). Переживает
+    рестарт, иначе ночная сверка за 14 дней заново искала бы в InSales каждую закрытую сделку.
+    Заказы, доведённые до включения отметки оплаты, сверка один раз пройдёт снова и доплатит.
 
 Входы: вебхук (переход в 142 в Офисе, работа в фоне) и сверка metrika_sync.reconcile_window
 (интрадей и ночная) — страховка на вебхуки, потерянные при пересборке контейнера.
@@ -39,11 +48,13 @@ from shared.timez import MSK
 from waybill_config import (
     FIELD_SITE_ORDER_NUMBER,
     INSALES_DELIVERED_STATUS,
+    INSALES_MARK_PAID,
     INSALES_STATUS_SENT_PATH,
     INSALES_STATUS_SINCE_TS,
     INSALES_STATUS_SYNC_ENABLED,
     PIPELINE_OFFICE,
     STATUS_SUCCESS,
+    is_cod_payment,
     is_tangemshop_lead,
 )
 
@@ -53,9 +64,11 @@ logger = logging.getLogger("uvicorn")
 # запаса — около двадцати пяти лишних заказов, всё равно одна страница.
 _LOOKUP_MARGIN_S = 3 * 86400
 
-# Не трогаем: отказ и возвраты — решение людей, «доставлен» с другим кодом — человек уже
-# поставил статус точнее нашего (например, «Получена оплата от СД»).
-_HANDS_OFF_STATUSES = ("declined", "returned", "returning", "delivered")
+# Не трогаем вовсе: отказ и возвраты — решение людей.
+_CLOSED_STATUSES = ("declined", "returned", "returning")
+# Статус не пишем: к закрытым добавляется «доставлен» с другим кодом — человек уже поставил
+# статус точнее нашего (например, «Получена оплата от СД»). Оплату при этом отмечаем.
+_HANDS_OFF_STATUSES = _CLOSED_STATUSES + ("delivered",)
 
 _FIELD_NUMBER = re.compile(r"^\s*(\d+)\s*tangemshop\s*$", re.IGNORECASE)
 _NAME_NUMBER = re.compile(r"№\s*(\d+)\s+tangemshop", re.IGNORECASE)
@@ -91,11 +104,24 @@ async def init() -> None:
     _sent = {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
     _enabled = True
     logger.info(
-        "InSales status sync включён (статус=%s, since=%s, в дедупе %s)",
+        "InSales status sync включён (статус=%s, оплата=%s, since=%s, в дедупе %s)",
         INSALES_DELIVERED_STATUS,
+        {"prepaid": "отмечаем у предоплаты", "all": "отмечаем у всех"}.get(INSALES_MARK_PAID, "не трогаем"),
         "выкл" if INSALES_STATUS_SINCE_TS is None else f"unix {INSALES_STATUS_SINCE_TS}",
         len(_sent),
     )
+
+
+def _done_token() -> str:
+    """Что считается доведённым заказом при текущих настройках (значение в дедупе)."""
+    return INSALES_DELIVERED_STATUS + ("+paid" if INSALES_MARK_PAID else "")
+
+
+def _should_mark_paid(order: dict) -> bool:
+    """Отмечать ли оплату этому заказу при текущем режиме INSALES_MARK_PAID."""
+    if not INSALES_MARK_PAID or order.get("financial_status") == "paid":
+        return False
+    return INSALES_MARK_PAID == "all" or not is_cod_payment(order.get("payment_title"))
 
 
 async def shutdown() -> None:
@@ -166,14 +192,23 @@ def on_lead_change(lead_id, pipeline_id, status_id, status_changed: bool) -> Non
         return
     if pipeline_id is not None and str(pipeline_id) != str(PIPELINE_OFFICE):
         return
-    task = asyncio.create_task(_process_bg(lead_id))
+    schedule(lead_id, "webhook")
+
+
+def schedule(lead_id, source: str) -> None:
+    """Прогнать одну сделку в фоне. Кроме вебхука зовёт office_transfer: самовывоз он кладёт
+    из УР воронки-источника сразу в УР Офиса, этап не меняется (142 → 142), и вебхук такую
+    сделку за переход не считает. Без этого её подбирала бы только сверка, через часы."""
+    if not _enabled or lead_id is None:
+        return
+    task = asyncio.create_task(_process_bg(lead_id, source))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
 
-async def _process_bg(lead_id) -> None:
+async def _process_bg(lead_id, source: str = "webhook") -> None:
     try:
-        await process_lead(lead_id, source="webhook")
+        await process_lead(lead_id, source=source)
     except Exception:
         logger.exception("InSales: ошибка по сделке %s", lead_id)
 
@@ -197,11 +232,12 @@ async def process_lead(lead_id, lead: dict | None = None, source: str = "reconci
         return "no_number"
     key = str(number)
     target = INSALES_DELIVERED_STATUS
-    if _sent.get(key) == target:
+    done = _done_token()
+    if _sent.get(key) == done:
         return "dedup"
 
     async with _lock:
-        if _sent.get(key) == target:
+        if _sent.get(key) == done:
             return "dedup"
         created = int(lead.get("created_at") or 0)
         since = datetime.datetime.fromtimestamp(max(0, created - _LOOKUP_MARGIN_S), MSK).isoformat()
@@ -219,17 +255,23 @@ async def process_lead(lead_id, lead: dict | None = None, source: str = "reconci
                 return "not_found"
             current = (order.get("custom_status") or {}).get("permalink")
             system = order.get("fulfillment_status")
-            if current == target:
-                _remember(key, target)
-                logger.info("InSales: заказ №%s уже «%s» — пропуск", number, target)
-                return "already"
-            if system in _HANDS_OFF_STATUSES:
+            paid = order.get("financial_status") == "paid"
+            if system in _CLOSED_STATUSES:
                 logger.info(
                     "InSales: заказ №%s (сделка %s) в «%s» (%s) — не трогаем",
                     number, lead_id, current, system,
                 )
                 return "hands_off"
-            await insales_client.set_custom_status(order["id"], target)
+            need_status = current != target and system not in _HANDS_OFF_STATUSES
+            need_paid = _should_mark_paid(order)
+            if not need_status and not need_paid:
+                _remember(key, done)
+                logger.info("InSales: заказ №%s уже «%s»%s — пропуск", number, current,
+                            ", оплачен" if paid else "")
+                return "already"
+            await insales_client.update_order(
+                order["id"], permalink=target if need_status else None, mark_paid=need_paid,
+            )
         except insales_client.InSalesError as exc:
             await _alert(
                 f"InSales: ошибка по заказу №{number} (сделка {lead_id}): {exc}",
@@ -237,8 +279,13 @@ async def process_lead(lead_id, lead: dict | None = None, source: str = "reconci
                 {"номер": key, "номер_сделки": lead_id, "ошибка": str(exc)},
             )
             return "error"
-        _remember(key, target)
+        _remember(key, done)
+    changes = []
+    if need_status:
+        changes.append(f"«{current}» → «{target}»")
+    if need_paid:
+        changes.append("оплачен")
     logger.info(
-        "InSales: заказ №%s (сделка %s, %s) «%s» → «%s»", number, lead_id, source, current, target,
+        "InSales: заказ №%s (сделка %s, %s) %s", number, lead_id, source, ", ".join(changes),
     )
     return "set"

@@ -20,6 +20,7 @@ from aiogram.exceptions import (
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message, MessageReactionUpdated, ReactionTypeEmoji
 
+import error_journal
 import waybill_service
 from shared.timez import now_msk
 from waybill_config import TG_ALLOWED_CHAT_ID, TG_BOT_TOKEN, TG_PROXY_URL
@@ -650,6 +651,10 @@ async def send_alert(
     message_thread_id — топик супергруппы-форума (None → General).
     parse_mode="HTML" — для кликабельных ссылок (uis_missed_call)."""
     target = chat_id if chat_id is not None else TG_ALLOWED_CHAT_ID
+    if target is not None and target == TG_ALLOWED_CHAT_ID:
+        # «Здоровье» (09.11.2026): всё, что идёт в технический чат, зеркалом уходит в журнал
+        # ошибок панели. Отправку ниже это не меняет; ошибки журнала сюда не долетают.
+        error_journal.mirror_tech_chat(text)
     if target is None:
         return _suppress(text, "адресат не задан")
     if _bot is None:

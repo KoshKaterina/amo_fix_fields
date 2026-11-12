@@ -1,7 +1,8 @@
-"""Async-клиент InSales (tangemshop.ru) — ТОЛЬКО поиск заказа и его статус.
+"""Async-клиент InSales (tangemshop.ru) — ТОЛЬКО поиск заказа, его статус и отметка оплаты.
 
-Делает ровно две вещи: находит заказ по отображаемому номеру и ставит ему пользовательский
-статус (custom_status_permalink). Оплату, состав, адрес и прочее НЕ трогает. Авторизация —
+Находит заказ по отображаемому номеру, ставит ему пользовательский статус
+(custom_status_permalink) и, если попросили, отмечает оплаченным (financial_status=paid;
+дату оплаты InSales ставит сам). Состав, адрес и прочее НЕ трогает. Авторизация —
 Basic (идентификатор ключа API и пароль) поверх HTTPS, как у woo-sklad. По образцу
 woo_client (httpx, ретраи на 429/5xx).
 
@@ -137,10 +138,22 @@ class InSalesClient:
     async def set_custom_status(self, order_id, permalink: str) -> dict:
         """Ставит заказу пользовательский статус. Возвращает заказ из ответа.
         ТОЛЬКО статус: PUT с одним полем custom_status_permalink."""
-        resp = await self._request(
-            "PUT", f"/orders/{order_id}.json",
-            json_body={"order": {"custom_status_permalink": permalink}},
-        )
+        return await self.update_order(order_id, permalink=permalink)
+
+    async def update_order(self, order_id, *, permalink: str | None = None, mark_paid: bool = False) -> dict:
+        """Одним PUT ставит статус и/или отмечает оплату. Возвращает заказ из ответа.
+
+        ⚠️ Оплаченный заказ InSales woo-sklad видит при следующей сверке и, если в МойСкладе по
+        заказу ещё нет оплат, создаёт там входящий платёж на всю сумму (mark_paid_insales) —
+        так же, как статус «выполнен» на сайте делает это в рознице."""
+        body: dict = {}
+        if permalink:
+            body["custom_status_permalink"] = permalink
+        if mark_paid:
+            body["financial_status"] = "paid"
+        if not body:
+            raise InSalesError(f"InSales PUT orders/{order_id}: нечего записывать")
+        resp = await self._request("PUT", f"/orders/{order_id}.json", json_body={"order": body})
         if resp.status_code != 200:
             raise InSalesError(
                 f"InSales PUT orders/{order_id}: {resp.status_code}", resp.status_code, resp.text[:300]
@@ -150,11 +163,17 @@ class InSalesClient:
         except ValueError:
             raise InSalesError(f"InSales PUT orders/{order_id}: невалидный JSON", resp.status_code)
         got = ((order or {}).get("custom_status") or {}).get("permalink")
-        if got is not None and got != permalink:
+        if permalink and got is not None and got != permalink:
             # Ответ 200, а статус другой: запись не легла так, как просили. Считаем
             # ошибкой, чтобы она дошла до технического чата, а не осела в логе.
             raise InSalesError(
                 f"InSales PUT orders/{order_id}: статус после записи «{got}», ждали «{permalink}»",
+                resp.status_code,
+            )
+        paid = (order or {}).get("financial_status")
+        if mark_paid and paid is not None and paid != "paid":
+            raise InSalesError(
+                f"InSales PUT orders/{order_id}: оплата после записи «{paid}», ждали «paid»",
                 resp.status_code,
             )
         return order
@@ -188,3 +207,7 @@ async def find_order_by_number(number: int, updated_since: str) -> dict | None:
 
 async def set_custom_status(order_id, permalink: str) -> dict:
     return await _ensure().set_custom_status(order_id, permalink)
+
+
+async def update_order(order_id, *, permalink: str | None = None, mark_paid: bool = False) -> dict:
+    return await _ensure().update_order(order_id, permalink=permalink, mark_paid=mark_paid)

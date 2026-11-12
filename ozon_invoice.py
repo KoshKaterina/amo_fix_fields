@@ -55,6 +55,7 @@ import httpx
 import amo_service
 import alerts
 import ms_client
+import ms_payment_flow
 import telegram_bot
 import tg_recipients
 from waybill_config import (
@@ -731,6 +732,39 @@ _NOTE_STALE_RE = re.compile(re.escape(_STALE_NOTE_MARK))
 _reconcile_task: asyncio.Task | None = None
 
 
+# Сумма выставленного счёта из примечания «Счёт СБП создан автоматически: 1500 ₽ (…)».
+_NOTE_AMOUNT_RE = re.compile(r"создан автоматически:\s*([\d.]+)\s*₽")
+
+
+async def _invoice_kopecks(lead_id, key: str = "") -> int | None:
+    """Сколько мы просили заплатить - по примечанию счёта в карточке (key - «<сделка>-<время>»,
+    чтобы взять примечание именно этого счёта, а не прежнего).
+
+    Нужна как запасной путь: в запись оплаты в МС мы всегда пишем СТРОГО ту сумму, что
+    заплатил клиент. Её даёт вебхук (она входит в подпись) или getPaymentDetails, но если
+    Ozon прислал пустую - лучше сумма счёта, чем потерянный платёж. Оплата Completed по
+    счёту на N рублей - это оплата ровно этих N рублей."""
+    try:
+        notes = await amo_service.get_lead_notes(lead_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("ozon: не прочитались примечания сделки %s для суммы счёта", lead_id)
+        return None
+    found = None
+    for note in notes:
+        text = ((note.get("params") or {}).get("text")) or ""
+        if "создан автоматически" not in text or (key and key not in text):
+            continue
+        match = _NOTE_AMOUNT_RE.search(text)
+        if match:
+            try:
+                found = int(round(float(match.group(1)) * 100))
+            except ValueError:
+                continue
+    return found
+
+
 def _lead_and_ts_from_ext(*values) -> tuple[int | None, int | None]:
     """(lead_id, ts) из первого подходящего extId — платежа или заказа."""
     for value in values:
@@ -778,7 +812,37 @@ def handle_notification_bg(payload: dict) -> None:
     task.add_done_callback(_notify_tasks.discard)
 
 
-async def _mark_paid(lead: dict, rub_str: str, marker: str, source: str) -> str:
+def _ms_payment_key(*exts) -> str:
+    """Устойчивый ключ оплаты для externalCode платежа МС. Вебхук и сверка видят один и
+    тот же платёж под разными extId (платежа «amo-…», заказа «ord-…» или «<номер МС>_amo-…»),
+    а ключ должен совпасть - иначе дубль не опознать. Берём «<сделка>-<время>» из первого
+    подходящего; чужой формат - как есть."""
+    lead_id, ts = _lead_and_ts_from_ext(*exts)
+    if lead_id is not None:
+        return f"{lead_id}-{ts}"
+    return next((str(v) for v in exts if v), "")
+
+
+async def _mark_paid(
+    lead: dict, rub_str: str, marker: str, source: str, *, kopecks=None, ext_key: str = "",
+) -> str:
+    """Оплата подтверждена (вебхук или сверка): перевести сделку и записать платёж в МС.
+
+    Порядок важен: сначала сделка (клиент ждёт «спасибо»), потом МС - он медленнее и может
+    ретраиться. Исход функции - исход перевода сделки, как и раньше; запись в МС на него не
+    влияет. kopecks/ext_key не заданы - в МС не пишем (старые вызовы без суммы)."""
+    result = await _move_deal_paid(lead, rub_str, marker, source)
+    if kopecks is not None and ext_key:
+        try:
+            await ms_payment_flow.on_ozon_paid(lead, kopecks, ext_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ms_payment: lead %s: запись оплаты в МС упала", lead.get("id"))
+    return result
+
+
+async def _move_deal_paid(lead: dict, rub_str: str, marker: str, source: str) -> str:
     """Общий путь «оплата подтверждена» для вебхука и сверки: перевести сделку
     в «Оплата получена» + примечание. Сделка уже дальше — только примечание.
 
@@ -859,9 +923,12 @@ async def _handle_notification(data: dict) -> str:
         return "skipped-duplicate"
 
     try:
-        rub = int(round(float(data.get("amount") or 0))) / 100
+        kopecks = int(round(float(data.get("amount") or 0)))
     except (TypeError, ValueError):
-        rub = 0
+        kopecks = 0
+    if kopecks <= 0:
+        kopecks = await _invoice_kopecks(lead_id, _ms_payment_key(ext_tx, ext_ord)) or 0
+    rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
 
     lead = await amo_service.get_lead_full(lead_id, with_=())
@@ -869,7 +936,10 @@ async def _handle_notification(data: dict) -> str:
         logger.error("ozon_notify: оплата Completed по %s, но сделка %s не прочиталась", ext_tx, lead_id)
         return "failed-lead-read"
 
-    return await _mark_paid(lead, rub_str, f"extId {ext_tx or ext_ord}", "вебхук")
+    return await _mark_paid(
+        lead, rub_str, f"extId {ext_tx or ext_ord}", "вебхук",
+        kopecks=kopecks, ext_key=_ms_payment_key(ext_tx, ext_ord),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1291,10 +1361,16 @@ async def _reconcile_once() -> str:
                     continue
 
                 _seen_paid(ext_id or payment_id)
+                pay_key = _ms_payment_key(ext_id, order_ext_id, payment_id)
+                if not kopecks:
+                    kopecks = await _invoice_kopecks(lead_id, pay_key)
                 rub = (kopecks or 0) / 100
                 rub_str = f"{rub:.2f}".rstrip("0").rstrip(".") if kopecks else "?"
                 marker = f"extId {ext_id}" if ext_id else f"paymentId {payment_id}"
-                if await _mark_paid(lead, rub_str, marker, "сверка") == "moved":
+                if await _mark_paid(
+                    lead, rub_str, marker, "сверка",
+                    kopecks=kopecks or 0, ext_key=pay_key,
+                ) == "moved":
                     moved += 1
                     _stale_alerted.pop(lead_id, None)
 

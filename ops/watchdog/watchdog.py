@@ -70,6 +70,72 @@ def log(msg):
     print(f"[{datetime.now(MSK).strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ---------------------------------------------------------------- «Здоровье»
+# 09.11.2026: каждая проверка сторожа пишет в журнал ошибок панели Team: «лежит» - событие,
+# «поверили, что починилось» - закрытие. Сообщения в Телеграм это НЕ меняет. Падения служб
+# («Сервис · …») сюда не идут: их пишет агент systemd (OnFailure), иначе одна поломка
+# задвоилась бы. Настройки и токен - /etc/sunscrypt-errors/env агента. Любая ошибка
+# журнала проглатывается: сторож из-за него падать не должен.
+JOURNAL_ENV = "/etc/sunscrypt-errors/env"
+_JOURNAL = []
+_JOURNAL_MODE = ""
+
+
+def _journal_code(name):
+    rules = [
+        ("amoCRM", "amo.access_failed"), ("МойСклад", "ms.access_failed"),
+        ("WooCommerce", "woo.access_failed"), ("Wazzup", "wazzup.access_failed"),
+        ("СДЭК", "cdek.access_failed"), ("Метрика", "metrika.access_failed"),
+        ("DeFi", "defi.data_missing"), ("Контейнер", "container.down"),
+        ("Телеграм-бот", "tg.bot_down"), ("Бэкап", "backup.failed"),
+        ("Таймер", "timer.disabled"), ("Сторож", "watchdog.crash"),
+    ]
+    for needle, code in rules:
+        if needle in name:
+            return code
+    return "watchdog.check_failed"
+
+
+def journal_note(name, why="", *, urgent=False, resolved=False):
+    try:
+        if name.startswith("Сервис · "):
+            return
+        sev = "critical" if urgent else ("warning" if name.startswith("DeFi") else "error")
+        _JOURNAL.append({
+            "v": 1, "service": "watchdog", "component": _JOURNAL_MODE or None,
+            "code": _journal_code(name), "severity": sev, "fingerprint": "watchdog:" + name,
+            "title": "" if resolved else f"Сторож: {name}"[:200], "message": why[:2000],
+            "resolves": resolved, "host": "85.193.91.169", "env": "prod",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            # в чат пишет сам сторож по своим тихим правилам, журнал только записывает
+            "notified": True,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def journal_flush():
+    if not _JOURNAL:
+        return
+    try:
+        cfg = parse_env_file(JOURNAL_ENV)
+        url, token = cfg.get("ERRORS_INGEST_URL"), cfg.get("INGEST_TOKEN")
+        if not url or not token:
+            return
+        import urllib.request
+        for i in range(0, len(_JOURNAL), 100):
+            body = json.dumps({"events": _JOURNAL[i:i + 100]}, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Content-Type": "application/json", "X-Ingest-Token": token,
+                "User-Agent": "sunscrypt-watchdog/1"})
+            urllib.request.urlopen(req, timeout=15).close()
+        log(f"  журнал «Здоровье»: передано событий {len(_JOURNAL)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"  журнал «Здоровье» недоступен ({type(e).__name__}), события пропущены")
+    finally:
+        _JOURNAL.clear()
+
+
 # ------------------------------------------------------------------------ state
 def load_state():
     try:
@@ -171,6 +237,12 @@ def triage(prev, checks, now, *, fail_to_open=1, ok_to_close=1):
                 urgent_fixed.append(f"• {name}")
             rec.update(ok=True, down_since=0, alerted=0, last_alert=0, why="")
 
+        # «Здоровье»: каждый сырой провал - повтор в журнале, поверили в починку - закрытие
+        if not ok:
+            journal_note(name, why, urgent=is_urgent(name))
+        elif not believed_ok and rec["ok"]:
+            journal_note(name, resolved=True)
+
         new_state[name] = rec
 
     return urgent_broken, urgent_fixed, quiet_once, new_state
@@ -227,21 +299,29 @@ def tg_send(text):
 
 
 # ------------------------------------------------------------------------- http
-def http(url, headers=None, method="GET", data=None, timeout=30):
+_LAST_MS = None  # время ответа последнего http(), мс - для плашек «Здоровья»
+
+
+def http(url, headers=None, method="GET", data=None, timeout=30, proxy=None):
     """Возвращает (код, тело). URL, заголовки и тело уходят в curl через stdin: токены
     живут во всех трёх (Bearer в заголовке, ключи Woo прямо в URL, секрет СДЭК в теле),
     а аргументы командной строки видны в `ps` всем. В лог они тоже не попадают."""
+    global _LAST_MS
     cfg = [curl_cfg("url", url)]
     for h in headers or []:
         cfg.append(curl_cfg("header", h))
     if data:
         cfg.append(curl_cfg("data", data))
+    if proxy:
+        cfg.append(curl_cfg("proxy", proxy))
     # --location нужен RDAP: rdap.org отвечает редиректом на сервер нужной зоны
     args = ["-s", "--globoff", "--compressed", "--location", "--max-time", str(timeout),
             "-w", "\n%{http_code}"]
     if method != "GET":
         args += ["-X", method]
+    t0 = time.monotonic()
     p = curl_run(cfg, args, timeout=timeout + 30)
+    _LAST_MS = int((time.monotonic() - t0) * 1000)
     out = p.stdout or ""
     nl = out.rfind("\n")
     body, code = (out[:nl], out[nl + 1:].strip()) if nl >= 0 else ("", out.strip())
@@ -249,7 +329,10 @@ def http(url, headers=None, method="GET", data=None, timeout=30):
 
 
 # ===================================================================== проверка 1
-def check_tokens():
+_TIMINGS = {}  # имя проверки → мс последнего ответа (плашки «Здоровья»)
+
+
+def check_tokens(metrika_hours=24):
     """Живы ли доступы. Возвращает список (имя, ok, пояснение)."""
     checks = []
 
@@ -260,6 +343,7 @@ def check_tokens():
             snippet = re.sub(r"\s+", " ", body)[:90]
             why += f" · {snippet}"
         checks.append((name, ok, why or hint))
+        _TIMINGS[name] = _LAST_MS
 
     amo_base = ENV.get("AMO_BASE", "https://new5a2e8ea7b16b4.amocrm.ru").rstrip("/")
     if secret("TOKEN"):
@@ -293,7 +377,7 @@ def check_tokens():
     # Метрику дёргать напрямую бесполезно: наш токен выписан только на загрузку
     # офлайн-заказов (CDP), а management и stat отвечают ему 403 - это норма, а не
     # поломка. Поэтому смотрим на факт: ругалась ли интеграция при отправке.
-    checks.append(check_metrika_by_logs())
+    checks.append(check_metrika_by_logs(metrika_hours))
 
     if secret("YOUGILE_API_KEY"):
         c, b = http("https://ru.yougile.com/api-v2/users?limit=1",
@@ -350,6 +434,90 @@ def run_tokens():
                 "\n\nКлиентов не задевает. Дальше скажу только в утренней сводке.")
     if not (broken or fixed or quiet):
         log("  новостей нет, письмо не отправляю")
+    return 0
+
+
+def check_telegram():
+    """Бот уведомлений жив: getMe через тот же шлюз, что и отправка."""
+    token = secret("TG_BOT_TOKEN")
+    if not token:
+        return None
+    c, b = http(f"https://api.telegram.org/bot{token}/getMe", proxy=secret("TG_PROXY_URL") or None, timeout=20)
+    ok = c == 200 and '"ok":true' in b.replace(" ", "")
+    _TIMINGS["Telegram Bot API"] = _LAST_MS
+    return ("Telegram Bot API", ok, "" if ok else f"HTTP {c or 'нет ответа'}")
+
+
+def check_extra_apis():
+    """API с ключами интеграции, которых нет в часовом `tokens` (10.11.2026): только для
+    плашек «Здоровья», о поломке сторож по ним в Телеграм не пишет.
+    InSales - `GET /admin/account.json` (сведения о магазине). GetCourse - запрос статуса
+    несуществующей выгрузки: ключ проверяется, сама выгрузка не создаётся."""
+    out = []
+    # адреса по умолчанию - как в waybill_config.py интеграции: в её .env их нет
+    shop = secret("INSALES_SHOP_URL") or "tangemshop.ru"
+    key, pwd = secret("INSALES_API_KEY"), secret("INSALES_API_PASSWORD")
+    if shop and key and pwd:
+        import base64
+        auth = base64.b64encode(f"{key}:{pwd}".encode()).decode()
+        c, b = http(f"https://{shop.strip('/')}/admin/account.json", [f"Authorization: Basic {auth}"], timeout=20)
+        _TIMINGS["InSales"] = _LAST_MS
+        out.append(("InSales", c == 200, "" if c == 200 else f"HTTP {c or 'нет ответа'}"))
+    acc, gkey = secret("GETCOURSE_ACCOUNT_URL") or "https://edu.sunscrypt.ru", secret("GETCOURSE_API_KEY")
+    if acc and gkey:
+        c, b = http(f"{acc.rstrip('/')}/pl/api/account/exports/1?key={gkey}", timeout=20)
+        _TIMINGS["GetCourse"] = _LAST_MS
+        try:
+            data = json.loads(b)
+        except ValueError:
+            data = None
+        # Замер 10.11.2026: верный ключ - error_code 907 «Объект не найден» (выгрузки 1 нет),
+        # неверный - 901 «Неавторизованное API-обращение». Ответ 200 в обоих случаях.
+        err = str((data or {}).get("error_message") or "").lower() if isinstance(data, dict) else ""
+        code_ = (data or {}).get("error_code") if isinstance(data, dict) else None
+        key_bad = code_ == 901 or "авториз" in err or any(w in err for w in ("ключ", "api key", "доступ запрещ"))
+        ok = c == 200 and isinstance(data, dict) and not key_bad
+        out.append(("GetCourse", ok, "" if ok else ("ключ отвергнут" if key_bad else f"HTTP {c or 'нет ответа'}")))
+    return out
+
+
+def run_apis():
+    """Плашки «Сторонние API» на странице «Здоровье» панели Team (10.11.2026).
+
+    Те же проверки ключей, что у `tokens`, плюс бот Telegram - и итог с временем ответа
+    в панель (`POST /api/ingest/health`). В Телеграм НЕ пишет и своё состояние НЕ трогает:
+    о поломках по-прежнему сообщает `tokens` раз в час. Запускается кроном раз в 10 минут
+    и по кнопке на странице (systemd path-юнит на файле-флаге панели).
+    Метрику смотрим по логу за 3 часа, а не за сутки: прогон частый, сутки лога тяжёлые."""
+    _TIMINGS.clear()
+    checks = check_tokens(metrika_hours=3)
+    tg = check_telegram()
+    if tg:
+        checks.append(tg)
+    checks += check_extra_apis()
+    items = []
+    for name, ok, why in checks:
+        log(f"  {name}: {'ок' if ok else 'СЛОМАНО'} {why}".rstrip())
+        item = {"name": name, "ok": bool(ok), "ms": _TIMINGS.get(name)}
+        if ok and why:
+            item["info"] = why  # например «за 3 ч отправлено заказов: 12»
+        elif not ok:
+            item["why"] = why
+        items.append(item)
+    cfg = parse_env_file(JOURNAL_ENV)
+    url, token = cfg.get("ERRORS_INGEST_URL", ""), cfg.get("INGEST_TOKEN")
+    if not url.endswith("/errors") or not token:
+        log("  панель не настроена, итог не отправлен")
+        return 0
+    try:
+        import urllib.request
+        body = json.dumps({"apis": items}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url[: -len("/errors")] + "/health", data=body, method="POST", headers={
+            "Content-Type": "application/json", "X-Ingest-Token": token, "User-Agent": "sunscrypt-watchdog/1"})
+        urllib.request.urlopen(req, timeout=15).close()
+        log(f"  в панель передано проверок: {len(items)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"  панель недоступна ({type(e).__name__}), итог не отправлен")
     return 0
 
 
@@ -958,7 +1126,7 @@ def run_digest():
 
 # --------------------------------------------------------------------------- main
 CHECKS = {"tokens": run_tokens, "deadlines": run_deadlines, "renewals": run_renewals,
-          "defi": run_defi, "services": run_services, "digest": run_digest}
+          "defi": run_defi, "services": run_services, "digest": run_digest, "apis": run_apis}
 
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -966,10 +1134,15 @@ if __name__ == "__main__":
         print(f"как запускать: watchdog.py [{' | '.join(CHECKS)}]")
         sys.exit(2)
     log(f"проверка: {what}")
+    _JOURNAL_MODE = what
     try:
-        sys.exit(CHECKS[what]())
+        rc = CHECKS[what]()
+        journal_flush()
+        sys.exit(rc)
     except Exception as e:  # noqa: BLE001
         log(f"ПАДЕНИЕ: {e}")
+        journal_note(f"Сторож · {what}", str(e))
+        journal_flush()
         # Без этого троттла сторож, упавший на пятиминутной проверке, шлёт 288
         # сообщений в сутки - ровно тот шум, от которого мы уходим. Само чтение
         # состояния тоже может не задаться (диск, битый json) - тогда шлём как

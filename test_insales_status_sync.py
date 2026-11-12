@@ -51,9 +51,10 @@ def _lead(number="18858 Tangemshop", name="Заказ №18858 Tangemshop", pipe
             "created_at": _CREATED, "closed_at": closed, "custom_fields_values": fields}
 
 
-def _order(permalink="novyy", system="new", number=18858, oid=1660000001):
-    return {"id": oid, "number": number, "fulfillment_status": system,
-            "custom_status": {"permalink": permalink}}
+def _order(permalink="novyy", system="new", number=18858, oid=1660000001, financial="pending",
+           pay="Оплата онлайн"):
+    return {"id": oid, "number": number, "fulfillment_status": system, "financial_status": financial,
+            "payment_title": pay, "custom_status": {"permalink": permalink}}
 
 
 class _InSales:
@@ -65,7 +66,8 @@ class _InSales:
         self.order = order
         self.fail_on = fail_on
         self.finds = []
-        self.sets = []
+        self.sets = []      # (id, код статуса) — записи статуса
+        self.paid = []      # id заказов, отмеченных оплаченными
 
     async def find_order_by_number(self, number, updated_since):
         self.finds.append((number, updated_since))
@@ -73,8 +75,11 @@ class _InSales:
             raise insales_client.InSalesError("InSales GET orders: 403", 403)
         return self.order
 
-    async def set_custom_status(self, order_id, permalink):
-        self.sets.append((order_id, permalink))
+    async def update_order(self, order_id, *, permalink=None, mark_paid=False):
+        if permalink:
+            self.sets.append((order_id, permalink))
+        if mark_paid:
+            self.paid.append(order_id)
         if self.fail_on == "set":
             raise insales_client.InSalesError("InSales PUT orders/1: 403", 403)
         return {"id": order_id, "custom_status": {"permalink": permalink}}
@@ -159,13 +164,86 @@ def test_already_delivered_is_not_rewritten(env):
     ("otmenen", "declined"),
     ("vozvrat", "returned"),
     ("v-protsesse-vozvrata", "returning"),
-    ("poluchena-oplata-ot-sd", "delivered"),
 ])
-def test_hands_off_statuses(env, permalink, system):
+@pytest.mark.parametrize("mode", ["", "prepaid", "all"])
+def test_cancelled_and_returns_are_not_touched_at_all(env, monkeypatch, permalink, system, mode):
+    monkeypatch.setattr(sync, "INSALES_MARK_PAID", mode)
     env.order = _order(permalink=permalink, system=system)
     assert _run(_lead()) == "hands_off"
-    assert env.sets == []
+    assert env.sets == [] and env.paid == []
     assert sync._sent == {}
+
+
+def test_human_delivered_status_is_kept(env):
+    # «Получена оплата от СД» поставил человек — точнее нашего «Доставлен», статус не пишем
+    env.order = _order(permalink="poluchena-oplata-ot-sd", system="delivered")
+    assert _run(_lead()) == "already"
+    assert env.sets == [] and env.paid == []
+
+
+# ── отметка оплаты (INSALES_MARK_PAID) ───────────────────────────────────────
+
+@pytest.fixture
+def paid_on(env, monkeypatch):
+    monkeypatch.setattr(sync, "INSALES_MARK_PAID", "all")
+    return env
+
+
+@pytest.mark.parametrize("pay,marked", [
+    ("Оплата онлайн", True),
+    ("Оплата картой", True),
+    ("Оплата при получении", False),   # наложку рефералка считает по «Доставлен»
+])
+def test_prepaid_mode_marks_only_prepayment(env, monkeypatch, pay, marked):
+    monkeypatch.setattr(sync, "INSALES_MARK_PAID", "prepaid")
+    env.order = _order(pay=pay)
+    assert _run(_lead()) == "set"
+    assert env.sets == [(1660000001, "dostavlen")]
+    assert env.paid == ([1660000001] if marked else [])
+    assert sync._sent == {"18858": "dostavlen+paid"}
+
+
+def test_mark_paid_goes_in_the_same_put_as_status(paid_on):
+    assert _run(_lead()) == "set"
+    assert paid_on.sets == [(1660000001, "dostavlen")]
+    assert paid_on.paid == [1660000001]
+    assert sync._sent == {"18858": "dostavlen+paid"}
+
+
+def test_delivered_but_unpaid_gets_only_payment(paid_on):
+    # Заказ уже «Доставлен» (догон или руками), а предоплата прошла мимо InSales
+    paid_on.order = _order(permalink="dostavlen", system="delivered")
+    assert _run(_lead()) == "set"
+    assert paid_on.sets == [] and paid_on.paid == [1660000001]
+
+
+def test_human_delivered_status_kept_but_payment_marked(paid_on):
+    paid_on.order = _order(permalink="poluchena-oplata-ot-sd", system="delivered")
+    assert _run(_lead()) == "set"
+    assert paid_on.sets == [] and paid_on.paid == [1660000001]
+
+
+def test_already_paid_is_not_marked_again(paid_on):
+    paid_on.order = _order(financial="paid")
+    assert _run(_lead()) == "set"
+    assert paid_on.sets == [(1660000001, "dostavlen")] and paid_on.paid == []
+
+
+def test_delivered_and_paid_needs_nothing(paid_on):
+    paid_on.order = _order(permalink="dostavlen", system="delivered", financial="paid")
+    assert _run(_lead()) == "already"
+    assert paid_on.sets == [] and paid_on.paid == []
+    assert sync._sent == {"18858": "dostavlen+paid"}
+
+
+def test_orders_done_before_the_flag_are_revisited_once(paid_on, monkeypatch):
+    # До включения флага в дедупе лежит «dostavlen» — сверка один раз дойдёт до оплаты
+    monkeypatch.setattr(sync, "_sent", {"18858": "dostavlen"})
+    paid_on.order = _order(permalink="dostavlen", system="delivered")
+    assert _run(_lead()) == "set"
+    assert paid_on.paid == [1660000001]
+    assert _run(_lead()) == "dedup"
+    assert len(paid_on.finds) == 1
 
 
 def test_not_found_alerts_once_and_retries_later(env):
@@ -232,6 +310,27 @@ def test_webhook_gate(env, monkeypatch, pipeline, status, changed, expected):
 
     asyncio.run(_go())
     assert calls == ([(36600001, "webhook")] if expected else [])
+
+
+@pytest.mark.parametrize("enabled,expected", [(True, [(36600001, "office_transfer")]), (False, [])])
+def test_schedule_from_office_transfer(env, monkeypatch, enabled, expected):
+    # Самовывоз перенос кладёт сразу в УР Офиса (142 → 142): вебхук молчит, синк ставит сам перенос
+    calls = []
+
+    async def _process(lead_id, lead=None, source="reconcile"):
+        calls.append((lead_id, source))
+        return "set"
+
+    monkeypatch.setattr(sync, "process_lead", _process)
+    monkeypatch.setattr(sync, "_enabled", enabled)
+
+    async def _go():
+        sync.schedule(36600001, "office_transfer")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(_go())
+    assert calls == expected
 
 
 # ── клиент InSales ────────────────────────────────────────────────────────────
@@ -313,6 +412,46 @@ def test_client_put_failure_raises(response):
         await c.init()
         try:
             await c.set_custom_status(1, "dostavlen")
+        finally:
+            await c.aclose()
+
+    with pytest.raises(insales_client.InSalesError):
+        asyncio.run(_go())
+
+
+@pytest.mark.parametrize("permalink,expected", [
+    ("dostavlen", {"order": {"custom_status_permalink": "dostavlen", "financial_status": "paid"}}),
+    (None, {"order": {"financial_status": "paid"}}),
+])
+def test_client_mark_paid_body(permalink, expected):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"id": 1, "financial_status": "paid",
+                                         "custom_status": {"permalink": permalink or "dostavlen"}})
+
+    async def _go():
+        c = _client(handler)
+        await c.init()
+        try:
+            return await c.update_order(1, permalink=permalink, mark_paid=True)
+        finally:
+            await c.aclose()
+
+    asyncio.run(_go())
+    assert bodies == [expected]
+
+
+def test_client_mark_paid_not_applied_raises():
+    response = httpx.Response(200, json={"id": 1, "financial_status": "pending",
+                                         "custom_status": {"permalink": "dostavlen"}})
+
+    async def _go():
+        c = _client(lambda request: response)
+        await c.init()
+        try:
+            await c.update_order(1, mark_paid=True)
         finally:
             await c.aclose()
 

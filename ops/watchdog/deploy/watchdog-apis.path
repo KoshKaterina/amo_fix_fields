@@ -1,0 +1,13 @@
+# Кнопка «Проверить» у плашек «Сторонние API» на странице «Здоровье» панели Team (10.11.2026).
+# Панель (пользователь teampanel) пишет файл-флаг не чаще раза в минуту, systemd запускает
+# проверку ключей сторожем от root: ключи чужих API в панель не попадают.
+# На сервере: /etc/systemd/system/watchdog-apis.path
+[Unit]
+Description=Проверка сторонних API по кнопке на странице «Здоровье»
+
+[Path]
+PathModified=/var/lib/team-panel-health/apis.request
+Unit=watchdog-apis.service
+
+[Install]
+WantedBy=multi-user.target

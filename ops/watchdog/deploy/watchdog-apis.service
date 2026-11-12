@@ -1,0 +1,8 @@
+# Запускается watchdog-apis.path. На сервере: /etc/systemd/system/watchdog-apis.service
+[Unit]
+Description=Сторож: проверка сторонних API для страницы «Здоровье»
+
+[Service]
+Type=oneshot
+ExecStart=/opt/watchdog/run.sh apis
+TimeoutStartSec=180
