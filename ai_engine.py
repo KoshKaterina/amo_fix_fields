@@ -38,6 +38,7 @@ from typing import Any
 import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
+import ai_engine_followup as followup
 import ai_engine_return
 import ai_engine_tasks
 import ai_engine_settings as settings
@@ -337,6 +338,7 @@ async def _on_outbound(chat_key: str, m: dict) -> None:
     `Phone`) в чате, который мы ведём или ждём, забирает диалог."""
     if is_robot_author(m.get("authorName")):
         return
+    await _followup_cancel(chat_key=chat_key, reason="manager_wrote", notify=True)      # отложенное касание ИИ не уходит
     s = await _db(store.get_session, chat_key)
     if s is None or s["state"] in (store.S_HUMAN, store.S_SKIP, store.S_RELEASED):
         return
@@ -356,6 +358,8 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
     caption = "" if mtype == "unsupported" else text    # у unsupported text это заглушка самого Wazzup, не слова клиента
     if not message_id:
         message_id = f"noid:{chat_key}:{m.get('dateTime')}:{abs(hash(text))}"
+    if await _db(store.seq_of, message_id) is None:         # не повтор вебхука: отложенное касание отменяется
+        await _followup_cancel(chat_key=chat_key, reason="client_wrote", notify=True)
 
     s = await _db(store.get_session, chat_key)
     if s is not None:
@@ -466,6 +470,7 @@ async def tick_once() -> None:
         except Exception:
             logger.exception("ai_engine: ошибка обработки чата %s", s.get("chat_key"))
             await _db(store.put_session, s["chat_key"], next_at=_now() + cfg.RESOLVE_RETRY_S)
+    await _followup_tick()
     if now - _last_off_sweep >= 10:
         _last_off_sweep = now
         async with _get_lock():
@@ -642,6 +647,7 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     up_to_seq = await _db(store.max_seq, chat_key)
     up_to_id = pending[-1]["message_id"] if pending else s["last_message_id"]
     window = settings.send_window()
+    cancelled_rows = await _db(followup.cancelled_notes, deal_id)
 
     def build(turn_id: int) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -654,7 +660,10 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
             "returning": None, "client_memory": None,
         }
         if event is not None:
-            body["event"] = {"type": event["type"], "at": event["at"]}
+            body["event"] = {"type": event["type"], "at": event["at"],
+                             **{k: event[k] for k in ("reason", "draft", "due_at") if k in event}}
+        if cancelled_rows:
+            body["followup_cancelled"] = followup.cancel_payload(cancelled_rows)
         return body
 
     turn = await _db(
@@ -663,10 +672,12 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     )
     await _db(store.put_session, chat_key, state=store.S_IN_TURN, current_turn=turn["turn_id"], next_at=None,
               has_media=0, pending_event=None, deal_id=deal_id)
+    if cancelled_rows:
+        await _db(followup.clear_notify, [r["id"] for r in cancelled_rows])
     logger.info("ai_engine: ход %s по сделке %s (%s, сообщений %s)", turn["turn_id"], deal_id, reason, len(pending))
 
 
-async def _queue_event(owner: dict, event_type: str) -> None:
+async def _queue_event(owner: dict, event_type: str, extra: dict | None = None) -> None:
     """Поставить служебное событие: оно идёт отдельным ходом, как только предыдущий закончился."""
     s = await _db(store.session_for_deal, int(owner["deal_id"]))
     if s is None:
@@ -678,7 +689,7 @@ async def _queue_event(owner: dict, event_type: str) -> None:
             channel_id=owner["channel_id"], chat_id=owner["chat_id"], chat_type=owner.get("chat_type") or "",
             state=store.S_AI, deal_id=int(owner["deal_id"]), first_batch=0,
         )
-    event = json.dumps({"type": event_type, "at": _iso(_now())})
+    event = json.dumps({"type": event_type, "at": _iso(_now()), **(extra or {})})
     fields: dict[str, Any] = {"pending_event": event}
     if s["state"] != store.S_IN_TURN:
         # Идущий ход не прерываем: событие дождётся его итога (`_after_turn`). Во всех остальных состояниях
@@ -687,6 +698,113 @@ async def _queue_event(owner: dict, event_type: str) -> None:
         if s["state"] != store.S_COLLECTING:
             fields["batch_start"] = _now()
     await _db(store.put_session, s["chat_key"], **fields)
+
+
+# =============================================================================================
+# отложенные касания (ai_engine_followup)
+# =============================================================================================
+
+async def _followup_note(deal_id: int, text: str) -> None:
+    try:
+        await asyncio.wait_for(amo_service.add_note(int(deal_id), "ИИ-менеджер: " + text), timeout=15)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: не записал примечание об отложенном касании в сделку %s", deal_id)
+
+
+async def _followup_cancel(*, chat_key: str | None = None, deal_id: int | None = None, reason: str, notify: bool = False) -> None:
+    """Снять ждущие касания чата или сделки; в сделку идёт примечание, ИИ (при `notify`) узнает в следующем ходе."""
+    try:
+        rows: list[dict] = []
+        if chat_key:
+            rows += await _db(followup.cancel_for_chat, chat_key, reason, _now(), notify)
+        if deal_id is not None:
+            rows += await _db(followup.cancel_for_deal, int(deal_id), reason, _now(), notify)
+    except Exception:  # noqa: BLE001 - отмена касания не должна ломать приём сообщений
+        logger.exception("ai_engine: не отменил отложенное касание (%s)", reason)
+        return
+    for r in rows:
+        _spawn(_followup_note(int(r["deal_id"]), f"отложенное касание на {followup.fmt_due(r['due_at'])} отменено: "
+                                                f"{followup.REASON_TEXT.get(reason, reason)}."))
+
+
+async def schedule_followup(deal_id: int, epoch: int, turn_id: int, up_to_message_id: str, due_at: float,
+                            reason: str, draft: str) -> tuple[int, dict]:
+    """Сервис регистрирует касание, о котором клиент попросил сам. Те же условия, что у разрешения на отправку."""
+    async with _get_lock():
+        code, out = decide_permit(deal_id, epoch, turn_id, up_to_message_id)
+        if not out.get("allowed"):
+            return code, out
+        ahead = float(due_at) - _now()
+        if ahead < followup.MIN_AHEAD_S:
+            return 422, {"allowed": False, "reason": "too_soon"}
+        if ahead > followup.MAX_AHEAD_S:
+            return 422, {"allowed": False, "reason": "too_far"}
+        owner = await _db(store.get_owner, deal_id)
+        chat_key = (owner or {}).get("chat_key") or ""
+        if not chat_key:
+            return 200, {"allowed": False, "reason": "owner_changed"}
+        row = await _db(followup.schedule, deal_id, chat_key, int(owner["epoch"]), turn_id, float(due_at), reason, draft, _now())
+    _spawn(_followup_note(deal_id, f"по просьбе клиента напишу ему {followup.fmt_due(due_at)}"
+                                   + (f". Причина: {_plain(reason)}" if reason else "")))
+    return 200, {"allowed": True, "id": row["id"], "due_at": followup.fmt_due(due_at)}
+
+
+async def _followup_tick() -> None:
+    now = _now()
+    for f in await _db(followup.due, now):
+        try:
+            async with _get_lock():
+                await _fire_followup(f)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("ai_engine: ошибка отложенного касания %s", f.get("id"))
+
+
+async def _fire_followup(f: dict) -> None:
+    """Срок пришёл. Проверяем, что касание всё ещё уместно, ждём окно отправки и ставим ИИ событие `followup_due`."""
+    now = _now()
+    deal_id = int(f["deal_id"])
+    current = await _db(followup.pending_for_deal, deal_id)
+    if current is None or int(current["id"]) != int(f["id"]):
+        return                                          # отменено или заменено, пока шли к замку
+    owner = await _db(store.get_owner, deal_id)
+    why = None
+    if owner is None or owner["closed"]:
+        why = "deal_closed"
+    elif owner["owner"] != store.OWNER_AI or int(owner["epoch"]) != int(f["epoch"]):
+        why = "owner_changed"
+    elif settings.effective_mode() == "off":
+        why = "mode_off"
+    elif owner["pipeline_id"] not in settings.allowed_pipelines():
+        why = "pipeline_not_allowed"
+    else:
+        ids = [int(c) for c in json.loads(owner.get("contact_ids") or "[]")]
+        if not settings.contact_allowed(ids, [owner.get("chat_id") or ""]):
+            why = "contact_not_allowed"
+    if why:
+        await _followup_fail(f, why)
+        return
+    if not settings.send_window()["open_now"]:
+        return                                          # вне окна отправки касание ждёт ближайшего окна
+    if not await _ai_is_up():
+        seen = await _db(followup.note_first_due_seen, int(f["id"]), now)
+        if now - seen > followup.AI_DOWN_GIVE_UP_S:
+            await _followup_fail(f, "ai_down")
+        return
+    await _db(followup.mark_fired, int(f["id"]), now)
+    await _queue_event(owner, "followup_due", extra={"reason": f["reason"], "draft": f["draft"], "due_at": followup.fmt_due(f["due_at"])})
+    logger.info("ai_engine: отложенное касание по сделке %s: срок пришёл, ИИ получает событие", deal_id)
+
+
+async def _followup_fail(f: dict, why: str) -> None:
+    """Касание не вышло: примечание в сделке и алерт в чат ОП, задачи менеджеру не ставим (решение Кати)."""
+    await _db(followup.cancel_one, int(f["id"]), why, _now(), False)
+    deal_id = int(f["deal_id"])
+    text = f"отложенное касание на {followup.fmt_due(f['due_at'])} не вышло: {followup.REASON_TEXT.get(why, why)}."
+    _spawn(_followup_note(deal_id, text))
+    await _alert("followup_failed", ["ИИ не смог написать клиенту в назначенное время.", _plain(text), _link(deal_id)],
+                 dedupe=f"followup_failed:{f['id']}", return_deal=None)
 
 
 # =============================================================================================
@@ -912,6 +1030,7 @@ async def handle_result(
             ], cancel=False)
         elif outcome == "release_to_engine":
             closed = bool(reason) and (reason.startswith("sale_completed") or reason.startswith("closed_nontarget"))
+            await _followup_cancel(deal_id=deal_id, reason="released")
             await _db(store.set_owner, deal_id, store.OWNER_ENGINE, reason=reason or "release", closed=closed or None)
             await _db(store.cancel_active_turns, deal_id)
             if s is not None:
@@ -1022,6 +1141,7 @@ async def _to_human(
     """`owner = human`, `epoch + 1`, ход снят, сообщения чата не нужны, сервису best-effort отмена."""
     if deal_id is None and s is not None:
         deal_id = s["deal_id"]
+    await _followup_cancel(chat_key=s["chat_key"] if s is not None else None, deal_id=deal_id, reason="handed_to_human")
     if deal_id is not None:
         owner = await _db(store.get_owner, int(deal_id))
         if owner is not None and owner["owner"] != store.OWNER_HUMAN:
@@ -1081,6 +1201,7 @@ async def _handoff_by_rule(s: dict, res: dedup.Resolution, owner: dict | None) -
 
 async def _deal_closed(deal_id: int, why: str) -> None:
     """Сделка закрыта (или ушла из воронок режима, как после `complete_sale`): владелец снимается, ходы отменяются."""
+    await _followup_cancel(deal_id=deal_id, reason="deal_closed")
     owner = await _db(store.get_owner, deal_id)
     if owner is not None and not owner["closed"]:
         if owner["owner"] == store.OWNER_AI:
