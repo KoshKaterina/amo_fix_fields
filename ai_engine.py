@@ -651,6 +651,7 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     window = settings.send_window()
     cancelled_rows = await _db(followup.cancelled_notes, deal_id)
     manager_cutoff = await _db(give.cutoff_iso, deal_id)         # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
+    given_forced = bool(await _db(give.is_forced, deal_id))      # отдали вопреки параллельной сделке: ИИ её не учитывает
 
     def build(turn_id: int) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -669,6 +670,8 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
             body["followup_cancelled"] = followup.cancel_payload(cancelled_rows)
         if manager_cutoff:
             body["manager_cutoff"] = manager_cutoff
+        if given_forced:
+            body["given_forced"] = True
         return body
 
     turn = await _db(

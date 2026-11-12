@@ -207,3 +207,18 @@ def test_ordinary_give_is_not_forced(env):
         await give()
         assert G.is_forced(DEAL) is False
     run(go())
+
+
+def test_forced_give_marks_every_turn_with_given_forced(env):
+    async def go():
+        env.lead()
+        env.lead(lead_id=DEAL2, price=5000)
+        await give(force=True)
+        await env.advance(1)
+        assert env.turn_requests[-1]["given_forced"] is True
+        env.leads = []
+        env.lead(lead_id=DEAL + 5)
+        code, _ = await give(deal_id=DEAL + 5)
+        await env.advance(1)
+        assert "given_forced" not in env.turn_requests[-1]
+    run(go())
