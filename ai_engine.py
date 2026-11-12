@@ -1453,10 +1453,11 @@ async def _ur_tick() -> None:
     if not cfg.UR_WAVE_1:
         return                                              # окна выключены (пусто в AI_UR_WAVE_1)
     now = _now()
-    t1, t2, late = _msk_at(now, cfg.UR_WAVE_1), _msk_at(now, cfg.UR_WAVE_2), _msk_at(now, cfg.UR_LATE_FROM)
+    day = datetime.datetime.fromtimestamp(now, _MSK).strftime("%Y-%m-%d")
+    first_at = cfg.UR_WAVE_1_BY_DAY.get(day) or cfg.UR_WAVE_1
+    t1, t2, late = _msk_at(now, first_at), _msk_at(now, cfg.UR_WAVE_2), _msk_at(now, cfg.UR_LATE_FROM)
     if now < t1 or settings.effective_mode() == "off":
         return
-    day = datetime.datetime.fromtimestamp(now, _MSK).strftime("%Y-%m-%d")
     async with _get_lock():
         for owner in await _db(store.list_owned, store.OWNER_AI):
             deal_id = int(owner["deal_id"])
@@ -1466,7 +1467,7 @@ async def _ur_tick() -> None:
                     last = await _db(ur_wave.last_sent, deal_id)
                     if last is not None and last >= late:
                         await _db(ur_wave.mark, day, deal_id, 1, "deferred", now)         # писали поздно: во второе окно
-                    elif await _fire_ur_wave(owner, 1, cfg.UR_WAVE_1):
+                    elif await _fire_ur_wave(owner, 1, first_at):
                         await _db(ur_wave.mark, day, deal_id, 1, "fired", now)
                 elif w1 == "deferred" and now >= t2 and await _db(ur_wave.state, day, deal_id, 2) is None:
                     if await _fire_ur_wave(owner, 2, cfg.UR_WAVE_2):

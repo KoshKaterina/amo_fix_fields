@@ -110,3 +110,15 @@ def test_mode_off_gives_no_event(env):
         await to(env, 17, 55)
         assert waves(env) == []
     run(go())
+
+
+def test_first_window_can_be_moved_for_one_date(env):
+    async def go():
+        day = datetime.datetime.fromtimestamp(at(12), MSK).strftime("%Y-%m-%d")
+        env.mp.setattr(E.cfg, "UR_WAVE_1_BY_DAY", {day: "16:50"})
+        await owned_and_wrote(env, 14)
+        await to(env, 16, 49)
+        assert waves(env) == []
+        await to(env, 16, 51)
+        assert len(waves(env)) == 1 and "16:50" in waves(env)[0]["event"]["reason"]
+    run(go())
