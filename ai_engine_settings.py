@@ -126,6 +126,12 @@ def timers() -> dict[str, int]:
     return out
 
 
+def intercept_enabled() -> bool:
+    """Тумблер «Перехватывать сделки» из панели (временная функция, `ai_engine_intercept`). Нет ключа: выключено."""
+    block = (_doc or {}).get("intercept")
+    return isinstance(block, dict) and block.get("enabled") is True
+
+
 def post_sale_window_days() -> int:
     try:
         return int((_doc or {}).get("post_sale_window_days", 7))

@@ -134,16 +134,18 @@ async def find_leads(chat_id: str, phone: str) -> list[dict] | None:
     return list(merged.values())
 
 
-async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None, force_deal_id: int | None = None) -> Resolution:
+async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None, force_deal_id: int | None = None,
+                  any_pipeline_ids: frozenset[int] = frozenset()) -> Resolution:
     """Выбор сделки для чата. `known_deal_id` - сделка, которую ИИ уже ведёт: тогда замеченная другая
-    сделка с признаком работы называется правилом C, а не A."""
+    сделка с признаком работы называется правилом C, а не A. `any_pipeline_ids` - сделки, которые подходят в любой воронке
+    (перехваченные у менеджера, `ai_engine_intercept`)."""
     leads = await find_leads(chat_id, phone)
     if leads is None:
         return Resolution(K_ERROR, note="amoCRM не ответила на поиск сделок")
 
     allowed = settings.allowed_pipelines()
     open_leads = [ld for ld in leads if is_open(ld)]
-    suitable = [ld for ld in open_leads if _pipeline(ld) in allowed]
+    suitable = [ld for ld in open_leads if _pipeline(ld) in allowed or int(ld["id"]) in any_pipeline_ids]
 
     if known_deal_id is not None:
         mine = next((ld for ld in suitable if int(ld["id"]) == int(known_deal_id)), None)
