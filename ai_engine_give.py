@@ -11,6 +11,7 @@
 Таблица создаётся при первом обращении (`IF NOT EXISTS`), в той же sqlite, что у `ai_engine_store`.
 """
 import datetime
+import sqlite3
 
 import ai_engine_store as store
 
@@ -26,20 +27,31 @@ class _Db:
         self._cm = store._connect()
         conn = self._cm.__enter__()
         conn.execute(_SCHEMA)
+        try:
+            conn.execute("ALTER TABLE deal_given ADD COLUMN forced INTEGER NOT NULL DEFAULT 0")     # таблица из прежнего выката без колонки
+        except sqlite3.OperationalError:
+            pass
         return conn
 
     def __exit__(self, *exc):
         return self._cm.__exit__(*exc)
 
 
-def mark(deal_id: int, now: float) -> str:
-    """Отметить передачу (повторная передача обновляет время). Возвращает ISO-время."""
+def mark(deal_id: int, now: float, forced: bool = False) -> str:
+    """Отметить передачу (повторная передача обновляет время). `forced`: человек отдал сделку вопреки правилам дублей (A, C, D),
+    они для неё больше не работают. Возвращает ISO-время."""
     iso = _iso(now)
     with _Db() as conn:
-        conn.execute("INSERT INTO deal_given (deal_id, given_at, given_iso) VALUES (?,?,?) "
-                     "ON CONFLICT(deal_id) DO UPDATE SET given_at=excluded.given_at, given_iso=excluded.given_iso",
-                     (int(deal_id), float(now), iso))
+        conn.execute("INSERT INTO deal_given (deal_id, given_at, given_iso, forced) VALUES (?,?,?,?) "
+                     "ON CONFLICT(deal_id) DO UPDATE SET given_at=excluded.given_at, given_iso=excluded.given_iso, forced=excluded.forced",
+                     (int(deal_id), float(now), iso, 1 if forced else 0))
     return iso
+
+
+def is_forced(deal_id: int) -> bool:
+    with _Db() as conn:
+        row = conn.execute("SELECT forced FROM deal_given WHERE deal_id=?", (int(deal_id),)).fetchone()
+        return bool(row and row["forced"])
 
 
 def cutoff_iso(deal_id: int) -> str | None:

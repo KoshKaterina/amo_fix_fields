@@ -179,3 +179,31 @@ def test_every_ai_alert_pings_the_extra_tag_besides_the_shift(env):
         assert "@offf1cer" in env.alerts[-1]                         # смена по-прежнему в алерте
         assert env.alerts[-1].count("@koshkatarina") == 1
     run(go())
+
+
+def test_forced_give_overrides_the_duplicate_rules_now_and_for_later_messages(env):
+    async def go():
+        env.lead()
+        env.lead(lead_id=DEAL2, price=5000)                          # вторая открытая сделка с признаком работы: правило A/D отказало бы
+        code, out = await give()
+        assert code == 409 and out["detail"] == "needs_human"
+        code, out = await give(force=True)
+        assert (code, out["ok"]) == (200, True) and G.is_forced(DEAL)
+        await env.advance(1)
+        first = env.turn_requests[-1]
+        assert first["event"]["type"] == "deal_given"
+        await E.handle_result(first["turn_id"], DEAL, first["epoch"], "continue", None, None)
+        env.turn_requests.clear()
+        await env.say(env.msg("Здравствуйте", mid="c-9"))
+        await env.advance(11)
+        assert env.turn_requests and env.turn_requests[-1]["reason"] == "client_message"          # правило C не отдало сделку человеку
+        assert store.get_owner(DEAL)["owner"] == "ai"
+    run(go())
+
+
+def test_ordinary_give_is_not_forced(env):
+    async def go():
+        env.lead()
+        await give()
+        assert G.is_forced(DEAL) is False
+    run(go())

@@ -497,7 +497,8 @@ async def _process_collecting(s: dict) -> None:
         return
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
     known = int(s["deal_id"]) if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] else None
-    res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known)
+    forced = known if known is not None and await _db(give.is_forced, known) else None
+    res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known, force_deal_id=forced)
     async with _get_lock():
         fresh = await _db(store.get_session, chat_key)
         if fresh is None or fresh["state"] != store.S_COLLECTING or (fresh["next_at"] or 0) > _now():
@@ -1317,7 +1318,7 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
 
 
 async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str, phone: str = "",
-                    contact_name: str = "") -> tuple[int, dict]:
+                    contact_name: str = "", force: bool = False) -> tuple[int, dict]:
     """Человек отдаёт ИИ существующую сделку (`deal_given`): `owner = ai`, `epoch + 1`, ход-событие сразу.
 
     Сделка выбирается тем же алгоритмом, что и при входе по сообщению клиента (`dedup.resolve`): чат клиента должен давать ровно эту
@@ -1329,7 +1330,7 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
     chat_id, channel_id = str(chat_id or "").strip(), str(channel_id or "").strip()
     if not chat_id or not channel_id:
         return 422, {"detail": "chat_required"}
-    res = await dedup.resolve(chat_id, phone)       # сеть без общего замка, как в `_process_collecting`
+    res = await dedup.resolve(chat_id, phone, force_deal_id=deal_id if force else None)       # сеть без общего замка, как в `_process_collecting`
     if res.kind == dedup.K_ERROR:
         return 503, {"detail": "amo_unavailable"}
     if res.kind in (dedup.K_NONE, dedup.K_GONE):
@@ -1357,7 +1358,7 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
             store.set_owner, deal_id, store.OWNER_AI, reason="deal_given", chat=chat,
             pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode,
         )
-        await _db(give.mark, deal_id, _now())
+        await _db(give.mark, deal_id, _now(), force)
         await _db(store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id, chat_type=chat_type, phone=phone,
                   contact_name=contact_name, state=store.S_AI, deal_id=deal_id, first_batch=0, last_message_id="",
                   next_at=None, has_media=0)

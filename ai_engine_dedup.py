@@ -134,7 +134,7 @@ async def find_leads(chat_id: str, phone: str) -> list[dict] | None:
     return list(merged.values())
 
 
-async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None) -> Resolution:
+async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None, force_deal_id: int | None = None) -> Resolution:
     """Выбор сделки для чата. `known_deal_id` - сделка, которую ИИ уже ведёт: тогда замеченная другая
     сделка с признаком работы называется правилом C, а не A."""
     leads = await find_leads(chat_id, phone)
@@ -159,6 +159,12 @@ async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None)
     if not permitted:
         return Resolution(K_SKIP, note="контакта нет в списке режима")
     suitable = permitted
+
+    if force_deal_id is not None:
+        # Человек отдал сделку вопреки правилам дублей (A, C, D): выбор уже сделан им, остальные сделки клиента не мешают.
+        forced = next((ld for ld in suitable if int(ld["id"]) == int(force_deal_id)), None)
+        if forced is not None:
+            return Resolution(K_AI, deal=forced)
 
     if len(suitable) > 1:
         # Правило D (никто не в работе) либо A (у кого-то уже есть признаки): в обоих случаях человек.
