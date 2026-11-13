@@ -46,6 +46,7 @@ import new_lead_watch
 import ms_client
 import office_record_watch
 import office_transfer
+import stage_guard
 import order_note
 import preorder_lead_name
 import order_watchdog
@@ -226,6 +227,9 @@ async def lifespan(app):
     # менеджеру перезаписать клиента. Модуль сам первым делом смотрит
     # OFFICE_RECORD_WATCH_ENABLED и без него не поднимает ни таблицу отметок, ни цикл.
     await office_record_watch.init()
+    # Сторож перемещений (13.11.2026): журнал событий amo, нарушения правил F5 -
+    # откат и уведомление. Сам смотрит STAGE_GUARD_ENABLED, режим по умолчанию dry.
+    await stage_guard.init()
     # Сторож бюджета (27.09.2026): бюджет сделки пишут мост amgroup и встроенный
     # пересчёт amo по товарам, и они перебивают друг друга. Модуль сверяет бюджет с
     # «Итого» из состава заказа и зовёт человека. Сам первым делом смотрит
@@ -280,6 +284,7 @@ async def lifespan(app):
     await uis_missed_call.shutdown()
     await new_lead_watch.shutdown()
     await office_record_watch.shutdown()
+    await stage_guard.shutdown()
     await budget_mismatch_watch.shutdown()
     await site_form_service.shutdown()
     await getcourse_service.shutdown()
@@ -333,6 +338,7 @@ async def health():
     return {"status": "ok", "telegram": telegram_bot.telegram_health(),
             "mail_watch": mail_watch.status(),
             "office_record": office_record_watch.status(),
+            "stage_guard": stage_guard.status(),
             "budget_watch": budget_mismatch_watch.status(),
             # Опрос вступлений: молчащий слушатель внутри живого контейнера
             # иначе неотличим от тишины по отсутствию вступлений.
