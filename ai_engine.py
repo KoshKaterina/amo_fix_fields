@@ -91,6 +91,8 @@ _ai_down_since: float | None = None
 _ai_down_alerted = False
 _off_alerted = False
 _alert_seen: dict[str, float] = {}      # дедуп алертов в памяти: ключ -> когда слали
+_send_failed_seen: dict[str, float] = {}   # отказ отправки клиенту: «сделка:причина» -> когда занесли в сделку и позвали людей
+SEND_FAILED_DEDUPE_S = 900
 _rule_c_seen: dict[int, float] = {}     # сделка -> когда проверяли правило C
 _rule_c_reads: list[float] = []         # когда читали сделки под правило C (для потолка в минуту)
 RULE_C_READS_PER_MIN = 30
@@ -1528,6 +1530,31 @@ async def _fire_ur_wave(owner: dict, wave: int, hhmm: str) -> bool:
     await _queue_event(owner, "ur_wave", extra={"reason": f"окно перевода в УР, волна {wave} ({hhmm} МСК)"})
     logger.info("ai_engine: сделка %s: окно УР, волна %s", owner["deal_id"], wave)
     return True
+
+
+async def send_failed(deal_id: int, code: str, reason: str) -> dict[str, Any]:
+    """ИИ-сервис не смог отправить клиенту сообщение (Wazzup отказал, канала нет): примечание в сделку, алерт в чат ОП с пингами и срочная задача
+    «Связаться с клиентом» на ответственного. Владелец сделки НЕ меняется, ИИ остаётся ведущим. Один раз на сделку и причину за 15 минут:
+    повторы (повторное одобрение, повтор хода) ничего не дублируют. Не бросает: сбой одной части не мешает остальным."""
+    now = _now()
+    key = f"{int(deal_id)}:{str(code)[:80]}"
+    if now - _send_failed_seen.get(key, 0) < SEND_FAILED_DEDUPE_S:
+        return {"ok": True, "deduped": True}
+    _send_failed_seen[key] = now
+    if len(_send_failed_seen) > 2000:
+        _send_failed_seen.clear()
+    text = " ".join(str(reason or "причина не названа").split())[:300]
+    try:
+        await asyncio.wait_for(amo_service.add_note(
+            int(deal_id), f"Не удалось отправить клиенту сообщение: {text}. Нужно связаться с клиентом вручную."), timeout=15)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: примечание об отказе отправки в сделку %s не записалось", deal_id)
+    s = await _db(store.session_for_deal, int(deal_id))
+    await _alert("send_failed", [f"ИИ не смог отправить клиенту сообщение: {_clean(text)}.", "Нужно связаться с клиентом вручную.",
+                                 _client_line(s), _link(int(deal_id))])
+    await ai_engine_tasks.create_send_failure_task(int(deal_id), str(code)[:80], text)
+    logger.warning("ai_engine: сделка %s: отказ отправки клиенту (%s), люди позваны", deal_id, code)
+    return {"ok": True, "deduped": False}
 
 
 async def raise_alert(key: str, lines: list[str]) -> None:
