@@ -736,10 +736,10 @@ def run_renewals(collect=False):
 # ===================================================================== проверка 4
 # DeFi-дашборд Пети (academy.sunscrypt.ru). Смотрим не на прокси и не на код
 # ответа, а на сами данные: источник может отвалиться молча, и снаружи сайт
-# останется живым - просто раздел опустеет. Morpho, Balancer и Compound вдобавок
+# останется живым - просто раздел опустеет. Morpho и Compound вдобавок
 # ходят через наш прокси в Вену (они режут российские IP), для них пустота почти
 # всегда значит «прокси лёг».
-DEFI_API = (ENV.get("DEFI_API") or "https://academy.sunscrypt.ru/defi-api").rstrip("/")
+DEFI_API = (ENV.get("DEFI_API") or "https://academy.sunscrypt.ru/internal/defi-monitor").rstrip("/")
 
 # раздел API -> какие протоколы там должны быть. Список снят с живой выдачи
 # 03.08.2026; добавит Петя новый источник - дописать сюда, иначе не следим.
@@ -747,7 +747,7 @@ DEFI_SOURCES = {
     "yields": [("Morpho", "morpho", True), ("Aave", "aave-v3", False), ("Euler", "euler", False),
                ("Compound", "compound", True), ("Fluid", "fluid", False),
                ("Jupiter Lend", "jupiter-lend", False)],
-    "pools": [("Uniswap", "uniswap", False), ("Balancer", "balancer", True),
+    "pools": [("Uniswap", "uniswap", False),
               ("Aerodrome", "aerodrome", False)],
     "perpdex": [("GMTrade", "gmtrade", False), ("GMX", "gmx", False), ("Jupiter JLP", "jupiter", False)],
 }
