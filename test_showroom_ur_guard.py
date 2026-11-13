@@ -103,8 +103,9 @@ def _ev(user, before_p=RET, before_s=83537718, at=100, after_p=RET):
             "value_after": [{"lead_status": {"id": 142, "pipeline_id": after_p}}]}
 
 
-def _reset(events=(), enabled=True, fail_reads=0, patch_ok=True):
+def _reset(events=(), enabled=True, fail_reads=0, patch_ok=True, dry=False):
     g.SHOWROOM_GUARD_ENABLED = enabled
+    g.SHOWROOM_GUARD_DRY_RUN = dry
     state.update(events=list(events), calls=0, fail_reads=fail_reads, patch_ok=patch_ok)
     patched.clear(); sent.clear()
 
@@ -159,3 +160,9 @@ def test_rollback_failed_still_blocks():
     _reset([_ev(IGOR)], patch_ok=False)
     assert run(g.check(_lead())) == "blocked-showroom-rollback-failed"
     assert "верните руками" in sent[0]["text"]
+
+
+def test_dry_run_logs_but_transfers():
+    _reset([_ev(IGOR)], dry=True)
+    assert run(g.check(_lead())) is None
+    assert patched == [] and sent == []

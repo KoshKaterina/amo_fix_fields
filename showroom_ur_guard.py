@@ -21,7 +21,8 @@
 в лог (сбой журнала не должен останавливать закрытие сделок офисом).
 ⚠️ Возврат в «Новый лид» заново запускает раздачу лидов - так велела Катя, в уведомлении
 об этом не пишем отдельно.
-Флаг `OFFICE_TRANSFER_SHOWROOM_GUARD=1`, по умолчанию выключено.
+Флаг `OFFICE_TRANSFER_SHOWROOM_GUARD`: пусто/0 - выключено (по умолчанию), `dry` - режим отчёта
+(в лог «остановила бы», перенос идёт как раньше), `1` - боевой режим.
 """
 from __future__ import annotations
 
@@ -46,7 +47,9 @@ from waybill_config import (
 
 logger = logging.getLogger("uvicorn")
 
-SHOWROOM_GUARD_ENABLED = os.getenv("OFFICE_TRANSFER_SHOWROOM_GUARD", "").strip() == "1"
+_MODE = os.getenv("OFFICE_TRANSFER_SHOWROOM_GUARD", "").strip().lower()
+SHOWROOM_GUARD_ENABLED = _MODE in ("1", "dry")
+SHOWROOM_GUARD_DRY_RUN = _MODE == "dry"
 # Сколько раз и с какой паузой искать событие перехода (amo пишет журнал чуть позже вебхука).
 LOOKUP_ATTEMPTS = int(os.getenv("SHOWROOM_GUARD_LOOKUP_ATTEMPTS", "3"))
 LOOKUP_PAUSE_S = float(os.getenv("SHOWROOM_GUARD_LOOKUP_PAUSE_S", "2"))
@@ -113,6 +116,10 @@ async def check(lead: dict) -> str | None:
 
     before = ((ev.get("value_before") or [{}])[0].get("lead_status") or {})
     back_pipeline, back_status = int(before.get("pipeline_id") or 0), int(before.get("id") or 0)
+    if SHOWROOM_GUARD_DRY_RUN:
+        logger.info("showroom_ur_guard %s [отчёт]: УР с самовывозом поставил онлайн-МОП %s - остановила бы "
+                    "перенос и вернула в %s/%s; переносим как раньше", lead_id, user_id, back_pipeline, back_status)
+        return None
     res = await amo_service.patch_lead(lead_id, pipeline_id=back_pipeline, status_id=back_status) \
         if back_pipeline and back_status else {"ok": False}
     returned = bool(res.get("ok"))
