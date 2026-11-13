@@ -48,6 +48,7 @@ import office_record_watch
 import office_transfer
 import stage_guard
 import shipment_missing_watch
+import shipment_resync
 import order_note
 import preorder_lead_name
 import order_watchdog
@@ -234,6 +235,9 @@ async def lifespan(app):
     # Сторож «отгрузка не создалась» (13.11.2026): этап отгрузки в Офисе, а «ID Отгрузки»
     # пуст - в чат ОП с причиной. Сам смотрит SHIPMENT_WATCH_ENABLED, по умолчанию отчёт.
     await shipment_missing_watch.init()
+    # Пересоздание отгрузки при правке заказа в МойСкладе (13.11.2026). Сам смотрит
+    # SHIPMENT_RESYNC_ENABLED, по умолчанию режим отчёта.
+    await shipment_resync.init()
     # Сторож бюджета (27.09.2026): бюджет сделки пишут мост amgroup и встроенный
     # пересчёт amo по товарам, и они перебивают друг друга. Модуль сверяет бюджет с
     # «Итого» из состава заказа и зовёт человека. Сам первым делом смотрит
@@ -290,6 +294,7 @@ async def lifespan(app):
     await office_record_watch.shutdown()
     await stage_guard.shutdown()
     await shipment_missing_watch.shutdown()
+    await shipment_resync.shutdown()
     await budget_mismatch_watch.shutdown()
     await site_form_service.shutdown()
     await getcourse_service.shutdown()
@@ -345,6 +350,7 @@ async def health():
             "office_record": office_record_watch.status(),
             "stage_guard": stage_guard.status(),
             "shipment_watch": shipment_missing_watch.status(),
+            "shipment_resync": shipment_resync.status(),
             "budget_watch": budget_mismatch_watch.status(),
             # Опрос вступлений: молчащий слушатель внутри живого контейнера
             # иначе неотличим от тишины по отсутствию вступлений.

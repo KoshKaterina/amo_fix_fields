@@ -84,7 +84,11 @@ from waybill_config import (
     FIELD_MOYSKLAD_ORDER_UUID,
     MS_API_URL,
     PIPELINE_OFFICE,
+    STATUS_OFFICE_AWAITING_PICKUP,
+    STATUS_OFFICE_COURIER_MSK,
     STATUS_OFFICE_COURIER_OWN,
+    STATUS_OFFICE_IN_TRANSIT,
+    STATUS_OFFICE_SHIPPED,
     STATUS_SUCCESS,
     STATUS_WAYBILL_READY,
 )
@@ -117,7 +121,27 @@ WAREHOUSE_ENUMS = {
 
 # Целевые этапы воронки «Офис» - см. докстринг модуля. Все три уже определены
 # в waybill_config.py, здесь только собираем набор для проверки.
-_TRIGGER_STATUSES = {STATUS_WAYBILL_READY, STATUS_OFFICE_COURIER_OWN, STATUS_SUCCESS}
+# 13.11.2026 (решение Кати): расширено с трёх до всех семи этапов, на которых отгрузку
+# создаёт сама интеграция amgroup (её настройки: Достависта МСК, Доставка наш курьер,
+# Готова накладная, Посылка отгружена, В пути, Ожидает в ПВЗ, Успешно реализовано).
+# Раньше на четырёх из них при лежащем amgroup товар не списывал никто. Двойного списания
+# не будет: обычный путь «Готова накладная → Отгружена → В пути → ПВЗ» отгрузку уже
+# несёт, и все три гейта (поле сделки, отгрузки заказа в МойСкладе, диск) это видят.
+_TRIGGER_STATUSES = {
+    STATUS_OFFICE_COURIER_MSK, STATUS_OFFICE_COURIER_OWN, STATUS_WAYBILL_READY,
+    STATUS_OFFICE_SHIPPED, STATUS_OFFICE_IN_TRANSIT, STATUS_OFFICE_AWAITING_PICKUP, STATUS_SUCCESS,
+}
+# ⚠️ Новые четыре этапа - только при СВЕЖЕМ переходе. Модуль зовут на ЛЮБОЙ вебхук сделки,
+# стоящей на этапе, а на «Посылка отгружена» / «В пути» / «Ожидает в ПВЗ» лежат и старые
+# сделки. Без этой проверки правка давней сделки без отгрузки списала бы товар задним
+# числом - ровно так в августе миграция родила фантомные отгрузки
+# (knowledge/amo-voronka-migration-phantom-shipments.md). Три прежних этапа не трогаем:
+# их поведение не меняется.
+_FRESH_ONLY_STATUSES = {
+    STATUS_OFFICE_COURIER_MSK, STATUS_OFFICE_SHIPPED, STATUS_OFFICE_IN_TRANSIT,
+    STATUS_OFFICE_AWAITING_PICKUP,
+}
+FRESH_WINDOW_S = int(os.getenv("AMGROUP_SHIPMENT_FRESH_WINDOW_S", str(24 * 3600)))
 
 # Разведка 03.09.2026: во всех трёх случаях отгрузка идёт с этого склада и от
 # этого юрлица (ИП Перфилов - в поля сделки не пишем, туда просят только
@@ -298,6 +322,25 @@ def _customerorder_meta(order_uuid: str) -> dict:
     }
 
 
+async def _entered_recently(lead_id, pipeline_id: int, status_id: int) -> bool:
+    """Сделку перевели на этот этап за последние FRESH_WINDOW_S. amoCRM молчит - False:
+    не уверены, что переход свежий, - отгрузку не создаём (молчание не равно «да»)."""
+    data = await amo_service._do_get("/api/v4/events", [
+        ("filter[type]", "lead_status_changed"),
+        ("filter[entity]", "lead"),
+        ("filter[entity_id]", str(lead_id)),
+        ("filter[created_at][from]", str(int(time.time()) - FRESH_WINDOW_S)),
+        ("limit", "100"),
+    ])
+    if data is None:
+        return False
+    for ev in (data.get("_embedded") or {}).get("events") or []:
+        after = ((ev.get("value_after") or [{}])[0].get("lead_status") or {})
+        if _as_int(after.get("pipeline_id")) == pipeline_id and _as_int(after.get("id")) == status_id:
+            return True
+    return False
+
+
 async def _find_existing_demand(order_uuid: str) -> list[dict] | None:
     """Отгрузки МойСклада, уже привязанные к этому заказу покупателя.
 
@@ -456,6 +499,13 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
         _note_failure(lead_id, "no_order")
         return None
 
+    if status_id in _FRESH_ONLY_STATUSES and not await _entered_recently(lead_id, pipeline_id, status_id):
+        logger.info(
+            "amgroup_shipment: сделка %s стоит на этапе %s давно (или amo не ответил) - "
+            "задним числом отгрузку не создаём", lead_id, status_id,
+        )
+        return None
+
     async with _lock_for(lead_id):
         key = str(lead_id)
 
@@ -558,6 +608,64 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
             if _created.get(key, {}).get("pending"):
                 del _created[key]
                 _save_state()
+
+
+async def recreate_shipment(lead: dict, order_uuid: str, old_demand_id: str) -> dict:
+    """Пересоздать отгрузку по изменённому заказу (пункт 1 плана Кати, 13.11.2026).
+
+    Порядок: удалить старую отгрузку → собрать шаблон по заказу → создать новую →
+    переписать три поля сделки. Шаблон собираем ПОСЛЕ удаления: МойСклад кладёт в
+    шаблон только неотгруженный остаток заказа, при живой старой отгрузке он был бы пуст.
+    Возвращает {"ok", "deleted", "result", "reason"}: ok - новая отгрузка создана;
+    deleted - старая удалена (при ok=False это значит: товар вернулся на склад, а новой
+    отгрузки нет - человек должен создать руками, причина в reason).
+    """
+    lead_id = lead.get("id")
+    key = str(lead_id)
+    out = {"ok": False, "deleted": False, "result": None, "reason": None}
+    async with _lock_for(lead_id):
+        _load_state()
+        deleted = await ms_client.delete(f"entity/demand/{old_demand_id}")
+        if not deleted:
+            out["reason"] = human_reason({"kind": "post_failed", "detail": ms_client.last_error})                 .replace("в создании отгрузки", "в удалении старой отгрузки")
+            return out
+        out["deleted"] = True
+        _created[key] = {"pending": True, "order_uuid": order_uuid}
+        _save_state()
+        try:
+            template = await ms_client.put(
+                "entity/demand/new", {"customerOrder": _customerorder_meta(order_uuid)},
+            )
+            if template is None:
+                out["reason"] = human_reason({"kind": "no_template", "detail": ms_client.last_error})
+                return out
+            demand = await ms_client.post("entity/demand", template)
+            if not demand or not demand.get("id"):
+                out["reason"] = human_reason({"kind": "post_failed", "detail": ms_client.last_error})
+                return out
+            shipment_id, shipment_number = str(demand["id"]), str(demand.get("name") or "")
+            _created[key] = {
+                "shipment_id": shipment_id, "shipment_number": shipment_number,
+                "order_uuid": order_uuid, "recreated_from": old_demand_id,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            _save_state()
+            _failures.pop(key, None)
+            warehouse_name = await _resolve_store_name(demand.get("store"))
+            result = {"shipment_id": shipment_id, "shipment_number": shipment_number,
+                      "warehouse": warehouse_name}
+            await write_shipment_fields_to_lead(lead_id, result)
+            out.update(ok=True, result=result)
+            return out
+        finally:
+            if _created.get(key, {}).get("pending"):
+                del _created[key]
+                _save_state()
+                _note_failure(lead_id, "post_failed", ms_client.last_error)
+                # Старой отгрузки уже нет - её номер в сделке врёт. Чистим «ID Отгрузки»,
+                # чтобы сторож «отгрузки нет» увидел дыру и позвал человека.
+                await amo_service._do_patch(f"/api/v4/leads/{lead_id}", {"custom_fields_values": [
+                    {"field_id": FIELD_SHIPMENT_ID, "values": None}]})
 
 
 async def handle_lead_status_change(lead_id: int | str, status_id, pipeline_id) -> dict | None:

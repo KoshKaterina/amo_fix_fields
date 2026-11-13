@@ -72,7 +72,9 @@ _stub("alerts", lead_link=lambda i: f"<a>{i}</a>",
 _stub("tg_recipients", NOTIFY_CHAT_ID=-100, NOTIFY_THREAD_ID=10479)
 _stub("waybill_config", PIPELINE_OFFICE=OFF, AMGROUP_SHIPMENT_DRY_RUN=False, AMGROUP_SHIPMENT_ENABLED=True,
       AMGROUP_SHIPMENT_GRACE_SEC=0, FIELD_MOYSKLAD_ORDER_UUID=F_ORDER, MS_API_URL="https://ms",
-      STATUS_OFFICE_COURIER_OWN=75426870, STATUS_SUCCESS=142, STATUS_WAYBILL_READY=75426874)
+      STATUS_OFFICE_COURIER_OWN=75426870, STATUS_SUCCESS=142, STATUS_WAYBILL_READY=75426874,
+      STATUS_OFFICE_COURIER_MSK=75426866, STATUS_OFFICE_SHIPPED=75426878, STATUS_OFFICE_IN_TRANSIT=75426882,
+      STATUS_OFFICE_AWAITING_PICKUP=75426886)
 for _m in ("amgroup_shipment", "shipment_missing_watch"):
     _SAVED.setdefault(_m, sys.modules.get(_m))
     sys.modules.pop(_m, None)
@@ -154,7 +156,7 @@ def test_reasons():
         {"error": "Нельзя отгрузить товар, которого нет на складе", "code": 3007}]}))
     assert "нет на складе" in W.reason_for(_lead(6))
     assert "не привязан заказ" in W.reason_for(_lead(7, order=None))
-    assert "этап не обслуживает" in W.reason_for(_lead(8, status=75426866))
+    assert "этап не обслуживает" in W.reason_for(_lead(8, status=75426858))
     assert "создайте её в МойСкладе" in W.reason_for(_lead(9))
     assert A.human_reason({"kind": "post_failed", "detail": "<html>502</html>"}).startswith("МойСклад отказал")
 
