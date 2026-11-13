@@ -95,6 +95,32 @@ async def create_contact_task(deal_id: int, reason: str, why: str) -> bool:
         return False
 
 
+SEND_FAILED_MARKER = "[send_failed:"     # не `[handoff:`: передачей это не считается, ИИ остаётся владельцем и не замолкает на шлюзе отправки
+
+
+async def create_send_failure_task(deal_id: int, code: str, why: str) -> bool:
+    """Срочная задача «Связаться с клиентом»: ИИ не смог отправить клиенту сообщение. Не ставит вторую по той же причине, пока первая открыта."""
+    if not cfg.HANDOFF_TASKS:
+        return False
+    try:
+        marker = f"{SEND_FAILED_MARKER}{code}]"
+        open_tasks = await _get_open(deal_id)
+        if open_tasks is None:
+            logger.warning("ai_engine_tasks: amo не ответил по задачам сделки %s, задачу об отказе отправки не ставлю", deal_id)
+            return False
+        if any(str(t.get("text") or "").startswith(marker) for t in open_tasks):
+            return False
+        uid = await _responsible(deal_id)
+        if not uid:
+            logger.info("ai_engine_tasks: у сделки %s нет ответственного, задачи об отказе отправки не будет (остался алерт)", deal_id)
+            return False
+        text = f"{marker} Связаться с клиентом, срочно: ИИ не смог отправить сообщение ({why.strip()})"[:500]
+        return bool(await _create(deal_id, text, uid, int(time.time()) + DUE_S))
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine_tasks: задача об отказе отправки по сделке %s не поставилась", deal_id)
+        return False
+
+
 async def release_intake(deal_id: int) -> int:
     """ИИ первый раз взял сделку: закрыть системные задачи приёма лида. Возвращает, сколько закрыто."""
     if not cfg.INTAKE_TASKS_CLOSE:

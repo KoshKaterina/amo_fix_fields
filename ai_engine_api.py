@@ -60,6 +60,14 @@ class GiveIn(BaseModel):
     retrigger: bool = False     # сделку ИИ уже ведёт: поставить ход-событие заново
 
 
+class SendFailedIn(BaseModel):
+    """ИИ-сервис не смог отправить сообщение клиенту: `code` короткий код причины (для дедупликации), `reason` читаемая причина по-русски."""
+    deal_id: int
+    turn_id: int = 0
+    code: str
+    reason: str
+
+
 class FollowupIn(BaseModel):
     """Отложенное касание, о котором клиент попросил сам (`ai_engine_followup`). `due_at_ts` это unix-секунды."""
     deal_id: int
@@ -141,6 +149,20 @@ async def followup(body: FollowupIn, x_service_token: str = Header(default=""), 
         logger.exception("ai_engine: отложенное касание по сделке %s не зарегистрировано", body.deal_id)
         return JSONResponse({"allowed": False, "reason": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
+
+
+@router.post("/send_failed")
+async def send_failed(body: SendFailedIn, x_service_token: str = Header(default=""), x_contract: str = Header(default="")):
+    """Отказ отправки клиенту: примечание, алерт и срочная задача (`ai_engine.send_failed`). Токен сервиса, как у `permit`."""
+    bad = _check_service(x_service_token, x_contract)
+    if bad is not None:
+        return bad
+    try:
+        out = await ai_engine.send_failed(body.deal_id, body.code, body.reason)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: отказ отправки по сделке %s не обработан", body.deal_id)
+        return JSONResponse({"detail": "engine_error"}, status_code=500)
+    return JSONResponse(out)
 
 
 @router.post("/return_dialog")
