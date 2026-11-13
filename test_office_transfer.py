@@ -1424,3 +1424,48 @@ def test_metrika_kartoteku_ne_vidit_a_roznicu_otpravlyaet_geyt_voro():
     assert _target is not None and _target["site"] == "19003", _target
     metrika_sync.amo_service.find_leads_by_query = _saved_find
 
+def test_samovyvoz_v_ur_onlayn_mopa_ostanavlivaet_perenos():
+    """Пункт 4 (13.11.2026): защита самовывоза вызывается ровно перед переносом в УР Офиса,
+    её «стоп» отменяет перенос, её «пропуск» - нет. Саму защиту проверяет
+    test_showroom_ur_guard.py."""
+    import showroom_ur_guard
+    original = showroom_ur_guard.check
+    seen = []
+
+    async def fake_block(lead):
+        seen.append(lead["id"])
+        return "blocked-showroom-online-mop"
+
+    async def fake_pass(lead):
+        seen.append(lead["id"])
+        return None
+
+    try:
+        _reset()
+        lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+                     delivery_text="Самовывоз из шоурума")
+        _install_dispatcher_mocks(lead)
+        showroom_ur_guard.check = fake_block
+        res = run(office_transfer.process_office_transfer(42))
+        assert res == "blocked-showroom-online-mop", res
+        assert not _patches and seen == [42]
+
+        _reset(); seen.clear()
+        _install_dispatcher_mocks(lead)
+        showroom_ur_guard.check = fake_pass
+        res = run(office_transfer.process_office_transfer(42))
+        assert res == "moved", res
+        assert _patches and _patches[0]["pipeline_id"] == PIPELINE_OFFICE and seen == [42]
+
+        # Не самовывоз (СДЭК → «Сделать накладную») - защиту даже не спрашиваем.
+        _reset(); seen.clear()
+        lead = _lead(application_type=APPLICATION_TYPE_ORDER, warehouse=WAREHOUSE_SUNSCRYPT_MAIN,
+                     delivery_text="CDEK: до двери")
+        _install_dispatcher_mocks(lead)
+        showroom_ur_guard.check = fake_block
+        res = run(office_transfer.process_office_transfer(42))
+        assert res == "moved", res
+        assert seen == []
+    finally:
+        showroom_ur_guard.check = original
+

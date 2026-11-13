@@ -101,6 +101,10 @@ _stub("tg_recipients", NOTIFY_CHAT_ID=-100, NOTIFY_THREAD_ID=10479)
 _stub("waybill_config", MANAGER_NAMES={9291546: "Игорь Оанча", 13963494: "Екатерина Зубалий"},
       WAZZUP_TG_HANDLES={9291546: "@thebarsa1"})
 
+# Модуль под тестом мог быть уже загружен другим файлом (его импортирует webhooks.py) -
+# тогда он держит настоящие зависимости. Грузим свежую копию поверх заглушек.
+_SAVED.setdefault("stage_guard", sys.modules.get("stage_guard"))
+sys.modules.pop("stage_guard", None)
 import stage_guard  # noqa: E402
 import stage_guard_rules as R  # noqa: E402
 

@@ -681,6 +681,17 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
         return "no-match"
     target_pipeline_id, target_status_id = target
 
+    # Самовывоз в УР Офиса закрывает офис, а не онлайн-менеджер (пункт 4 плана Кати,
+    # 13.11.2026): УР Офиса создаёт отгрузку, товар списывается. Онлайн-МОП перевёл сделку
+    # с самовывозом в УР - не переносим, возвращаем, откуда перевёл, и зовём его в чат ОП.
+    # Флаг OFFICE_TRANSFER_SHOWROOM_GUARD, по умолчанию выключено. Импорт ленивый.
+    if (target_pipeline_id, target_status_id) == (PIPELINE_OFFICE, STATUS_SUCCESS):
+        import showroom_ur_guard
+        blocked = await showroom_ur_guard.check(lead)
+        if blocked:
+            _clear_fail(lead_id)
+            return blocked
+
     # PAID/CANCELLED ДО переноса (мина «копирование→перенос», фикс 31.07.2026):
     # Метрика и Woo классифицируют предоплату по состоянию «CLEVER/142», а
     # после PATCH сделка в нём больше не появится — сверка по расписанию его
