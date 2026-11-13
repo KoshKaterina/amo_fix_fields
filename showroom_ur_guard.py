@@ -48,8 +48,11 @@ from waybill_config import (
 logger = logging.getLogger("uvicorn")
 
 _MODE = os.getenv("OFFICE_TRANSFER_SHOWROOM_GUARD", "").strip().lower()
-SHOWROOM_GUARD_ENABLED = _MODE in ("1", "dry")
+SHOWROOM_GUARD_ENABLED = _MODE in ("1", "dry", "notify")
 SHOWROOM_GUARD_DRY_RUN = _MODE == "dry"
+# `notify` - живое уведомление в чат ОП без действия: сделка уезжает в Офис как раньше
+# (Катя 13.11: «живые алерты на всё» на неделю проверки).
+SHOWROOM_GUARD_NOTIFY_ONLY = _MODE == "notify"
 # Сколько раз и с какой паузой искать событие перехода (amo пишет журнал чуть позже вебхука).
 LOOKUP_ATTEMPTS = int(os.getenv("SHOWROOM_GUARD_LOOKUP_ATTEMPTS", "3"))
 LOOKUP_PAUSE_S = float(os.getenv("SHOWROOM_GUARD_LOOKUP_PAUSE_S", "2"))
@@ -120,14 +123,26 @@ async def check(lead: dict) -> str | None:
         logger.info("showroom_ur_guard %s [отчёт]: УР с самовывозом поставил онлайн-МОП %s - остановила бы "
                     "перенос и вернула в %s/%s; переносим как раньше", lead_id, user_id, back_pipeline, back_status)
         return None
+    tag = WAZZUP_TG_HANDLES.get(user_id) or MANAGER_NAMES.get(user_id) or "менеджер"
+    link = alerts.lead_link(lead_id)
+    if SHOWROOM_GUARD_NOTIFY_ONLY:
+        await _notify(lead_id, tag, link, "Режим проверки: сделка уехала в Офис как раньше и товар "
+                      "списан. Самовывоз закрывает офис, когда клиент забрал товар.")
+        logger.info("showroom_ur_guard %s [уведомление]: УР с самовывозом поставил онлайн-МОП %s, "
+                    "переносим как раньше", lead_id, user_id)
+        return None
     res = await amo_service.patch_lead(lead_id, pipeline_id=back_pipeline, status_id=back_status) \
         if back_pipeline and back_status else {"ok": False}
     returned = bool(res.get("ok"))
-
-    tag = WAZZUP_TG_HANDLES.get(user_id) or MANAGER_NAMES.get(user_id) or "менеджер"
-    link = alerts.lead_link(lead_id)
     tail = ("Сделка возвращена на прежний этап. Самовывоз закрывает офис, когда клиент забрал товар."
             if returned else "Вернуть сделку не получилось - верните руками, в Офис она не перенесена.")
+    await _notify(lead_id, tag, link, tail)
+    logger.info("showroom_ur_guard %s: УР онлайн-МОПа %s остановлен, возврат %s/%s - %s",
+                lead_id, user_id, back_pipeline, back_status, "ок" if returned else "НЕ УДАЛСЯ")
+    return "blocked-showroom-online-mop" if returned else "blocked-showroom-rollback-failed"
+
+
+async def _notify(lead_id: int, tag: str, link: str, tail: str) -> None:
     text = f"⛔ {tag} некорректное действие в CRM: попытка перевода офисной сделки в УР.\n{tail}\n{link}"
     try:
         d = alerts.decide(EVENT_KEY, legacy_text=text,
@@ -138,6 +153,3 @@ async def check(lead: dict) -> str | None:
             await telegram_bot.send_alert(d.text, **d.send_kwargs())
     except Exception:
         logger.exception("showroom_ur_guard %s: уведомление не ушло", lead_id)
-    logger.info("showroom_ur_guard %s: УР онлайн-МОПа %s остановлен, возврат %s/%s - %s",
-                lead_id, user_id, back_pipeline, back_status, "ок" if returned else "НЕ УДАЛСЯ")
-    return "blocked-showroom-online-mop" if returned else "blocked-showroom-rollback-failed"

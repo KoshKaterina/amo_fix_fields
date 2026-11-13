@@ -103,9 +103,10 @@ def _ev(user, before_p=RET, before_s=83537718, at=100, after_p=RET):
             "value_after": [{"lead_status": {"id": 142, "pipeline_id": after_p}}]}
 
 
-def _reset(events=(), enabled=True, fail_reads=0, patch_ok=True, dry=False):
+def _reset(events=(), enabled=True, fail_reads=0, patch_ok=True, dry=False, notify=False):
     g.SHOWROOM_GUARD_ENABLED = enabled
     g.SHOWROOM_GUARD_DRY_RUN = dry
+    g.SHOWROOM_GUARD_NOTIFY_ONLY = notify
     state.update(events=list(events), calls=0, fail_reads=fail_reads, patch_ok=patch_ok)
     patched.clear(); sent.clear()
 
@@ -166,3 +167,10 @@ def test_dry_run_logs_but_transfers():
     _reset([_ev(IGOR)], dry=True)
     assert run(g.check(_lead())) is None
     assert patched == [] and sent == []
+
+
+def test_notify_only_alerts_but_transfers():
+    _reset([_ev(IGOR)], notify=True)
+    assert run(g.check(_lead())) is None
+    assert patched == [] and len(sent) == 1
+    assert "@thebarsa1" in sent[0]["text"] and "Режим проверки" in sent[0]["text"]

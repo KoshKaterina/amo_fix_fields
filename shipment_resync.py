@@ -52,6 +52,9 @@ logger = logging.getLogger("uvicorn")
 
 SHIPMENT_RESYNC_ENABLED = os.getenv("SHIPMENT_RESYNC_ENABLED", "").strip() == "1"
 SHIPMENT_RESYNC_DRY_RUN = os.getenv("SHIPMENT_RESYNC_DRY_RUN", "1").strip() != "0"
+# Живое уведомление без действия (Катя 13.11: «живые алерты на всё» на неделю проверки):
+# сообщение «до → после» уходит в чат, отгрузка НЕ трогается. Главнее DRY_RUN.
+SHIPMENT_RESYNC_NOTIFY_ONLY = os.getenv("SHIPMENT_RESYNC_MODE", "").strip().lower() == "notify"
 SHIPMENT_RESYNC_INTERVAL_S = int(os.getenv("SHIPMENT_RESYNC_INTERVAL_S", "300"))
 SHIPMENT_RESYNC_OVERLAP_S = int(os.getenv("SHIPMENT_RESYNC_OVERLAP_S", "120"))
 SHIPMENT_RESYNC_START_LOOKBACK_S = int(os.getenv("SHIPMENT_RESYNC_START_LOOKBACK_S", "600"))
@@ -68,6 +71,7 @@ _last_run: dict = {}
 # Заказы с несколькими отгрузками, о которых уже сказали: ключ - заказ плюс его состав.
 # Иначе каждая новая правка такого заказа (смена статуса, комментарий) повторяла бы алерт.
 _multi_notified: set[tuple[str, str]] = set()
+_changed_notified: set[tuple[str, str]] = set()
 
 
 # ─────────────────────────────── сравнение ───────────────────────────────
@@ -204,6 +208,7 @@ def build_message(order: dict, lead: dict, who: str, outcome: str, lines: list[s
     head = f"🔄 Заказ №{order.get('name') or '?'} изменён пользователем {who} в воронке Офис"
     status = {
         "recreated": "отгрузка пересоздана",
+        "would": "отгрузка НЕ пересоздана (режим проверки): склад списал старый состав",
         "multi": "отгрузка НЕ изменена: у заказа несколько отгрузок, поправьте руками",
         "delete_failed": "отгрузка НЕ изменена",
         "create_failed": "⚠️ старая отгрузка удалена, новая НЕ создалась - товар вернулся на склад, "
@@ -280,10 +285,22 @@ async def handle_order(order: dict) -> str:
         key = (order_id, json.dumps(sorted((list(k), v) for k, v in after.items())))
         if key in _multi_notified:
             return "multi-known"
-        if not SHIPMENT_RESYNC_DRY_RUN:
+        if not SHIPMENT_RESYNC_DRY_RUN or SHIPMENT_RESYNC_NOTIFY_ONLY:
             _multi_notified.add(key)
             await _send(build_message(order, lead, who, "multi", []), lead)
         return "multi"
+
+    if SHIPMENT_RESYNC_NOTIFY_ONLY:
+        # Один раз на один состав заказа: иначе любая следующая правка заказа (статус,
+        # комментарий) при неизменном расхождении повторяла бы сообщение.
+        key = (order_id, json.dumps(sorted((list(k), v) for k, v in after.items())))
+        if key in _changed_notified:
+            return "notify-known"
+        _changed_notified.add(key)
+        await _send(build_message(order, lead, who, "would", lines), lead)
+        logger.info("Пересоздание отгрузок [уведомление]: заказ %s, сделка %s, правил %s. %s",
+                    order.get("name"), lead.get("id"), who, "; ".join(lines))
+        return "notified"
 
     if SHIPMENT_RESYNC_DRY_RUN:
         logger.info("Пересоздание отгрузок [отчёт]: заказ %s, сделка %s, правил %s - пересоздала бы. %s",
@@ -326,7 +343,7 @@ async def sweep_once() -> dict:
             logger.exception("Пересоздание отгрузок: заказ %s упал", order.get("name"))
             o = "error"
         outcomes[o] += 1
-        if o in ("recreated", "create_failed", "delete_failed", "multi", "dry"):
+        if o in ("recreated", "create_failed", "delete_failed", "multi", "dry", "notified"):
             acted += 1
     # Курсор не двигаем, если что-то отложили: следующий проход доберёт.
     if not outcomes.get("deferred") and not outcomes.get("ms-silent"):

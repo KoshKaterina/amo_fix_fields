@@ -162,9 +162,11 @@ def _lead(lid=5, pipeline=OFF, status=75426874, order="ord-1"):
             "custom_fields_values": [{"field_id": F_ORDER, "values": [{"value": order}]}]}
 
 
-def _setup(order_rows, demand_rows, demands=("dem-1",), dry=False, lead=None):
+def _setup(order_rows, demand_rows, demands=("dem-1",), dry=False, lead=None, notify=False):
     S.SHIPMENT_RESYNC_DRY_RUN = dry
+    S.SHIPMENT_RESYNC_NOTIFY_ONLY = notify
     sent.clear(); calls.clear(); patched_amo.clear(); ms.clear(); S._multi_notified.clear()
+    S._changed_notified.clear()
     A._created.clear(); A._failures.clear()
     ms_mod.last_error = None
     ms["entity/customerorder/ord-1/positions"] = {"rows": order_rows}
@@ -272,3 +274,11 @@ def test_old_stages_unchanged():
     _setup([], [])
     amo_events.clear()
     assert run(A.create_shipment_for_lead(_lead(lid=12, status=75426874)))["shipment_id"] == "new-d"
+
+
+def test_notify_only_sends_diff_once_and_touches_nothing():
+    o = _setup([pos(TANGEM, 2, 1, name="Tangem")], [pos(TANGEM, 1, 1, name="Tangem")], dry=True, notify=True)
+    assert run(S.handle_order(o)) == "notified"
+    assert run(S.handle_order(o)) == "notify-known"
+    assert len(sent) == 1 and "НЕ пересоздана" in sent[0]["text"] and "Tangem: ×1 → ×2" in sent[0]["text"]
+    assert not any(c[0] in ("DELETE", "POST", "PUT") for c in calls)
