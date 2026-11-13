@@ -142,6 +142,64 @@ _STATE_CAP = 5000
 _bg_tasks: set = set()
 
 # ---------------------------------------------------------------------------
+# Причина последнего отказа по сделке (пункт 3 плана Кати, 13.11.2026). Сторож
+# `shipment_missing_watch` пишет в чат ОП «отгрузка не создалась» и берёт причину
+# отсюда - человеческим языком, а не строкой лога. Память процесса: пересборка
+# контейнера её стирает, тогда сторож назовёт общую причину. Успех причину снимает.
+# ---------------------------------------------------------------------------
+_failures: dict[str, dict] = {}
+_FAILURES_CAP = 2000
+
+
+def _note_failure(lead_id, kind: str, detail: str | None = None) -> None:
+    if len(_failures) >= _FAILURES_CAP:
+        for k in sorted(_failures, key=lambda x: _failures[x]["ts"])[: _FAILURES_CAP // 4]:
+            _failures.pop(k, None)
+    _failures[str(lead_id)] = {"kind": kind, "detail": detail, "ts": time.time()}
+
+
+def last_failure(lead_id) -> dict | None:
+    return _failures.get(str(lead_id))
+
+
+def _ms_error_text(detail: str | None) -> str:
+    """Ответ МойСклада с ошибкой → его же человеческий текст («Нельзя отгрузить
+    товар, которого нет на складе…»). Не JSON - отдаём как есть, обрезав."""
+    if not detail:
+        return ""
+    try:
+        data = json.loads(detail)
+        errs = data.get("errors") if isinstance(data, dict) else None
+        if errs:
+            texts = [str(e.get("error") or "").strip() for e in errs if isinstance(e, dict)]
+            texts = [t for t in texts if t]
+            if texts:
+                return "; ".join(dict.fromkeys(texts))[:400]
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return str(detail)[:300]
+
+
+def human_reason(failure: dict | None) -> str | None:
+    """Причина отказа для уведомления. None - отказа не записано."""
+    if not failure:
+        return None
+    kind, detail = failure.get("kind"), failure.get("detail")
+    if kind == "no_order":
+        return "к сделке не привязан заказ МойСклада (пустое поле «ID Заказа»), отгружать не по чему"
+    if kind == "ms_silent_check":
+        return "МойСклад не ответил, когда проверяли, нет ли уже отгрузки по заказу"
+    if kind == "no_template":
+        ms = _ms_error_text(detail)
+        return "МойСклад не собрал отгрузку по заказу" + (f": {ms}" if ms else "")
+    if kind == "post_failed":
+        ms = _ms_error_text(detail)
+        return "МойСклад отказал в создании отгрузки" + (f": {ms}" if ms else "")
+    if kind == "lead_unread":
+        return "amoCRM не отдал сделку, когда пришло время делать отгрузку"
+    return None
+
+# ---------------------------------------------------------------------------
 # Дебаунс по сделке (05.10.2026). Вебхук `/lead_change` приходит на ЛЮБОЕ
 # изменение сделки, и по сделке на целевом этапе их прилетает несколько: замер
 # за 50 минут дал 211 запусков этого модуля на 77 уникальных сделок, то есть
@@ -395,6 +453,7 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
             "(576689) - отгрузку делать не по чему",
             lead_id,
         )
+        _note_failure(lead_id, "no_order")
         return None
 
     async with _lock_for(lead_id):
@@ -425,6 +484,7 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
                     "«отгрузки нет»)",
                     order_uuid, lead_id,
                 )
+                _note_failure(lead_id, "ms_silent_check")
                 return None
             if existing:
                 logger.info(
@@ -443,6 +503,7 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
                     "amgroup_shipment: МойСклад не отдал шаблон отгрузки по заказу %s (сделка %s)",
                     order_uuid, lead_id,
                 )
+                _note_failure(lead_id, "no_template", ms_client.last_error)
                 return None
 
             if AMGROUP_SHIPMENT_DRY_RUN:
@@ -466,6 +527,7 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
                     "amgroup_shipment: МойСклад не создал отгрузку по заказу %s (сделка %s): %r",
                     order_uuid, lead_id, demand,
                 )
+                _note_failure(lead_id, "post_failed", ms_client.last_error)
                 return None
 
             shipment_id = str(demand["id"])
@@ -483,6 +545,7 @@ async def create_shipment_for_lead(lead: dict) -> dict | None:
             }
             _save_state()
 
+            _failures.pop(key, None)
             warehouse_name = await _resolve_store_name(demand.get("store"))
             result = {"shipment_id": shipment_id, "shipment_number": shipment_number, "warehouse": warehouse_name}
             await write_shipment_fields_to_lead(lead_id, result)
@@ -525,6 +588,7 @@ async def handle_lead_status_change(lead_id: int | str, status_id, pipeline_id) 
         logger.warning(
             "amgroup_shipment: сделку %s не удалось прочитать, отгрузку не создаём", lead_id,
         )
+        _note_failure(lead_id, "lead_unread")
         return None
     return await create_shipment_for_lead(lead)
 
