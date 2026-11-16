@@ -53,6 +53,13 @@ OFFICE_RETURN_TARGETS = frozenset({PIPELINE_RETAIL, PIPELINE_TANGEMSHOP})
 # Единственный разрешённый онлайн-МОПу ход в Офисе (G6): из «Предзаказ оплачен» сюда.
 MOP_OFFICE_ALLOWED_TARGETS = frozenset({STATUS_MAKE_WAYBILL, STATUS_ARRANGE_DELIVERY, STATUS_LOST})
 
+STATUS_WAYBILL_READY = 75426874     # Готова накладная
+
+# Ходы онлайн-МОПа в Офисе, которые сторож пока не судит (решение Кати 16.11.2026).
+# «Готова накладная → Сделать накладную» сразу после своего УР: по словам Кати, баг amo,
+# ход обратим - в чат ОП не шлём. Дубли накладных СДЭК от этого хода - отдельная задача.
+MOP_OFFICE_IGNORED_MOVES = frozenset({(STATUS_WAYBILL_READY, STATUS_MAKE_WAYBILL)})
+
 ROBOT_USER_ID = 0
 
 
@@ -140,6 +147,9 @@ def judge(m: Move, cfg: Config) -> Verdict | None:
 
     # G6: онлайн-МОП и воронка Офис.
     if m.user_id in cfg.online_mops and touches_office:
+        if (m.from_pipeline == m.to_pipeline == PIPELINE_OFFICE
+                and (m.from_status, m.to_status) in MOP_OFFICE_IGNORED_MOVES):
+            return None
         allowed = (
             m.from_pipeline == PIPELINE_OFFICE and m.from_status == STATUS_PREORDER_PAID
             and m.to_pipeline == PIPELINE_OFFICE and m.to_status in MOP_OFFICE_ALLOWED_TARGETS

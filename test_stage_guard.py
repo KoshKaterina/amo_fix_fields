@@ -162,7 +162,9 @@ def test_g5_free_inside_pipeline_and_from_waitlist():
 def test_g6_online_mop_in_office():
     assert R.judge(mv(IGOR, OFF, 83953914, OFF, 75426822), CFG) is None
     assert R.judge(mv(IGOR, OFF, 83953914, OFF, 143), CFG) is None
-    assert R.judge(mv(IGOR, OFF, 75426874, OFF, 75426822), CFG).rule == "G6"   # перезаказ накладной
+    assert R.judge(mv(IGOR, OFF, 75426874, OFF, 75426822), CFG) is None   # не судим с 16.11
+    assert R.judge(mv(IGOR, OFF, 75426822, OFF, 75426874), CFG).rule == "G6"   # обратно - нельзя
+    assert R.judge(mv(IGOR, OFF, 75426874, OFF, 142), CFG).rule == "G6"
     assert R.judge(mv(IGOR, OFF, 83953914, OFF, 142), CFG).rule == "G6"
     assert R.judge(mv(IGOR, OFF, 83953914, RET, 83537718), CFG).rule == "G6"
     assert R.judge(mv(14310230, RET, 83537718, OFF, 75426822), CFG).rule == "G6"
@@ -215,10 +217,10 @@ def test_rollback_and_notify(monkeypatch=None):
     _reset("rollback")
     import time
     now = int(time.time())
-    events_feed.append(_ev("e1", 11, IGOR, OFF, 75426874, OFF, 75426822, now - 10))
+    events_feed.append(_ev("e1", 11, IGOR, OFF, 75428410, OFF, 75426822, now - 10))
     lead_state[11] = (OFF, 75426822)
     asyncio.run(stage_guard.sweep_once())
-    assert patched == [(11, OFF, 75426874)]
+    assert patched == [(11, OFF, 75428410)]
     assert len(sent) == 1 and "@thebarsa1" in sent[0]["text"] and sent[0]["message_thread_id"] == 10479
     # Повтор того же события при перекрытии окна - не судится второй раз.
     asyncio.run(stage_guard.sweep_once())
@@ -230,10 +232,10 @@ def test_cooldown_second_violation_only_notifies():
     import time
     now = int(time.time())
     lead_state[12] = (OFF, 75426822)
-    events_feed.append(_ev("a", 12, IGOR, OFF, 75426874, OFF, 75426822, now - 20))
+    events_feed.append(_ev("a", 12, IGOR, OFF, 75428410, OFF, 75426822, now - 20))
     asyncio.run(stage_guard.sweep_once())
     lead_state[12] = (OFF, 75426822)
-    events_feed.append(_ev("b", 12, IGOR, OFF, 75426874, OFF, 75426822, now - 5))
+    events_feed.append(_ev("b", 12, IGOR, OFF, 75428410, OFF, 75426822, now - 5))
     asyncio.run(stage_guard.sweep_once())
     assert len(patched) == 1
     assert "полчаса" in sent[-1]["text"]
@@ -254,7 +256,7 @@ def test_dry_does_nothing():
     import time
     now = int(time.time())
     lead_state[14] = (OFF, 75426822)
-    events_feed.append(_ev("d", 14, IGOR, OFF, 75426874, OFF, 75426822, now - 5))
+    events_feed.append(_ev("d", 14, IGOR, OFF, 75428410, OFF, 75426822, now - 5))
     r = asyncio.run(stage_guard.sweep_once())
     assert patched == [] and sent == [] and r["violations"] == 1
 
@@ -279,7 +281,7 @@ def test_detailed_violation_text():
     import time
     now = int(time.time())
     lead_state[40] = (OFF, 75426822)
-    events_feed.append(_ev("det", 40, IGOR, OFF, 75426874, OFF, 75426822, now - 5))
+    events_feed.append(_ev("det", 40, IGOR, OFF, 75428410, OFF, 75426822, now - 5))
     asyncio.run(stage_guard.sweep_once())
     t = sent[0]["text"]
     assert "Сделка: «Заказ 40», заказ №09001, 12 990 ₽" in t
@@ -294,7 +296,7 @@ def test_repeats_go_to_one_digest():
     now = int(time.time())
     for i in range(3):
         lead_state[50 + i] = (OFF, 75426822)
-        events_feed.append(_ev(f"dg{i}", 50 + i, IGOR, OFF, 75426874, OFF, 75426822, now - 30 + i))
+        events_feed.append(_ev(f"dg{i}", 50 + i, IGOR, OFF, 75428410, OFF, 75426822, now - 30 + i))
     asyncio.run(stage_guard.sweep_once())
     assert len([s for s in sent if "некорректный перевод в" in s["text"]]) == 1
     assert not any("ещё некорректных" in s["text"] for s in sent)
