@@ -246,6 +246,41 @@ def test_admin_routes_need_their_own_token(db, monkeypatch):
     assert _code(asyncio.run(API.state(5, "")))[0] == 503
 
 
+def test_give_deal_accepts_the_narrow_panel_token_and_that_token_opens_nothing_else(db, monkeypatch):
+    """Панель отдаёт сделку со своим токеном `X-Give-Token`; админский токен в панель не кладётся, а узкий токен не подходит ни к чему, кроме `/give_deal`."""
+    monkeypatch.setattr(cfg, "ENGINE_TOKEN", "eng")
+    monkeypatch.setattr(cfg, "ADMIN_TOKEN", "adm")
+    monkeypatch.setattr(cfg, "GIVE_TOKEN", "give")
+    store.set_owner(5, "human", reason="t", pipeline_id=8642414)
+    asked = []
+
+    async def fake_give(*args):
+        asked.append(args)
+        return 200, {"ok": True, "deal_id": args[0]}
+
+    monkeypatch.setattr(E, "give_deal", fake_give)
+    body = API.GiveIn(deal_id=5, chat_id="79990001122", chat_type="whatsapp", channel_id="ch", phone="79990001122", force=True)
+    # узкий токен: другие ручки человека и ручки сервиса его не принимают
+    assert _code(asyncio.run(API.state(5, "give")))[0] == 403
+    assert _code(asyncio.run(API.return_dialog(API.ReturnIn(deal_id=5), "give")))[0] == 403
+    assert _code(asyncio.run(API.alert(API.AlertIn(lines=["x"]), "give")))[0] == 403
+    assert _code(asyncio.run(API.permit(API.PermitIn(deal_id=5, epoch=1, turn_id=1), "give", "2")))[0] == 403
+    # /give_deal: чужой токен отказ, узкий и админский проходят до логики движка
+    assert _code(asyncio.run(API.give_deal(body, "", "wrong")))[0] == 403
+    assert _code(asyncio.run(API.give_deal(body, "give", "")))[0] == 403            # узкий токен в заголовке админского не работает
+    assert asked == []
+    assert _code(asyncio.run(API.give_deal(body, "", "give"))) == (200, {"ok": True, "deal_id": 5})
+    assert _code(asyncio.run(API.give_deal(body, "adm", ""))) == (200, {"ok": True, "deal_id": 5})
+    assert [a[0] for a in asked] == [5, 5] and asked[0][5:] == ("", True, False)       # флаги дошли до движка
+    # пустой узкий токен: ручка по нему закрыта (503), админская дорога работает как раньше
+    monkeypatch.setattr(cfg, "GIVE_TOKEN", "")
+    assert _code(asyncio.run(API.give_deal(body, "", "give")))[0] == 503
+    assert _code(asyncio.run(API.give_deal(body, "adm", "")))[0] == 200
+    monkeypatch.setattr(cfg, "GIVE_TOKEN", "give")
+    monkeypatch.setattr(cfg, "ENABLED", False)                                      # движок выключен целиком: и узкий токен не открывает
+    assert _code(asyncio.run(API.give_deal(body, "", "give")))[0] == 503
+
+
 def test_routes_are_wired_into_the_app():
     import webhooks
     paths = {getattr(r, "path", "") for r in webhooks.app.routes}
