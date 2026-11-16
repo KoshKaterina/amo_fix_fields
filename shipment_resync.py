@@ -377,7 +377,8 @@ async def init() -> None:
     if _task is None:
         _task = asyncio.create_task(_loop())
         logger.info("Пересоздание отгрузок: поднято, опрос %ss, %s", SHIPMENT_RESYNC_INTERVAL_S,
-                    "режим отчёта" if SHIPMENT_RESYNC_DRY_RUN else "боевой режим")
+                    "только уведомления" if SHIPMENT_RESYNC_NOTIFY_ONLY
+                    else "режим отчёта" if SHIPMENT_RESYNC_DRY_RUN else "боевой режим")
 
 
 async def shutdown() -> None:

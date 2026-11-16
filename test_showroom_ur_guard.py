@@ -174,3 +174,17 @@ def test_notify_only_alerts_but_transfers():
     assert run(g.check(_lead())) is None
     assert patched == [] and len(sent) == 1
     assert "@thebarsa1" in sent[0]["text"] and "Режим проверки" in sent[0]["text"]
+
+
+def test_alert_has_order_details():
+    _reset([_ev(IGOR)], notify=True)
+    lead = _lead()
+    lead["name"] = "Заказ №20400"
+    lead["price"] = 15990
+    lead["custom_fields_values"] += [
+        {"field_id": 576697, "values": [{"value": "09120"}]},
+        {"field_id": 576703, "values": [{"value": "Tangem 2.0 (3 карты) x1\nИтого: 15 990"}]}]
+    run(g.check(lead))
+    t = sent[0]["text"]
+    assert "Сделка: «Заказ №20400», заказ №09120, 15 990 ₽" in t
+    assert "Доставка: Самовывоз из шоурума" in t and "Состав: Tangem 2.0 (3 карты) x1 Итого: 15 990" in t

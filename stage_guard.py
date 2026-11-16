@@ -71,6 +71,18 @@ STAGE_GUARD_MAX_PAGES = int(os.getenv("STAGE_GUARD_MAX_PAGES", "20"))
 # Сколько нарушений за час значат «виджет F5 не держит».
 STAGE_GUARD_F5_ALARM_PER_HOUR = int(os.getenv("STAGE_GUARD_F5_ALARM_PER_HOUR", "3"))
 STAGE_GUARD_F5_ALARM_REPEAT_S = int(os.getenv("STAGE_GUARD_F5_ALARM_REPEAT_S", str(6 * 3600)))
+# Окно сводки: первое нарушение менеджера - подробным сообщением сразу, следующие в течение
+# окна копятся и уходят одной сводкой (за выходные 13-15.11: 8 одинаковых сообщений в день).
+# 0 - каждое нарушение отдельным сообщением.
+STAGE_GUARD_DIGEST_S = int(os.getenv("STAGE_GUARD_DIGEST_S", "3600"))
+
+# Поля сделки для подробностей в уведомлении.
+FIELD_MS_ORDER_NUMBER = 576697     # «№ Заказа» МойСклада
+FIELD_SITE_ORDER_NUMBER = 577415   # номер заказа на сайте
+FIELD_CDEK_NUMBER = 571657         # номер накладной СДЭК
+PIPELINE_OFFICE = 9421022
+STATUS_MAKE_WAYBILL = 75426822
+SHIPMENT_STATUSES = {75426866, 75426870, 75426874, 75426878, 75426882, 75426886, 142}
 
 _DB_PATH = pathlib.Path(os.getenv("STAGE_GUARD_DB", "/app/var/stage_guard.sqlite"))
 _JOURNAL_PATH = pathlib.Path(os.getenv("STAGE_GUARD_JOURNAL", "/app/var/stage_guard.jsonl"))
@@ -87,6 +99,9 @@ _pipe_names: dict[int, str] = {}
 _unsorted: set[tuple[int, int]] = set()    # системные этапы «Неразобранное»
 _names_loaded_at = 0.0
 _violations_ts: deque[float] = deque()
+_recent: deque[str] = deque(maxlen=50)          # короткие строки нарушений - для сигнала «F5 не держит»
+_last_alert: dict[int, int] = {}                # менеджер → время его последнего полного уведомления
+_digest: dict[int, dict] = {}                   # менеджер → повторы, ждущие сводки
 _last_f5_alarm = 0.0
 _last_run: dict = {}
 
@@ -264,15 +279,61 @@ async def _send(event_key: str, text: str, values: dict, *, tech: bool = False) 
         logger.exception("Сторож перемещений: уведомление %s не ушло", event_key)
 
 
+def _field(lead: dict | None, field_id: int) -> str:
+    if not lead:
+        return ""
+    return str(amo_service.get_custom_field_value(lead, field_id) or "").strip()
+
+
+def _deal_line(lead: dict | None) -> str:
+    """«Название», заказ №…, сумма - чтобы сделку узнавали без перехода по ссылке."""
+    if not lead:
+        return "Сделка: amo не отдал карточку"
+    parts = [f"«{lead.get('name') or 'без названия'}»"]
+    order = _field(lead, FIELD_MS_ORDER_NUMBER) or _field(lead, FIELD_SITE_ORDER_NUMBER)
+    if order:
+        parts.append(f"заказ №{order}")
+    if lead.get("price"):
+        parts.append(f"{int(lead['price']):,} ₽".replace(",", " "))
+    return "Сделка: " + ", ".join(parts)
+
+
+def _hint(m: Move) -> str | None:
+    """Что этот переход уже успел сделать сам по себе - чтобы было понятно, что проверить."""
+    if m.to_pipeline == PIPELINE_OFFICE and m.to_status == STATUS_MAKE_WAYBILL:
+        return ("«Сделать накладную» заново создаёт накладную СДЭК - проверьте в СДЭК, не осталось ли "
+                "двух накладных на одну посылку, лишнюю отмените.")
+    if m.to_pipeline == PIPELINE_OFFICE and m.to_status in SHIPMENT_STATUSES:
+        return "На этом этапе МойСклад создаёт отгрузку - товар списывается со склада."
+    if m.to_pipeline != m.from_pipeline:
+        return "Переносы между воронками делает автоматика по «Успешно реализовано» и «Закрыто»."
+    return None
+
+
+def _now_line(lead: dict | None) -> str | None:
+    if not lead:
+        return None
+    stage = _stage(int(lead.get("pipeline_id") or 0), int(lead.get("status_id") or 0))
+    cdek = _field(lead, FIELD_CDEK_NUMBER)
+    return f"Сейчас: «{stage}»" + (f", накладная СДЭК № {cdek}" if cdek else "")
+
+
+def _hhmm(ts: int) -> str:
+    return time.strftime("%H:%M", time.gmtime(ts + 3 * 3600))
+
+
 async def _handle(m: Move, v: Verdict, now: int) -> dict:
     tag, name = await _who(m.user_id)
     src, dst = _stage(m.from_pipeline, m.from_status), _stage(m.to_pipeline, m.to_status)
     link = alerts.lead_link(m.lead_id)
     row = {"ts": now, "event_id": m.event_id, "lead_id": m.lead_id, "user_id": m.user_id,
            "user": name, "rule": v.rule, "from": src, "to": dst, "mode": STAGE_GUARD_MODE}
+    lead = await amo_service.get_lead_full(m.lead_id, with_=())
+    deal = _deal_line(lead)
 
     if v.action == "notify":
-        text = f"↩️ {name} вернул(а) сделку из Офиса: «{src}» → «{dst}»\n{link}"
+        text = (f"↩️ {name} вернул(а) сделку из Офиса в {_hhmm(m.created_at)}: «{src}» → «{dst}»\n"
+                f"{deal}\n{link}")
         await _send(EVENT_OFFICE_RETURN, text,
                     {"кто": name, "откуда": src, "куда": dst, "ссылка_на_сделку": link})
         row["outcome"] = "notified" if STAGE_GUARD_MODE != "dry" else "dry"
@@ -280,14 +341,49 @@ async def _handle(m: Move, v: Verdict, now: int) -> dict:
 
     outcome = await _rollback(m, now)
     row["outcome"] = outcome
-    text = (f"⛔ {tag} некорректный перевод: «{src}» → «{dst}»\n"
-            f"Почему нельзя: {v.reason}.\n"
-            f"{_OUTCOME_TEXT[outcome].format(back=src)}\n{link}")
-    await _send(EVENT_VIOLATION, text, {"теги": tag, "кто": name, "откуда": src, "куда": dst,
-                                        "причина": v.reason, "ссылка_на_сделку": link})
+    if outcome == "done":
+        lead = await amo_service.get_lead_full(m.lead_id, with_=())
+    short = f"{_hhmm(m.created_at)} «{(lead or {}).get('name') or 'сделка'}»: «{src}» → «{dst}» - {link}"
+    _recent.append(f"{name}, {short}")
     _violations_ts.append(now)
+
+    if _in_digest_window(m.user_id, now):
+        _digest.setdefault(m.user_id, {"tag": tag, "items": []})["items"].append(short)
+    else:
+        lines = [f"⛔ {tag} некорректный перевод в {_hhmm(m.created_at)}: «{src}» → «{dst}»", deal,
+                 f"Почему нельзя: {v.reason}."]
+        hint = _hint(m)
+        if hint:
+            lines.append(hint)
+        now_line = _now_line(lead)
+        if now_line:
+            lines.append(now_line)
+        lines += [_OUTCOME_TEXT[outcome].format(back=src), link]
+        await _send(EVENT_VIOLATION, "\n".join(lines),
+                    {"теги": tag, "кто": name, "откуда": src, "куда": dst,
+                     "причина": v.reason, "ссылка_на_сделку": link})
+        _last_alert[m.user_id] = now
     await _maybe_f5_alarm(now)
     return row
+
+
+def _in_digest_window(user_id: int, now: int) -> bool:
+    last = _last_alert.get(user_id)
+    return STAGE_GUARD_DIGEST_S > 0 and last is not None and now - last < STAGE_GUARD_DIGEST_S
+
+
+async def _flush_digests(now: int, force: bool = False) -> None:
+    """Повторы одного менеджера за час - одной сводкой, а не восемью сообщениями подряд."""
+    for user_id in list(_digest):
+        if not force and _in_digest_window(user_id, now):
+            continue
+        d = _digest.pop(user_id)
+        if not d["items"]:
+            continue
+        n = len(d["items"])
+        text = "\n".join([f"⛔ {d['tag']} ещё некорректных переводов за час: {n}"]
+                         + [f"— {x}" for x in d["items"]])
+        await _send(EVENT_VIOLATION, text, {"теги": d["tag"], "сколько": n})
 
 
 async def _maybe_f5_alarm(now: int) -> None:
@@ -299,9 +395,12 @@ async def _maybe_f5_alarm(now: int) -> None:
     if now - _last_f5_alarm < STAGE_GUARD_F5_ALARM_REPEAT_S:
         return
     _last_f5_alarm = now
-    text = (f"⚠️ За последний час {len(_violations_ts)} запрещённых перемещений сделок. "
-            "Похоже, виджет F5 «Управление полями» перестал держать «Контроль перемещений» - "
-            "проверьте виджет в amo (оплата, доступ, настройки).")
+    recent = list(_recent)[-len(_violations_ts):]
+    text = "\n".join(
+        [f"⚠️ За последний час {len(_violations_ts)} запрещённых перемещений сделок. "
+         "Похоже, виджет F5 «Управление полями» перестал держать «Контроль перемещений» - "
+         "проверьте виджет в amo (оплата, доступ, настройки) или каким путём двигают сделки:"]
+        + [f"— {x}" for x in recent[-10:]])
     logger.warning("Сторож перемещений: %s", text)
     await _send(EVENT_F5_DOWN, text, {"сколько": len(_violations_ts)}, tech=True)
 
@@ -343,6 +442,7 @@ async def sweep_once() -> dict:
                    "outcome": "error"}
         logger.info("Сторож перемещений: %s", row)
         await asyncio.to_thread(_journal, row)
+    await _flush_digests(now)
     await asyncio.to_thread(_set_cursor, newest)
     await asyncio.to_thread(_prune, now)
     _last_run.update(at=now, ok=True, events=len(moves), judged=judged, violations=acted)

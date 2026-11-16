@@ -127,7 +127,7 @@ async def check(lead: dict) -> str | None:
     link = alerts.lead_link(lead_id)
     if SHOWROOM_GUARD_NOTIFY_ONLY:
         await _notify(lead_id, tag, link, "Режим проверки: сделка уехала в Офис как раньше и товар "
-                      "списан. Самовывоз закрывает офис, когда клиент забрал товар.")
+                      "списан. Самовывоз закрывает офис, когда клиент забрал товар.", lead)
         logger.info("showroom_ur_guard %s [уведомление]: УР с самовывозом поставил онлайн-МОП %s, "
                     "переносим как раньше", lead_id, user_id)
         return None
@@ -136,14 +136,39 @@ async def check(lead: dict) -> str | None:
     returned = bool(res.get("ok"))
     tail = ("Сделка возвращена на прежний этап. Самовывоз закрывает офис, когда клиент забрал товар."
             if returned else "Вернуть сделку не получилось - верните руками, в Офис она не перенесена.")
-    await _notify(lead_id, tag, link, tail)
+    await _notify(lead_id, tag, link, tail, lead)
     logger.info("showroom_ur_guard %s: УР онлайн-МОПа %s остановлен, возврат %s/%s - %s",
                 lead_id, user_id, back_pipeline, back_status, "ок" if returned else "НЕ УДАЛСЯ")
     return "blocked-showroom-online-mop" if returned else "blocked-showroom-rollback-failed"
 
 
-async def _notify(lead_id: int, tag: str, link: str, tail: str) -> None:
-    text = f"⛔ {tag} некорректное действие в CRM: попытка перевода офисной сделки в УР.\n{tail}\n{link}"
+FIELD_MS_ORDER_NUMBER = 576697   # «№ Заказа» МойСклада
+FIELD_COMPOSITION = 576703       # «Состав заказа» (пишет мост МойСклада, с «Итого»)
+
+
+def details(lead: dict | None) -> list[str]:
+    """Строки подробностей: сделка, заказ, сумма, доставка, состав."""
+    if not lead:
+        return []
+    head = [f"«{lead.get('name') or 'без названия'}»"]
+    order = str(amo_service.get_custom_field_value(lead, FIELD_MS_ORDER_NUMBER) or "").strip()
+    if order:
+        head.append(f"заказ №{order}")
+    if lead.get("price"):
+        head.append(f"{int(lead['price']):,} ₽".replace(",", " "))
+    out = ["Сделка: " + ", ".join(head)]
+    delivery = str(amo_service.get_custom_field_value(lead, FIELD_DELIVERY_TYPE) or "").strip()
+    if delivery:
+        out.append(f"Доставка: {delivery}")
+    comp = " ".join(str(amo_service.get_custom_field_value(lead, FIELD_COMPOSITION) or "").split())
+    if comp:
+        out.append(f"Состав: {comp[:300]}" + ("…" if len(comp) > 300 else ""))
+    return out
+
+
+async def _notify(lead_id: int, tag: str, link: str, tail: str, lead: dict | None = None) -> None:
+    text = "\n".join([f"⛔ {tag} некорректное действие в CRM: попытка перевода офисной сделки в УР."]
+                     + details(lead) + [tail, link])
     try:
         d = alerts.decide(EVENT_KEY, legacy_text=text,
                           values={"теги": tag, "ссылка_на_сделку": link},

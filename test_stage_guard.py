@@ -73,7 +73,19 @@ async def _pipes():
 
 async def _get_lead_full(lead_id, with_=()):
     st = lead_state.get(lead_id)
-    return None if st is None else {"id": lead_id, "pipeline_id": st[0], "status_id": st[1]}
+    if st is None:
+        return None
+    return {"id": lead_id, "pipeline_id": st[0], "status_id": st[1], "name": f"Заказ {lead_id}",
+            "price": 12990, "custom_fields_values": [
+                {"field_id": 576697, "values": [{"value": "09001"}]},
+                {"field_id": 571657, "values": [{"value": "1650000001"}]}]}
+
+
+def _cfv(lead, fid):
+    for f in lead.get("custom_fields_values") or []:
+        if f["field_id"] == fid:
+            return f["values"][0]["value"]
+    return None
 
 
 async def _patch_lead(lead_id, status_id=None, pipeline_id=None, **kw):
@@ -92,7 +104,8 @@ async def _send_alert(text, **kw):
 
 
 _stub("amo_service", _do_get=_do_get, get_pipelines_with_statuses=_pipes,
-      get_lead_full=_get_lead_full, patch_lead=_patch_lead, get_user_name=_user_name)
+      get_lead_full=_get_lead_full, patch_lead=_patch_lead, get_user_name=_user_name,
+      get_custom_field_value=_cfv)
 _stub("telegram_bot", send_alert=_send_alert)
 _stub("alerts", decide=lambda key, legacy_text, values, chat_id=None, thread_id=None, parse_mode=None:
       _D(legacy_text, chat_id, thread_id, parse_mode),
@@ -185,11 +198,13 @@ def _ev(eid, lead, user, fp, fs, tp, ts, at):
             "value_after": [{"lead_status": {"id": ts, "pipeline_id": tp}}]}
 
 
-def _reset(mode):
+def _reset(mode, digest_s=0):
     stage_guard.STAGE_GUARD_MODE = mode
+    stage_guard.STAGE_GUARD_DIGEST_S = digest_s
     stage_guard._cfg = CFG
     sent.clear(); patched.clear(); lead_state.clear(); events_feed.clear()
-    stage_guard._violations_ts.clear()
+    stage_guard._violations_ts.clear(); stage_guard._recent.clear()
+    stage_guard._last_alert.clear(); stage_guard._digest.clear()
     stage_guard._last_f5_alarm = 0
     for f in (os.environ["STAGE_GUARD_DB"],):
         if os.path.exists(f):
@@ -257,3 +272,33 @@ def test_g7_notify_without_rollback_and_f5_alarm():
     assert len(patched) == 3
     assert any("вернул(а) сделку из Офиса" in s["text"] for s in sent)
     assert any("виджет F5" in s["text"] and s["chat_id"] is None for s in sent)
+
+
+def test_detailed_violation_text():
+    _reset("notify")
+    import time
+    now = int(time.time())
+    lead_state[40] = (OFF, 75426822)
+    events_feed.append(_ev("det", 40, IGOR, OFF, 75426874, OFF, 75426822, now - 5))
+    asyncio.run(stage_guard.sweep_once())
+    t = sent[0]["text"]
+    assert "Сделка: «Заказ 40», заказ №09001, 12 990 ₽" in t
+    assert "заново создаёт накладную СДЭК" in t
+    assert "Сейчас: «Офис / Сделать накладную», накладная СДЭК № 1650000001" in t
+    assert "не возвращена" in t
+
+
+def test_repeats_go_to_one_digest():
+    _reset("notify", digest_s=3600)
+    import time
+    now = int(time.time())
+    for i in range(3):
+        lead_state[50 + i] = (OFF, 75426822)
+        events_feed.append(_ev(f"dg{i}", 50 + i, IGOR, OFF, 75426874, OFF, 75426822, now - 30 + i))
+    asyncio.run(stage_guard.sweep_once())
+    assert len([s for s in sent if "некорректный перевод в" in s["text"]]) == 1
+    assert not any("ещё некорректных" in s["text"] for s in sent)
+    stage_guard._last_alert[IGOR] -= 4000          # окно сводки прошло
+    asyncio.run(stage_guard.sweep_once())
+    dig = [s for s in sent if "ещё некорректных переводов за час: 2" in s["text"]]
+    assert len(dig) == 1 and "@thebarsa1" in dig[0]["text"] and "Заказ 51" in dig[0]["text"]
