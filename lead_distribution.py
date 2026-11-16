@@ -366,11 +366,42 @@ def _today_msk() -> str:
     return datetime.datetime.now(_MSK).strftime("%Y-%m-%d")
 
 
+# 16.11.2026 (Катя): счётчики обнуляются в КОНЦЕ РАБОЧЕГО ДНЯ правила, а не в полночь.
+# После конца work_hours (например, 19:00) сделки уходят на завтрашнюю смену, и
+# считать их надо в завтрашний день: иначе вечерняя раздача ориентировалась на
+# дневную нагрузку, а к утру счётчики всё равно пропадали. Рабочий день счётчиков =
+# от конца вчерашнего рабочего дня до конца сегодняшнего. Правило без work_hours
+# живёт как раньше - сутки по календарю.
+#
+# Формат файла тот же (v2), добавлен один ключ: "counts_next_day" - счётчики
+# завтрашнего рабочего дня, набранные после конца сегодняшнего. В полночь они
+# становятся "counts_by_pipeline" нового дня. Старый код ключ просто не видит,
+# поэтому откат на прежнюю версию файл не ломает.
+NEXT_DAY_KEY = "counts_next_day"
+
+
+def _counter_day(profile: "Profile | None", now: datetime.datetime | None = None) -> str:
+    """День счётчиков для решения по правилу: сегодня, а после конца рабочего дня
+    правила (_work_day_ended) - завтра."""
+    now = now or datetime.datetime.now(_MSK)
+    if profile is not None and profile.work_hours and _work_day_ended(profile, now):
+        return (now.date() + datetime.timedelta(days=1)).isoformat()
+    return now.strftime("%Y-%m-%d")
+
+
+def _counts_key(state: dict, day: str | None) -> str:
+    """Ключ среза счётчиков для дня: сегодняшний день файла или завтрашний."""
+    if day is None or day <= state["date"]:
+        return "counts_by_pipeline"
+    return NEXT_DAY_KEY
+
+
 def _load_counters_state() -> dict:
     """{"v": 2, "date": "YYYY-MM-DD", "counts_by_pipeline": {pipeline_id: {user_id: {source_id: n}}},
-    "assignments": {lead_id: {...}}, "outcomes_logged": [...]}. Дата в файле
-    отличается от сегодняшней → пустое состояние (вчерашние счётчики просто перестают
-    использоваться, явного сброса не нужно).
+    "counts_next_day": {...та же форма...}, "assignments": {lead_id: {...}},
+    "outcomes_logged": [...]}. Дата в файле вчерашняя → счётчики "counts_next_day"
+    (набраны вчера после конца рабочего дня) становятся сегодняшними, остальное
+    сбрасывается. Дата старше → пустое состояние.
 
     ⚠️ Защиты от повторной раздачи здесь больше НЕТ (20.10.2026): список routed_ids
     жил в этом файле и обнулялся вместе со счётчиками в полночь, и сделку,
@@ -392,6 +423,15 @@ def _load_counters_state() -> dict:
         logger.exception("lead_distribution: не удалось прочитать %s", COUNTERS_PATH)
         return empty
     if state.get("date") != today:
+        yesterday = (datetime.date.fromisoformat(today) - datetime.timedelta(days=1)).isoformat()
+        if state.get("date") == yesterday and state.get("v") == COUNTERS_VERSION:
+            carried = dict(empty)
+            carried["counts_by_pipeline"] = state.get(NEXT_DAY_KEY) or {}
+            carried["assignments"] = {
+                k: r for k, r in (state.get("assignments") or {}).items()
+                if (r.get("day") or r.get("date") or "") >= today
+            }
+            return carried
         return empty
     state.pop("routed_ids", None)
     if state.get("v") != COUNTERS_VERSION:
@@ -413,11 +453,11 @@ def _pipeline_key(pipeline_id) -> str:
     return str(pipeline_id) if pipeline_id is not None else "0"
 
 
-def _pipeline_counts(state: dict, pipeline_id) -> dict:
-    """Срез счётчиков одной воронки в форме {"counts": {user_id: {source_id: n}}} -
-    той же, что у _open_deals_state, поэтому _source_count/_total_count и
-    _decide_load_balanced работают с ним без правок."""
-    return {"counts": (state.get("counts_by_pipeline") or {}).get(_pipeline_key(pipeline_id)) or {}}
+def _pipeline_counts(state: dict, pipeline_id, day: str | None = None) -> dict:
+    """Срез счётчиков одной воронки за рабочий день `day` (None - сегодняшний) в форме
+    {"counts": {user_id: {source_id: n}}} - той же, что у _open_deals_state, поэтому
+    _source_count/_total_count и _decide_load_balanced работают с ним без правок."""
+    return {"counts": (state.get(_counts_key(state, day)) or {}).get(_pipeline_key(pipeline_id)) or {}}
 
 
 def _source_count(state: dict, user_id: int, source_id: int) -> int:
@@ -428,17 +468,19 @@ def _total_count(state: dict, user_id: int) -> int:
     return sum(((state.get("counts") or {}).get(str(user_id)) or {}).values())
 
 
-def _bump(state: dict, pipeline_id, user_id: int, source_id: int, delta: int) -> None:
-    counts = state.setdefault("counts_by_pipeline", {}).setdefault(_pipeline_key(pipeline_id), {})
+def _bump(state: dict, pipeline_id, user_id: int, source_id: int, delta: int,
+          day: str | None = None) -> None:
+    counts = state.setdefault(_counts_key(state, day), {}).setdefault(_pipeline_key(pipeline_id), {})
     user_counts = counts.setdefault(str(user_id), {})
     user_counts[str(source_id)] = max(0, user_counts.get(str(source_id), 0) + delta)
 
 
 def _apply_assignment(state: dict, *, lead_id: int, source_id: int, user_id: int, pipeline_id,
-                      profile_id: str | None = None) -> None:
-    _bump(state, pipeline_id, user_id, source_id, +1)
+                      profile_id: str | None = None, day: str | None = None) -> None:
+    day = day or state["date"]
+    _bump(state, pipeline_id, user_id, source_id, +1, day=day)
     state.setdefault("assignments", {})[str(lead_id)] = {
-        "source_id": source_id, "user_id": user_id, "date": state["date"],
+        "source_id": source_id, "user_id": user_id, "date": state["date"], "day": day,
         "pipeline_id": _pipeline_key(pipeline_id), "profile_id": profile_id,
     }
 
@@ -496,7 +538,10 @@ async def correct_reassignment(lead_id: int, new_user_id: int) -> None:
     async with _counters_lock:
         state = _load_counters_state()
         record = (state.get("assignments") or {}).get(str(lead_id))
-        if not record or record.get("date") != state["date"]:
+        # Сделка, розданная вчера после конца рабочего дня, считается в сегодняшнем
+        # рабочем дне - её смену ответственного тоже правим.
+        record_day = (record or {}).get("day") or (record or {}).get("date") or ""
+        if not record or record_day < state["date"]:
             return
         old_user_id = record.get("user_id")
         source_id = record.get("source_id")
@@ -512,10 +557,10 @@ async def correct_reassignment(lead_id: int, new_user_id: int) -> None:
         # Поправка идёт в счётчиках той воронки, куда сделка была роздана.
         pipeline_id = record.get("pipeline_id")
         if source_id is not None:
-            old_counts = _pipeline_counts(state, pipeline_id)["counts"].get(str(old_user_id)) or {}
+            old_counts = _pipeline_counts(state, pipeline_id, record_day)["counts"].get(str(old_user_id)) or {}
             if str(source_id) in old_counts:
-                _bump(state, pipeline_id, old_user_id, source_id, -1)
-            _bump(state, pipeline_id, new_user_id, source_id, +1)
+                _bump(state, pipeline_id, old_user_id, source_id, -1, day=record_day)
+            _bump(state, pipeline_id, new_user_id, source_id, +1, day=record_day)
         state["assignments"][str(lead_id)] = {**record, "user_id": new_user_id}
         _save_counters_state(state)
         logger.info(
@@ -554,7 +599,7 @@ def _is_on_shift(user_id: int) -> bool:
     return _in_hour_window(now_hour, LEAD_DISTRIBUTION_DEFAULT_WINDOW)
 
 
-def _work_day_ended(profile: Profile) -> bool:
+def _work_day_ended(profile: Profile, now: datetime.datetime | None = None) -> bool:
     """Рабочий день профиля ЗАКОНЧИЛСЯ на сегодня (сейчас позже конца последнего
     интервала work_hours). Один из двух триггеров ухода на _upcoming_pool в
     decide_and_record - см. его комментарий там: сам по себе этот флаг больше
@@ -562,8 +607,11 @@ def _work_day_ended(profile: Profile) -> bool:
     начала первого интервала/в перерыве молча простаивал до конца дня)."""
     if not profile.work_hours:
         return False
-    now_hhmm = datetime.datetime.now(_MSK).strftime("%H:%M")
-    return now_hhmm > max(iv["end"] for iv in profile.work_hours)
+    # Конец интервала не входит в рабочее время: при work_hours до 19:00 в 19:00
+    # день уже закончен (с 16.11.2026; раньше - только с 19:01). В эту же минуту
+    # обнуляются счётчики правила (_counter_day).
+    now_hhmm = (now or datetime.datetime.now(_MSK)).strftime("%H:%M")
+    return now_hhmm >= max(iv["end"] for iv in profile.work_hours)
 
 
 def eligible_pool(profile: Profile) -> list[int]:
@@ -849,7 +897,11 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
         # этой сделки. Режим открытых сделок и так считает по воронкам профиля.
         stored = _load_counters_state() if open_deals_state is None else None
         lead_pipeline_id = lead.get("pipeline_id")
-        state = open_deals_state if open_deals_state is not None else _pipeline_counts(stored, lead_pipeline_id)
+        # После конца рабочего дня правила сделка идёт на завтрашнюю смену и
+        # считается в завтрашних счётчиках - для смены они начинаются с нуля.
+        counter_day = _counter_day(profile)
+        state = (open_deals_state if open_deals_state is not None
+                 else _pipeline_counts(stored, lead_pipeline_id, counter_day))
         rule = ""
 
         if profile.repeat_contact_mode == "always":
@@ -900,6 +952,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
             meta["counter_kind"] = "open_deals" if open_deals_state is not None else "daily"
             if open_deals_state is None:
                 meta["counter_pipeline_id"] = lead_pipeline_id
+                meta["counter_day"] = counter_day
             meta["fairness_gap"] = LEAD_DISTRIBUTION_FAIRNESS_GAP
             counter_uids = list(dict.fromkeys(
                 [*pool, *([repeat_priority_candidate] if repeat_priority_candidate is not None else [])]
@@ -917,7 +970,7 @@ async def decide_and_record(lead: dict, profile: Profile, *, meta: dict | None =
             # следующее решение просто перезапросит его живьём (уже с учётом
             # PATCH, который process_lead_distribution сделает следом).
             _apply_assignment(stored, lead_id=int(lead["id"]), source_id=source_id, user_id=target,
-                              pipeline_id=lead_pipeline_id, profile_id=profile.id)
+                              pipeline_id=lead_pipeline_id, profile_id=profile.id, day=counter_day)
             _save_counters_state(stored)
         if meta is not None:
             meta["rule"] = rule
@@ -1042,6 +1095,7 @@ async def _log_decision(
         "counters": meta.get("counters"),
         "counter_kind": meta.get("counter_kind"),
         "counter_pipeline_id": meta.get("counter_pipeline_id"),
+        "counter_day": meta.get("counter_day"),
         "fairness_gap": meta.get("fairness_gap"),
         "reason": meta.get("reason"),
         "tied": meta.get("tied"),
