@@ -172,14 +172,47 @@ async def _positions(kind: str, doc_id: str) -> list[dict] | None:
     return data.get("rows") or []
 
 
-async def _who_changed(order_id: str) -> str:
-    """Логин сотрудника из последней правки заказа в журнале МойСклада."""
+# Логины МойСклада, под которыми пишут интеграции, а не люди. Правку из карточки amo
+# виджет amgroup отправляет в МойСклад под «admin», а настоящего автора оставляет в сделке
+# служебным примечанием «Заказ сохранен пользователем <Имя>» (разбор 17.11.2026, заказ 10151).
+SHIPMENT_RESYNC_INTEGRATION_LOGINS = {
+    s.strip().lower() for s in os.getenv("SHIPMENT_RESYNC_INTEGRATION_LOGINS", "admin").split(",") if s.strip()}
+_AMGROUP_SAVED_PREFIX = "заказ сохранен пользователем"
+_AMGROUP_NOTE_WINDOW_S = 3600
+
+
+async def _amgroup_saver(lead_id) -> str | None:
+    """Имя из последнего примечания amgroup «Заказ сохранен пользователем …» за последний час."""
+    try:
+        data = await amo_service._do_get(f"/api/v4/leads/{lead_id}/notes",
+                                         [("limit", "50"), ("order[id]", "desc")])
+    except Exception:
+        logger.exception("Пересоздание отгрузок: примечания сделки %s не прочитались", lead_id)
+        return None
+    now = int(time.time())
+    for n in ((data or {}).get("_embedded") or {}).get("notes") or []:
+        text = str((n.get("params") or {}).get("text") or "").strip()
+        if not text.casefold().startswith(_AMGROUP_SAVED_PREFIX):
+            continue
+        if now - int(n.get("created_at") or 0) > _AMGROUP_NOTE_WINDOW_S:
+            return None
+        return text[len(_AMGROUP_SAVED_PREFIX):].strip() or None
+    return None
+
+
+async def _who_changed(order_id: str, lead: dict | None = None) -> str:
+    """Кто правил заказ: логин из журнала МойСклада, а если правка пришла через интеграцию
+    (логин admin) - имя из примечания amgroup в сделке."""
     data = await ms_client.get(f"entity/customerorder/{order_id}/audit", params={"limit": 20})
     rows = (data or {}).get("rows") or []
     rows = [r for r in rows if (r.get("eventType") or "") in ("update", "create")] or rows
     rows.sort(key=lambda r: r.get("moment") or "", reverse=True)
-    uid = (rows[0].get("uid") if rows else "") or ""
-    return uid.split("@")[0] or "не определён"
+    login = ((rows[0].get("uid") if rows else "") or "").split("@")[0]
+    if (not login or login.lower() in SHIPMENT_RESYNC_INTEGRATION_LOGINS) and lead and lead.get("id"):
+        name = await _amgroup_saver(lead["id"])
+        if name:
+            return name
+    return login or "не определён"
 
 
 async def _office_lead(order_id: str) -> dict | None:
@@ -279,7 +312,7 @@ async def handle_order(order: dict) -> str:
     if lead is None:
         return "no-office-lead"
     lines = diff_lines(before, after, names(demand_rows, order_rows))
-    who = await _who_changed(order_id)
+    who = await _who_changed(order_id, lead)
 
     if len(demands) > 1:
         key = (order_id, json.dumps(sorted((list(k), v) for k, v in after.items())))

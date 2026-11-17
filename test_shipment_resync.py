@@ -75,7 +75,12 @@ async def _ms_post(path, body):
     return {"id": "new-d", "name": "00099", "store": None}
 
 
+amo_notes: list = []
+
+
 async def _amo_get(path, params):
+    if path.endswith("/notes"):
+        return {"_embedded": {"notes": list(amo_notes)}}
     return {"_embedded": {"events": list(amo_events)}}
 
 
@@ -175,6 +180,7 @@ def _setup(order_rows, demand_rows, demands=("dem-1",), dry=False, lead=None, no
     ms["entity/customerorder/ord-1/audit"] = {"rows": [
         {"uid": "kirillp@aperfilovvv", "eventType": "update", "moment": "2026-11-13 12:00:00"},
         {"uid": "admin@aperfilovvv", "eventType": "update", "moment": "2026-11-13 11:00:00"}]}
+    amo_notes.clear()
     leads_by_query.clear()
     leads_by_query["ord-1"] = [lead or _lead()]
     return {"id": "ord-1", "name": "09100", "demands": [{"id": d, "name": f"D-{d}"} for d in demands]}
@@ -282,3 +288,29 @@ def test_notify_only_sends_diff_once_and_touches_nothing():
     assert run(S.handle_order(o)) == "notify-known"
     assert len(sent) == 1 and "НЕ пересоздана" in sent[0]["text"] and "Tangem: ×1 → ×2" in sent[0]["text"]
     assert not any(c[0] in ("DELETE", "POST", "PUT") for c in calls)
+
+
+def test_integration_login_replaced_by_amgroup_saver():
+    """Правка из карточки amo: в МойСкладе автор admin, имя - из примечания amgroup (17.11)."""
+    import time as _t
+    o = _setup([pos(TANGEM, 1, 499000, name="Tangem 2.0")], [pos(LEDGER, 1, 900000, name="Ledger")])
+    ms["entity/customerorder/ord-1/audit"] = {"rows": [
+        {"uid": "admin@aperfilovvv", "eventType": "update", "moment": "2026-11-17 18:19:00"}]}
+    amo_notes[:] = [
+        {"note_type": "service_message", "created_at": int(_t.time()) - 60,
+         "params": {"text": "Заказ сохранен пользователем Егор Константинов", "service": "МойСклад интеграция №1 от amgroup"}},
+        {"note_type": "service_message", "created_at": int(_t.time()) - 600,
+         "params": {"text": "Заказ сохранен пользователем Игорь Оанча", "service": "МойСклад интеграция №1 от amgroup"}}]
+    assert run(S.handle_order(o)) == "recreated"
+    assert "изменён пользователем Егор Константинов" in sent[0]["text"] and "admin" not in sent[0]["text"]
+
+
+def test_stale_amgroup_note_keeps_login():
+    import time as _t
+    o = _setup([pos(TANGEM, 1, 499000, name="Tangem 2.0")], [pos(LEDGER, 1, 900000, name="Ledger")])
+    ms["entity/customerorder/ord-1/audit"] = {"rows": [
+        {"uid": "admin@aperfilovvv", "eventType": "update", "moment": "2026-11-17 18:19:00"}]}
+    amo_notes[:] = [{"note_type": "service_message", "created_at": int(_t.time()) - 2 * 3600,
+                     "params": {"text": "Заказ сохранен пользователем Егор Константинов"}}]
+    assert run(S.handle_order(o)) == "recreated"
+    assert "изменён пользователем admin" in sent[0]["text"]
