@@ -31,7 +31,7 @@ FIELD_DELIVERY = 577315
 IGOR, KIRILL = 9291546, 13946318
 
 state = {"events": [], "calls": 0, "fail_reads": 0, "patch_ok": True}
-patched, sent = [], []
+patched, sent, notes = [], [], []
 
 
 async def _do_get(path, params):
@@ -45,6 +45,11 @@ async def _do_get(path, params):
 async def _patch_lead(lead_id, pipeline_id=None, status_id=None, **kw):
     patched.append((lead_id, pipeline_id, status_id))
     return {"ok": state["patch_ok"]}
+
+
+async def _add_note(lead_id, text):
+    notes.append((lead_id, text))
+    return {"ok": True}
 
 
 def _cfv(lead, fid):
@@ -66,7 +71,8 @@ class _D:
         return {"chat_id": self.c, "message_thread_id": self.th, "parse_mode": self.p}
 
 
-_stub("amo_service", _do_get=_do_get, patch_lead=_patch_lead, get_custom_field_value=_cfv)
+_stub("amo_service", _do_get=_do_get, patch_lead=_patch_lead, get_custom_field_value=_cfv,
+      add_note=_add_note)
 _stub("telegram_bot", send_alert=_send_alert)
 _stub("alerts", lead_link=lambda i: f"<a>{i}</a>",
       decide=lambda key, legacy_text, values, chat_id=None, thread_id=None, parse_mode=None:
@@ -108,7 +114,7 @@ def _reset(events=(), enabled=True, fail_reads=0, patch_ok=True, dry=False, noti
     g.SHOWROOM_GUARD_DRY_RUN = dry
     g.SHOWROOM_GUARD_NOTIFY_ONLY = notify
     state.update(events=list(events), calls=0, fail_reads=fail_reads, patch_ok=patch_ok)
-    patched.clear(); sent.clear()
+    patched.clear(); sent.clear(); notes.clear()
 
 
 def run(c):
@@ -119,6 +125,7 @@ def test_online_mop_blocked_and_returned():
     _reset([_ev(KIRILL, at=50), _ev(IGOR, before_s=86706902, at=100)])
     assert run(g.check(_lead())) == "blocked-showroom-online-mop"
     assert patched == [(77, RET, 86706902)]          # куда перевёл последний раз
+    assert len(notes) == 1 and notes[0][0] == 77 and "Игорь Оанча" in notes[0][1]
     assert "@thebarsa1" in sent[0]["text"] and sent[0]["message_thread_id"] == 10479
 
 
@@ -160,7 +167,7 @@ def test_event_appears_on_retry():
 def test_rollback_failed_still_blocks():
     _reset([_ev(IGOR)], patch_ok=False)
     assert run(g.check(_lead())) == "blocked-showroom-rollback-failed"
-    assert "верните руками" in sent[0]["text"]
+    assert "верните руками" in sent[0]["text"] and notes == []
 
 
 def test_dry_run_logs_but_transfers():
@@ -172,7 +179,7 @@ def test_dry_run_logs_but_transfers():
 def test_notify_only_alerts_but_transfers():
     _reset([_ev(IGOR)], notify=True)
     assert run(g.check(_lead())) is None
-    assert patched == [] and len(sent) == 1
+    assert patched == [] and len(sent) == 1 and notes == []
     assert "@thebarsa1" in sent[0]["text"] and "Режим проверки" in sent[0]["text"]
 
 

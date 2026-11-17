@@ -103,9 +103,17 @@ async def _send_alert(text, **kw):
     return True
 
 
+notes: list[tuple] = []
+
+
+async def _add_note(lead_id, text):
+    notes.append((lead_id, text))
+    return {"ok": True}
+
+
 _stub("amo_service", _do_get=_do_get, get_pipelines_with_statuses=_pipes,
       get_lead_full=_get_lead_full, patch_lead=_patch_lead, get_user_name=_user_name,
-      get_custom_field_value=_cfv)
+      get_custom_field_value=_cfv, add_note=_add_note)
 _stub("telegram_bot", send_alert=_send_alert)
 _stub("alerts", decide=lambda key, legacy_text, values, chat_id=None, thread_id=None, parse_mode=None:
       _D(legacy_text, chat_id, thread_id, parse_mode),
@@ -204,7 +212,7 @@ def _reset(mode, digest_s=0):
     stage_guard.STAGE_GUARD_MODE = mode
     stage_guard.STAGE_GUARD_DIGEST_S = digest_s
     stage_guard._cfg = CFG
-    sent.clear(); patched.clear(); lead_state.clear(); events_feed.clear()
+    sent.clear(); patched.clear(); lead_state.clear(); events_feed.clear(); notes.clear()
     stage_guard._violations_ts.clear(); stage_guard._recent.clear()
     stage_guard._last_alert.clear(); stage_guard._digest.clear()
     stage_guard._last_f5_alarm = 0
@@ -222,6 +230,9 @@ def test_rollback_and_notify(monkeypatch=None):
     asyncio.run(stage_guard.sweep_once())
     assert patched == [(11, OFF, 75428410)]
     assert len(sent) == 1 and "@thebarsa1" in sent[0]["text"] and sent[0]["message_thread_id"] == 10479
+    # Откат оставляет примечание в сделке: кто, что и почему.
+    assert len(notes) == 1 and notes[0][0] == 11
+    assert "вернул сделку на этап «Офис / Первичка»" in notes[0][1] and "Почему нельзя" in notes[0][1]
     # Повтор того же события при перекрытии окна - не судится второй раз.
     asyncio.run(stage_guard.sweep_once())
     assert len(patched) == 1 and len(sent) == 1
@@ -239,6 +250,7 @@ def test_cooldown_second_violation_only_notifies():
     asyncio.run(stage_guard.sweep_once())
     assert len(patched) == 1
     assert "полчаса" in sent[-1]["text"]
+    assert len(notes) == 1          # примечание только на настоящий откат
 
 
 def test_moved_on_not_rolled_back():
@@ -248,7 +260,7 @@ def test_moved_on_not_rolled_back():
     lead_state[13] = (OFF, 75426874)   # робот уже увёл дальше
     events_feed.append(_ev("c", 13, IGOR, OFF, 83953914, OFF, 142, now - 5))
     asyncio.run(stage_guard.sweep_once())
-    assert patched == [] and "ушла с этого этапа" in sent[0]["text"]
+    assert patched == [] and "ушла с этого этапа" in sent[0]["text"] and notes == []
 
 
 def test_dry_does_nothing():
@@ -258,7 +270,7 @@ def test_dry_does_nothing():
     lead_state[14] = (OFF, 75426822)
     events_feed.append(_ev("d", 14, IGOR, OFF, 75428410, OFF, 75426822, now - 5))
     r = asyncio.run(stage_guard.sweep_once())
-    assert patched == [] and sent == [] and r["violations"] == 1
+    assert patched == [] and sent == [] and notes == [] and r["violations"] == 1
 
 
 def test_g7_notify_without_rollback_and_f5_alarm():

@@ -322,6 +322,18 @@ def _hhmm(ts: int) -> str:
     return time.strftime("%H:%M", time.gmtime(ts + 3 * 3600))
 
 
+async def _add_rollback_note(m: Move, name: str, src: str, dst: str, reason: str) -> None:
+    """Примечание в сделку после отката (просьба Кати 17.11.2026): в карточке видно, почему этап
+    вернулся. Сбой примечания откат не отменяет - только лог."""
+    text = (f"Сторож перемещений вернул сделку на этап «{src}».\n"
+            f"{name} в {_hhmm(m.created_at)} перевёл(а) её «{src}» → «{dst}».\n"
+            f"Почему нельзя: {reason}.")
+    try:
+        await amo_service.add_note(m.lead_id, text)
+    except Exception:
+        logger.exception("Сторож перемещений: примечание в сделку %s не записалось", m.lead_id)
+
+
 async def _handle(m: Move, v: Verdict, now: int) -> dict:
     tag, name = await _who(m.user_id)
     src, dst = _stage(m.from_pipeline, m.from_status), _stage(m.to_pipeline, m.to_status)
@@ -342,6 +354,7 @@ async def _handle(m: Move, v: Verdict, now: int) -> dict:
     outcome = await _rollback(m, now)
     row["outcome"] = outcome
     if outcome == "done":
+        await _add_rollback_note(m, name, src, dst, v.reason)
         lead = await amo_service.get_lead_full(m.lead_id, with_=())
     short = f"{_hhmm(m.created_at)} «{(lead or {}).get('name') or 'сделка'}»: «{src}» → «{dst}» - {link}"
     _recent.append(f"{name}, {short}")

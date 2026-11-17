@@ -134,6 +134,13 @@ async def check(lead: dict) -> str | None:
     res = await amo_service.patch_lead(lead_id, pipeline_id=back_pipeline, status_id=back_status) \
         if back_pipeline and back_status else {"ok": False}
     returned = bool(res.get("ok"))
+    if returned:
+        try:
+            await amo_service.add_note(
+                lead_id, f"Защита самовывоза вернула сделку на прежний этап: {MANAGER_NAMES.get(user_id) or tag} "
+                "перевёл(а) её в «Успешно реализовано», а самовывоз закрывает офис, когда клиент забрал товар.")
+        except Exception:
+            logger.exception("showroom_ur_guard %s: примечание в сделку не записалось", lead_id)
     tail = ("Сделка возвращена на прежний этап. Самовывоз закрывает офис, когда клиент забрал товар."
             if returned else "Вернуть сделку не получилось - верните руками, в Офис она не перенесена.")
     await _notify(lead_id, tag, link, tail, lead)
