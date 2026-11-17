@@ -207,3 +207,34 @@ def test_disabled_is_noop(monkeypatch):
     C.call_started("x", CALLER, 1)          # не трогает базу
     C.schedule_attribution("x", CALLER, 1, _find)
     assert C.is_enabled() is False
+
+
+def test_place_in_note_and_referrer_field(amo):
+    t = time.time() - 100
+    accept(ev(at=t, place="header-phone", link_text="+7(905)606-36-78", referrer="https://yandex.ru/"))
+    assert attribute("c20", CALLER, t + 7) == "sure"
+    text = amo["notes"][0][1]
+    assert "Где нажал номер: шапка сайта, номер в шапке\n" in text + "\n"
+    assert "кнопка" not in text            # текст ссылки - сам номер, его не повторяем
+    assert amo["utm"] == [(501, {**UTM, "referrer": "https://yandex.ru/"})]
+
+
+def test_place_block_and_button_text(amo):
+    t = time.time() - 100
+    accept(ev(at=t, place="#sales", link_text="Позвонить   в отдел"))
+    attribute("c21", CALLER, t + 7)
+    assert "Где нажал номер: блок страницы #sales, кнопка «Позвонить в отдел»" in amo["notes"][0][1]
+
+
+def test_place_garbage_dropped():
+    now = 1_800_000_000
+    cleaned = C.clean_event(ev(at=now, place="<b>x</b>", link_text="a" * 500), now)
+    assert cleaned["place"] == "" and len(cleaned["link_text"]) == 60
+
+
+def test_no_utm_no_fields_even_with_referrer(amo):
+    t = time.time() - 100
+    accept(ev(at=t, utm={}, referrer="https://google.com/"))
+    assert attribute("c22", CALLER, t + 7) == "sure"
+    assert amo["utm"] == []
+    assert "Откуда пришёл: https://google.com/" in amo["notes"][0][1]

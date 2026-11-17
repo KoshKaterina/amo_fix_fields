@@ -79,6 +79,7 @@ KINDS = ("tel_click", "utm_visit")
 MAX_BODY_BYTES = 8192
 _EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CLIENT_ID_RE = re.compile(r"^\d{6,30}$")
+_PLACE_RE = re.compile(r"^[a-z0-9#_\-]{1,60}$")
 _RATE_PER_MINUTE = _env_int("CALL_CLICK_RATE_PER_MINUTE", 120)
 _rate: list[float] = []
 _bg: set = set()
@@ -165,10 +166,13 @@ def clean_event(payload: dict, now: float | None = None) -> dict:
     except (TypeError, ValueError):
         first_at = 0.0
     device = _s(payload.get("device"), 16)
+    place = _s(payload.get("place"), 60).lower()
     return {
         "kind": kind, "event_id": event_id, "at": at, "number": number, "client_id": client_id,
         "page_url": _url(payload.get("page_url")), "referrer": _url(payload.get("referrer")),
         "device": device if device in ("mobile", "desktop") else "",
+        "place": place if _PLACE_RE.match(place) else "",
+        "link_text": re.sub(r"\s+", " ", _s(payload.get("link_text"), 60)),
         "utm": utm, "utm_first": _utm(payload.get("utm_first")), "utm_first_at": first_at,
     }
 
@@ -308,7 +312,12 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
             note = note_ambiguous([c["payload"] for c in chosen], call_start)
         else:
             note = note_repeat(visit["payload"])
-        await _write(lead_id, ref, verdict, note, chosen[0]["payload"]["utm"] if verdict == "sure" else {})
+        fields = {}
+        if verdict == "sure":
+            fields = dict(chosen[0]["payload"]["utm"])
+            if chosen[0]["payload"].get("referrer"):
+                fields["referrer"] = chosen[0]["payload"]["referrer"]
+        await _write(lead_id, ref, verdict, note, fields)
         return verdict
     except Exception:
         logger.exception("call_click: склейка звонка %s не удалась", call_id)
@@ -316,6 +325,8 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
 
 
 async def _write(lead_id: int, ref: str, verdict: str, note: str, utm: dict) -> None:
+    """utm - метки и referrer для стандартных полей «Статистики» сделки (utm_* и REFERRER).
+    Пишем только когда метки поставлены у ОДНОЗНАЧНОЙ склейки и в сделке их ещё нет."""
     if CALL_CLICK_MODE == "log":
         logger.info("call_click: сделка %s, %s - режим log, в amo не пишу. Примечание было бы:\n%s",
                     lead_id, verdict, note)
@@ -325,7 +336,7 @@ async def _write(lead_id: int, ref: str, verdict: str, note: str, utm: dict) -> 
         await asyncio.to_thread(store.release_attribution, lead_id, ref)
         return
     logger.info("call_click: примечание в сделке %s (%s)", lead_id, verdict)
-    if CALL_CLICK_MODE != "live" or not utm:
+    if CALL_CLICK_MODE != "live" or not any(utm.get(k) for k in UTM_KEYS):
         return
     lead = await amo_service.get_lead_full(lead_id, with_=())
     if lead is None:
@@ -386,9 +397,34 @@ def _number(n: str) -> str:
 
 _DEVICES = {"mobile": "телефон", "desktop": "компьютер"}
 
+# Место клика по номеру (плагин сайта sun-call-tracking, функция place()).
+_PLACES = {
+    "header-phone": "шапка сайта, номер в шапке",
+    "mobile-menu": "мобильное меню",
+    "header": "шапка сайта",
+    "footer": "подвал сайта",
+    "popup": "всплывающее окно",
+    "main": "основная часть страницы",
+    "page": "страница",
+}
+
+
+def place_label(place: str) -> str:
+    if not place:
+        return ""
+    if place.startswith("#"):
+        return f"блок страницы {place}"
+    return _PLACES.get(place, place)
+
 
 def _visit_lines(ev: dict) -> list[str]:
     lines = [f"Страница: {_page(ev.get('page_url', ''))}"]
+    if ev.get("place"):
+        where = place_label(ev["place"])
+        text = ev.get("link_text") or ""
+        if re.search(r"[A-Za-zА-Яа-яЁё]", text):
+            where += f", кнопка «{text}»"
+        lines.append(f"Где нажал номер: {where}")
     utm = ev.get("utm") or {}
     lines.append("Метки визита: " + (_utm_line(utm) or "нет (прямой заход или метки потерялись)"))
     first = ev.get("utm_first") or {}
@@ -418,7 +454,8 @@ def note_ambiguous(events: list[dict], call_start: float) -> str:
         "или звонили несколько человек. Метки в поля не записаны. Варианты:",
     ]
     for i, ev in enumerate(events[:3], 1):
-        lines.append(f"{i}) {_hms(ev['at'])}, {_path(ev.get('page_url', ''))}, "
+        where = f" ({place_label(ev['place'])})" if ev.get("place") else ""
+        lines.append(f"{i}) {_hms(ev['at'])}, {_path(ev.get('page_url', ''))}{where}, "
                      f"{_utm_line(ev.get('utm') or {}) or 'без меток'}")
     return "\n".join(lines)
 
