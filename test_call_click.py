@@ -34,7 +34,7 @@ def amo(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "cc.sqlite3"))
     monkeypatch.setattr(C, "CALL_CLICK_MODE", "live")
     monkeypatch.setattr(C, "CALL_CLICK_SECRET", "s")
-    monkeypatch.setattr(C, "LEAD_RETRY_S", 0)
+    monkeypatch.setattr(C, "LEAD_RETRIES", ())
     monkeypatch.setattr(C, "_last_cleanup", time.time())
     monkeypatch.setattr(C, "_rate", [])
     store.init_db()
@@ -238,3 +238,36 @@ def test_no_utm_no_fields_even_with_referrer(amo):
     assert attribute("c22", CALLER, t + 7) == "sure"
     assert amo["utm"] == []
     assert "Откуда пришёл: https://google.com/" in amo["notes"][0][1]
+
+
+def test_same_visitor_double_tap_is_one_click(amo):
+    """17.11.2026: Катя нажала номер дважды за 40 с и позвонила - было «спорно», должно быть «точно»."""
+    t = time.time() - 200
+    accept(ev(at=t))
+    accept(ev(at=t + 41))
+    assert attribute("c30", CALLER, t + 53) == "sure"
+    assert "позвонил через 12 с" in amo["notes"][0][1]
+    assert amo["utm"] == [(501, UTM)]
+    # оба клика заняты этим звонком: следующий звонок их не подхватит
+    assert attribute("c31", OTHER, t + 80) == "none"
+
+
+def test_two_visitors_still_ambiguous(amo):
+    t = time.time() - 200
+    accept(ev(at=t))
+    accept(ev(at=t + 10, device="desktop"))
+    assert attribute("c32", CALLER, t + 30) == "ambiguous"
+
+
+def test_lead_found_on_retry(amo, monkeypatch):
+    monkeypatch.setattr(C, "LEAD_RETRIES", (0, 0))
+    calls = []
+
+    async def finder(phone):
+        calls.append(phone)
+        return {"id": 501} if len(calls) == 3 else None
+
+    t = time.time() - 100
+    accept(ev(at=t))
+    assert attribute("c33", CALLER, t + 9, finder) == "sure"
+    assert len(calls) == 3 and len(amo["notes"]) == 1

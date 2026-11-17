@@ -72,7 +72,9 @@ CALL_CLICK_NUMBERS = {
 WINDOW_S = _env_int("CALL_CLICK_WINDOW_S", 120)
 SKEW_S = _env_int("CALL_CLICK_SKEW_S", 15)
 VISIT_DAYS = _env_int("CALL_CLICK_VISIT_DAYS", 30)
-LEAD_RETRY_S = _env_int("CALL_CLICK_LEAD_RETRY_S", 60)
+# Паузы перед повторным поиском сделки, с. Сделку Sipuni создаёт не мгновенно, а для известного
+# номера без открытой сделки не создаёт вовсе: её может завести менеджер после перезвона.
+LEAD_RETRIES = tuple(int(x) for x in re.findall(r"\d+", os.getenv("CALL_CLICK_LEAD_RETRIES", "60,180,600")))
 
 UTM_KEYS = ("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content")
 KINDS = ("tel_click", "utm_visit")
@@ -232,6 +234,27 @@ def call_started(call_id: str, phone: str, started_at: int | float | None) -> No
         logger.exception("call_click: начало звонка %s не записалось", call_id)
 
 
+def _visitor_key(click: dict) -> tuple:
+    """Один посетитель: та же страница, метки, источник и устройство. Человек часто жмёт номер
+    дважды (вернулся из звонилки и нажал снова) - это не два кандидата (тест 17.11.2026)."""
+    p = click["payload"]
+    return (p.get("page_url", ""), tuple(sorted((p.get("utm") or {}).items())),
+            p.get("referrer", ""), p.get("device", ""))
+
+
+def collapse(clicks: list[dict]) -> list[dict]:
+    """Клики одного посетителя → один, самый поздний; у него в "same" все клики группы."""
+    groups: dict = {}
+    for c in sorted(clicks, key=lambda c: c["at"]):
+        groups.setdefault(_visitor_key(c), []).append(c)
+    out = []
+    for group in groups.values():
+        last = dict(group[-1])
+        last["same"] = [g["event_id"] for g in group]
+        out.append(last)
+    return sorted(out, key=lambda c: c["at"])
+
+
 def decide(clicks: list[dict], callers: dict) -> tuple[str, list]:
     """Чистое решение. clicks - клики по нашим номерам в окне звонка, ещё не занятые.
     callers[event_id] - разные звонящие в окне этого клика (сам звонок туда входит).
@@ -271,7 +294,7 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
         if time.time() - _last_cleanup > 3600:
             _last_cleanup = time.time()
             await asyncio.to_thread(cleanup)
-        clicks = await asyncio.to_thread(_candidates, call_start)
+        clicks = collapse(await asyncio.to_thread(_candidates, call_start))
         callers = {}
         for c in clicks:
             callers[c["event_id"]] = await asyncio.to_thread(_phones_in_window, c["at"])
@@ -288,18 +311,22 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
                 return "none"
             verdict = "repeat"
         if verdict == "sure":
-            await asyncio.to_thread(store.mark_matched, chosen[0]["event_id"], call_id)
+            for event_id in chosen[0].get("same") or [chosen[0]["event_id"]]:
+                await asyncio.to_thread(store.mark_matched, event_id, call_id)
         logger.info("call_click: звонок %s в %s - %s (кликов в окне %s)", call_id, _hms(call_start),
                     verdict, len(clicks))
         if not phone:
             logger.info("call_click: звонок %s со скрытого номера, сделку не найти", call_id)
             return "no-lead"
         lead = await find_lead(phone.lstrip("+"))
-        if not lead and LEAD_RETRY_S > 0:
-            await asyncio.sleep(LEAD_RETRY_S)
+        for pause in LEAD_RETRIES:
+            if lead:
+                break
+            await asyncio.sleep(pause)
             lead = await find_lead(phone.lstrip("+"))
         if not lead:
-            logger.info("call_click: звонок %s - открытой сделки по номеру нет, метки не записаны", call_id)
+            logger.info("call_click: звонок %s - открытой сделки по номеру нет и за %s с не появилось, "
+                        "метки не записаны", call_id, sum(LEAD_RETRIES))
             return "no-lead"
         lead_id = int(lead["id"])
         ref = f"visit:{visit['event_id']}" if verdict == "repeat" else f"call:{call_id}"
