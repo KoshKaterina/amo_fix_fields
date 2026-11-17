@@ -4,10 +4,8 @@
 идентификаторами клиента (ClientID/email/phone), отдельная загрузка клиентов
 не нужна.
 
-ВНИМАНИЕ: точную обёртку загрузки (multipart `file` vs сырой CSV-боди) и формат
-дат документация Яндекса отдаёт только в JS-рендере — проверить на первом живом
-вызове по логам ответа. Здесь реализован multipart `file` (как в остальных
-upload-ручках Метрики) + UNIX-таймстампы.
+Отправка файла и его валидация — разные состояния. get_upload_receipts читает
+квитанции, сохраняя тот же представительский контекст, что и POST.
 """
 
 import asyncio
@@ -97,6 +95,43 @@ class MetrikaClient:
             )
         return resp.json().get("counters") or []
 
+    async def get_upload_receipts(self, counter_id: int, upload_ids: set[str]) -> dict:
+        """Find exact receipts, paging strictly backwards by upload time.
+
+        Bounded to 5,000 recent API uploads. Missing/unknown receipts remain
+        pending, never become successful because of a truncated page.
+        """
+        if self._client is None:
+            raise MetrikaError("MetrikaClient not initialized")
+        found = {}
+        offset = None
+        for _ in range(5):
+            params = self._params(limit=1000, source="API")
+            if offset:
+                params["datetime_offset"] = offset
+            try:
+                response = await self._client.get(
+                    f"{self._base_url}/cdp/api/v1/counter/{counter_id}/last_uploadings",
+                    headers=self._headers(), params=params)
+                if response.status_code != 200:
+                    raise MetrikaError("Metrika upload receipts unavailable", response.status_code)
+                rows = response.json()["uploadings"]
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise ValueError("invalid upload receipt list")
+            except (httpx.RequestError, ValueError, KeyError) as exc:
+                raise MetrikaError("Metrika upload receipts unreadable") from exc
+            for row in rows:
+                uid = str(row.get("uploading_id") or "")
+                if uid in upload_ids:
+                    found[uid] = row
+            if upload_ids <= found.keys() or len(rows) < 1000:
+                break
+            new_offset = rows[-1].get("datetime")
+            if not new_offset or new_offset == offset:
+                break
+            offset = new_offset
+        return found
+
     async def upload_simple_orders(self, counter_id: int, rows: list[dict]) -> dict:
         if self._client is None:
             raise MetrikaError("MetrikaClient not initialized")
@@ -166,3 +201,7 @@ async def get_counters() -> list[dict]:
 
 async def upload_simple_order(counter_id: int, row: dict) -> dict:
     return await _ensure().upload_simple_orders(counter_id, [row])
+
+
+async def get_upload_receipts(counter_id: int, upload_ids: set[str]) -> dict:
+    return await _ensure().get_upload_receipts(counter_id, upload_ids)

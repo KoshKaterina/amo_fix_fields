@@ -53,12 +53,20 @@ class EvidenceTest(unittest.TestCase):
 
 
 class SyncTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import metrika_sync as s
+        from shared.metrika_delivery import DeliveryStore
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.object(s, '_delivery', DeliveryStore(Path(directory.name)/'delivery.sqlite3'))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_status_updated_on_same_id_without_woo_write(self):
         import metrika_sync as s
         lead={'id':42,'pipeline_id':s.PIPELINE_CLEVER_MAIN,'status_id':999,'created_at':1793000000,'updated_at':1793000100,'price':9900}
         evidence=m.Evidence('woo_transaction',1793000050,'5000.00')
-        s._last_sent.clear()
-        with patch.object(s,'_enabled',True), patch.object(s,'_counter_id',93845803), patch.object(s,'METRIKA_SINCE_TS',None), patch.object(s.migration_freeze,'skip',AsyncMock(return_value=False)), patch.object(s,'is_tangemshop_lead',return_value=False), patch.object(s,'_cf',side_effect=lambda ld,f:'онлайн'), patch.object(s,'_contact_info',AsyncMock(return_value=(123,None,None))), patch.object(s.metrika_payment_evidence,'for_lead',AsyncMock(return_value=evidence)), patch.object(s.metrika_client,'upload_simple_order',AsyncMock(return_value={})) as upload:
+        with patch.object(s,'_enabled',True), patch.object(s,'_counter_id',93845803), patch.object(s,'METRIKA_SINCE_TS',None), patch.object(s.migration_freeze,'skip',AsyncMock(return_value=False)), patch.object(s,'is_tangemshop_lead',return_value=False), patch.object(s,'_cf',side_effect=lambda ld,f:'онлайн'), patch.object(s,'_contact_info',AsyncMock(return_value=(123,None,None))), patch.object(s.metrika_payment_evidence,'for_lead',AsyncMock(return_value=evidence)), patch.object(s.metrika_client,'upload_simple_order',AsyncMock(return_value={'uploading': {'uploading_id': 'fixture', 'api_validation_status': 'PASSED', 'elements_count': 1}})) as upload:
             await s.process_sync({'lead_id':42},lead)
             await s.process_sync({'lead_id':42},lead)
             self.assertEqual(upload.await_count,1)
@@ -69,8 +77,7 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_order_not_resurrected_by_receipt(self):
         import metrika_sync as s
         lead={'id':43,'pipeline_id':s.PIPELINE_CLEVER_MAIN,'status_id':s.STATUS_CLOSED_LOST,'created_at':1793000000,'updated_at':1793000100,'price':9900}
-        s._last_sent.clear()
-        with patch.object(s,'_enabled',True), patch.object(s,'_counter_id',93845803), patch.object(s,'METRIKA_SINCE_TS',None), patch.object(s.migration_freeze,'skip',AsyncMock(return_value=False)), patch.object(s,'is_tangemshop_lead',return_value=False), patch.object(s,'_cf',return_value='онлайн'), patch.object(s,'_contact_info',AsyncMock(return_value=(123,None,None))), patch.object(s.metrika_payment_evidence,'cached',return_value=m.Evidence('woo_transaction',1000,'5000')), patch.object(s.metrika_payment_evidence,'for_lead',AsyncMock()) as evidence, patch.object(s.metrika_client,'upload_simple_order',AsyncMock(return_value={})) as upload:
+        with patch.object(s,'_enabled',True), patch.object(s,'_counter_id',93845803), patch.object(s,'METRIKA_SINCE_TS',None), patch.object(s.migration_freeze,'skip',AsyncMock(return_value=False)), patch.object(s,'is_tangemshop_lead',return_value=False), patch.object(s,'_cf',return_value='онлайн'), patch.object(s,'_contact_info',AsyncMock(return_value=(123,None,None))), patch.object(s.metrika_payment_evidence,'cached',return_value=m.Evidence('woo_transaction',1000,'5000')), patch.object(s.metrika_payment_evidence,'for_lead',AsyncMock()) as evidence, patch.object(s.metrika_client,'upload_simple_order',AsyncMock(return_value={'uploading': {'uploading_id': 'fixture', 'api_validation_status': 'PASSED', 'elements_count': 1}})) as upload:
             await s.process_sync({'lead_id':43},lead)
             evidence.assert_not_awaited()
             self.assertEqual(upload.call_args.args[1]['order_status'],'CANCELLED')

@@ -5,9 +5,10 @@
     Дубликат (Офис/Фулфилмент) → оригинал резолвится по полю 576689 (UUID МойСклад).
   - Определение типа оплаты по полю 577373 «Способ оплаты»:
         наложка (COD) = содержит «при получении / наличны / эвотор / наложен».
-    Пустой способ оплаты → сделку не передаём.
+    Пустой способ оплаты → пропускаем, кроме отмены.
   - Маппинг статусов:
-        CANCELLED  — этап 143 в ЛЮБОЙ воронке (даже поверх PAID).
+        CANCELLED  — этап 143 в рознице/Офисе и подтверждённый розничный
+                     заказ в Листе ожидания (даже поверх PAID).
         IN_PROGRESS — CLEVER, любой не-терминальный этап.
         PAID (предоплата) — CLEVER «Успешно реализовано» (142).
         PAID (наложка)   — Офис «Успешно реализовано» (142)
@@ -28,6 +29,11 @@
 import asyncio
 import datetime
 import logging
+import hashlib
+from pathlib import Path
+from collections import Counter
+
+from shared.metrika_delivery import DeliveryStore
 import os
 import time
 
@@ -40,6 +46,7 @@ from waybill_config import (
     FIELD_EMAIL,
     FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_PAYMENT_METHOD,
+    FIELD_SITE_ORDER_NUMBER,
     FIELD_PHONE,
     FIELD_YM_CLIENT_ID,
     METRIKA_COUNTER_ID,
@@ -48,6 +55,7 @@ from waybill_config import (
     PIPELINE_CLEVER_MAIN,
     PIPELINE_DB_WORK,
     PIPELINE_OFFICE,
+    PIPELINE_WAITLIST,
     STATUS_CLOSED_LOST,
     STATUS_SUCCESS,
     is_cod_payment,
@@ -91,12 +99,103 @@ _last_reconcile_ts: int | None = None
 # Сверки не должны пересекаться (ночная и интрадей на границе суток и т.п.).
 _reconcile_lock = asyncio.Lock()
 
-# Дедуп по исходящему состоянию: id заказа → подпись последней успешно
-# отправленной строки. Гасит повторные отправки ОДНОГО И ТОГО ЖЕ состояния
-# (echo-вебхуки, перебор нетерминальных этапов в CLEVER — все мапятся в
-# IN_PROGRESS). В памяти: после рестарта будет один повторный upsert на заказ —
-# идемпотентно (merge_mode=UPDATE по id). Ночная сверка опирается на тот же стор.
-_last_sent: dict[int, str] = {}
+# Only metadata and hashes persist; fresh CRM reads reconstruct every retry.
+_delivery = DeliveryStore(Path(__file__).parent / "var" / "metrika_delivery.sqlite3")
+# Do not flood API while Yandex is validating a file or after a transport failure.
+_RETRY_AFTER_SECONDS = 3600
+_last_run = {}
+
+
+def delivery_health() -> dict:
+    result = {"enabled": _enabled, "last_run": dict(_last_run)}
+    try:
+        result["validation"] = _delivery.counts(_counter_id) if _enabled else {}
+    except Exception as exc:
+        result["store_error"] = type(exc).__name__
+    return result
+
+
+def _validated(receipt: dict | None, uploading_id: str) -> bool:
+    return bool(receipt and uploading_id
+                and str(receipt.get("uploading_id") or "") == uploading_id
+                and receipt.get("api_validation_status") == "PASSED"
+                and receipt.get("elements_count") == 1)
+
+
+async def _retail_origin(lead: dict) -> bool:
+    """Allow a moved website order, never every lead in the waitlist.
+
+    A previously attempted order or a status event in retail proves lineage.
+    A numeric Woo order ID is required for historical, unregistered orders.
+    """
+    if _delivery.get(_counter_id, lead["id"]):
+        return True
+    if not str(_cf(lead, FIELD_SITE_ORDER_NUMBER) or "").strip().isdigit():
+        return False
+    for page in range(1, 6):
+        data = await amo_service._do_get("/api/v4/events", [
+            ("filter[entity]", "lead"), ("filter[entity_id][]", str(lead["id"])),
+            ("filter[type]", "lead_status_changed"), ("limit", "100"), ("page", str(page))])
+        if data is None:
+            raise metrika_client.MetrikaError("CRM order origin unavailable")
+        events = (data.get("_embedded") or {}).get("events") or []
+        for event in events:
+            if str(event.get("entity_id")) != str(lead["id"]):
+                continue
+            for field in ("value_before", "value_after"):
+                for value in event.get(field) or []:
+                    status = value.get("lead_status") or {}
+                    if status.get("pipeline_id") == PIPELINE_CLEVER_MAIN:
+                        return True
+        if len(events) < 100 and not (data.get("_links") or {}).get("next"):
+            return False
+    raise metrika_client.MetrikaError("CRM order origin history incomplete")
+
+
+async def _deliver(row: dict, lead_id: int) -> str:
+    oid = row["id"]
+    # Include timestamps: correcting a conversion date is a meaningful update.
+    signature = hashlib.sha256((str(_counter_id) + "|" + _row_signature(row) + "|"
+        + str(row.get("create_date_time")) + "|" + str(row.get("update_date_time"))
+        + "|" + str(row.get("finish_date_time"))).encode()).hexdigest()
+    previous = _delivery.get(_counter_id, oid)
+    now = time.time()
+    if previous:
+        if previous["state"] == "validated" and previous["signature"] == signature:
+            return "unchanged"
+        if previous["state"] != "validated" and now - previous["attempted_at"] < _RETRY_AFTER_SECONDS:
+            # Wait for an older in-flight upload even if CRM changed meanwhile.
+            return "pending"
+    # Persist BEFORE the network request: crashes and HTTP failures remain retryable.
+    _delivery.put(_counter_id, oid, lead_id, signature, "pending", None, now)
+    response = await metrika_client.upload_simple_order(_counter_id, row)
+    receipt = response.get("uploading") or {}
+    uid = str(receipt.get("uploading_id") or "")
+    if not uid:
+        raise metrika_client.MetrikaError("Metrika upload missing receipt ID")
+    state = "validated" if _validated(receipt, uid) else "pending"
+    if receipt.get("api_validation_status") == "FAILED":
+        state = "failed"
+    _delivery.put(_counter_id, oid, lead_id, signature, state, uid, now)
+    if state == "failed":
+        raise metrika_client.MetrikaError("Metrika upload validation FAILED")
+    return state
+
+
+async def _check_pending_receipts() -> None:
+    pending = _delivery.pending(_counter_id)
+    ids = {r["uploading_id"] for r in pending if r["uploading_id"]}
+    if not ids:
+        return
+    receipts = await metrika_client.get_upload_receipts(_counter_id, ids)
+    for row in pending:
+        uid = row["uploading_id"]
+        receipt = receipts.get(uid)
+        if _validated(receipt, uid):
+            _delivery.confirm(_counter_id, row["order_id"], uid)
+        elif receipt and receipt.get("api_validation_status") == "FAILED":
+            await _alert(f"Metrika: validation FAILED for upload {uid}")
+
 
 
 def is_enabled() -> bool:
@@ -176,7 +275,6 @@ async def shutdown() -> None:
                 pass
     _nightly_task = None
     _intraday_task = None
-    _last_sent.clear()
     await metrika_client.aclose()
     logger.info("Metrika sync stopped")
 
@@ -238,7 +336,7 @@ def _classify(pipeline_id, status_id, cod: bool) -> tuple[str | None, bool]:
     return None, False
 
 
-async def process_sync(payload: dict, lead: dict | None = None) -> None:
+async def process_sync(payload: dict, lead: dict | None = None, *, preview: bool = False) -> str | dict | None:
     if not _enabled:
         return
     lead_id = payload["lead_id"]
@@ -256,9 +354,9 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
     pipeline_id = lead.get("pipeline_id")
     status_id = lead.get("status_id")
 
-    # Работаем только со сквозным потоком заказа: CLEVER → Офис/Фулфилмент.
-    # Сделки из прочих воронок (опт, отдел продаж и т.п.) игнорируем.
-    if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE):
+    moved_cancellation = (pipeline_id == PIPELINE_WAITLIST
+                          and status_id == STATUS_CLOSED_LOST)
+    if pipeline_id not in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE) and not moved_cancellation:
         return
 
     # ⚠️ Заказы магазина tangemshop.ru (29.09.2026). Гейта по воронке выше тут
@@ -274,16 +372,19 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
         logger.info("Metrika: сделка %s — заказ Tangemshop, в счётчик Sunscrypt не шлём", lead_id)
         return
 
+    if moved_cancellation and not await _retail_origin(lead):
+        return
     payment = _cf(lead, FIELD_PAYMENT_METHOD)
-    if not str(payment or "").strip():
-        logger.info("Metrika: сделка %s без способа оплаты — пропуск", lead_id)
+    # Cancellation of a known order must propagate even if payment was cleared.
+    if status_id != STATUS_CLOSED_LOST and not str(payment or "").strip():
+        logger.info("Metrika: order %s has no payment method, skipped", lead_id)
         return
     cod = is_cod_payment(payment)
-
     order_status, need_resolve = _classify(pipeline_id, status_id, cod)
-    # An actual online receipt may precede the terminal CRM stage. Resolve the
-    # SAME canonical order even when the office stage has no status mapping.
-    if not order_status:
+    if moved_cancellation:
+        # History/registry proves this very ID was the retail original.
+        order_status, need_resolve = "CANCELLED", False
+    elif not order_status:
         need_resolve = pipeline_id != PIPELINE_CLEVER_MAIN
 
     # Каноническая сделка — всегда оригинал в CLEVER (источник id, ym, суммы, дат).
@@ -372,30 +473,18 @@ async def process_sync(payload: dict, lead: dict | None = None) -> None:
         # Confirm the original order, not the manager's additional basket/sum.
         row["revenue"] = payment_evidence.original_total
 
-    # Дедуп: не шлём заказ повторно, если его значимое состояние не изменилось
-    # с прошлой успешной отправки (гасит echo и перебор этапов → один IN_PROGRESS).
-    sig = _row_signature(row)
-    if _last_sent.get(metrika_order_id) == sig:
-        logger.info(
-            "Metrika: заказ %s без изменений состояния (%s) — отправку пропускаем",
-            metrika_order_id, order_status,
-        )
-        return
-
+    if preview:
+        return row
     try:
-        await metrika_client.upload_simple_order(_counter_id, row)
-        _last_sent[metrika_order_id] = sig
-        if len(_last_sent) > 10000:
-            _last_sent.clear()
-        logger.info(
-            "Metrika: заказ %s → %s (cod=%s, trigger lead %s)",
-            metrika_order_id, order_status, cod, lead_id,
-        )
+        outcome = await _deliver(row, lead_id)
+        logger.info("Metrika: order %s %s (%s)", metrika_order_id, order_status, outcome)
+        return outcome
     except metrika_client.MetrikaError as exc:
         await _alert(
             f"Metrika: ошибка загрузки заказа {metrika_order_id}: {exc}",
             "metrika_order_load_failed", {"номер": metrika_order_id, "ошибка": str(exc)},
         )
+        return "failed"
 
 
 async def _resolve_clever(dup_lead: dict) -> dict | None:
@@ -403,9 +492,11 @@ async def _resolve_clever(dup_lead: dict) -> dict | None:
     uuid = str(_cf(dup_lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
     if not uuid:
         return None
-    # find_leads_by_query теперь возвращает None при сбое запроса (не только
-    # пустой список) - or [] сохраняет прежнее поведение (сбой = нет сиблинга).
-    for cand in await amo_service.find_leads_by_query(uuid, with_=("contacts",)) or []:
+    # Не путать сбой поиска с подтверждённым отсутствием оригинала.
+    candidates = await amo_service.find_leads_by_query(uuid, with_=("contacts",))
+    if candidates is None:
+        raise metrika_client.MetrikaError("CRM canonical order lookup unavailable")
+    for cand in candidates:
         if cand.get("pipeline_id") == PIPELINE_CLEVER_MAIN and str(
             _cf(cand, FIELD_MOYSKLAD_ORDER_UUID) or ""
         ).strip() == uuid:
@@ -470,6 +561,15 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
         since = since_ts if since_ts is not None else run_started - days * 86400
         leads_by_id: dict[int, dict] = {}
         fetch_failed = False
+        retry_ids = {row["lead_id"] for row in _delivery.pending(_counter_id)}
+        _last_run.clear()
+        _last_run.update(started_at=run_started, running=True)
+        try:
+            await _check_pending_receipts()
+        except metrika_client.MetrikaError:
+            logger.exception("Metrika: could not check pending upload receipts")
+            fetch_failed = True
+        # Durable retries survive both the moving window and process restart.
         for pipeline in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE):
             try:
                 batch = await amo_service.get_leads_updated_since(pipeline, since, with_=("contacts",))
@@ -489,6 +589,33 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
                 if lid is not None:
                     leads_by_id[lid] = ld
 
+        for lid in retry_ids - leads_by_id.keys():
+            try:
+                lead = await amo_service.get_lead_full(lid, with_=("contacts",))
+            except Exception:
+                logger.exception("Metrika: retry source unavailable for lead %s", lid)
+                fetch_failed = True
+                continue
+            if lead:
+                leads_by_id[lid] = lead
+            else:
+                fetch_failed = True
+
+        # Only cancellations in this follow-up pipeline; no Woo/InSales side effects.
+        extra_ids = set()
+        try:
+            batch = await amo_service.get_leads_updated_since(PIPELINE_WAITLIST, since, with_=("contacts",))
+        except Exception:
+            logger.exception("Metrika: waitlist source unavailable")
+            batch = None
+        if batch is None:
+            fetch_failed = True
+        else:
+            for lead in batch:
+                if lead.get("status_id") == STATUS_CLOSED_LOST:
+                    extra_ids.add(lead["id"])
+                    leads_by_id[lead["id"]] = lead
+
         window_h = (run_started - since) / 3600
         logger.info(
             "Metrika reconcile: %s сделок за окно %.1f ч — старт", len(leads_by_id), window_h
@@ -497,28 +624,35 @@ async def reconcile_window(days: int = RECONCILE_DAYS, since_ts: int | None = No
         # поэтому здесь — внутри функции, чтобы не было кольцевого импорта.
         import woo_status_sync
         import insales_status_sync
-        ok = 0
+        outcomes = Counter()
         for lid, ld in leads_by_id.items():
             try:
-                await process_sync({"lead_id": lid}, lead=ld)
-                ok += 1
+                outcome = await process_sync({"lead_id": lid}, lead=ld)
+                outcomes[outcome or "skipped"] += 1
+                if outcome == "failed":
+                    fetch_failed = True
             except Exception:
                 logger.exception("Metrika reconcile: ошибка по сделке %s", lid)
+                outcomes["failed"] += 1
+                fetch_failed = True
             # Woo — тем же проходом, последовательно после Метрики (та же сделка
             # уже в памяти, повторного запроса в amo нет). Своя обработка ошибок.
-            if woo_status_sync.is_enabled():
+            if lid not in extra_ids and ld.get("pipeline_id") in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE) and woo_status_sync.is_enabled():
                 try:
                     await woo_status_sync.process_sync({"lead_id": lid}, lead=ld)
                 except Exception:
                     logger.exception("Woo reconcile: ошибка по сделке %s", lid)
             # InSales — страховка вебхука: заказ Tangemshop, чья сделка закрылась в
             # Офисе, пока контейнер пересобирался. Сделки не наши модуль отсеет сам.
-            if insales_status_sync.is_enabled():
+            if lid not in extra_ids and ld.get("pipeline_id") in (PIPELINE_CLEVER_MAIN, PIPELINE_OFFICE) and insales_status_sync.is_enabled():
                 try:
                     await insales_status_sync.process_lead(lid, lead=ld, source="reconcile")
                 except Exception:
                     logger.exception("InSales reconcile: ошибка по сделке %s", lid)
-        logger.info("Metrika reconcile: обработано %s/%s", ok, len(leads_by_id))
+        _last_run.clear()
+        _last_run.update(at=run_started, orders=len(leads_by_id), outcomes=dict(outcomes),
+                         fetch_failed=fetch_failed, running=False)
+        logger.info("Metrika reconcile outcomes: %s", dict(outcomes))
         # Двигаем метку только если выборка прошла по всем воронкам: упавшая
         # воронка не должна выпасть из следующего окна.
         if fetch_failed:
