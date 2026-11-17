@@ -39,6 +39,7 @@ import telegram_bot
 import alerts
 import lead_distribution_routed_store as routed_store
 import sipuni_events
+import call_click_service
 from api import BASE_URL
 from tg_recipients import (
     NOTIFY_CHAT_ID,
@@ -492,6 +493,9 @@ async def _sipuni_apply(payload: list) -> None:
         try:
             ev = sipuni_events.parse_event(raw)
             st, duplicate = sipuni_events.tracker.ingest(ev)
+            if (st is not None and not duplicate and ev.kind == 1 and st.starts == 1
+                    and st.direction == sipuni_events.DIR_IN):
+                call_click_service.call_started(st.call_id, st.client_phone, st.first_ts)
             logger.info("%s%s", sipuni_events.log_line(ev, st), " dup=1" if duplicate else "")
         except Exception:
             logger.exception("Sipuni событие: ошибка обработки")
@@ -500,6 +504,7 @@ async def _sipuni_apply(payload: list) -> None:
 async def _sipuni_on_missed(missed) -> None:
     """Решение «пропущенный» принято (тихое окно истекло, ни одна нога не отвечена)."""
     dropped = bool(getattr(missed, "dropped_in_menu", False))
+    call_click_service.schedule_attribution(missed.call_id, missed.phone, missed.first_ts, _find_lead_row)
     if SIPUNI_EVENTS_MODE != "live":
         logger.info(
             "Sipuni пропущенный: call=%s тел=%s ног=%s к_сотрудникам=%s на_приветствии=%s "
@@ -527,6 +532,8 @@ async def _sipuni_on_missed(missed) -> None:
 
 async def _sipuni_on_answered(call) -> None:
     """Звонок ответили (входящий или исходящий), тихое окно прошло: «Успешный звонок»."""
+    if call.direction == sipuni_events.DIR_IN:
+        call_click_service.schedule_attribution(call.call_id, call.phone, call.first_ts, _find_lead_row)
     if SIPUNI_EVENTS_MODE != "live" or not SIPUNI_SET_TAGS:
         logger.info(
             "Sipuni отвеченный: call=%s напр=%s тел=%s - %s, тег НЕ ставлю",

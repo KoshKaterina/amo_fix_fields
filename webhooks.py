@@ -57,6 +57,7 @@ import showroom_alert
 import showroom_store
 import showroom_tag
 import site_form_service
+import call_click_service
 import sipuni_events
 import getcourse_service
 import team_panel_client
@@ -233,6 +234,7 @@ async def lifespan(app):
     await budget_mismatch_watch.init()
     # Формы сайта: без SITE_FORM_ENABLED роут отвечает 404 и ничего не делает.
     await site_form_service.init()
+    call_click_service.init()
     # Заказы GetCourse → сделки Академии (21.10.2026): без GETCOURSE_ENABLED роут отвечает
     # 404, ни очередь, ни обработчик не поднимаются.
     await getcourse_service.init()
@@ -596,6 +598,28 @@ async def site_form(request: Request):
         return {"ok": True}
     site_form_service.handle_bg(payload, ip)
     return {"ok": True}
+
+
+@app.post("/site_call_click")
+async def site_call_click(request: Request):
+    """Коллтрекинг сайта (17.11.2026): клик по номеру и вход с метками → склейка со звонком
+    Sipuni (call_click_service). Шлёт сервер WP, заголовок X-Api-Key как у /site_form."""
+    if not call_click_service.is_enabled():
+        return Response("disabled", status_code=404)
+    if not call_click_service.secret_ok(request.headers.get("X-Api-Key", "")):
+        logger.warning("site_call_click: неверный X-Api-Key")
+        return Response("forbidden", status_code=403)
+    raw = await request.body()
+    if len(raw) > call_click_service.MAX_BODY_BYTES:
+        return JSONResponse({"ok": False, "error": "too-large"}, status_code=413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad-json"}, status_code=422)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "bad-json"}, status_code=422)
+    status_code, body = await call_click_service.accept(payload)
+    return JSONResponse(body, status_code=status_code)
 
 
 @app.post("/getcourse/{secret}")
