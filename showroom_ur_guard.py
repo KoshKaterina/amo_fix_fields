@@ -137,8 +137,8 @@ async def check(lead: dict) -> str | None:
     if returned:
         try:
             await amo_service.add_note(
-                lead_id, f"Защита самовывоза вернула сделку на прежний этап: {MANAGER_NAMES.get(user_id) or tag} "
-                "перевёл(а) её в «Успешно реализовано», а самовывоз закрывает офис, когда клиент забрал товар.")
+                lead_id, f"{MANAGER_NAMES.get(user_id) or tag} - ЗАПРЕЩЕННОЕ ДЕЙСТВИЕ: перевод сделки "
+                "с самовывозом в «Успешно реализовано». Сделка возвращена.")
         except Exception:
             logger.exception("showroom_ur_guard %s: примечание в сделку не записалось", lead_id)
     tail = ("Сделка возвращена на прежний этап. Самовывоз закрывает офис, когда клиент забрал товар."

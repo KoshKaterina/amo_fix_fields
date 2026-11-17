@@ -232,7 +232,8 @@ def test_rollback_and_notify(monkeypatch=None):
     assert len(sent) == 1 and "@thebarsa1" in sent[0]["text"] and sent[0]["message_thread_id"] == 10479
     # Откат оставляет примечание в сделке: кто, что и почему.
     assert len(notes) == 1 and notes[0][0] == 11
-    assert "вернул сделку на этап «Офис / Первичка»" in notes[0][1] and "Почему нельзя" in notes[0][1]
+    assert notes[0][1] == ("Игорь Оанча - ЗАПРЕЩЕННОЕ ДЕЙСТВИЕ: перемещение из «Офис / Первичка» "
+                           "в «Офис / Сделать накладную». Сделка возвращена.")
     # Повтор того же события при перекрытии окна - не судится второй раз.
     asyncio.run(stage_guard.sweep_once())
     assert len(patched) == 1 and len(sent) == 1

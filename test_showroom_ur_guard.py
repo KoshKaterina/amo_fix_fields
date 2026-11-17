@@ -125,7 +125,9 @@ def test_online_mop_blocked_and_returned():
     _reset([_ev(KIRILL, at=50), _ev(IGOR, before_s=86706902, at=100)])
     assert run(g.check(_lead())) == "blocked-showroom-online-mop"
     assert patched == [(77, RET, 86706902)]          # куда перевёл последний раз
-    assert len(notes) == 1 and notes[0][0] == 77 and "Игорь Оанча" in notes[0][1]
+    assert len(notes) == 1 and notes[0][0] == 77
+    assert notes[0][1] == ("Игорь Оанча - ЗАПРЕЩЕННОЕ ДЕЙСТВИЕ: перевод сделки с самовывозом "
+                           "в «Успешно реализовано». Сделка возвращена.")
     assert "@thebarsa1" in sent[0]["text"] and sent[0]["message_thread_id"] == 10479
 
 

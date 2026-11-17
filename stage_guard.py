@@ -325,9 +325,7 @@ def _hhmm(ts: int) -> str:
 async def _add_rollback_note(m: Move, name: str, src: str, dst: str, reason: str) -> None:
     """Примечание в сделку после отката (просьба Кати 17.11.2026): в карточке видно, почему этап
     вернулся. Сбой примечания откат не отменяет - только лог."""
-    text = (f"Сторож перемещений вернул сделку на этап «{src}».\n"
-            f"{name} в {_hhmm(m.created_at)} перевёл(а) её «{src}» → «{dst}».\n"
-            f"Почему нельзя: {reason}.")
+    text = f"{name} - ЗАПРЕЩЕННОЕ ДЕЙСТВИЕ: перемещение из «{src}» в «{dst}». Сделка возвращена."
     try:
         await amo_service.add_note(m.lead_id, text)
     except Exception:
