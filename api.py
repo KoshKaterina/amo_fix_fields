@@ -913,6 +913,14 @@ async def add_note_to_lead(lead_id: Any, text: str, *, max_attempts: int | None 
     return data is not None
 
 
+async def add_note_to_contact(contact_id: Any, text: str) -> bool:
+    """Добавляет обычное примечание (common) к контакту. True при успехе."""
+    url = f"{BASE_URL}/api/v4/contacts/{contact_id}/notes"
+    body = [{"note_type": "common", "params": {"text": str(text)}}]
+    data = await _request_json("POST", url, body=body, what=f"add_contact_note[{contact_id}]")
+    return data is not None
+
+
 async def set_lead_tags(lead_id: Any, tags: list) -> bool:
     """Ставит сделке теги по именам (ЗАМЕНЯЕТ весь набор). Нужен потому, что
     unsorted/forms существующий тег по имени не линкует — создаёт и цепляет

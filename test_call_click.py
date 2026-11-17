@@ -53,6 +53,18 @@ def amo(tmp_path, monkeypatch):
 
     monkeypatch.setattr(C.api, "add_note_to_lead", add_note)
     monkeypatch.setattr(C.api, "set_lead_utm", set_utm)
+    calls["contact_notes"] = []
+    calls["contact_id"] = 777
+
+    async def find_contact(q):
+        return calls["contact_id"]
+
+    async def contact_note(cid, text):
+        calls["contact_notes"].append((cid, text))
+        return True
+
+    monkeypatch.setattr(C.api, "find_contact_id", find_contact)
+    monkeypatch.setattr(C.api, "add_note_to_contact", contact_note)
     monkeypatch.setattr(C.amo_service, "get_lead_full", get_lead)
     return calls
 
@@ -195,11 +207,33 @@ def test_note_failure_releases(amo):
     assert store.claim_attribution(501, "call:c12") is True  # запись освобождена для повтора
 
 
-def test_no_lead(amo):
+def test_no_lead_note_goes_to_contact(amo):
+    """17.11.2026: известный номер, все сделки закрыты, Sipuni новую не создал - пишем в контакт."""
+    t = time.time() - 100
+    accept(ev(at=t, place="header-phone"))
+    assert attribute("c13", CALLER, t + 9, _nothing) == "contact"
+    assert amo["notes"] == [] and amo["utm"] == []
+    cid, text = amo["contact_notes"][0]
+    assert cid == 777 and "Звонок с сайта" in text and "utm_campaign=keystone" in text
+    assert text.endswith("Открытой сделки по номеру не было, поэтому примечание в контакте.")
+    assert attribute("c13", CALLER, t + 9, _nothing) in ("none", "skip")
+    assert len(amo["contact_notes"]) == 1
+
+
+def test_no_lead_no_contact(amo):
+    amo["contact_id"] = None
     t = time.time() - 100
     accept(ev(at=t))
-    assert attribute("c13", CALLER, t + 9, _nothing) == "no-lead"
-    assert amo["notes"] == []
+    assert attribute("c14", CALLER, t + 9, _nothing) == "no-lead"
+    assert amo["contact_notes"] == []
+
+
+def test_contact_in_log_mode_not_written(amo, monkeypatch):
+    monkeypatch.setattr(C, "CALL_CLICK_MODE", "log")
+    t = time.time() - 100
+    accept(ev(at=t))
+    assert attribute("c15", CALLER, t + 9, _nothing) == "contact"
+    assert amo["contact_notes"] == []
 
 
 def test_disabled_is_noop(monkeypatch):

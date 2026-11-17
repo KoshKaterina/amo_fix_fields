@@ -325,20 +325,13 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
             await asyncio.sleep(pause)
             lead = await find_lead(phone.lstrip("+"))
         if not lead:
-            logger.info("call_click: звонок %s - открытой сделки по номеру нет и за %s с не появилось, "
-                        "метки не записаны", call_id, sum(LEAD_RETRIES))
-            return "no-lead"
+            return await _write_contact(call_id, phone, verdict, chosen, visit, call_start)
         lead_id = int(lead["id"])
         ref = f"visit:{visit['event_id']}" if verdict == "repeat" else f"call:{call_id}"
         if not await asyncio.to_thread(store.claim_attribution, lead_id, ref):
             logger.info("call_click: в сделку %s уже писали (%s)", lead_id, ref)
             return "skip"
-        if verdict == "sure":
-            note = note_sure(chosen[0]["payload"], call_start)
-        elif verdict == "ambiguous":
-            note = note_ambiguous([c["payload"] for c in chosen], call_start)
-        else:
-            note = note_repeat(visit["payload"])
+        note = _note_for(verdict, chosen, visit, call_start)
         fields = {}
         if verdict == "sure":
             fields = dict(chosen[0]["payload"]["utm"])
@@ -349,6 +342,42 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
     except Exception:
         logger.exception("call_click: склейка звонка %s не удалась", call_id)
         return "error"
+
+
+def _note_for(verdict: str, chosen: list, visit: dict | None, call_start: float) -> str:
+    if verdict == "sure":
+        return note_sure(chosen[0]["payload"], call_start)
+    if verdict == "ambiguous":
+        return note_ambiguous([c["payload"] for c in chosen], call_start)
+    return note_repeat(visit["payload"])
+
+
+async def _write_contact(call_id: str, phone: str, verdict: str, chosen: list, visit: dict | None,
+                         call_start: float) -> str:
+    """Открытой сделки нет и не появилось (известный номер, Sipuni новую не создаёт): примечание в
+    карточку контакта, чтобы метки не пропали. Полей «Статистики» у контакта нет - только текст.
+    Решение Кати 17.11.2026."""
+    contact_id = await api.find_contact_id(phone.lstrip("+"))
+    if not contact_id:
+        logger.info("call_click: звонок %s - ни сделки, ни контакта по номеру, метки не записаны", call_id)
+        return "no-lead"
+    contact_id = int(contact_id)
+    ref = f"contact-visit:{visit['event_id']}" if verdict == "repeat" else f"contact-call:{call_id}"
+    if not await asyncio.to_thread(store.claim_attribution, contact_id, ref):
+        logger.info("call_click: в контакт %s уже писали (%s)", contact_id, ref)
+        return "skip"
+    note = (_note_for(verdict, chosen, visit, call_start)
+            + "\nОткрытой сделки по номеру не было, поэтому примечание в контакте.")
+    if CALL_CLICK_MODE == "log":
+        logger.info("call_click: контакт %s, %s - режим log, в amo не пишу. Примечание было бы:\n%s",
+                    contact_id, verdict, note)
+        return "contact"
+    if not await api.add_note_to_contact(contact_id, note):
+        logger.warning("call_click: примечание в контакт %s не легло (%s)", contact_id, ref)
+        await asyncio.to_thread(store.release_attribution, contact_id, ref)
+        return "error"
+    logger.info("call_click: открытой сделки нет - примечание в контакте %s (%s)", contact_id, verdict)
+    return "contact"
 
 
 async def _write(lead_id: int, ref: str, verdict: str, note: str, utm: dict) -> None:
