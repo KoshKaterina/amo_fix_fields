@@ -280,6 +280,25 @@ def apply_entry_override(cfg: dict, payload: dict) -> dict:
     return merged
 
 
+# Квиз сайта открывает ту же форму «Обратный звонок или вопрос», что и обычная кнопка, и до
+# 17.11.2026 его сделку было не отличить от формы ничем, кроме текста примечания. Панель Team
+# считает квизы отдельным источником новых лидов по этому тегу (решение Кати 17.11.2026).
+# `quiz-exit` - та же форма из квиза, открытая без результата; Катя: «квиз и есть квиз».
+# Квиз Mini App сюда не входит (его пометка `miniapp-quiz-result`): он считается в Mini App.
+QUIZ_ENTRIES = frozenset({"quiz-result", "quiz-exit"})
+QUIZ_TAG = "Квиз"
+
+
+def apply_quiz_tag(cfg: dict, payload: dict) -> dict:
+    """Добавляет тег «Квиз» заявке из квиза сайта. Маршрут, источник и прочие теги не трогает.
+    Возвращает НОВЫЙ словарь, если тег добавлен; иначе тот же cfg."""
+    entry = str(((payload.get("context") or {}).get("entry") or "")).strip()
+    tags = list(cfg.get("tags") or [])
+    if entry not in QUIZ_ENTRIES or QUIZ_TAG in tags:
+        return cfg
+    return {**cfg, "tags": tags + [QUIZ_TAG]}
+
+
 FORM_MAP = _load_map()
 ENTRY_MAP = _load_entry_map()
 
@@ -1027,7 +1046,7 @@ async def deliver(row: dict, attempt: dict) -> bool | None:
         logger.info("site_form[%s]: пометка %s → воронка %s, этап %s, ответственный %s",
                     row["form"], (payload.get("context") or {}).get("entry"),
                     routed["pipeline_id"], routed["status_id"], routed.get("responsible_user_id"))
-    cfg = routed
+    cfg = apply_quiz_tag(routed, payload)
     try:
         if row["status"] == "pending":
             lead_id, uid = await _create_lead_v2(payload, cfg, attempt)

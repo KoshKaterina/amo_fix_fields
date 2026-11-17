@@ -2136,3 +2136,119 @@ def test_empty_schedule_pool_but_someone_live_now_goes_by_load():
     assert _patch_calls[0]["responsible_user_id"] == 2
     assert _log_calls[-1]["rule"] == "load"
     assert _log_calls[-1]["detail"]["pool_is_future"] is False  # признак живёт в detail
+
+
+# ════════════════ сброс счётчиков в конце рабочего дня (16.11.2026) ════════════════
+# После конца work_hours сделки уходят на завтрашнюю смену и считаются в завтрашних
+# счётчиках: сегодняшняя нагрузка на вечернюю раздачу не влияет, а в полночь
+# завтрашние счётчики становятся сегодняшними.
+
+def _tomorrow_iso() -> str:
+    return (_now().date() + datetime.timedelta(days=1)).isoformat()
+
+
+def test_work_day_ended_at_exact_end_minute():
+    p = ld.Profile(id="x", name="x", work_hours=[{"start": "10:00", "end": _hhmm(_now())}])
+    assert ld._work_day_ended(p, _now()) is True
+    assert ld._counter_day(p, _now()) == _tomorrow_iso()
+    assert ld._counter_day(p, _now() - datetime.timedelta(minutes=1)) == _now().date().isoformat()
+
+
+def test_counter_day_without_work_hours_is_calendar_day():
+    p = ld.Profile(id="x", name="x", work_hours=None)
+    assert ld._counter_day(p, _now()) == _now().date().isoformat()
+
+
+def test_after_work_day_end_counters_start_from_zero_for_next_day():
+    """Днём Егор (2) набрал 10 сделок, Игорь (1) - ноль. Вечером Игорю уже
+    досталась одна сделка на завтра. Следующая вечерняя сделка уходит Егору:
+    решение смотрит на завтрашние счётчики (1 : 0), а не на дневные (0 : 10)."""
+    _reset_fakes()
+    now = _now()
+    work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=3)), "end": _hhmm(now - datetime.timedelta(hours=1))}]
+    _seed_profile(name="EveningReset", participant_ids=[1, 2], duty_user_id=9, work_hours=work_hours)
+    _tomorrow_statuses[1] = True
+    _tomorrow_statuses[2] = True
+    _seed_counts({2: {1: 10}})
+    state = ld._load_counters_state()
+    ld._bump(state, _DEFAULT_PIPELINE, 1, 1, +1, day=_tomorrow_iso())
+    ld._save_counters_state(state)
+
+    lead = _lead(lead_id=230, source_id=1, contacts=[{"id": 502}])
+    _lead_by_id[230] = lead
+    _contact_by_id[502] = _contact(502, other_leads=[])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(230)))
+
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 2
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 2, 1) == 10, "дневные счётчики не трогаем"
+    tomorrow = ld._pipeline_counts(final, _DEFAULT_PIPELINE, _tomorrow_iso())
+    assert ld._source_count(tomorrow, 1, 1) == 1
+    assert ld._source_count(tomorrow, 2, 1) == 1
+    assert final["assignments"]["230"]["day"] == _tomorrow_iso()
+    assert _log_calls[-1]["detail"]["counter_day"] == _tomorrow_iso()
+
+
+def test_during_work_day_counters_are_todays():
+    _reset_fakes()
+    now = _now()
+    work_hours = [{"start": _hhmm(now - datetime.timedelta(hours=1)), "end": _hhmm(now + datetime.timedelta(hours=1))}]
+    _seed_profile(name="DayRunning", participant_ids=[1, 2], work_hours=work_hours)
+    _seed_counts({2: {1: 10}})
+    lead = _lead(lead_id=231, source_id=1, contacts=[{"id": 503}])
+    _lead_by_id[231] = lead
+    _contact_by_id[503] = _contact(503, other_leads=[])
+    outcome = run(_call_and_drain(ld.process_lead_distribution(231)))
+    assert outcome == "routed"
+    assert _patch_calls[0]["responsible_user_id"] == 1
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 1) == 1
+    assert not final.get(ld.NEXT_DAY_KEY)
+
+
+def test_midnight_next_day_counters_become_todays():
+    today = _now().date().isoformat()
+    yesterday = (_now().date() - datetime.timedelta(days=1)).isoformat()
+    ld.COUNTERS_PATH.write_text(json.dumps({
+        "v": ld.COUNTERS_VERSION, "date": yesterday,
+        "counts_by_pipeline": {str(_DEFAULT_PIPELINE): {"2": {"1": 10}}},
+        ld.NEXT_DAY_KEY: {str(_DEFAULT_PIPELINE): {"1": {"1": 2}}},
+        "assignments": {
+            "800": {"source_id": 1, "user_id": 2, "date": yesterday, "day": yesterday},
+            "801": {"source_id": 1, "user_id": 1, "date": yesterday, "day": today,
+                    "pipeline_id": str(_DEFAULT_PIPELINE)},
+        },
+        "outcomes_logged": ["5:no_candidate"],
+    }), encoding="utf-8")
+    state = ld._load_counters_state()
+    assert state["date"] == today
+    assert state["counts_by_pipeline"] == {str(_DEFAULT_PIPELINE): {"1": {"1": 2}}}
+    assert not state.get(ld.NEXT_DAY_KEY)
+    assert set(state["assignments"]) == {"801"}
+    assert "outcomes_logged" not in state
+
+
+def test_midnight_carry_skips_file_older_than_yesterday():
+    ld.COUNTERS_PATH.write_text(json.dumps({
+        "v": ld.COUNTERS_VERSION, "date": "2000-01-01", "counts_by_pipeline": {},
+        ld.NEXT_DAY_KEY: {str(_DEFAULT_PIPELINE): {"1": {"1": 2}}}, "assignments": {},
+    }), encoding="utf-8")
+    assert ld._load_counters_state()["counts_by_pipeline"] == {}
+
+
+def test_correct_reassignment_of_evening_lead_after_midnight():
+    """Сделку роздали вечером на завтра, утром её переложили на другого -
+    поправка идёт в сегодняшних (бывших завтрашних) счётчиках."""
+    today = _now().date().isoformat()
+    yesterday = (_now().date() - datetime.timedelta(days=1)).isoformat()
+    ld.COUNTERS_PATH.write_text(json.dumps({
+        "v": ld.COUNTERS_VERSION, "date": yesterday, "counts_by_pipeline": {},
+        ld.NEXT_DAY_KEY: {str(_DEFAULT_PIPELINE): {"1": {"42": 1}}},
+        "assignments": {"802": {"source_id": 42, "user_id": 1, "date": yesterday, "day": today,
+                                "pipeline_id": str(_DEFAULT_PIPELINE)}},
+    }), encoding="utf-8")
+    run(ld.correct_reassignment(802, 2))
+    final = ld._load_counters_state()
+    assert ld._source_count(_counts_of(final), 1, 42) == 0
+    assert ld._source_count(_counts_of(final), 2, 42) == 1
