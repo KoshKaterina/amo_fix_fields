@@ -299,7 +299,7 @@ def test_detailed_violation_text():
     t = sent[0]["text"]
     assert "Сделка: «Заказ 40», заказ №09001, 12 990 ₽" in t
     assert "заново создаёт накладную СДЭК" in t
-    assert "Сейчас: «Офис / Сделать накладную», накладная СДЭК № 1650000001" in t
+    assert "Сейчас:" not in t and "Переносы между воронками" not in t   # укорочено 17.11
     assert "не возвращена" in t
 
 

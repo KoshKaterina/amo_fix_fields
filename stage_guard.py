@@ -305,17 +305,8 @@ def _hint(m: Move) -> str | None:
                 "двух накладных на одну посылку, лишнюю отмените.")
     if m.to_pipeline == PIPELINE_OFFICE and m.to_status in SHIPMENT_STATUSES:
         return "На этом этапе МойСклад создаёт отгрузку - товар списывается со склада."
-    if m.to_pipeline != m.from_pipeline:
-        return "Переносы между воронками делает автоматика по «Успешно реализовано» и «Закрыто»."
     return None
 
-
-def _now_line(lead: dict | None) -> str | None:
-    if not lead:
-        return None
-    stage = _stage(int(lead.get("pipeline_id") or 0), int(lead.get("status_id") or 0))
-    cdek = _field(lead, FIELD_CDEK_NUMBER)
-    return f"Сейчас: «{stage}»" + (f", накладная СДЭК № {cdek}" if cdek else "")
 
 
 def _hhmm(ts: int) -> str:
@@ -366,9 +357,6 @@ async def _handle(m: Move, v: Verdict, now: int) -> dict:
         hint = _hint(m)
         if hint:
             lines.append(hint)
-        now_line = _now_line(lead)
-        if now_line:
-            lines.append(now_line)
         lines += [_OUTCOME_TEXT[outcome].format(back=src), link]
         await _send(EVENT_VIOLATION, "\n".join(lines),
                     {"теги": tag, "кто": name, "откуда": src, "куда": dst,
