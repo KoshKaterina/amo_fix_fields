@@ -67,7 +67,6 @@ import time
 
 import api
 import site_form_store as store
-import call_click_service
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -655,7 +654,6 @@ def clean_v2(payload: dict) -> dict:
             "page_title": _s(ctx_in.get("page_title"), 300),
             "referrer": _url(ctx_in.get("referrer")),
             "utm": utm,
-            "client_id": _s(ctx_in.get("client_id"), 30),
             "product": product,
             "service": _clean_ref(ctx_in.get("service"), with_verified=True) if form_type == "consultation" else None,
             "format": {"code": fmt_code, "label": FORMATS[fmt_code]} if form_type != "unavailable" and fmt_code in FORMATS else None,
@@ -686,7 +684,6 @@ async def accept_v2(payload: dict) -> tuple[int, dict]:
                     clean["form"], short_id, row.get("status"))
         return 200, {"ok": True, "status": "duplicate"}
     logger.info("site_form[%s]: заявка %s принята в очередь", clean["form"], short_id)
-    await call_click_service.link_form_phone(clean["contact"].get("phone", ""), clean["context"].get("client_id", ""))
     _kick()
     return 200, {"ok": True, "status": "accepted"}
 

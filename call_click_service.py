@@ -6,22 +6,22 @@
 
 Вход. POST /site_call_click, заголовок X-Api-Key (тот же секрет, что у /site_form). Браузер сюда
 не ходит: событие принимает WordPress на своём домене и пересылает со своей стороны.
-    {"schema": 1, "kind": "tel_click" | "utm_visit", "event_id": "<32 hex>",
+    {"schema": 1, "kind": "tel_click", "event_id": "<32 hex>",
      "at": <unix, время приёма сервером WP>, "number": "+79056063678",
-     "page_url": "...", "referrer": "...", "client_id": "<ClientID Метрики>",
-     "device": "mobile" | "desktop", "utm": {...последнее касание},
+     "page_url": "...", "referrer": "...", "device": "mobile" | "desktop",
+     "place": "header-phone" | ..., "link_text": "...", "utm": {...последнее касание},
      "utm_first": {...первое касание} | {}, "utm_first_at": <unix> | 0}
-utm_visit сайт шлёт при входе по ссылке с метками: он нужен повторному клиенту, который
-позвонит позже и сам.
+Считаем ТОЛЬКО звонки после клика по номеру на сайте. Звонок без клика (набрал руками) не
+сопоставляем, ClientID Метрики не собираем и не храним (решение Кати 17.11.2026).
 
 Склейка (на каждом закончившемся входящем звонке Sipuni, отвеченном и пропущенном):
   * клики по номерам из CALL_CLICK_NUMBERS в окне [начало звонка - WINDOW, начало + SKEW];
   * ровно один клик и в окне этого клика звонил ровно один человек → «точно»: примечание и,
     в режиме live, UTM в поля сделки, если поля пустые (метки сделки не перетираем);
   * кликов или звонящих больше → «спорно»: только примечание со списком вариантов;
-  * кликов нет → повторный клиент: телефон → ClientID из прошлых заявок сайта → последний
-    визит с метками за CALL_CLICK_VISIT_DAYS. Только примечание, с пометкой «по прошлому визиту».
-Одна запись на звонок и одно примечание о визите на сделку (call_click_store.attributions).
+  * кликов нет → ничего не делаем;
+  * открытой сделки нет и за CALL_CLICK_LEAD_RETRIES не появилась → примечание в контакт.
+Одна запись на звонок (call_click_store.attributions).
 
 Env:
     CALL_CLICK_MODE=off      off - маршрут 404, ничего не пишем; log - принимаем и пишем журнал;
@@ -30,7 +30,6 @@ Env:
     CALL_CLICK_NUMBERS=+79056063678   номера на Sipuni, клики по остальным не склеиваем
     CALL_CLICK_WINDOW_S=120  сколько секунд клик ждёт звонка
     CALL_CLICK_SKEW_S=15     допуск часов WP и Sipuni в обратную сторону
-    CALL_CLICK_VISIT_DAYS=30 давность визита для повторного клиента
     CALL_CLICK_DB_PATH=/app/var/call_click.sqlite3
 """
 
@@ -71,16 +70,14 @@ CALL_CLICK_NUMBERS = {
 }
 WINDOW_S = _env_int("CALL_CLICK_WINDOW_S", 120)
 SKEW_S = _env_int("CALL_CLICK_SKEW_S", 15)
-VISIT_DAYS = _env_int("CALL_CLICK_VISIT_DAYS", 30)
 # Паузы перед повторным поиском сделки, с. Сделку Sipuni создаёт не мгновенно, а для известного
 # номера без открытой сделки не создаёт вовсе: её может завести менеджер после перезвона.
 LEAD_RETRIES = tuple(int(x) for x in re.findall(r"\d+", os.getenv("CALL_CLICK_LEAD_RETRIES", "60,180,600")))
 
 UTM_KEYS = ("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content")
-KINDS = ("tel_click", "utm_visit")
+KINDS = ("tel_click",)
 MAX_BODY_BYTES = 8192
 _EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-_CLIENT_ID_RE = re.compile(r"^\d{6,30}$")
 _PLACE_RE = re.compile(r"^[a-z0-9#_\-]{1,60}$")
 _RATE_PER_MINUTE = _env_int("CALL_CLICK_RATE_PER_MINUTE", 120)
 _rate: list[float] = []
@@ -154,15 +151,10 @@ def clean_event(payload: dict, now: float | None = None) -> dict:
         raise PayloadError("bad-at")
     if not now - 600 <= at <= now + 60:
         raise PayloadError("stale")
-    number = _phone(payload.get("number")) if kind == "tel_click" else ""
-    if kind == "tel_click" and not number:
+    number = _phone(payload.get("number"))
+    if not number:
         raise PayloadError("bad-number")
-    client_id = _s(payload.get("client_id"), 30)
-    if not _CLIENT_ID_RE.match(client_id):
-        client_id = ""
     utm = _utm(payload.get("utm"))
-    if kind == "utm_visit" and not utm:
-        raise PayloadError("no-utm")
     try:
         first_at = float(payload.get("utm_first_at") or 0)
     except (TypeError, ValueError):
@@ -170,7 +162,7 @@ def clean_event(payload: dict, now: float | None = None) -> dict:
     device = _s(payload.get("device"), 16)
     place = _s(payload.get("place"), 60).lower()
     return {
-        "kind": kind, "event_id": event_id, "at": at, "number": number, "client_id": client_id,
+        "kind": kind, "event_id": event_id, "at": at, "number": number,
         "page_url": _url(payload.get("page_url")), "referrer": _url(payload.get("referrer")),
         "device": device if device in ("mobile", "desktop") else "",
         "place": place if _PLACE_RE.match(place) else "",
@@ -203,21 +195,11 @@ async def accept(payload: dict) -> tuple[int, dict]:
     except Exception:
         logger.exception("call_click: хранилище недоступно")
         return 503, {"ok": False, "error": "store"}
-    logger.info("call_click: %s %s %s в %s, страница %s, метки %s, ClientID %s",
+    logger.info("call_click: %s %s %s в %s, страница %s, место %s, метки %s",
                 "принят" if inserted else "повтор", event["kind"], event["number"] or "-",
-                _hms(event["at"]), _path(event["page_url"]), _utm_line(event["utm"]) or "-",
-                "есть" if event["client_id"] else "нет")
+                _hms(event["at"]), _path(event["page_url"]), event["place"] or "-",
+                _utm_line(event["utm"]) or "-")
     return 200, {"ok": True}
-
-
-async def link_form_phone(phone: str, client_id: str) -> None:
-    """Заявка сайта дала пару «телефон ↔ ClientID»: так узнаём повторного клиента."""
-    if not is_enabled() or not phone or not _CLIENT_ID_RE.match(client_id or ""):
-        return
-    try:
-        await asyncio.to_thread(store.link_phone, _phone(phone), client_id)
-    except Exception:
-        logger.exception("call_click: связка телефона и ClientID не записалась")
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +270,7 @@ def schedule_attribution(call_id: str, phone: str, first_ts, find_lead: LeadFind
 
 
 async def attribute_call(call_id: str, phone: str, call_start: float, find_lead: LeadFinder) -> str:
-    """Возвращает итог для журнала и тестов: sure / ambiguous / repeat / none / no-lead / skip."""
+    """Возвращает итог для журнала и тестов: sure / ambiguous / none / no-lead / contact / skip."""
     global _last_cleanup
     try:
         if time.time() - _last_cleanup > 3600:
@@ -299,17 +281,9 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
         for c in clicks:
             callers[c["event_id"]] = await asyncio.to_thread(_phones_in_window, c["at"])
         verdict, chosen = decide(clicks, callers)
-        visit = None
         if verdict == "none":
-            if not phone:
-                return "none"
-            client_ids = await asyncio.to_thread(store.client_ids_for_phone, phone)
-            visit = await asyncio.to_thread(store.latest_utm_event, client_ids,
-                                            call_start - VISIT_DAYS * 86400)
-            if not visit:
-                logger.info("call_click: звонок %s - кликов в окне нет, прошлых визитов с метками нет", call_id)
-                return "none"
-            verdict = "repeat"
+            # Звонок без клика по номеру (набрал руками и т.п.) не сопоставляем.
+            return "none"
         if verdict == "sure":
             for event_id in chosen[0].get("same") or [chosen[0]["event_id"]]:
                 await asyncio.to_thread(store.mark_matched, event_id, call_id)
@@ -325,13 +299,13 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
             await asyncio.sleep(pause)
             lead = await find_lead(phone.lstrip("+"))
         if not lead:
-            return await _write_contact(call_id, phone, verdict, chosen, visit, call_start)
+            return await _write_contact(call_id, phone, verdict, chosen, call_start)
         lead_id = int(lead["id"])
-        ref = f"visit:{visit['event_id']}" if verdict == "repeat" else f"call:{call_id}"
+        ref = f"call:{call_id}"
         if not await asyncio.to_thread(store.claim_attribution, lead_id, ref):
             logger.info("call_click: в сделку %s уже писали (%s)", lead_id, ref)
             return "skip"
-        note = _note_for(verdict, chosen, visit, call_start)
+        note = _note_for(verdict, chosen, call_start)
         fields = {}
         if verdict == "sure":
             fields = dict(chosen[0]["payload"]["utm"])
@@ -344,16 +318,13 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
         return "error"
 
 
-def _note_for(verdict: str, chosen: list, visit: dict | None, call_start: float) -> str:
+def _note_for(verdict: str, chosen: list, call_start: float) -> str:
     if verdict == "sure":
         return note_sure(chosen[0]["payload"], call_start)
-    if verdict == "ambiguous":
-        return note_ambiguous([c["payload"] for c in chosen], call_start)
-    return note_repeat(visit["payload"])
+    return note_ambiguous([c["payload"] for c in chosen], call_start)
 
 
-async def _write_contact(call_id: str, phone: str, verdict: str, chosen: list, visit: dict | None,
-                         call_start: float) -> str:
+async def _write_contact(call_id: str, phone: str, verdict: str, chosen: list, call_start: float) -> str:
     """Открытой сделки нет и не появилось (известный номер, Sipuni новую не создаёт): примечание в
     карточку контакта, чтобы метки не пропали. Полей «Статистики» у контакта нет - только текст.
     Решение Кати 17.11.2026."""
@@ -362,11 +333,11 @@ async def _write_contact(call_id: str, phone: str, verdict: str, chosen: list, v
         logger.info("call_click: звонок %s - ни сделки, ни контакта по номеру, метки не записаны", call_id)
         return "no-lead"
     contact_id = int(contact_id)
-    ref = f"contact-visit:{visit['event_id']}" if verdict == "repeat" else f"contact-call:{call_id}"
+    ref = f"contact-call:{call_id}"
     if not await asyncio.to_thread(store.claim_attribution, contact_id, ref):
         logger.info("call_click: в контакт %s уже писали (%s)", contact_id, ref)
         return "skip"
-    note = (_note_for(verdict, chosen, visit, call_start)
+    note = (_note_for(verdict, chosen, call_start)
             + "\nОткрытой сделки по номеру не было, поэтому примечание в контакте.")
     if CALL_CLICK_MODE == "log":
         logger.info("call_click: контакт %s, %s - режим log, в amo не пишу. Примечание было бы:\n%s",
@@ -516,16 +487,6 @@ def note_ambiguous(events: list[dict], call_start: float) -> str:
     return "\n".join(lines)
 
 
-def note_repeat(ev: dict) -> str:
-    return "\n".join([
-        "Звонок, возможно, после визита на сайт (коллтрекинг, по прошлому визиту)",
-        f"Клика по номеру не было. Этот клиент оставлял заявку на сайте, и с того же браузера "
-        f"{_dm_hm(ev['at'])} был визит с метками. Метки в поля не записаны.",
-        *_visit_lines(ev),
-    ])
-
-
 def cleanup() -> None:
     if is_enabled():
-        store.cleanup(time.time(), click_keep_s=2 * 86400, visit_keep_s=(VISIT_DAYS + 1) * 86400,
-                      link_keep_s=365 * 86400)
+        store.cleanup(time.time(), click_keep_s=2 * 86400, attribution_keep_s=30 * 86400)

@@ -6,8 +6,9 @@
   * метки в сделке уже есть → не перетираем, только примечание;
   * два клика или два звонящих в окне → «спорно»: примечание без полей;
   * клик по номеру не на Sipuni (495) и клик вне окна не склеиваются;
-  * повторный клиент без клика: телефон из заявки → ClientID → визит с метками → примечание
-    «по прошлому визиту» один раз на сделку;
+  * звонок без клика по номеру (набрал руками) не сопоставляется, ClientID не принимается и не
+    хранится (решение Кати 17.11.2026);
+  * открытой сделки нет → примечание в контакт;
   * режим log в amo не пишет; сбой примечания освобождает запись для повтора;
   * выключенный модуль (по умолчанию) ничего не делает в обработчиках Sipuni.
 Сети нет: amo подменена. Запуск: python -m pytest test_call_click.py -q
@@ -77,10 +78,10 @@ async def _nothing(phone):
     return None
 
 
-def ev(kind="tel_click", at=None, number=NUMBER, utm=None, client_id="", **kw):
+def ev(kind="tel_click", at=None, number=NUMBER, utm=None, **kw):
     payload = {"schema": 1, "kind": kind, "event_id": kw.pop("event_id", None) or uuid.uuid4().hex,
                "at": time.time() if at is None else at, "number": number, "page_url": PAGE,
-               "client_id": client_id, "device": "mobile", "utm": UTM if utm is None else utm}
+               "device": "mobile", "utm": UTM if utm is None else utm}
     payload.update(kw)
     return payload
 
@@ -104,10 +105,11 @@ def test_clean_event_rejects_garbage():
         with pytest.raises(C.PayloadError):
             C.clean_event({**good, **bad}, now)
     with pytest.raises(C.PayloadError):
-        C.clean_event(ev(kind="utm_visit", at=now, utm={}), now)
-    cleaned = C.clean_event({**good, "client_id": "<script>", "page_url": "javascript:1",
+        C.clean_event(ev(kind="utm_visit", at=now), now)      # вход с метками больше не принимаем
+    cleaned = C.clean_event({**good, "client_id": "1700000000123456789", "page_url": "javascript:1",
                              "utm": {"utm_source": "x", "evil": "y"}}, now)
-    assert cleaned["client_id"] == "" and cleaned["page_url"] == "" and cleaned["utm"] == {"utm_source": "x"}
+    assert "client_id" not in cleaned                          # ClientID не храним
+    assert cleaned["page_url"] == "" and cleaned["utm"] == {"utm_source": "x"}
 
 
 def test_accept_stores_once(amo):
@@ -180,15 +182,16 @@ def test_other_number_and_out_of_window_ignored(amo):
     assert amo["notes"] == []
 
 
-def test_repeat_client_by_form_phone(amo):
-    now = time.time()
-    asyncio.run(C.link_form_phone(CALLER, "1700000000123456789"))
-    accept(ev(kind="utm_visit", at=now - 300, number="", client_id="1700000000123456789"))
-    assert attribute("c9", CALLER, now) == "repeat"
-    assert "по прошлому визиту" in amo["notes"][0][1]
-    assert amo["utm"] == []
-    assert attribute("c10", CALLER, now + 60) == "skip"
-    assert len(amo["notes"]) == 1
+def test_call_without_click_is_ignored(amo):
+    """Набрал номер руками: клика нет - ничего не пишем ни в сделку, ни в контакт."""
+    assert attribute("c9", CALLER, time.time()) == "none"
+    assert amo["notes"] == [] and amo["contact_notes"] == [] and amo["utm"] == []
+
+
+def test_stored_click_has_no_client_id(amo):
+    accept({**ev(), "client_id": "1700000000123456789"})
+    row = store.clicks_between(0, time.time() + 10)[0]
+    assert row["client_id"] == "" and "client_id" not in row["payload"]
 
 
 def test_log_mode_does_not_touch_amo(amo, monkeypatch):
