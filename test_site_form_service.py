@@ -2177,3 +2177,42 @@ def test_cf7_preorder_accepted_by_automation_finishes_same_queued_lead(cf7, monk
     assert store.get(SID)['status'] == 'done'
     assert store.get(SID)['payload'] is None
     assert all('status_id' not in body and 'responsible_user_id' not in body for _, body in writes)
+
+# ── Тег «Квиз» (решение Кати 17.11.2026): панель Team считает квизы отдельным источником ──
+
+def test_quiz_tag_added_for_site_quiz_entries():
+    base = {"source": "Форма: обратный звонок или вопрос", "pipeline_id": 1, "status_id": 2, "tags": []}
+    for entry in ("quiz-result", "quiz-exit"):
+        out = sf.apply_quiz_tag(base, {"form": "callback", "context": {"entry": entry}})
+        assert out["tags"] == ["Квиз"]
+        assert (out["source"], out["pipeline_id"], out["status_id"]) == ("Форма: обратный звонок или вопрос", 1, 2)
+    # Запись карты форм не тронута: она переживает все заявки.
+    assert base["tags"] == []
+
+
+def test_quiz_tag_not_added_elsewhere():
+    base = {"source": "S", "pipeline_id": 1, "status_id": 2, "tags": ["тест"]}
+    for payload in ({"context": {"entry": "product-card"}}, {"context": {}}, {},
+                    {"context": {"entry": "miniapp-quiz-result"}}):
+        assert sf.apply_quiz_tag(base, payload) is base
+    tagged = {**base, "tags": ["Квиз"]}
+    assert sf.apply_quiz_tag(tagged, {"context": {"entry": "quiz-result"}}) is tagged
+
+
+def test_run_due_quiz_lead_gets_quiz_tag(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    payload = _v2_payload()
+    payload["context"]["entry"] = "quiz-result"
+    asyncio.run(sf.accept_v2(payload))
+    assert asyncio.run(sf.run_due()) == 1
+    assert calls["create"]["lead_tags"] == ["Форма: обратный звонок", "тест", "Квиз"]
+    assert calls["tags"][1] == ["Форма: обратный звонок", "тест", "Квиз"]
+    assert calls["create"]["lead_name"] == "Форма: обратный звонок: Иван"
+
+
+def test_run_due_ordinary_form_has_no_quiz_tag(v2, monkeypatch):
+    calls = _mock_api_v2(monkeypatch)
+    asyncio.run(sf.accept_v2(_v2_payload()))
+    assert asyncio.run(sf.run_due()) == 1
+    assert "Квиз" not in calls["create"]["lead_tags"]
+    assert "Квиз" not in calls["tags"][1]
