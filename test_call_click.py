@@ -91,7 +91,12 @@ def accept(payload):
 
 
 def attribute(call_id, phone, start, finder=_find):
-    return asyncio.run(C.attribute_call(call_id, phone, start, finder))
+    async def go():
+        result = await C.attribute_call(call_id, phone, start, finder)
+        while C._bg:                                   # фоновая отправка в Метрику
+            await asyncio.gather(*list(C._bg))
+        return result
+    return asyncio.run(go())
 
 
 # --- приём ---------------------------------------------------------------
@@ -216,6 +221,7 @@ def ym(amo, monkeypatch):
         return {"id": len(sent["rows"]), "status": "UPLOADED"}
 
     monkeypatch.setattr(M, "_post", post)
+    monkeypatch.setattr(C, "METRIKA_CLIENT_ID_WAITS", (0, 0, 0))
     return sent
 
 
@@ -450,3 +456,41 @@ def test_no_direct_mark_with_source(amo):
     accept(ev(at=t + 200))                      # с метками
     attribute("d3", OTHER, t + 207)
     assert all("напрямую" not in n[1] for n in amo["notes"]) and len(amo["notes"]) == 2
+
+
+def test_client_id_follow_up_before_report(ym):
+    """18.11.2026: в Telegram сразу «Позвонить» - ClientID дослан после клика и ушёл в Метрику."""
+    t = time.time() - 100
+    click = ev(at=t)
+    accept(click)
+    assert accept({"schema": 1, "kind": "client_id", "event_id": click["event_id"], "client_id": CID}) == (200, {"ok": True})
+    assert attribute("f1", CALLER, t + 9) == "sure"
+    assert ym["rows"] == [f"ClientId,DateTime\n{CID},{int(t + 9)}\n"]
+
+
+def test_client_id_follow_up_while_waiting(ym, monkeypatch):
+    """Досылка пришла уже после склейки - отправка в Метрику её дождалась."""
+    t = time.time() - 100
+    click = ev(at=t)
+    accept(click)
+    real = store.client_id_of
+    calls = {"n": 0}
+
+    def late(ids):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            store.set_client_id(click["event_id"], CID, 0)
+        return real(ids)
+
+    monkeypatch.setattr(store, "client_id_of", late)
+    assert attribute("f2", CALLER, t + 9) == "sure"
+    assert len(ym["rows"]) == 1 and CID in ym["rows"][0]
+
+
+def test_client_id_follow_up_rules(amo):
+    click = ev()
+    accept({**click, "client_id": CID})
+    assert accept({"schema": 1, "kind": "client_id", "event_id": click["event_id"], "client_id": "1700000000111"})[0] == 200
+    assert store.clicks_between(0, time.time() + 10)[0]["client_id"] == CID       # уже был - не перетираем
+    assert accept({"schema": 1, "kind": "client_id", "event_id": "zz", "client_id": CID})[0] == 422
+    assert accept({"schema": 1, "kind": "client_id", "event_id": click["event_id"], "client_id": "abc"})[0] == 422

@@ -186,7 +186,27 @@ def _allow() -> bool:
     return True
 
 
+async def accept_client_id(payload: dict) -> tuple[int, dict]:
+    """Досылка ClientID к уже принятому клику (плагин 1.5.0): Метрика ответила после клика."""
+    event_id = _s(payload.get("event_id"), 64).lower()
+    client_id = _s(payload.get("client_id"), 30)
+    if not _EVENT_ID_RE.match(event_id) or not _CLIENT_ID_RE.match(client_id):
+        return 422, {"ok": False, "error": "bad-client-id"}
+    if not _allow():
+        return 429, {"ok": False, "error": "rate-limit"}
+    try:
+        updated = await asyncio.to_thread(store.set_client_id, event_id, client_id, time.time() - 3600)
+    except Exception:
+        logger.exception("call_click: хранилище недоступно")
+        return 503, {"ok": False, "error": "store"}
+    logger.info("call_click: досылка ClientID к клику %s - %s", event_id[:8],
+                "принята" if updated else "клик не найден или ClientID уже есть")
+    return 200, {"ok": True}
+
+
 async def accept(payload: dict) -> tuple[int, dict]:
+    if payload.get("schema") == 1 and payload.get("kind") == "client_id":
+        return await accept_client_id(payload)
     try:
         event = clean_event(payload)
     except PayloadError as exc:
@@ -298,10 +318,10 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
                     verdict, len(clicks))
         if verdict == "sure":
             # Метрика не зависит от сделки: факт звонка уходит сразу, до поиска сделки.
-            try:
-                await call_click_metrika.report_call(chosen[0]["payload"], call_id, call_start)
-            except Exception:
-                logger.exception("call_click: Метрика - сбой отправки звонка %s, в amo пишем как обычно", call_id)
+            # Фоном: ClientID может прийти досылкой после звонка, сделку это ждать не заставляет.
+            task = asyncio.create_task(_report_metrika(chosen[0], call_id, call_start))
+            _bg.add(task)
+            task.add_done_callback(_bg.discard)
         if not phone:
             logger.info("call_click: звонок %s со скрытого номера, сделку не найти", call_id)
             return "no-lead"
@@ -329,6 +349,27 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
     except Exception:
         logger.exception("call_click: склейка звонка %s не удалась", call_id)
         return "error"
+
+
+# Сколько ждать досылки ClientID перед отправкой звонка в Метрику, с (в сумме 3 минуты).
+METRIKA_CLIENT_ID_WAITS = (30, 60, 90)
+
+
+async def _report_metrika(click: dict, call_id: str, call_start: float) -> None:
+    try:
+        payload = dict(click["payload"])
+        ids = click.get("same") or [click["event_id"]]
+        if call_click_metrika.is_enabled() and not payload.get("client_id"):
+            for pause in METRIKA_CLIENT_ID_WAITS:
+                payload["client_id"] = await asyncio.to_thread(store.client_id_of, ids)
+                if payload["client_id"]:
+                    break
+                await asyncio.sleep(pause)
+            else:
+                payload["client_id"] = await asyncio.to_thread(store.client_id_of, ids)
+        await call_click_metrika.report_call(payload, call_id, call_start)
+    except Exception:
+        logger.exception("call_click: Метрика - сбой отправки звонка %s, в amo пишем как обычно", call_id)
 
 
 def _note_for(verdict: str, chosen: list, call_start: float) -> str:

@@ -89,6 +89,31 @@ def clicks_between(start: float, end: float) -> list[dict]:
     return [_event_row(r) for r in rows]
 
 
+def set_client_id(event_id: str, client_id: str, since: float) -> bool:
+    """Досылка ClientID к клику (плагин 1.5.0): только к клику без ClientID и не старше since."""
+    with _connect() as conn:
+        row = conn.execute("SELECT payload FROM site_events WHERE event_id = ? AND kind = 'tel_click' "
+                           "AND client_id = '' AND at >= ?", (event_id, since)).fetchone()
+        if not row:
+            return False
+        payload = json.loads(row[0] or "{}")
+        payload["client_id"] = client_id
+        conn.execute("UPDATE site_events SET client_id = ?, payload = ? WHERE event_id = ?",
+                     (client_id, json.dumps(payload, ensure_ascii=False), event_id))
+        return True
+
+
+def client_id_of(event_ids: list[str]) -> str:
+    """ClientID любого из кликов (группа кликов одного посетителя), самый поздний непустой."""
+    if not event_ids:
+        return ""
+    marks = ",".join("?" for _ in event_ids)
+    with _connect() as conn:
+        row = conn.execute(f"SELECT client_id FROM site_events WHERE event_id IN ({marks}) AND client_id != '' "
+                           "ORDER BY at DESC LIMIT 1", tuple(event_ids)).fetchone()
+    return row[0] if row else ""
+
+
 def mark_matched(event_id: str, call_id: str) -> None:
     with _connect() as conn:
         conn.execute("UPDATE site_events SET matched_call = ? WHERE event_id = ? AND matched_call IS NULL",
