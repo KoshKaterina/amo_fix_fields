@@ -159,6 +159,12 @@ from waybill_config import (
     OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT,
     OFFICE_TRANSFER_SOURCE_WAITLIST,
     OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP,
+    OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT,
+    OFFICE_TRANSFER_RULE_ZNR_RETAIL,
+    REASON_OPT_CONSIGNMENT,
+    REASON_RETAIL,
+    STATUS_CLEVER_IN_PROGRESS,
+    STATUS_OPT_CONSIGNMENT_NEGOTIATION,
     OFFICE_TRANSFER_ZNR_DB_WORK,
     OFFICE_TRANSFER_ZNR_TANGEMSHOP,
     PIPELINE_OPT_CONSIGNMENT,
@@ -412,11 +418,32 @@ def _match_znr_tangemshop(lead: dict, *, ignore_flags: bool = False) -> tuple[in
     return (PIPELINE_TANGEMSHOP, STATUS_TANGEM_IN_PROGRESS)
 
 
+def _match_znr_opt_consignment(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Причина «Опт под реализацию» → ОПТ под реализацию / «Переговоры» (Катя 18.11.2026)."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT:
+        return None
+    if _reason_enum(lead) != REASON_OPT_CONSIGNMENT:
+        return None
+    return (PIPELINE_OPT_CONSIGNMENT, STATUS_OPT_CONSIGNMENT_NEGOTIATION)
+
+
+def _match_znr_retail(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Причина «Розница» → ОП розница / «Взят в работу», ответственный прежний.
+    Не «Новый лид»: это раздатчик (сменит ответственного) с приветствиями клиенту."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_RETAIL:
+        return None
+    if _reason_enum(lead) != REASON_RETAIL:
+        return None
+    return (PIPELINE_CLEVER_MAIN, STATUS_CLEVER_IN_PROGRESS)
+
+
 _ZNR_RULES = (
     _match_znr_waitlist,
     _match_znr_academy,
     _match_znr_opt,
     _match_znr_tangemshop,
+    _match_znr_opt_consignment,
+    _match_znr_retail,
 )
 
 
@@ -772,7 +799,7 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
             patch_kwargs["custom_fields"] = {
                 FIELD_FORMER_RESPONSIBLE: former_name or (str(current_responsible) if current_responsible else ""),
             }
-    elif target_pipeline_id == PIPELINE_OPT:
+    elif target_pipeline_id in (PIPELINE_OPT, PIPELINE_OPT_CONSIGNMENT):
         # Причина ЗИН=Опт (решение Тианы 25.08.2026): распределение лидов не
         # смотрит на воронку ОПТ, без явной смены сделка осталась бы на
         # прежнем розничном МОПе. Прежнего сюда не пишем — 578151 хранит

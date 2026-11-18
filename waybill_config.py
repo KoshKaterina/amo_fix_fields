@@ -1500,6 +1500,12 @@ OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT = (
 # 9 ботов пишут клиенту), ответственный прежний.
 OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP = (
     os.getenv("OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP", "").strip() == "1")
+# «Опт под реализацию» → ОПТ под реализацию / «Переговоры», ответственный Артём Коннов
+# (все сделки воронки на нём). «Розница» → ОП розница / «Взят в работу», ответственный
+# прежний: «Новый лид» - раздатчик с приветствиями клиенту, туда не ведём.
+OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT = (
+    os.getenv("OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT", "").strip() == "1")
+OFFICE_TRANSFER_RULE_ZNR_RETAIL = os.getenv("OFFICE_TRANSFER_RULE_ZNR_RETAIL", "").strip() == "1"
 
 # Автозакрытие по ЛЮБОЙ причине ЗИН (dup_autoclose): воронки через запятую. Пусто -
 # выключено, работают только мусорные причины DUP_REASON_ENUM_IDS (во всех воронках).
@@ -1590,6 +1596,9 @@ REASON_ACADEMY = 1041243   # Академия
 REASON_OPT = 1041905       # Опт (сверено live 25.08.2026)
 REASON_TANGEMSHOP = 1041893  # Tangemshop (сверено live 18.11.2026)
 PIPELINE_OPT_CONSIGNMENT = 11075670  # «ОПТ под реализацию» - источник ЗНР-переноса с 18.11.2026
+REASON_OPT_CONSIGNMENT = 1042029  # «Опт под реализацию» (заведено Катей 18.11.2026)
+REASON_RETAIL = 1042031           # «Розница» (заведено Катей 18.11.2026)
+STATUS_OPT_CONSIGNMENT_NEGOTIATION = 86989254  # ОПТ под реализацию / «Переговоры» (роботов нет)
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
 # Самовывоз бывает двух видов: из офиса (как было) и из шоурума (с 06.08.2026, свой склад).
