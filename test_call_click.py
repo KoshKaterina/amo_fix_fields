@@ -327,3 +327,20 @@ def test_lead_found_on_retry(amo, monkeypatch):
     accept(ev(at=t))
     assert attribute("c33", CALLER, t + 9, finder) == "sure"
     assert len(calls) == 3 and len(amo["notes"]) == 1
+
+
+def test_same_visitor_different_pages_is_one_click(amo):
+    """18.11.2026 10:03/10:04: один мобильный нажал номер в каталоге и на главной - это один человек."""
+    t = time.time() - 200
+    accept(ev(at=t, page_url="https://sunscrypt.ru/product-category/hardware-wallets/", place="header"))
+    accept(ev(at=t + 71, page_url="https://sunscrypt.ru/", place="header"))
+    assert attribute("c40", CALLER, t + 82) == "sure"
+    text = amo["notes"][0][1]
+    assert "Страница: https://sunscrypt.ru/\n" in text and "позвонил через 11 с" in text
+
+
+def test_different_source_still_two_visitors(amo):
+    t = time.time() - 200
+    accept(ev(at=t, referrer="https://yandex.ru/"))
+    accept(ev(at=t + 20, referrer="https://google.com/"))
+    assert attribute("c41", CALLER, t + 30) == "ambiguous"
