@@ -75,8 +75,9 @@ def _lead(pipeline_id, status_id, reason, *, responsible=999, lead_id=42):
             "_embedded": {"contacts": []}}
 
 
-def _event(enum_id):
+def _event(enum_id, ago=30):
     return {"type": f"custom_field_{DUP_REASON_FIELD_ID}_value_changed",
+            "created_at": int(time.time()) - ago,
             "value_after": [{"custom_field_value": {"field_id": DUP_REASON_FIELD_ID,
                                                     "enum_id": enum_id}}]}
 
@@ -86,7 +87,8 @@ def _event(enum_id):
 @pytest.fixture()
 def autoclose(monkeypatch):
     """Стабы amo: сделка, журнал событий, PATCH. Возвращает (state, запуск)."""
-    state = {"lead": None, "events": [], "patches": [], "event_params": None, "events_fail": False}
+    state = {"lead": None, "events": [], "status_events": [], "patches": [], "event_params": None,
+             "status_params": None, "events_fail": False}
 
     async def get_lead_full(lid, with_=()):
         return state["lead"]
@@ -97,7 +99,11 @@ def autoclose(monkeypatch):
 
     async def do_get(path, params=None):
         assert path == "/api/v4/events"
-        state["event_params"] = dict(params)
+        p = dict(params)
+        if p["filter[type]"] == "lead_status_changed":
+            state["status_params"] = p
+            return {"_embedded": {"events": state["status_events"]}}
+        state["event_params"] = p
         if state["events_fail"]:
             return None
         return {"_embedded": {"events": state["events"]}}
@@ -107,9 +113,10 @@ def autoclose(monkeypatch):
     monkeypatch.setattr(dup_autoclose.amo_service, "_do_get", do_get)
     monkeypatch.setattr(dup_autoclose, "ZNR_AUTOCLOSE_ANY_REASON_PIPELINES", SIX)
 
-    def go(lead, events=()):
+    def go(lead, events=(), status_events=()):
         state["lead"] = lead
         state["events"] = list(events)
+        state["status_events"] = list(status_events)
         state["patches"].clear()
         state["event_params"] = None
         run(dup_autoclose._maybe_close(lead["id"]))
@@ -133,6 +140,36 @@ def test_staraya_prichina_posle_perenosa_ne_zakryvaet(autoclose):
     """Сделка Листа ожидания с причиной «Лист ожидания» от переноса - событий смены нет."""
     _, go = autoclose
     assert go(_lead(PIPELINE_WAITLIST, STATUS_WAITLIST, REASON_WAITLIST), []) == []
+
+
+def _status_event(ago):
+    return {"type": "lead_status_changed", "created_at": int(time.time()) - ago}
+
+
+def test_posle_vybora_byl_perenos_ne_zakryvaem(autoclose):
+    """Поймано на выкатке 18.11: причину «Лист ожидания» выбрали в рознице минуту назад,
+    сделку закрыли и перенесли в Лист ожидания - вебхук переноса не должен закрыть её там."""
+    state, go = autoclose
+    patches = go(_lead(PIPELINE_WAITLIST, STATUS_WAITLIST, REASON_WAITLIST),
+                 [_event(REASON_WAITLIST, ago=60)], [_status_event(58), _status_event(50)])
+    assert patches == []
+    assert int(state["status_params"]["filter[created_at][from]"]) == int(time.time()) - 60 or         abs(int(state["status_params"]["filter[created_at][from]"]) - (int(time.time()) - 60)) <= 2
+
+
+def test_smena_etapa_v_tu_zhe_sekundu_ne_zakryvaem(autoclose):
+    _, go = autoclose
+    now_ago = 20
+    assert go(_lead(PIPELINE_OPT, OPEN_STATUS, REASON_LOST),
+              [_event(REASON_LOST, ago=now_ago)], [_status_event(now_ago)]) == []
+
+
+def test_etap_menyali_do_vybora_prichiny_zakryvaem(autoclose):
+    """Менеджер перевёл сделку руками, потом выбрал причину - это свежий выбор."""
+    _, go = autoclose
+    # фильтр по времени в запросе отсёк бы старое событие, но и пришедшее раньше не мешает
+    patches = go(_lead(PIPELINE_WAITLIST, OPEN_STATUS, REASON_LOST),
+                 [_event(REASON_LOST, ago=10)], [_status_event(300)])
+    assert patches == [{"status_id": STATUS_CLOSED_LOST, "pipeline_id": PIPELINE_WAITLIST}]
 
 
 def test_sobytie_pro_drugoe_znachenie_ne_schitaetsya(autoclose):

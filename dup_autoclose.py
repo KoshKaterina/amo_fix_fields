@@ -70,31 +70,53 @@ def _reason_enum_id(lead: dict) -> int | None:
     return None
 
 
-async def _reason_chosen_recently(lead_id, enum_id: int) -> bool:
-    """В журнале amo есть смена «Причины ЗИН» на enum_id по этой сделке за последние
-    ZNR_AUTOCLOSE_FRESH_WINDOW_S секунд. Событие приходит раньше вебхука (сверено
-    18.11.2026 на сделке 36602317: смена поля 07:34:42, наш перевод 07:34:44).
-    Журнал не прочитался - не закрываем: лишнее закрытие хуже пропущенного,
-    менеджер закроет сам."""
-    since = int(time.time()) - ZNR_AUTOCLOSE_FRESH_WINDOW_S
+async def _events(lead_id, event_type: str, since: int) -> list | None:
     params = [
         ("filter[entity]", "lead"),
         ("filter[entity_id]", str(lead_id)),
-        ("filter[type]", f"custom_field_{DUP_REASON_FIELD_ID}_value_changed"),
+        ("filter[type]", event_type),
         ("filter[created_at][from]", str(since)),
-        ("limit", "50"),
+        ("limit", "100"),
     ]
     d = await amo_service._do_get("/api/v4/events", params)
-    events = ((d or {}).get("_embedded") or {}).get("events") or []
-    for e in events:
+    if d is None:
+        return None
+    return ((d or {}).get("_embedded") or {}).get("events") or []
+
+
+async def _reason_chosen_recently(lead_id, enum_id: int) -> bool:
+    """Причину enum_id выбрали в этой сделке недавно И после этого сделка не меняла
+    этап или воронку.
+
+    Свежесть: событие custom_field_577623_value_changed с этим значением не старше
+    ZNR_AUTOCLOSE_FRESH_WINDOW_S (событие приходит раньше вебхука: 18.11.2026 на
+    36602317 смена поля 07:34:42, наш перевод 07:34:44).
+
+    «После этого этап не менялся» (поймано на выкатке 18.11.2026): перенос из ЗНР
+    розницы в Лист ожидания сам рождает вебхук с полем причины, а причина выбрана
+    минуту назад — без этой проверки сделку закрыло бы уже в Листе ожидания.
+    Смена этапа в ту же секунду тоже считается «после»: лишнее закрытие хуже
+    пропущенного, менеджер закроет сам. Журнал не прочитался — не закрываем."""
+    since = int(time.time()) - ZNR_AUTOCLOSE_FRESH_WINDOW_S
+    reason_events = await _events(lead_id, f"custom_field_{DUP_REASON_FIELD_ID}_value_changed", since)
+    if not reason_events:
+        return False
+    chosen_at = None
+    for e in reason_events:
         for v in e.get("value_after") or []:
             cfv = (v or {}).get("custom_field_value") or {}
             try:
                 if int(cfv.get("enum_id")) == enum_id:
-                    return True
+                    ts = int(e.get("created_at") or 0)
+                    chosen_at = ts if chosen_at is None else max(chosen_at, ts)
             except (TypeError, ValueError):
                 continue
-    return False
+    if chosen_at is None:
+        return False
+    status_events = await _events(lead_id, "lead_status_changed", chosen_at)
+    if status_events is None:
+        return False
+    return not any(int(e.get("created_at") or 0) >= chosen_at for e in status_events)
 
 
 async def _maybe_close(lead_id) -> None:
