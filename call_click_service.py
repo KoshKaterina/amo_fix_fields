@@ -477,6 +477,11 @@ def _visit_lines(ev: dict) -> list[str]:
         lines.append(f"Первый визит с метками{when}: {_utm_line(first)}")
     if ev.get("referrer"):
         lines.append(f"Откуда пришёл: {ev['referrer']}")
+    elif not utm:
+        # Ни меток, ни сайта-источника (за сутки и по входу с метками за 90 дней): адрес набрали
+        # руками или открыли из закладок. Решение Кати 18.11.2026. Встроенные браузеры приложений
+        # иногда тоже прячут источник - поэтому «потенциально».
+        lines.append("Потенциально знаком с компанией - зашёл на сайт напрямую")
     if ev.get("device"):
         lines.append(f"Устройство: {_DEVICES.get(ev['device'], ev['device'])}")
     return lines

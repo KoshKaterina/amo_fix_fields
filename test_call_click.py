@@ -433,3 +433,20 @@ def test_different_source_still_two_visitors(amo):
     accept(ev(at=t, referrer="https://yandex.ru/"))
     accept(ev(at=t + 20, referrer="https://google.com/"))
     assert attribute("c41", CALLER, t + 30) == "ambiguous"
+
+
+def test_direct_visit_marked_in_note(amo):
+    """18.11.2026: ни меток, ни источника - пометка «зашёл напрямую»."""
+    t = time.time() - 100
+    accept(ev(at=t, utm={}))
+    assert attribute("d1", CALLER, t + 7) == "sure"
+    assert "Потенциально знаком с компанией - зашёл на сайт напрямую" in amo["notes"][0][1]
+
+
+def test_no_direct_mark_with_source(amo):
+    t = time.time() - 300
+    accept(ev(at=t, utm={}, referrer="https://yandex.ru/"))
+    attribute("d2", CALLER, t + 7)
+    accept(ev(at=t + 200))                      # с метками
+    attribute("d3", OTHER, t + 207)
+    assert all("напрямую" not in n[1] for n in amo["notes"]) and len(amo["notes"]) == 2
