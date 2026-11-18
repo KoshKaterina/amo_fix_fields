@@ -1506,6 +1506,8 @@ OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP = (
 OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT = (
     os.getenv("OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT", "").strip() == "1")
 OFFICE_TRANSFER_RULE_ZNR_RETAIL = os.getenv("OFFICE_TRANSFER_RULE_ZNR_RETAIL", "").strip() == "1"
+# «Работа с базой» → картотека / «Новый лид», ответственный прежний.
+OFFICE_TRANSFER_RULE_ZNR_DB_WORK = os.getenv("OFFICE_TRANSFER_RULE_ZNR_DB_WORK", "").strip() == "1"
 
 # Автозакрытие по ЛЮБОЙ причине ЗИН (dup_autoclose): воронки через запятую. Пусто -
 # выключено, работают только мусорные причины DUP_REASON_ENUM_IDS (во всех воронках).
@@ -1598,6 +1600,8 @@ REASON_TANGEMSHOP = 1041893  # Tangemshop (сверено live 18.11.2026)
 PIPELINE_OPT_CONSIGNMENT = 11075670  # «ОПТ под реализацию» - источник ЗНР-переноса с 18.11.2026
 REASON_OPT_CONSIGNMENT = 1042029  # «Опт под реализацию» (заведено Катей 18.11.2026)
 REASON_RETAIL = 1042031           # «Розница» (заведено Катей 18.11.2026)
+REASON_DB_WORK = 1042033          # «Работа с базой» (заведено Катей 18.11.2026)
+STATUS_DB_WORK_NEW_LEAD = 89434626  # Работа с базой / «Новый лид» (роботов нет)
 STATUS_OPT_CONSIGNMENT_NEGOTIATION = 86989254  # ОПТ под реализацию / «Переговоры» (роботов нет)
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)

@@ -161,6 +161,9 @@ from waybill_config import (
     OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP,
     OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT,
     OFFICE_TRANSFER_RULE_ZNR_RETAIL,
+    OFFICE_TRANSFER_RULE_ZNR_DB_WORK,
+    REASON_DB_WORK,
+    STATUS_DB_WORK_NEW_LEAD,
     REASON_OPT_CONSIGNMENT,
     REASON_RETAIL,
     STATUS_CLEVER_IN_PROGRESS,
@@ -437,6 +440,15 @@ def _match_znr_retail(lead: dict, *, ignore_flags: bool = False) -> tuple[int, i
     return (PIPELINE_CLEVER_MAIN, STATUS_CLEVER_IN_PROGRESS)
 
 
+def _match_znr_db_work(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Причина «Работа с базой» → картотека / «Новый лид», ответственный прежний (18.11.2026)."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_DB_WORK:
+        return None
+    if _reason_enum(lead) != REASON_DB_WORK:
+        return None
+    return (PIPELINE_DB_WORK, STATUS_DB_WORK_NEW_LEAD)
+
+
 _ZNR_RULES = (
     _match_znr_waitlist,
     _match_znr_academy,
@@ -444,6 +456,7 @@ _ZNR_RULES = (
     _match_znr_tangemshop,
     _match_znr_opt_consignment,
     _match_znr_retail,
+    _match_znr_db_work,
 )
 
 
