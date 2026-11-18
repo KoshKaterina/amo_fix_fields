@@ -86,7 +86,8 @@ async def get(path: str, params: dict | None = None, retries: int = 3) -> dict |
 async def put(path: str, body: dict, retries: int = 3) -> dict | None:
     """PUT к МС. Используется для простановки статуса заказа (идемпотентно —
     set state X безопасно ретраить)."""
-    global _last_request
+    global _last_request, last_error
+    last_error = None
     if _client is None:
         logger.error("MS client не инициализирован")
         return None
@@ -115,12 +116,19 @@ async def put(path: str, body: dict, retries: int = 3) -> dict | None:
             continue
         if resp.status_code >= 400:
             logger.error("MS PUT %s → %s: %s", path, resp.status_code, resp.text[:300])
+            last_error = resp.text[:2000]
             return None
         try:
             return resp.json()
         except ValueError:
             return {}
     return None
+
+
+# Текст последнего отказа МойСклада на запись (PUT/POST) - для человеческой причины в
+# уведомлении об ошибке отгрузки (пункт 3 плана Кати, 13.11.2026). Сбрасывается в начале
+# каждого PUT/POST; читать сразу после неудачного вызова, в том же потоке выполнения.
+last_error: str | None = None
 
 
 async def post(path: str, body: dict, retries: int = 3) -> dict | None:
@@ -144,9 +152,11 @@ async def post(path: str, body: dict, retries: int = 3) -> dict | None:
     вызывающий код прочитал None как пустой список и объявил живые заказы
     потерянными. Вызывающий код обязан отличать None (склад не ответил) от
     настоящего успешного ответа, а не смешивать их."""
-    global _last_request
+    global _last_request, last_error
+    last_error = None
     if _client is None:
         logger.error("MS client не инициализирован")
+        last_error = "клиент МойСклада не запущен"
         return None
     url = f"{MS_API_URL}/{path.lstrip('/')}"
     for attempt in range(1, retries + 1):
@@ -164,6 +174,7 @@ async def post(path: str, body: dict, retries: int = 3) -> dict | None:
                 "MS POST %s ошибка соединения: %s - не ретраим (метод неидемпотентный, "
                 "повтор мог бы создать второй документ)", path, exc.__class__.__name__,
             )
+            last_error = "МойСклад не ответил (обрыв связи)"
             return None
         if resp.status_code == 429:
             await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
@@ -175,12 +186,52 @@ async def post(path: str, body: dict, retries: int = 3) -> dict | None:
                 "MS POST %s → %s: %s - не ретраим (метод неидемпотентный, склад "
                 "мог документ создать)", path, resp.status_code, resp.text[:300],
             )
+            last_error = f"МойСклад не ответил (код {resp.status_code})"
             return None
         if resp.status_code >= 400:
             logger.error("MS POST %s → %s: %s", path, resp.status_code, resp.text[:300])
+            last_error = resp.text[:2000]
             return None
         try:
             return resp.json()
         except ValueError:
             return {}
+    return None
+
+async def delete(path: str, retries: int = 3) -> bool | None:
+    """DELETE к МС - удаление документа (заведено для пересоздания отгрузки при правке
+    заказа, пункт 1 плана Кати 13.11.2026). True - удалено (или уже нет: 404), None -
+    склад не ответил или отказал; текст отказа в `last_error`. Ретраим только 429 -
+    как у post(): по пятисотке не знаем, дошёл ли запрос.
+    ⚠️ Заголовок Accept-Encoding: gzip обязателен для записи (без него nginx МС отвечает
+    415) - он стоит на клиенте целиком (init)."""
+    global _last_request, last_error
+    last_error = None
+    if _client is None:
+        last_error = "клиент МойСклада не запущен"
+        return None
+    url = f"{MS_API_URL}/{path.lstrip('/')}"
+    for attempt in range(1, retries + 1):
+        async with _lock:
+            elapsed = time.monotonic() - _last_request
+            if elapsed < _min_interval:
+                await asyncio.sleep(_min_interval - elapsed)
+            _last_request = time.monotonic()
+        try:
+            resp = await _client.delete(url)
+        except asyncio.CancelledError:
+            raise
+        except httpx.RequestError as exc:
+            logger.warning("MS DELETE %s ошибка соединения: %s", path, exc.__class__.__name__)
+            last_error = "МойСклад не ответил (обрыв связи)"
+            return None
+        if resp.status_code == 429:
+            await asyncio.sleep(int(resp.headers.get("Retry-After", 2)))
+            continue
+        if resp.status_code in (200, 204, 404):
+            return True
+        logger.error("MS DELETE %s → %s: %s", path, resp.status_code, resp.text[:300])
+        last_error = resp.text[:2000] if resp.status_code < 500 else f"МойСклад не ответил (код {resp.status_code})"
+        return None
+    last_error = "МойСклад: слишком много запросов"
     return None
