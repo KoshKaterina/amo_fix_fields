@@ -108,7 +108,8 @@ def test_clean_event_rejects_garbage():
         C.clean_event(ev(kind="utm_visit", at=now), now)      # вход с метками больше не принимаем
     cleaned = C.clean_event({**good, "client_id": "1700000000123456789", "page_url": "javascript:1",
                              "utm": {"utm_source": "x", "evil": "y"}}, now)
-    assert "client_id" not in cleaned                          # ClientID не храним
+    assert cleaned["client_id"] == "1700000000123456789"       # ClientID для Метрики (18.11)
+    assert C.clean_event({**good, "client_id": "<x>"}, now)["client_id"] == ""
     assert cleaned["page_url"] == "" and cleaned["utm"] == {"utm_source": "x"}
 
 
@@ -188,10 +189,98 @@ def test_call_without_click_is_ignored(amo):
     assert amo["notes"] == [] and amo["contact_notes"] == [] and amo["utm"] == []
 
 
-def test_stored_click_has_no_client_id(amo):
+def test_stored_click_keeps_client_id(amo):
     accept({**ev(), "client_id": "1700000000123456789"})
     row = store.clicks_between(0, time.time() + 10)[0]
-    assert row["client_id"] == "" and "client_id" not in row["payload"]
+    assert row["client_id"] == "1700000000123456789" == row["payload"]["client_id"]
+
+
+# --- Метрика (решение Кати 18.11.2026) ------------------------------------
+
+import call_click_metrika as M
+
+CID = "1700000000123456789"
+
+
+@pytest.fixture
+def ym(amo, monkeypatch):
+    monkeypatch.setattr(M, "ENABLED", True)
+    monkeypatch.setattr(M, "TOKEN", "t")
+    monkeypatch.setattr(M, "COUNTER_ID", "93845803")
+    sent = {"rows": [], "fail": False}
+
+    async def post(body, comment):
+        if sent["fail"]:
+            raise RuntimeError("http 500")
+        sent["rows"].append(body.decode())
+        return {"id": len(sent["rows"]), "status": "UPLOADED"}
+
+    monkeypatch.setattr(M, "_post", post)
+    return sent
+
+
+def test_metrika_sure_call_sent(ym):
+    t = time.time() - 100
+    accept({**ev(at=t), "client_id": CID})
+    assert attribute("m1", CALLER, t + 9) == "sure"
+    assert ym["rows"] == [f"ClientId,DateTime\n{CID},{int(t + 9)}\n"]
+
+
+def test_metrika_same_client_same_source_once_in_3_days(ym):
+    t = time.time() - 500
+    accept({**ev(at=t), "client_id": CID})
+    assert attribute("m2", CALLER, t + 9) == "sure"
+    accept({**ev(at=t + 300), "client_id": CID})
+    assert attribute("m3", CALLER, t + 309) == "sure"
+    assert len(ym["rows"]) == 1
+
+
+def test_metrika_same_client_other_source_counted(ym):
+    t = time.time() - 500
+    accept({**ev(at=t), "client_id": CID})
+    assert attribute("m4", CALLER, t + 9) == "sure"
+    accept({**ev(at=t + 300, utm={"utm_source": "vk", "utm_medium": "cpc"}), "client_id": CID})
+    assert attribute("m5", CALLER, t + 309) == "sure"
+    assert len(ym["rows"]) == 2
+
+
+def test_metrika_repeat_after_3_days_counted(amo):
+    import call_click_store as S
+    assert S.metrika_claim("a", CID, "direct", 1000.0, 3 * 86400, 1000.0)
+    assert not S.metrika_claim("b", CID, "direct", 1000.0 + 86400, 3 * 86400, 1000.0)
+    assert S.metrika_claim("c", CID, "direct", 1000.0 + 3 * 86400 + 1, 3 * 86400, 1000.0)
+
+
+def test_metrika_skips_without_client_id_and_ambiguous(ym):
+    t = time.time() - 300
+    accept(ev(at=t))
+    attribute("m6", CALLER, t + 9)                      # без ClientID
+    accept({**ev(at=t + 150, device="desktop"), "client_id": CID})
+    accept({**ev(at=t + 160), "client_id": "1700000000999"})
+    attribute("m7", CALLER, t + 170)                    # спорно
+    assert ym["rows"] == []
+
+
+def test_metrika_failure_releases_and_amo_still_written(ym, amo):
+    ym["fail"] = True
+    t = time.time() - 100
+    accept({**ev(at=t), "client_id": CID})
+    assert attribute("m8", CALLER, t + 9) == "sure"
+    assert len(amo["notes"]) == 1
+    import call_click_store as S
+    assert S.metrika_claim("m8", CID, M.source_key({"utm": UTM}), t + 9, M.REPEAT_S, time.time())
+
+
+def test_metrika_off_by_default(amo):
+    t = time.time() - 100
+    accept({**ev(at=t), "client_id": CID})
+    assert attribute("m9", CALLER, t + 9) == "sure"     # выключено - ничего не шлём, склейка идёт
+
+
+def test_source_key():
+    assert M.source_key({"utm": {"utm_source": "yandex_direct", "utm_medium": "cpc", "utm_campaign": "k"}}) == "utm:yandex_direct|cpc|k"
+    assert M.source_key({"utm": {}, "referrer": "https://www.google.com/"}) == "ref:google.com"
+    assert M.source_key({"utm": {}, "referrer": ""}) == "direct"
 
 
 def test_log_mode_does_not_touch_amo(amo, monkeypatch):

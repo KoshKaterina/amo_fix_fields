@@ -12,7 +12,8 @@
      "place": "header-phone" | ..., "link_text": "...", "utm": {...последнее касание},
      "utm_first": {...первое касание} | {}, "utm_first_at": <unix> | 0}
 Считаем ТОЛЬКО звонки после клика по номеру на сайте. Звонок без клика (набрал руками) не
-сопоставляем, ClientID Метрики не собираем и не храним (решение Кати 17.11.2026).
+сопоставляем. ClientID Метрики приходит с кликом (решение Кати 18.11.2026) и нужен только для
+отправки факта звонка в Метрику (call_click_metrika.py), храним его не дольше 3 дней.
 
 Склейка (на каждом закончившемся входящем звонке Sipuni, отвеченном и пропущенном):
   * клики по номерам из CALL_CLICK_NUMBERS в окне [начало звонка - WINDOW, начало + SKEW];
@@ -45,6 +46,7 @@ from urllib.parse import urlsplit
 
 import amo_service
 import api
+import call_click_metrika
 import call_click_store as store
 from shared.phones import digits_only, ru_8_to_7
 from shared.timez import MSK
@@ -79,6 +81,7 @@ KINDS = ("tel_click",)
 MAX_BODY_BYTES = 8192
 _EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _PLACE_RE = re.compile(r"^[a-z0-9#_\-]{1,60}$")
+_CLIENT_ID_RE = re.compile(r"^\d{6,30}$")
 _RATE_PER_MINUTE = _env_int("CALL_CLICK_RATE_PER_MINUTE", 120)
 _rate: list[float] = []
 _bg: set = set()
@@ -161,8 +164,10 @@ def clean_event(payload: dict, now: float | None = None) -> dict:
         first_at = 0.0
     device = _s(payload.get("device"), 16)
     place = _s(payload.get("place"), 60).lower()
+    client_id = _s(payload.get("client_id"), 30)
     return {
         "kind": kind, "event_id": event_id, "at": at, "number": number,
+        "client_id": client_id if _CLIENT_ID_RE.match(client_id) else "",
         "page_url": _url(payload.get("page_url")), "referrer": _url(payload.get("referrer")),
         "device": device if device in ("mobile", "desktop") else "",
         "place": place if _PLACE_RE.match(place) else "",
@@ -291,6 +296,12 @@ async def attribute_call(call_id: str, phone: str, call_start: float, find_lead:
                 await asyncio.to_thread(store.mark_matched, event_id, call_id)
         logger.info("call_click: звонок %s в %s - %s (кликов в окне %s)", call_id, _hms(call_start),
                     verdict, len(clicks))
+        if verdict == "sure":
+            # Метрика не зависит от сделки: факт звонка уходит сразу, до поиска сделки.
+            try:
+                await call_click_metrika.report_call(chosen[0]["payload"], call_id, call_start)
+            except Exception:
+                logger.exception("call_click: Метрика - сбой отправки звонка %s, в amo пишем как обычно", call_id)
         if not phone:
             logger.info("call_click: звонок %s со скрытого номера, сделку не найти", call_id)
             return "no-lead"
@@ -495,4 +506,5 @@ def note_ambiguous(events: list[dict], call_start: float) -> str:
 
 def cleanup() -> None:
     if is_enabled():
-        store.cleanup(time.time(), click_keep_s=2 * 86400, attribution_keep_s=30 * 86400)
+        store.cleanup(time.time(), click_keep_s=2 * 86400, attribution_keep_s=30 * 86400,
+                      metrika_keep_s=call_click_metrika.REPEAT_S)
