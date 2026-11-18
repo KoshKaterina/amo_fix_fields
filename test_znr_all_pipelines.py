@@ -385,3 +385,89 @@ def test_reconcile_ne_sprashivaet_lishnego(transfer, monkeypatch):
         assert (src, STATUS_CLOSED_LOST) in asked, src
     for src in (PIPELINE_CLEVER_MAIN, PIPELINE_OPT, PIPELINE_DB_WORK, PIPELINE_TANGEMSHOP):
         assert (src, STATUS_SUCCESS) in asked, src
+
+
+# ════════════════ 3. УР → Офис для Листа ожидания и ОПТ под реализацию (18.11.2026) ════════════════
+
+from waybill_config import (  # noqa: E402
+    APPLICATION_TYPE_ORDER,
+    FIELD_APPLICATION_TYPE,
+    FIELD_DELIVERY_TYPE,
+    FIELD_ORDER_WAREHOUSE,
+    RESPONSIBLE_OFFICE_MANAGER_USER_ID,
+    STATUS_CREATE_WAYBILL,
+    WAREHOUSE_SUNSCRYPT_MAIN,
+)
+
+_UR_RULES_ON = (
+    "OFFICE_TRANSFER_RULE_UR_DELIVERY", "OFFICE_TRANSFER_RULE_UR_PICKUP",
+    "OFFICE_TRANSFER_RULE_UR_WAYBILL", "OFFICE_TRANSFER_RULE_UR_PREORDER",
+    "OFFICE_TRANSFER_RULE_UR_RESERVE", "OFFICE_TRANSFER_RULE_UR_POST",
+    "OFFICE_TRANSFER_UR_WAITLIST", "OFFICE_TRANSFER_UR_OPT_CONSIGNMENT",
+)
+
+
+@pytest.fixture()
+def transfer_ur(transfer, monkeypatch):
+    for name in _UR_RULES_ON:
+        monkeypatch.setattr(office_transfer, name, True)
+
+    async def get_user_name(uid):
+        return "Иван Иванов"
+
+    monkeypatch.setattr(office_transfer.amo_service, "get_user_name", get_user_name)
+    return transfer
+
+
+def _order_lead(pipeline_id, **kw):
+    lead = _lead(pipeline_id, STATUS_SUCCESS, None, **kw)
+    lead["custom_fields_values"] = [
+        {"field_id": FIELD_APPLICATION_TYPE, "values": [{"enum_id": APPLICATION_TYPE_ORDER}]},
+        {"field_id": FIELD_ORDER_WAREHOUSE, "values": [{"enum_id": WAREHOUSE_SUNSCRYPT_MAIN}]},
+        {"field_id": FIELD_DELIVERY_TYPE, "values": [{"value": "СДЭК до ПВЗ"}]},
+    ]
+    return lead
+
+
+@pytest.mark.parametrize("src", [PIPELINE_WAITLIST, PIPELINE_OPT_CONSIGNMENT])
+def test_ur_novyh_voronok_edet_v_ofis_kak_roznica(transfer_ur, src):
+    st, go = transfer_ur
+    assert go(_order_lead(src)) == "moved"
+    p = st["patches"][0]
+    assert (p["pipeline_id"], p["status_id"]) == (PIPELINE_OFFICE, STATUS_CREATE_WAYBILL)
+    assert p["responsible_user_id"] == RESPONSIBLE_OFFICE_MANAGER_USER_ID
+
+
+@pytest.mark.parametrize("src", [PIPELINE_WAITLIST, PIPELINE_OPT_CONSIGNMENT])
+def test_ur_pustye_polya_alert_kak_v_roznice(transfer_ur, src):
+    st, go = transfer_ur
+    res = go(_lead(src, STATUS_SUCCESS, None))
+    assert res != "moved" and st["patches"] == []
+    assert st["alerts"], "незаполненный заказ - алерт, как в рознице"
+
+
+@pytest.mark.parametrize("flag,src", [("OFFICE_TRANSFER_UR_WAITLIST", PIPELINE_WAITLIST),
+                                      ("OFFICE_TRANSFER_UR_OPT_CONSIGNMENT", PIPELINE_OPT_CONSIGNMENT)])
+def test_ur_flag_vyklyuchen_ne_trogaem(transfer_ur, monkeypatch, flag, src):
+    st, go = transfer_ur
+    monkeypatch.setattr(office_transfer, flag, False)
+    assert go(_order_lead(src)) == "no-match"
+    assert st["patches"] == [] and st["alerts"] == []
+
+
+def test_ur_reconcile_sprashivaet_142_novyh_voronok(transfer_ur, monkeypatch):
+    asked = []
+
+    async def do_get(path, params=None):
+        d = dict(params)
+        asked.append((int(d["filter[value_after][leads_statuses][0][pipeline_id]"]),
+                      int(d["filter[value_after][leads_statuses][0][status_id]"])))
+        return {"_embedded": {"events": []}}
+
+    monkeypatch.setattr(office_transfer.amo_service, "_do_get", do_get)
+    monkeypatch.setattr(office_transfer, "OFFICE_TRANSFER_SINCE_TS", int(time.time()) - 60)
+    monkeypatch.setattr(office_transfer, "_last_reconcile_ts", 0)
+    run(office_transfer._reconcile_once())
+    for src in SIX:
+        assert (src, STATUS_SUCCESS) in asked, src
+        assert (src, STATUS_CLOSED_LOST) in asked, src

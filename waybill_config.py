@@ -1496,6 +1496,10 @@ OFFICE_TRANSFER_ZNR_TANGEMSHOP = os.getenv("OFFICE_TRANSFER_ZNR_TANGEMSHOP", "")
 OFFICE_TRANSFER_SOURCE_WAITLIST = os.getenv("OFFICE_TRANSFER_SOURCE_WAITLIST", "").strip() == "1"
 OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT = (
     os.getenv("OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT", "").strip() == "1")
+# 18.11.2026 (Катя): в этих двух воронках «Успешно реализовано» тоже переводит сделку в
+# Офис по тем же правилам, что у розницы. Отдельные флаги поверх SOURCE_*.
+OFFICE_TRANSFER_UR_WAITLIST = os.getenv("OFFICE_TRANSFER_UR_WAITLIST", "").strip() == "1"
+OFFICE_TRANSFER_UR_OPT_CONSIGNMENT = os.getenv("OFFICE_TRANSFER_UR_OPT_CONSIGNMENT", "").strip() == "1"
 # Причина «Tangemshop» → воронка TangemShop / «взят в работу» (не «Новый лид»: там
 # 9 ботов пишут клиенту), ответственный прежний.
 OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP = (

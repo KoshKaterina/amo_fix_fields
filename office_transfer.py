@@ -158,6 +158,8 @@ from waybill_config import (
     OFFICE_TRANSFER_SOURCE_TANGEMSHOP,
     OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT,
     OFFICE_TRANSFER_SOURCE_WAITLIST,
+    OFFICE_TRANSFER_UR_OPT_CONSIGNMENT,
+    OFFICE_TRANSFER_UR_WAITLIST,
     OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP,
     OFFICE_TRANSFER_RULE_ZNR_OPT_CONSIGNMENT,
     OFFICE_TRANSFER_RULE_ZNR_RETAIL,
@@ -548,9 +550,14 @@ def _allowed_branches(pipeline_id) -> frozenset[str]:
     if pid == PIPELINE_TANGEMSHOP:
         return (frozenset({_BRANCH_UR, _BRANCH_ZNR}) if OFFICE_TRANSFER_ZNR_TANGEMSHOP
                 else frozenset({_BRANCH_UR}))
-    # Новые источники 18.11.2026: успешные сделки отсюда в Офис не переводились.
-    if pid in (PIPELINE_WAITLIST, PIPELINE_OPT_CONSIGNMENT):
-        return frozenset({_BRANCH_ZNR})
+    # Новые источники 18.11.2026. Сначала только ЗНР; в тот же день Катя попросила, чтобы
+    # и «Успешно реализовано» переводило в Офис, как в остальных рабочих воронках, - за
+    # флагами OFFICE_TRANSFER_UR_WAITLIST / _UR_OPT_CONSIGNMENT.
+    if pid == PIPELINE_WAITLIST:
+        return frozenset({_BRANCH_UR, _BRANCH_ZNR}) if OFFICE_TRANSFER_UR_WAITLIST else frozenset({_BRANCH_ZNR})
+    if pid == PIPELINE_OPT_CONSIGNMENT:
+        return (frozenset({_BRANCH_UR, _BRANCH_ZNR}) if OFFICE_TRANSFER_UR_OPT_CONSIGNMENT
+                else frozenset({_BRANCH_ZNR}))
     return frozenset({_BRANCH_UR, _BRANCH_ZNR})
 
 
