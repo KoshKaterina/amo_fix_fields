@@ -269,12 +269,31 @@ def test_place_garbage_dropped():
     assert cleaned["place"] == "" and len(cleaned["link_text"]) == 60
 
 
-def test_no_utm_no_fields_even_with_referrer(amo):
+def test_referrer_written_without_utm(amo):
+    """18.11.2026: органика без меток - источник перехода всё равно в поле referrer."""
     t = time.time() - 100
-    accept(ev(at=t, utm={}, referrer="https://google.com/"))
+    accept(ev(at=t, utm={}, referrer="https://yandex.ru/"))
     assert attribute("c22", CALLER, t + 7) == "sure"
+    assert amo["utm"] == [(501, {"referrer": "https://yandex.ru/"})]
+    text = amo["notes"][0][1]
+    assert "Откуда пришёл: https://yandex.ru/" in text
+    assert "Метки визита: нет\n" in text and "прямой заход" not in text
+
+
+def test_no_utm_no_referrer_no_fields(amo):
+    t = time.time() - 100
+    accept(ev(at=t, utm={}))
+    assert attribute("c23", CALLER, t + 7) == "sure"
     assert amo["utm"] == []
-    assert "Откуда пришёл: https://google.com/" in amo["notes"][0][1]
+
+
+def test_existing_referrer_not_overwritten(amo):
+    amo["lead"] = {"id": 501, "custom_fields_values": [
+        {"field_code": "REFERRER", "values": [{"value": "https://google.com/"}]}]}
+    t = time.time() - 100
+    accept(ev(at=t, referrer="https://yandex.ru/"))
+    assert attribute("c24", CALLER, t + 7) == "sure"
+    assert amo["utm"] == [] and len(amo["notes"]) == 1
 
 
 def test_same_visitor_double_tap_is_one_click(amo):

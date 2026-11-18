@@ -353,7 +353,8 @@ async def _write_contact(call_id: str, phone: str, verdict: str, chosen: list, c
 
 async def _write(lead_id: int, ref: str, verdict: str, note: str, utm: dict) -> None:
     """utm - метки и referrer для стандартных полей «Статистики» сделки (utm_* и REFERRER).
-    Пишем только когда метки поставлены у ОДНОЗНАЧНОЙ склейки и в сделке их ещё нет."""
+    Пишем только у ОДНОЗНАЧНОЙ склейки, когда есть метки или источник перехода, и только если в
+    сделке ни меток, ни источника ещё нет (18.11.2026: referrer пишем и без меток - органика)."""
     if CALL_CLICK_MODE == "log":
         logger.info("call_click: сделка %s, %s - режим log, в amo не пишу. Примечание было бы:\n%s",
                     lead_id, verdict, note)
@@ -363,22 +364,25 @@ async def _write(lead_id: int, ref: str, verdict: str, note: str, utm: dict) -> 
         await asyncio.to_thread(store.release_attribution, lead_id, ref)
         return
     logger.info("call_click: примечание в сделке %s (%s)", lead_id, verdict)
-    if CALL_CLICK_MODE != "live" or not any(utm.get(k) for k in UTM_KEYS):
+    if CALL_CLICK_MODE != "live" or not any(utm.get(k) for k in (*UTM_KEYS, "referrer")):
         return
     lead = await amo_service.get_lead_full(lead_id, with_=())
     if lead is None:
         logger.warning("call_click: сделка %s не прочиталась, поля UTM не пишу", lead_id)
         return
     if has_utm(lead):
-        logger.info("call_click: в сделке %s метки уже есть, не перетираю (новые в примечании)", lead_id)
+        logger.info("call_click: в сделке %s метки или источник уже есть, не перетираю (новые в примечании)", lead_id)
         return
     ok = await api.set_lead_utm(lead_id, utm)
-    logger.info("call_click: поля UTM сделки %s %s", lead_id, "записаны" if ok else "НЕ записаны")
+    logger.info("call_click: поля «Статистики» сделки %s (%s) %s", lead_id, ",".join(k for k in utm if utm[k]),
+                "записаны" if ok else "НЕ записаны")
 
 
 def has_utm(lead: dict) -> bool:
+    """В сделке уже заполнено хоть одно поле utm_* или referrer."""
+    codes = {k.upper() for k in UTM_KEYS} | {"REFERRER"}
     for field in lead.get("custom_fields_values") or []:
-        if str(field.get("field_code") or "").upper() in {k.upper() for k in UTM_KEYS}:
+        if str(field.get("field_code") or "").upper() in codes:
             if any(str(v.get("value") or "").strip() for v in field.get("values") or []):
                 return True
     return False
@@ -453,7 +457,7 @@ def _visit_lines(ev: dict) -> list[str]:
             where += f", кнопка «{text}»"
         lines.append(f"Где нажал номер: {where}")
     utm = ev.get("utm") or {}
-    lines.append("Метки визита: " + (_utm_line(utm) or "нет (прямой заход или метки потерялись)"))
+    lines.append("Метки визита: " + (_utm_line(utm) or "нет"))
     first = ev.get("utm_first") or {}
     if first and first != utm:
         when = f" ({_dm_hm(ev['utm_first_at'])})" if ev.get("utm_first_at") else ""
