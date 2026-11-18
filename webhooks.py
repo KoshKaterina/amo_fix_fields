@@ -348,6 +348,7 @@ async def health():
     контейнера иначе неотличим от тишины по отсутствию событий (инцидент 28.08.2026,
     сутки без алертов при зелёном контейнере)."""
     return {"status": "ok", "telegram": telegram_bot.telegram_health(),
+            "metrika": metrika_sync.delivery_health(),
             "mail_watch": mail_watch.status(),
             "office_record": office_record_watch.status(),
             "stage_guard": stage_guard.status(),

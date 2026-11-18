@@ -6,7 +6,9 @@
   • без `AI_ENGINE_ENABLED=1` или без `AI_ENGINE_TOKEN` ручки `permit`/`result` отвечают 503;
   • токен сверяется в постоянное время (`hmac.compare_digest`), версия контракта обязательна (426);
   • ручки человека (`return_dialog`, `state`) закрыты ОТДЕЛЬНЫМ `AI_ADMIN_TOKEN`: у ИИ-сервиса его нет, и
-    сервис не может сам забрать назад сделку, которую у него отняли.
+    сервис не может сам забрать назад сделку, которую у него отняли;
+  • кнопка «Дать сделку ИИ» в панели Team ходит со своим узким `X-Give-Token` (`AI_GIVE_TOKEN`): он открывает только `/give_deal`,
+    админский токен в панель не кладётся.
 
 Рекомендация к выкатке: закрыть `/amo/internal/` в nginx (сервис ходит по docker-сети напрямую на
 `amo-fix-fields:8000`, публичный путь ему не нужен). Токены это защита второго эшелона, а не замена.
@@ -104,6 +106,15 @@ def _check_admin(token: str) -> JSONResponse | None:
     return None
 
 
+def _check_give(token: str) -> JSONResponse | None:
+    """Узкий токен панели для `/give_deal`. Другие ручки человека и ручки сервиса его не принимают."""
+    if not cfg.ENABLED or not cfg.GIVE_TOKEN:
+        return _deny(503, "ai_engine_give_disabled")
+    if not hmac.compare_digest(token.encode("utf-8"), cfg.GIVE_TOKEN.encode("utf-8")):
+        return _deny(403, "forbidden")
+    return None
+
+
 @router.post("/permit")
 async def permit(body: PermitIn, x_service_token: str = Header(default=""), x_contract: str = Header(default="")):
     bad = _check_service(x_service_token, x_contract)
@@ -176,9 +187,11 @@ async def return_dialog(body: ReturnIn, x_admin_token: str = Header(default=""))
 
 
 @router.post("/give_deal")
-async def give_deal(body: GiveIn, x_admin_token: str = Header(default="")):
-    """Человек отдал ИИ сделку: движок ставит `owner = ai` и шлёт ходом событие `deal_given`. Закрыта админским токеном, как `return_dialog`."""
-    bad = _check_admin(x_admin_token)
+async def give_deal(body: GiveIn, x_admin_token: str = Header(default=""), x_give_token: str = Header(default="")):
+    """Человек отдал ИИ сделку: движок ставит `owner = ai` и шлёт ходом событие `deal_given`. Закрыта админским токеном, как `return_dialog`.
+
+    Панель Team (кнопка «Дать сделку ИИ») ходит сюда со своим узким токеном `X-Give-Token` (`AI_GIVE_TOKEN`): он подходит только к этой ручке."""
+    bad = _check_give(x_give_token) if x_give_token else _check_admin(x_admin_token)
     if bad is not None:
         return bad
     try:
