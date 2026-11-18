@@ -21,6 +21,14 @@ tangemshop.ru через amoCRM). Правила те же — они читаю
 воронку. ⚠️ Ей тоже разрешена ТОЛЬКО ветка УР, прямыми словами Кати: «УР
 переводит сделку в офис, ЗИН закрывает её без перехода в офис».
 
+18.11.2026 (решение Кати): ЗНР по причине — во всех рабочих воронках. Картотеке и
+TangemShop ветка ЗНР открыта флагами OFFICE_TRANSFER_ZNR_DB_WORK / _TANGEMSHOP;
+Лист ожидания и ОПТ под реализацию — новые источники только с веткой ЗНР
+(OFFICE_TRANSFER_SOURCE_WAITLIST / _OPT_CONSIGNMENT). Новая причина «Tangemshop» →
+TangemShop / «взят в работу», ответственный прежний. Причина, ведущая в ту же
+воронку, где сделка закрыта, не переносит её. Закрытие в 143 по любой причине —
+dup_autoclose (ZNR_AUTOCLOSE_ANY_REASON_PIPELINES).
+
 ⚠️ Сделка, уехавшая отсюда в Офис, по воронке больше не отличима от розничной —
 об этом знают metrika_sync и woo_status_sync, у них свой отсев по признаку
 магазина (waybill_config.is_tangemshop_order_number, канал продаж 576725).
@@ -148,6 +156,14 @@ from waybill_config import (
     OFFICE_TRANSFER_SOURCE_DB_WORK,
     OFFICE_TRANSFER_SOURCE_OPT,
     OFFICE_TRANSFER_SOURCE_TANGEMSHOP,
+    OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT,
+    OFFICE_TRANSFER_SOURCE_WAITLIST,
+    OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP,
+    OFFICE_TRANSFER_ZNR_DB_WORK,
+    OFFICE_TRANSFER_ZNR_TANGEMSHOP,
+    PIPELINE_OPT_CONSIGNMENT,
+    REASON_TANGEMSHOP,
+    STATUS_TANGEM_IN_PROGRESS,
     OFFICE_TRANSFER_STALE_ALERT_MIN,
     OFFICE_TRANSFER_WAREHOUSES,
     PIPELINE_ACADEMY,
@@ -385,10 +401,22 @@ async def _match_znr_opt(lead: dict, *, ignore_flags: bool = False) -> tuple[int
     return (PIPELINE_OPT, STATUS_OPT_PRIMARY_CONTACT)
 
 
+def _match_znr_tangemshop(lead: dict, *, ignore_flags: bool = False) -> tuple[int, int] | None:
+    """Причина ЗИН=Tangemshop → TangemShop / «взят в работу» (решение Кати
+    18.11.2026). Не «Новый лид»: там 9 ботов «[TANGEM] …» пишут клиенту.
+    Ответственный прежний - в process_office_transfer для этой воронки его не меняем."""
+    if not ignore_flags and not OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP:
+        return None
+    if _reason_enum(lead) != REASON_TANGEMSHOP:
+        return None
+    return (PIPELINE_TANGEMSHOP, STATUS_TANGEM_IN_PROGRESS)
+
+
 _ZNR_RULES = (
     _match_znr_waitlist,
     _match_znr_academy,
     _match_znr_opt,
+    _match_znr_tangemshop,
 )
 
 
@@ -410,6 +438,11 @@ async def _match_rules(lead: dict, status_id: int, *, ignore_flags: bool = False
         if asyncio.iscoroutine(target):
             target = await target
         if target is not None:
+            # Причина ведёт в ту же воронку, где сделка закрыта (Опт в ОПТ, Лист
+            # ожидания в Листе ожидания, Tangemshop в TangemShop): сделка остаётся
+            # закрытой у себя, переносить некуда (18.11.2026).
+            if target[0] == _pipeline_id(lead):
+                return None
             return target
     return None
 
@@ -435,6 +468,11 @@ def _source_pipelines() -> tuple[int, ...]:
         out.append(PIPELINE_DB_WORK)
     if OFFICE_TRANSFER_SOURCE_TANGEMSHOP:
         out.append(PIPELINE_TANGEMSHOP)
+    # 18.11.2026: только ветка ЗНР, см. _allowed_branches().
+    if OFFICE_TRANSFER_SOURCE_WAITLIST:
+        out.append(PIPELINE_WAITLIST)
+    if OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT:
+        out.append(PIPELINE_OPT_CONSIGNMENT)
     return tuple(out)
 
 
@@ -462,8 +500,17 @@ def _allowed_branches(pipeline_id) -> frozenset[str]:
         pid = int(pipeline_id)
     except (TypeError, ValueError):
         return frozenset({_BRANCH_UR, _BRANCH_ZNR})
-    if pid in (PIPELINE_DB_WORK, PIPELINE_TANGEMSHOP):
-        return frozenset({_BRANCH_UR})
+    # 18.11.2026 Катя сняла запрет ЗНР для картотеки и TangemShop: переносы по
+    # причинам Лист ожидания / Академия / Опт / Tangemshop нужны во всех рабочих
+    # воронках. Включается отдельными флагами, без них - прежнее поведение.
+    if pid == PIPELINE_DB_WORK:
+        return frozenset({_BRANCH_UR, _BRANCH_ZNR}) if OFFICE_TRANSFER_ZNR_DB_WORK else frozenset({_BRANCH_UR})
+    if pid == PIPELINE_TANGEMSHOP:
+        return (frozenset({_BRANCH_UR, _BRANCH_ZNR}) if OFFICE_TRANSFER_ZNR_TANGEMSHOP
+                else frozenset({_BRANCH_UR}))
+    # Новые источники 18.11.2026: успешные сделки отсюда в Офис не переводились.
+    if pid in (PIPELINE_WAITLIST, PIPELINE_OPT_CONSIGNMENT):
+        return frozenset({_BRANCH_ZNR})
     return frozenset({_BRANCH_UR, _BRANCH_ZNR})
 
 
@@ -675,7 +722,9 @@ async def process_office_transfer(lead_id, source: str = "webhook") -> str:
 
     target = await _match_rules(lead, status_id)
     if target is None:
-        if status_id == STATUS_SUCCESS:
+        # Воронке без ветки УР (Лист ожидания, ОПТ под реализацию) успешная сделка
+        # не «заполнена некорректно» - её просто не переносим, алерт не нужен.
+        if status_id == STATUS_SUCCESS and _BRANCH_UR in _allowed_branches(pipeline_id):
             return await _no_match_ur(lead)
         # ЗНР без «Листа ожидания»/«Академии» остаётся в CLEVER — норма, молчим.
         return "no-match"
@@ -840,8 +889,11 @@ async def _reconcile_once() -> str:
     # с запасом (замер лимитов amo: 50 на аккаунт, 7 на интеграцию, 03.08.2026).
     leads: set[int] = set()
     for _src in _source_pipelines():
-        leads |= await _entered_status_leads(_src, STATUS_SUCCESS, window_from, now)
-        leads |= await _entered_status_leads(_src, STATUS_CLOSED_LOST, window_from, now)
+        allowed = _allowed_branches(_src)
+        if _BRANCH_UR in allowed:
+            leads |= await _entered_status_leads(_src, STATUS_SUCCESS, window_from, now)
+        if _BRANCH_ZNR in allowed:
+            leads |= await _entered_status_leads(_src, STATUS_CLOSED_LOST, window_from, now)
 
     # Предохранитель: в норме за проход набегают единицы сделок. Много — значит
     # в перенос завели воронку, которой нет в MIGRATION_SOURCE_PIPELINES, и её

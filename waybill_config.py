@@ -1484,6 +1484,34 @@ OFFICE_TRANSFER_SOURCE_DB_WORK = os.getenv("OFFICE_TRANSFER_SOURCE_DB_WORK", "")
 # Разводку держит office_transfer._allowed_branches().
 OFFICE_TRANSFER_SOURCE_TANGEMSHOP = os.getenv("OFFICE_TRANSFER_SOURCE_TANGEMSHOP", "").strip() == "1"
 
+# ═══ ЗНР по причине во всех рабочих воронках (решение Кати 18.11.2026) ═══
+# Катя отменила прежние запреты: ЗНР картотеки (07.09) и TangemShop (29.09) теперь
+# тоже переносится по причинам Лист ожидания / Академия / Опт / Tangemshop. В Офис
+# по-прежнему переводит только «Успешно реализовано» - эта ветка не меняется.
+# Каждый флаг по умолчанию выключен, включение - в .env при выкатке.
+OFFICE_TRANSFER_ZNR_DB_WORK = os.getenv("OFFICE_TRANSFER_ZNR_DB_WORK", "").strip() == "1"
+OFFICE_TRANSFER_ZNR_TANGEMSHOP = os.getenv("OFFICE_TRANSFER_ZNR_TANGEMSHOP", "").strip() == "1"
+# Лист ожидания и ОПТ под реализацию - новые источники, только ветка ЗНР (успешные
+# сделки этих воронок в Офис не переводились и не переводятся).
+OFFICE_TRANSFER_SOURCE_WAITLIST = os.getenv("OFFICE_TRANSFER_SOURCE_WAITLIST", "").strip() == "1"
+OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT = (
+    os.getenv("OFFICE_TRANSFER_SOURCE_OPT_CONSIGNMENT", "").strip() == "1")
+# Причина «Tangemshop» → воронка TangemShop / «взят в работу» (не «Новый лид»: там
+# 9 ботов пишут клиенту), ответственный прежний.
+OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP = (
+    os.getenv("OFFICE_TRANSFER_RULE_ZNR_TANGEMSHOP", "").strip() == "1")
+
+# Автозакрытие по ЛЮБОЙ причине ЗИН (dup_autoclose): воронки через запятую. Пусто -
+# выключено, работают только мусорные причины DUP_REASON_ENUM_IDS (во всех воронках).
+# ⚠️ Причина остаётся в сделке после переноса (на 18.11: 124 открытых в Листе
+# ожидания с «Лист ожидания», 137 в картотеке с «Пропал»), а вебхук несёт поле
+# целиком. Поэтому немусорная причина закрывает сделку только если её ВЫБРАЛИ
+# только что: в журнале amo есть событие смены поля не старше окна ниже.
+ZNR_AUTOCLOSE_ANY_REASON_PIPELINES = frozenset(
+    int(x) for x in os.getenv("ZNR_AUTOCLOSE_ANY_REASON_PIPELINES", "").replace(" ", "").split(",")
+    if x.isdigit())
+ZNR_AUTOCLOSE_FRESH_WINDOW_S = int(os.getenv("ZNR_AUTOCLOSE_FRESH_WINDOW_S", "600"))
+
 # Cutover-граница (unix ts): события ДО неё игнорируются везде (вебхук и
 # reconciliation) — без ретроактивности. 0 = не задана; в этом состоянии
 # фича не должна включаться на проде (задать перед первым боевым включением).
@@ -1560,6 +1588,8 @@ OFFICE_TRANSFER_WAREHOUSES = {
 REASON_WAITLIST = 1041245  # Лист ожидания
 REASON_ACADEMY = 1041243   # Академия
 REASON_OPT = 1041905       # Опт (сверено live 25.08.2026)
+REASON_TANGEMSHOP = 1041893  # Tangemshop (сверено live 18.11.2026)
+PIPELINE_OPT_CONSIGNMENT = 11075670  # «ОПТ под реализацию» - источник ЗНР-переноса с 18.11.2026
 
 # Подстроки «Тип доставки» (577315, text) — регистронезависимо (.casefold(), как DELIVERY_SHOWROOM_MARKER)
 # Самовывоз бывает двух видов: из офиса (как было) и из шоурума (с 06.08.2026, свой склад).
