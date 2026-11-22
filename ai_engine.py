@@ -27,7 +27,8 @@
 в ходе они всегда `null`.
 
 ⚠️ Режим у сделки (`ai_engine_modes`): ИИ ведёт сделку, только если взял её в активном `mode_id` панели. Сменился режим, и сделки
-чужого режима снимаются тихо (`_release_for_mode`); проверка стоит в каждой точке, где ИИ что-то делает со сделкой.
+чужого режима снимаются тихо (`_release_for_mode`); проверка стоит в каждой точке, где ИИ что-то делает со сделкой. Снятие уходит
+событием `mode_release` в журнал ИИ панели (`ai_engine_events`, фоном, потеря допустима).
 """
 import asyncio
 import datetime
@@ -42,6 +43,7 @@ from typing import Any
 import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
+import ai_engine_events as panel_events
 import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_intercept as intercept
@@ -185,10 +187,11 @@ async def _guarded_loop(loop_fn, what: str) -> None:
             await asyncio.sleep(5)
 
 
-def _spawn(coro) -> None:
+def _spawn(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _bg.add(task)
     task.add_done_callback(_bg.discard)
+    return task
 
 
 # =============================================================================================
@@ -1109,8 +1112,20 @@ async def _release_for_mode(owner: dict, active: str, *, chat_key: str | None = 
         # Чат забывается целиком, а не помечается `released`: запрет для ИИ идёт по сделке (владелец `engine`), а у клиента в активном
         # режиме может быть другая подходящая сделка, и чат `released` не пустил бы ИИ в неё до уборки через 30 дней.
         await _db(store.drop_session, key)
-    await _db(modes.log_release, deal_id, from_mode, active, int(row["epoch"]), _now())
+    now = _now()
+    await _db(modes.log_release, deal_id, from_mode, active, int(row["epoch"]), now)
     logger.info("ai_engine: сделка %s %s (%s -> %s), эпоха %s", deal_id, modes.RELEASED_NOTE, from_mode, active, row["epoch"])
+    _publish_mode_release(deal_id, from_mode, active, int(row["epoch"]), now)
+
+
+def _publish_mode_release(deal_id: int, from_mode: str | None, to_mode: str, epoch: int | None, now: float) -> None:
+    """Событие снятия в журнал ИИ на экране панели (`ai_engine_events`). Зовётся ПОСЛЕ записи в `mode_release`, которая остаётся
+    источником правды: отправка фоном (задача в `_bg`), не задерживает снятие, любой сбой ловится здесь и до снятия не доходит;
+    панель недоступна или не знает ручку (движок выкатывается раньше панели): событие теряется, повторы и лог ограничены."""
+    try:
+        panel_events.enqueue(modes.release_event(deal_id, from_mode, to_mode, epoch, now), _spawn)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: не поставил событие снятия сделки %s в очередь панели", deal_id)
 
 
 async def _expire_turns() -> None:

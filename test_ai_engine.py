@@ -71,6 +71,7 @@ class Env:
         mp.setattr(cfg, "SERVICE_TOKEN", "svc-token")
         mp.setattr(cfg, "ENGINE_TOKEN", "engine-token")
         mp.setattr(cfg, "ADMIN_TOKEN", "admin-token")
+        mp.setattr(cfg, "PANEL_TOKEN", "")                   # события в панель (ai_engine_events) не уходят; их проверяет test_ai_engine_events.py
         store.init()
         self.set_settings()
 

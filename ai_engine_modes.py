@@ -9,7 +9,8 @@
   • сделка тихо снимается: `owner = engine`, `epoch + 1` (идущий ход отбит по эпохе), ход отменён, отложенные касания и лестница тишины
     сняты, чат забыт (запрет для ИИ держит владелец `engine`, а не чат: у клиента в новом режиме может быть другая подходящая сделка);
   • в amo НЕ пишется ничего (ни примечания, ни задачи, ни смены этапа), клиенту ничего не уходит, алерта нет;
-  • в журнал движка (лог и таблица `mode_release` ниже) идёт «снята при смене режима»;
+  • в журнал движка (лог и таблица `mode_release` ниже) идёт «снята при смене режима»; то же событие уходит в панель, в журнал ИИ
+    на её экране (`release_event` собирает тело, `ai_engine_events` отправляет фоном, потеря допустима: правда в `mode_release`);
   • дальше обычный порядок без ИИ: сценарии движка, сторож розничных лидов, SLA-таймер. Обратно ИИ сделку сам не берёт (владелец
     `engine` значит «вернули сценарию»): вернуть её может только человек («Дать сделку ИИ» или возврат диалога), и тогда режим сделки
     станет активным.
@@ -25,6 +26,7 @@
 
 Таблица `mode_release` создаётся при первом обращении (`IF NOT EXISTS`), в той же sqlite, что у `ai_engine_store`.
 """
+import datetime
 from typing import Any
 
 import ai_engine_config as cfg
@@ -32,6 +34,7 @@ import ai_engine_store as store
 
 RELEASED_NOTE = "снята при смене режима"
 KEEP_S = 90 * 86400
+EVENT_NOTE_MAX = 255                  # длина `note` в событии для панели
 
 _SCHEMA = ("CREATE TABLE IF NOT EXISTS mode_release (id INTEGER PRIMARY KEY AUTOINCREMENT, deal_id INTEGER NOT NULL, at REAL NOT NULL, "
            "from_mode TEXT, to_mode TEXT, epoch INTEGER, note TEXT NOT NULL)")
@@ -73,6 +76,21 @@ def log_release(deal_id: int, from_mode: str | None, to_mode: str, epoch: int | 
         conn.execute("INSERT INTO mode_release (deal_id, at, from_mode, to_mode, epoch, note) VALUES (?,?,?,?,?,?)",
                      (int(deal_id), float(now), from_mode, to_mode, epoch, RELEASED_NOTE))
         conn.execute("DELETE FROM mode_release WHERE at<?", (float(now) - KEEP_S,))
+
+
+def release_event(deal_id: int, from_mode: str | None, to_mode: str, epoch: int | None, now: float) -> dict[str, Any]:
+    """Тело события для панели (`POST /api/ingest/ai/engine-event`), форма договорена с панелью. `at` строится из того же `now`, что
+    пишется в `mode_release.at`: по нему вместе с `deal_id` панель отсекает повторы. Личных данных клиента в теле нет, только сделка."""
+    at = datetime.datetime.fromtimestamp(float(now), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "kind": "mode_release",
+        "deal_id": int(deal_id),
+        "from_mode": from_mode if isinstance(from_mode, str) else None,
+        "to_mode": str(to_mode),
+        "epoch": None if epoch is None else int(epoch),
+        "at": at,
+        "note": RELEASED_NOTE[:EVENT_NOTE_MAX],
+    }
 
 
 def releases(limit: int = 50) -> list[dict[str, Any]]:
