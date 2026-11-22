@@ -365,7 +365,7 @@ async def _process(eng, row: dict[str, Any], now: float, cfg: dict[str, Any]) ->
             logger.warning("ai_engine: сделка %s получила владельца (%s) во время перехвата, не беру", deal_id, owner["owner"])
             await eng._db(forget_wait, chat_key)
             return
-        mode = settings.effective_mode()
+        mode = settings.active_mode_id()        # режим сделки (`ai_engine_modes`): в нём она и остаётся у ИИ
         chat = {"chat_id": chat_id, "chat_type": row["chat_type"], "channel_id": row["channel_id"], "chat_key": chat_key}
         owner = await eng._db(
             store.set_owner, deal_id, store.OWNER_AI, reason="intercept" if kind == KIND_TAKE else "intercept_reply", chat=chat,

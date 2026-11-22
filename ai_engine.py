@@ -25,6 +25,9 @@
 
 ⚠️ Правило B (послепродажный разговор), `returning` и `client_memory` из первой версии вынесены:
 в ходе они всегда `null`.
+
+⚠️ Режим у сделки (`ai_engine_modes`): ИИ ведёт сделку, только если взял её в активном `mode_id` панели. Сменился режим, и сделки
+чужого режима снимаются тихо (`_release_for_mode`); проверка стоит в каждой точке, где ИИ что-то делает со сделкой.
 """
 import asyncio
 import datetime
@@ -42,6 +45,7 @@ import ai_engine_dedup as dedup
 import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_intercept as intercept
+import ai_engine_modes as modes
 import ai_engine_silence as silence
 import ai_engine_ur as ur_wave
 import ai_engine_return
@@ -99,6 +103,7 @@ RULE_C_READS_PER_MIN = 30
 _last_housekeeping = 0.0
 _last_expire = 0.0
 _last_off_sweep = 0.0
+_last_mode_id: str | None = None        # активный режим на прошлом проходе: смена запускает снятие чужих сделок сразу, не через 10 с
 
 
 def _now() -> float:
@@ -409,6 +414,14 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
             if s["skip_until"] and s["skip_until"] > now:
                 return
             s = None
+    if s is not None and s["deal_id"] is not None:
+        # Режим сменился, а сделка взята в другом: её ИИ больше не ведёт (`ai_engine_modes`). Чат забыт, а это сообщение разбираем как
+        # первое в чате: в активном режиме у клиента может быть другая подходящая сделка.
+        owner = await _db(store.get_owner, int(s["deal_id"]))
+        active = settings.active_mode_id()
+        if modes.is_stale(owner, active):
+            await _release_for_mode(owner, active, chat_key=chat_key)
+            s = None
     if s is None:
         if not settings.phone_may_match(phone, chat_id):
             return
@@ -494,8 +507,13 @@ async def _tick_loop() -> None:
 async def tick_once() -> None:
     """Один проход таймеров: чаты, у которых пришёл срок; раз в 10 с проверка «режим выключили»; раз в 30 с
     ходы без итога; раз в час уборка. Вынесено из цикла, чтобы тесты гоняли ровно тот же код."""
-    global _last_housekeeping, _last_expire, _last_off_sweep
+    global _last_housekeeping, _last_expire, _last_off_sweep, _last_mode_id
     now = _now()
+    mode_id = settings.active_mode_id()
+    if mode_id != _last_mode_id:
+        _last_mode_id = mode_id
+        async with _get_lock():
+            await _sweep_mode_mismatch()
     for s in await _db(store.due_sessions, now):
         try:
             await _process_collecting(s)
@@ -512,6 +530,7 @@ async def tick_once() -> None:
         _last_off_sweep = now
         async with _get_lock():
             await _sweep_if_off()
+            await _sweep_mode_mismatch()
     if now - _last_expire >= 30:
         _last_expire = now
         async with _get_lock():
@@ -527,11 +546,19 @@ async def _process_collecting(s: dict) -> None:
     под замком и по свежей строке чата: если пока мы ходили в amo, чат сменил состояние, это решение устарело."""
     chat_key = s["chat_key"]
     mode = settings.effective_mode()
+    mode_id = settings.active_mode_id()
     if mode == "off":
         async with _get_lock():
             await _db(store.drop_session, chat_key)
         return
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
+    if modes.is_stale(owner, mode_id):
+        # Сделку ведёт ИИ, взявший её в другом режиме: снимаем и в amo за решением не ходим.
+        async with _get_lock():
+            fresh_owner = await _db(store.get_owner, int(s["deal_id"]))
+            if modes.is_stale(fresh_owner, settings.active_mode_id()):
+                await _release_for_mode(fresh_owner, settings.active_mode_id(), chat_key=chat_key)
+        return
     known = int(s["deal_id"]) if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] else None
     forced = known if known is not None and (await _db(give.is_forced, known) or await _db(intercept.is_taken, known)) else None
     taken = frozenset({known}) if known is not None and await _db(intercept.is_taken, known) else frozenset()   # перехваченная: любая воронка
@@ -540,12 +567,17 @@ async def _process_collecting(s: dict) -> None:
         fresh = await _db(store.get_session, chat_key)
         if fresh is None or fresh["state"] != store.S_COLLECTING or (fresh["next_at"] or 0) > _now():
             return
-        await _apply_resolution(fresh, res, mode)
+        await _apply_resolution(fresh, res, mode, mode_id)
 
 
-async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
+async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: str | None = None) -> None:
     chat_key = s["chat_key"]
     now = _now()
+    mode_id = mode_id or settings.active_mode_id()
+    if settings.effective_mode() != mode or settings.active_mode_id() != mode_id:
+        # Режим сменили, пока шёл поиск в amo: выбор сделки сделан по воронкам прежнего режима, применять его нельзя. Решаем заново.
+        await _db(store.put_session, chat_key, next_at=now)
+        return
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
     if owner is not None and owner["owner"] == store.OWNER_HUMAN:
         await _db(store.put_session, chat_key, state=store.S_HUMAN, next_at=None)
@@ -581,6 +613,9 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
     chat = _chat_dict(s)
     if owner is None:
         owner = await _db(store.get_owner, deal_id)
+    if modes.is_stale(owner, mode_id):
+        await _release_for_mode(owner, mode_id, chat_key=chat_key)         # эту сделку ИИ взял в другом режиме
+        return
     if owner is not None and owner["owner"] == store.OWNER_HUMAN:
         await _db(store.put_session, chat_key, state=store.S_HUMAN, deal_id=deal_id, next_at=None)
         await _db(store.discard_pending, chat_key)
@@ -602,7 +637,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
                        if r["msg_type"] != "text" and r["msg_type"] not in ATTACHMENT_TYPES]
         owner = await _db(
             store.set_owner, deal_id, store.OWNER_HUMAN, reason="media", chat=chat,
-            pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode,
+            pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
         )
         await _db(store.put_session, chat_key, state=store.S_HUMAN, deal_id=deal_id, next_at=None, has_media=0)
         await _db(store.discard_pending, chat_key)
@@ -630,7 +665,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str) -> None:
     first_entry = owner is None      # ИИ входит в сделку впервые (а не после возврата диалога)
     owner = await _db(
         store.set_owner, deal_id, store.OWNER_AI, reason="client_message", chat=chat,
-        pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode,
+        pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
     )
     if first_entry:
         _spawn(ai_engine_tasks.release_intake(deal_id))     # системные «Связаться»/«Новый заказ с сайта»: теперь клиентом занят ИИ
@@ -690,8 +725,10 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     window = settings.send_window()
     cancelled_rows = await _db(followup.cancelled_notes, deal_id)
     intercepted = bool(await _db(intercept.is_taken, deal_id))   # перехвачена у менеджера: только консультация, воронка любая
-    manager_cutoff = (await _db(intercept.cutoff_iso, deal_id)) or await _db(give.cutoff_iso, deal_id)   # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
-    given_forced = bool(await _db(give.is_forced, deal_id)) or intercepted      # отдали вопреки параллельной сделке: ИИ её не учитывает
+    mode_id = settings.active_mode_id()
+    manager_cutoff = (await _db(intercept.cutoff_iso, deal_id)) or await _db(give.cutoff_iso, deal_id, mode_id)   # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
+    given_forced = bool(await _db(give.is_forced, deal_id, mode_id)) or intercepted      # отдали вопреки параллельной сделке: ИИ её не учитывает
+    mode_settings = settings.mode_settings()                                         # только при настройках версии 2 (`mode_id`, `review`)
 
     def build(turn_id: int) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -714,6 +751,8 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
             body["given_forced"] = True
         if intercepted:
             body["intercepted"] = True
+        if mode_settings is not None:
+            body["mode_settings"] = mode_settings
         return body
 
     turn = await _db(
@@ -728,7 +767,12 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
 
 
 async def _queue_event(owner: dict, event_type: str, extra: dict | None = None) -> None:
-    """Поставить служебное событие: оно идёт отдельным ходом, как только предыдущий закончился."""
+    """Поставить служебное событие: оно идёт отдельным ходом, как только предыдущий закончился.
+    Сделке, взятой в другом режиме, событий не ставим (её снимет `_release_for_mode`): это общая точка оплаты, возврата диалога,
+    касаний, лестницы тишины, окон УР и перехвата."""
+    if modes.is_stale(owner, settings.active_mode_id()):
+        logger.warning("ai_engine: событие %s по сделке %s не поставлено: сделка взята в другом режиме", event_type, owner.get("deal_id"))
+        return
     s = await _db(store.session_for_deal, int(owner["deal_id"]))
     if s is None:
         # Рестарт или чистка унесли строку чата - собираем её из владельца сделки.
@@ -819,6 +863,9 @@ async def _fire_followup(f: dict) -> None:
     if current is None or int(current["id"]) != int(f["id"]):
         return                                          # отменено или заменено, пока шли к замку
     owner = await _db(store.get_owner, deal_id)
+    if modes.is_stale(owner, settings.active_mode_id()):
+        await _release_for_mode(owner, settings.active_mode_id())       # тихо: касание снимается без примечания и алерта
+        return
     why = None
     if owner is None or owner["closed"]:
         why = "deal_closed"
@@ -884,7 +931,21 @@ async def _send_turn(turn: dict) -> None:
         # Владелец сменился, пока ход ждал: запоздавший ход не отправляем (его всё равно отбил бы permit).
         await _db(store.update_turn, turn["turn_id"], state=store.T_CANCELLED, finished_at=_now(), outcome="stale")
         return
-    result = await client.post_turn(json.loads(turn["payload"]))
+    if modes.is_stale(owner, settings.active_mode_id()):
+        # Режим сменился, пока ход ждал отправки: сделка чужого режима ИИ не достаётся, ход не уходит, сделку снимаем.
+        async with _get_lock():
+            fresh = await _db(store.get_owner, deal_id)
+            if modes.is_stale(fresh, settings.active_mode_id()):
+                await _release_for_mode(fresh, settings.active_mode_id())
+        return
+    payload = json.loads(turn["payload"])
+    # Настройки режима берём на момент отправки, а не создания хода: ход мог лежать в очереди, пока включали «пилот».
+    ms = settings.mode_settings()
+    if ms is not None:
+        payload["mode_settings"] = ms
+    else:
+        payload.pop("mode_settings", None)
+    result = await client.post_turn(payload)
     if result.kind == client.SENT:
         await _db(store.update_turn, turn["turn_id"], state=store.T_ACCEPTED, accepted_at=_now())
         return
@@ -1003,6 +1064,55 @@ async def _sweep_if_off() -> None:
         ], dedupe="mode_off")
 
 
+async def _sweep_mode_mismatch() -> None:
+    """Активный режим сменился (Тест -> Полный и наоборот): сделки, которые ИИ взял в другом режиме, снимаются (`ai_engine_modes`).
+    Раз в 10 с под замком, вместе с `_sweep_if_off`; те же проверки стоят и в каждой точке решения, этот проход лишь не оставляет
+    сделки, до которых событий пока не дошло. Режим `off` сюда не относится: им занят `_sweep_if_off`, а протухшие настройки
+    ничего снимать не должны."""
+    if not cfg.ENABLED:
+        return
+    active = settings.active_mode_id()
+    if active == "off":
+        return
+    for row in await _db(store.list_owned, store.OWNER_AI):
+        if not modes.is_stale(row, active):
+            continue
+        try:
+            await _release_for_mode(row, active)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - одна сделка не должна оставить остальные при чужом режиме
+            logger.exception("ai_engine: не снял сделку %s при смене режима", row.get("deal_id"))
+
+
+async def _release_for_mode(owner: dict, active: str, *, chat_key: str | None = None) -> None:
+    """Сделка взята в другом режиме, чем активный `active`: тихо снять ИИ. Зовётся под общим замком.
+
+    Правило в шапке `ai_engine_modes`: владелец возвращается движку (`epoch + 1`, идущий ход отбит по эпохе и отменён у сервиса),
+    чат забыт, лестница тишины и отложенные касания сняты. В amo не пишется ничего, клиенту ничего не уходит, алерта нет: касания
+    гасятся без примечания (`_followup_cancel` оставил бы его в сделке), а в журнал движка идёт «снята при смене режима»."""
+    deal_id = int(owner["deal_id"])
+    from_mode = modes.mode_of(owner)
+    try:
+        await _db(followup.cancel_for_deal, deal_id, "mode_changed", _now(), False)
+    except Exception:  # noqa: BLE001 - касание не должно помешать снятию
+        logger.exception("ai_engine: не отменил отложенное касание сделки %s при смене режима", deal_id)
+    await _db(silence.clear, deal_id)
+    row = await _db(store.set_owner, deal_id, store.OWNER_ENGINE, reason="mode_changed")
+    for t in await _db(store.cancel_active_turns, deal_id):
+        _spawn(client.post_cancel(int(t["turn_id"])))
+    keys = {chat_key} if chat_key else set()
+    s = await _db(store.session_for_deal, deal_id)
+    if s is not None:
+        keys.add(s["chat_key"])
+    for key in keys:
+        # Чат забывается целиком, а не помечается `released`: запрет для ИИ идёт по сделке (владелец `engine`), а у клиента в активном
+        # режиме может быть другая подходящая сделка, и чат `released` не пустил бы ИИ в неё до уборки через 30 дней.
+        await _db(store.drop_session, key)
+    await _db(modes.log_release, deal_id, from_mode, active, int(row["epoch"]), _now())
+    logger.info("ai_engine: сделка %s %s (%s -> %s), эпоха %s", deal_id, modes.RELEASED_NOTE, from_mode, active, row["epoch"])
+
+
 async def _expire_turns() -> None:
     now = _now()
     for t in await _db(store.turns_in_state, store.T_ACCEPTED):
@@ -1031,6 +1141,8 @@ def decide_permit(deal_id: int, epoch: int, turn_id: int, up_to_message_id: str)
         return 409, {"allowed": False, "reason": "stale_epoch"}
     if owner["owner"] != store.OWNER_AI:
         return 200, {"allowed": False, "reason": "owner_changed"}
+    if modes.is_stale(owner, settings.active_mode_id()):
+        return 200, {"allowed": False, "reason": "owner_changed"}      # сделка взята в другом режиме: сервису это то же, что смена владельца
     if intercept.manager_replied_after(deal_id):          # перехват: после заметки «ИИ взял сделку» менеджер написал клиенту
         return 200, {"allowed": False, "reason": "owner_changed"}
     turn = store.get_turn(turn_id)
@@ -1244,7 +1356,7 @@ async def _handoff_by_rule(s: dict, res: dedup.Resolution, owner: dict | None) -
     if deal_id is not None:
         await _db(store.set_owner, deal_id, store.OWNER_HUMAN, reason=f"rule_{res.rule}", chat=_chat_dict(s),
                   pipeline_id=int(res.deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(res.deal),
-                  mode=settings.effective_mode())
+                  mode=settings.active_mode_id())
     await _db(store.put_session, s["chat_key"], state=store.S_HUMAN, next_at=None, deal_id=deal_id,
               skip_until=None if deal_id is not None else _now() + cfg.HUMAN_CHAT_TTL_S)
     await _db(store.discard_pending, s["chat_key"])
@@ -1295,6 +1407,9 @@ async def _lead_event_under_lock(ev: dict) -> bool:
     if owner is not None and not owner["closed"] and ev["status_id"] in cfg.CLOSED_STATUS_IDS:
         await _deal_closed(lead_id, "deal_closed")
         return True
+    if modes.is_stale(owner, settings.active_mode_id()):
+        await _release_for_mode(owner, settings.active_mode_id())
+        return True
     if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]:
         if (ev["pipeline_id"] is not None and ev["pipeline_id"] not in settings.allowed_pipelines()
                 and not await _db(intercept.is_taken, lead_id)):
@@ -1338,9 +1453,10 @@ async def _rule_c_check(lead_id: int) -> None:
         return
     theirs = set(dedup.contact_ids_of(lead))
     async with _get_lock():
+        active = settings.active_mode_id()
         for row in await _db(store.list_owned, store.OWNER_AI):
             mine = {int(c) for c in json.loads(row["contact_ids"] or "[]")}
-            if not (mine & theirs) or int(row["deal_id"]) == lead_id:
+            if not (mine & theirs) or int(row["deal_id"]) == lead_id or modes.is_stale(row, active):
                 continue
             s = await _db(store.session_for_deal, int(row["deal_id"]))
             res = dedup.Resolution(dedup.K_HUMAN, rule="C", others=[lead])
@@ -1357,14 +1473,18 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
         mode = settings.effective_mode()
         if mode == "off":
             return 409, {"detail": "mode_off"}
+        mode_id = settings.active_mode_id()
         owner = await _db(store.get_owner, deal_id)
+        if modes.is_stale(owner, mode_id):
+            await _release_for_mode(owner, mode_id)                  # ИИ ведёт сделку из другого режима: она уже не его, человек возвращает её заново
+            owner = await _db(store.get_owner, deal_id)
         if owner is None or owner["closed"] or owner["owner"] == store.OWNER_AI:
             return 409, {"detail": "not_returnable"}
         if owner["pipeline_id"] not in settings.allowed_pipelines() and not await _db(intercept.is_taken, deal_id):
             return 409, {"detail": "pipeline_not_allowed"}
         if not await _ai_is_up():
             return 503, {"detail": "ai_unavailable"}
-        owner = await _db(store.set_owner, deal_id, store.OWNER_AI, reason="dialog_returned", mode=mode)
+        owner = await _db(store.set_owner, deal_id, store.OWNER_AI, reason="dialog_returned", mode=mode_id)
         await _queue_event(owner, "dialog_returned")
         _spawn(ai_engine_tasks.release(deal_id))      # ИИ снова ведёт диалог: задачи «Связаться» по передаче закрываем
         return 200, {"ok": True, "epoch": owner["epoch"]}
@@ -1380,6 +1500,7 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
     mode = settings.effective_mode()
     if mode == "off":
         return 409, {"detail": "mode_off"}
+    mode_id = settings.active_mode_id()
     chat_id, channel_id = str(chat_id or "").strip(), str(channel_id or "").strip()
     if not chat_id or not channel_id:
         return 422, {"detail": "chat_required"}
@@ -1398,6 +1519,10 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
         return 409, {"detail": "other_deal_chosen", "deal_id": int(deal["id"]) if deal else None}
     async with _get_lock():
         owner = await _db(store.get_owner, deal_id)
+        if modes.is_stale(owner, mode_id):
+            # Сделку ИИ взял в другом режиме: она уже не его. Человек отдаёт её заново, это новое ведение в активном режиме.
+            await _release_for_mode(owner, mode_id)
+            owner = await _db(store.get_owner, deal_id)
         if owner is not None and owner["closed"]:
             return 409, {"detail": "deal_closed"}
         if owner is not None and owner["owner"] == store.OWNER_AI:
@@ -1418,16 +1543,16 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
         chat = {"chat_id": chat_id, "chat_type": chat_type, "channel_id": channel_id, "chat_key": chat_key}
         owner = await _db(
             store.set_owner, deal_id, store.OWNER_AI, reason="deal_given", chat=chat,
-            pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode,
+            pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
         )
-        await _db(give.mark, deal_id, _now(), force)
+        await _db(give.mark, deal_id, _now(), force, mode_id)
         await _db(store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id, chat_type=chat_type, phone=phone,
                   contact_name=contact_name, state=store.S_AI, deal_id=deal_id, first_batch=0, last_message_id="",
                   next_at=None, has_media=0)
         await _queue_event(owner, "deal_given")
     _spawn(ai_engine_tasks.release_intake(deal_id))       # системные «Связаться»/«Новый заказ с сайта»: клиентом теперь занят ИИ
     _spawn(_followup_note(deal_id, "сделка передана ИИ-менеджеру, дальше переписку ведёт он"))
-    logger.info("ai_engine: сделка %s передана ИИ (эпоха %s, режим %s)", deal_id, owner["epoch"], mode)
+    logger.info("ai_engine: сделка %s передана ИИ (эпоха %s, режим %s)", deal_id, owner["epoch"], mode_id)
     return 200, {"ok": True, "epoch": owner["epoch"], "deal_id": int(deal_id)}
 
 
@@ -1464,6 +1589,9 @@ async def _silence_step(row: dict) -> None:
     now = _now()
     deal_id = int(row["deal_id"])
     owner = await _db(store.get_owner, deal_id)
+    if modes.is_stale(owner, settings.active_mode_id()):
+        await _release_for_mode(owner, settings.active_mode_id())
+        return
     if owner is None or owner["closed"] or owner["owner"] != store.OWNER_AI or settings.effective_mode() == "off":
         await _db(silence.clear, deal_id)
         return
@@ -1503,8 +1631,12 @@ async def _ur_tick() -> None:
     if now < t1 or settings.effective_mode() == "off":
         return
     async with _get_lock():
+        active = settings.active_mode_id()
         for owner in await _db(store.list_owned, store.OWNER_AI):
             deal_id = int(owner["deal_id"])
+            if modes.is_stale(owner, active):
+                await _release_for_mode(owner, active)      # сделка из другого режима окон УР не получает: её снимаем
+                continue
             if await _db(intercept.is_taken, deal_id):
                 continue                                    # перехваченная сделка: окна УР не её дело
             try:
@@ -1649,7 +1781,8 @@ def status() -> dict[str, Any]:
     if not cfg.ENABLED:
         return out
     out.update(
-        mode=settings.effective_mode(), settings_age_s=settings.age_s(),
+        mode=settings.effective_mode(), mode_id=settings.active_mode_id(), settings_version=settings.settings_version(),
+        settings_age_s=settings.age_s(),
         ai_up=_ai_ok_at is not None and (_now() - _ai_ok_at) <= max(3 * cfg.HEALTH_POLL_S, 45),
         loops_alive=sum(1 for t in _tasks if not t.done()),
     )

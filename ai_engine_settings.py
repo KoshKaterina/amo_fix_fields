@@ -6,18 +6,23 @@
 последним правилам» без срока, а у ИИ срок есть (`AI_SETTINGS_STALE_S`). ИИ пишет живым людям, и вчерашний
 `prod`, которого никто уже не может выключить, не должен жить вечно.
 
-⚠️ Три случая, в которых `effective_mode()` возвращает `off`, хотя в панели написано иное:
+⚠️ Четыре случая, в которых `effective_mode()` возвращает `off`, хотя в панели написано иное:
   • флаг `AI_ENGINE_ENABLED` на сервере не стоит;
   • настроек нет вовсе (первый запуск без панели) или они старше `AI_SETTINGS_STALE_S`;
   • воронки в документе не совпали с зашитыми в движке для этого режима. Панель и движок держат одни и те
     же числа в двух местах, и расхождение означает опечатку в одном из них: лучше выключиться, чем увести
-    ИИ в чужую воронку.
+    ИИ в чужую воронку;
+  • (версия 2) `mode_id` противоречит `mode`: например `mode: prod` и `mode_id: test`.
 
 ⚠️ Пустой список контактов при `restricted` означает «никого», а не «всех».
+
+⚠️ Документ бывает версий 1 и 2 (`settings_version`). Версия 2 только дополняет первую (`mode_id`, `review`, справочный `deals`),
+старые ключи значат то же, поэтому движок можно выкатывать в любом порядке с панелью. Нет `settings_version` или он 1: читаем как раньше.
 """
 import asyncio
 import datetime
 import logging
+import re
 import time
 from typing import Any
 
@@ -92,6 +97,14 @@ def effective_mode() -> str:
     mode = str(_doc.get("mode") or "off")
     if mode not in cfg.MODE_PIPELINES:
         return "off"
+    raw_id = _doc.get("mode_id") if is_v2() else None
+    if raw_id == "off" or (raw_id in cfg.MODE_IDS and cfg.MODE_ID_TO_LEGACY[raw_id] != mode):
+        # Панель дала два ответа на вопрос «какой режим» (скажем, `mode: prod` и `mode_id: test`): верить ни одному нельзя.
+        sig = f"{mode}/{raw_id}"
+        if _mismatch_logged != sig:
+            _mismatch_logged = sig
+            logger.error("ai_engine: mode=%s не согласуется с mode_id=%s - считаю off", mode, raw_id)
+        return "off"
     try:
         got = {int(p) for p in (_doc.get("pipelines") or [])}
     except (TypeError, ValueError):
@@ -113,8 +126,84 @@ def allowed_pipelines() -> frozenset[int]:
     return cfg.MODE_PIPELINES.get(mode, frozenset())
 
 
+# ---------------------------------------------------------------------------------------------
+# документ версии 2: активный режим, пилот, справочник сделок (этап 1 плана «режимы ИИ-менеджера»)
+# ---------------------------------------------------------------------------------------------
+# Версия 2 только ДОПОЛНЯЕТ документ: все прежние ключи (`mode`, `pipelines`, `contacts`, `timers`, ...) значат то же самое, и решение
+# «разрешён ли контакт» по-прежнему принимается по `contacts`. Документ без `settings_version` (или с 1) читается ровно как раньше.
+
+def settings_version() -> int:
+    """Версия документа панели. Нет ключа или мусор: 1, то есть «читай как раньше»."""
+    raw = (_doc or {}).get("settings_version")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1 else 1
+
+
+def is_v2() -> bool:
+    """Версии выше второй читаются как вторая: схема только дополняется, известные блоки не меняют смысл."""
+    return settings_version() >= 2
+
+
+def active_mode_id() -> str:
+    """`off` | `test` | `full` | `help` | `intercept`. Нет `mode_id` (документ версии 1 или версия 2 без ключа) или в нём мусор:
+    выводится из старого `mode` (`test` -> `test`, `prod` -> `full`). Несогласованные `mode` и `mode_id` отсеял `effective_mode`."""
+    mode = effective_mode()
+    if mode == "off":
+        return "off"
+    if is_v2():
+        raw = (_doc or {}).get("mode_id")
+        if isinstance(raw, str) and raw in cfg.MODE_IDS:
+            return raw
+    return cfg.LEGACY_TO_MODE_ID[mode]
+
+
+def review_enabled() -> bool:
+    """Включена ли проверка человеком (`review.enabled`). Нет блока, мусор или документ версии 1: включена, потому что ошибка в эту
+    сторону лишь замедляет ответ, а в другую отправляет клиенту текст без проверки."""
+    block = (_doc or {}).get("review") if is_v2() else None
+    if isinstance(block, dict) and isinstance(block.get("enabled"), bool):
+        return block["enabled"]
+    return True
+
+
+def deal_items() -> list[dict[str, int]]:
+    """Справочный список разрешённых сделок (`deals.items`). Для решений НЕ используется: контакт разрешён или нет, движок смотрит по
+    `contacts`. Нужен срезу состояния и проверкам; мусорные записи пропускаются, нет блока: пусто."""
+    block = (_doc or {}).get("deals") if is_v2() else None
+    raw = block.get("items") if isinstance(block, dict) else None
+    out: list[dict[str, int]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        deal, contact = _pos_int(item.get("deal_id")), _pos_int(item.get("contact_id"))
+        if deal is not None:
+            out.append({"deal_id": deal, "contact_id": contact or 0})
+    return out
+
+
+def _pos_int(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        number = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value)
+    else:
+        return None
+    return number if number > 0 else None
+
+
+def mode_settings() -> dict[str, Any] | None:
+    """Блок `mode_settings` хода (`POST /v1/turn`, необязательное поле): `{"mode_id": ..., "review": {"enabled": ...}}`. Нет настроек
+    версии 2 или режим выключен: None, и поле в ход не кладётся. Форма и имя поля договорены с ИИ-сервисом, не менять."""
+    if not is_v2():
+        return None
+    mode_id = active_mode_id()
+    if mode_id == "off":
+        return None
+    return {"mode_id": mode_id, "review": {"enabled": review_enabled()}}
+
+
 def timers() -> dict[str, int]:
-    raw = (_doc or {}).get("timers") or {}
+    raw = (_doc or {}).get("timers")
+    raw = raw if isinstance(raw, dict) else {}
     out = dict(DEFAULT_TIMERS)
     for key in out:
         try:
@@ -186,7 +275,8 @@ def contact_items() -> list[dict[str, Any]]:
     contacts = (_doc or {}).get("contacts")
     if not isinstance(contacts, dict):
         return []
-    return [i for i in (contacts.get("items") or []) if isinstance(i, dict)]
+    items = contacts.get("items")
+    return [i for i in (items if isinstance(items, list) else []) if isinstance(i, dict)]
 
 
 def phone_key(raw: Any) -> str:
@@ -244,8 +334,15 @@ def contact_allowed(contact_ids: list[int], phones: list[Any]) -> bool:
 # рабочие часы
 # ---------------------------------------------------------------------------------------------
 
+def _hhmm(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"\d{1,2}:\d{2}", value) is not None
+
+
 def work_hours() -> list[dict[str, str]]:
-    return [h for h in ((_doc or {}).get("work_hours") or []) if isinstance(h, dict) and h.get("start") and h.get("end")]
+    """Интервалы окна отправки. Не список, интервал не словарь или время не вида `ЧЧ:ММ`: такой интервал пропускается, а пустой
+    результат значит «не отправляет никогда» (см. `send_window`), то есть мусор закрывает окно, а не роняет проход."""
+    raw = (_doc or {}).get("work_hours")
+    return [h for h in (raw if isinstance(raw, list) else []) if isinstance(h, dict) and _hhmm(h.get("start")) and _hhmm(h.get("end"))]
 
 
 def send_window(now: datetime.datetime | None = None) -> dict[str, Any]:

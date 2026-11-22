@@ -32,6 +32,7 @@ REASON_TEXT = {
     "deal_closed": "сделка закрыта",
     "owner_changed": "сменился владелец диалога",
     "released": "ИИ вернул сделку движку",
+    "mode_changed": "сменился режим ИИ",
     "mode_off": "режим ИИ выключен",
     "pipeline_not_allowed": "сделка вне воронок режима",
     "contact_not_allowed": "контакт вне списка режима",

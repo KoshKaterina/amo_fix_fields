@@ -227,5 +227,5 @@ async def state(deal_id: int, x_admin_token: str = Header(default="")):
     if owner is None:
         return _deny(404, "unknown_deal")
     turn = store.active_turn_for_deal(deal_id)
-    return {"owner": {k: owner[k] for k in ("deal_id", "owner", "epoch", "since", "reason", "closed", "pipeline_id")},
+    return {"owner": {k: owner[k] for k in ("deal_id", "owner", "epoch", "since", "reason", "closed", "pipeline_id", "mode")},
             "active_turn": None if turn is None else {k: turn[k] for k in ("turn_id", "state", "reason", "epoch")}}

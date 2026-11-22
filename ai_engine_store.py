@@ -7,7 +7,8 @@
 
 Таблицы:
 
-  deal_owner    владелец сделки: `engine` | `ai` | `human`, `epoch` растёт на 1 при каждой смене
+  deal_owner    владелец сделки: `engine` | `ai` | `human`, `epoch` растёт на 1 при каждой смене; `mode` - режим
+                (`test`/`full`/`help`/`intercept`), в котором ИИ взял сделку (см. `ai_engine_modes`)
   chat_session  один чат = одна строка: чего ждём (пачку сообщений, ход, ничего) и когда
   inbox         сообщения клиентов, накопленные для хода; `seq` монотонен, по нему permit решает,
                 писал ли клиент что-то после хода
@@ -174,6 +175,21 @@ def init() -> None:
             seeded = conn.execute("SELECT COUNT(*) FROM sqlite_sequence WHERE name='turn'").fetchone()[0]
             if not seeded:
                 conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('turn', ?)", (int(_now()),))
+        _migrate_deal_modes(conn)
+
+
+def _migrate_deal_modes(conn) -> None:
+    """Режим у сделки (этап 1 «режимов ИИ-менеджера»). Идемпотентно и безопасно на живой базе: колонка добавляется только если её нет,
+    а значение получают только строки без понятного режима (NULL, либо прежнее `prod`: до режимов в колонку писали `test`/`prod`,
+    никто её не читал). Воронка «Тест» значит `test`, любая другая `full`. Строки с уже верным режимом не трогаются: повторный
+    запуск (рестарт, откат и повторный выкат) ничего не меняет."""
+    if "mode" not in {row[1] for row in conn.execute("PRAGMA table_info(deal_owner)")}:
+        conn.execute("ALTER TABLE deal_owner ADD COLUMN mode TEXT")
+    marks = ",".join("?" * len(cfg.MODE_IDS))
+    conn.execute(
+        f"UPDATE deal_owner SET mode = CASE WHEN pipeline_id = ? THEN 'test' ELSE 'full' END WHERE mode IS NULL OR mode NOT IN ({marks})",
+        (cfg.PIPELINE_TEST, *cfg.MODE_IDS),
+    )
 
 
 def _dict(row) -> dict | None:
@@ -257,7 +273,11 @@ def set_owner(
     closed: bool | None = None,
 ) -> dict:
     """Сменить владельца. Эпоха растёт на 1 при КАЖДОМ вызове с новым владельцем; записи для
-    сделки ещё нет, она рождается с эпохой 1 (переход из «engine, 0»)."""
+    сделки ещё нет, она рождается с эпохой 1 (переход из «engine, 0»).
+
+    `mode` (режим, в котором ИИ взял сделку) пишется, когда строка рождается, владелец меняется (началось новое ведение) или режима
+    в строке нет. Повторный вызов с тем же владельцем режим НЕ перезаписывает: иначе клиентское сообщение в сделке, взятой в Тесте,
+    молча переклеило бы её в «Полный», и проверка «ИИ ведёт только сделки активного режима» стала бы пустой."""
     chat = chat or {}
     now_iso = _iso(_now())
     with _connect() as conn:
@@ -273,6 +293,8 @@ def set_owner(
         else:
             changed = cur["owner"] != owner
             epoch = cur["epoch"] + (1 if changed else 0)
+            if not changed and cur["mode"]:
+                mode = None
             conn.execute(
                 "UPDATE deal_owner SET owner=?, epoch=?, since=?, reason=?, "
                 "chat_id=COALESCE(?, chat_id), chat_type=COALESCE(?, chat_type), "
@@ -551,6 +573,8 @@ def counts() -> dict:
         out = {"owners": {}, "turns": {}, "sessions": {}}
         for r in conn.execute("SELECT owner, COUNT(*) FROM deal_owner WHERE closed=0 GROUP BY owner"):
             out["owners"][r[0]] = r[1]
+        out["ai_by_mode"] = {(r[0] or "?"): r[1] for r in conn.execute(
+            "SELECT mode, COUNT(*) FROM deal_owner WHERE owner=? AND closed=0 GROUP BY mode", (OWNER_AI,))}
         for r in conn.execute("SELECT state, COUNT(*) FROM turn GROUP BY state"):
             out["turns"][r[0]] = r[1]
         for r in conn.execute("SELECT state, COUNT(*) FROM chat_session GROUP BY state"):

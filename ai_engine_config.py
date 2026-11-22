@@ -73,6 +73,13 @@ MODE_PIPELINES: dict[str, frozenset[int]] = {
 }
 CLOSED_STATUS_IDS = frozenset({int(STATUS_SUCCESS), int(STATUS_CLOSED_LOST)})
 
+# Режимы работы ИИ-менеджера (план 20.11.2026, этап 1): один активный `mode_id`. Старый ключ `mode` остаётся с прежним смыслом
+# (`off`/`test`/`prod`): это то, чему воронки и движок верили до режимов. Словарь ниже сводит новый id к старому ключу: документ, в
+# котором они не согласуются, считается ошибкой панели, и ИИ выключается (как при несовпадении воронок).
+MODE_IDS = ("test", "full", "help", "intercept")
+MODE_ID_TO_LEGACY = {"test": "test", "full": "prod", "help": "prod", "intercept": "prod"}
+LEGACY_TO_MODE_ID = {"off": "off", "test": "test", "prod": "full"}
+
 # --- служебные события ----------------------------------------------------------------------
 # «Оплата получена» в «ОП розница» и в TangemShop (id этапов в amo уникальны на весь аккаунт, воронку сверять не нужно)
 PAYMENT_RECEIVED_STATUSES = frozenset({int(STATUS_PAYMENT_RECEIVED), int(STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED)})
