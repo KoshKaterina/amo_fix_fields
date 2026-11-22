@@ -59,7 +59,21 @@ def test_panel_template_gets_deal_client_and_text(env, monkeypatch):
     store.put_session(CHAT_KEY, channel_id=CHAN, chat_id="1920391385", contact_name="Тиана", deal_id=DEAL, state=store.S_AI)
     panel(monkeypatch, "ai_alert_head", template="Руководитель нужен\n{{клиент}}\n{{текст}}\n{{сделка}}\n{{теги}}", recipients_mode="nobody")
     assert call({"deal_id": DEAL, "event": "ai_alert_head", "text": TEXT})[1] == {"status": "sent"}
-    assert env.alerts[-1] == f"Руководитель нужен\nТиана\n{TEXT}\nhttps://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{DEAL}"
+    assert env.alerts[-1] == f"Руководитель нужен\nТиана\n{TEXT}\nСделка №{DEAL}"         # сделки в amo нет: название по номеру
+
+
+def test_deal_name_comes_from_amo_and_amo_failure_falls_back_to_number(env, monkeypatch):
+    env.lead()["name"] = "Тангем Кошелёк <2 карты>"
+    panel(monkeypatch, "ai_alert_head", template="{{сделка}}\n{{текст}}", recipients_mode="nobody")
+    assert call({"deal_id": DEAL, "event": "ai_alert_head", "text": TEXT})[1] == {"status": "sent"}
+    assert env.alerts[-1] == f"Тангем Кошелёк &lt;2 карты&gt;\n{TEXT}"                    # название экранировано, адреса в нём нет
+
+    async def amo_down(lead_id, with_=()):
+        raise RuntimeError("amo недоступна")
+
+    monkeypatch.setattr(E.amo_service, "get_lead_full", amo_down)
+    assert call({"deal_id": DEAL, "event": "ai_alert_head", "text": "другое"})[1] == {"status": "sent"}
+    assert env.alerts[-1] == f"Сделка №{DEAL}\nдругое"
 
 
 # Шаблоны каталога Team (team-panel, ветка feat/ai-duty-alerts, коммит cd0d853, backend/app/alerts/catalog.py) дословно.
@@ -72,6 +86,7 @@ TEAM_TEMPLATES = {
 @pytest.mark.parametrize("event", sorted(TEAM_TEMPLATES))
 def test_team_catalog_template_is_rendered_not_the_code_text(env, monkeypatch, event):
     store.put_session(CHAT_KEY, channel_id=CHAN, chat_id="1920391385", contact_name="Тиана", deal_id=DEAL, state=store.S_AI)
+    env.lead()["name"] = "Заказ Tangem"
     panel(monkeypatch, event, template=TEAM_TEMPLATES[event], recipients_mode="listed",
           recipients=[{"name": "Саша", "handle": "@rop_test", "amo_user_id": 1}])
     assert call({"deal_id": DEAL, "event": event, "text": "Клиент: оплата <b>не</b> проходит & всё"})[1] == {"status": "sent"}
@@ -81,7 +96,7 @@ def test_team_catalog_template_is_rendered_not_the_code_text(env, monkeypatch, e
         head,
         "Клиент: оплата &lt;b&gt;не&lt;/b&gt; проходит &amp; всё",            # текст ИИ экранирован, хоть переменная и «с разметкой»
         "👤 Тиана",
-        f"📝 {url}",
+        "📝 Заказ Tangem",                                                    # название сделки; адрес только в ссылке
         "@rop_test",
         f'🔗 <a href="{url}">Открыть сделку</a>',
     ])

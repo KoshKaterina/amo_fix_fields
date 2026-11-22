@@ -1577,8 +1577,8 @@ _duty_seen: dict[str, float] = {}       # «сделка:событие:текс
 async def duty_alert(deal_id: int, event: str, text: str) -> str:
     """Дежурный алерт по событию панели `event` (`DUTY_EVENTS`). Возвращает `sent`, `disabled` (выключено в панели или её канал
     у интеграции не настроен), `duplicate` (тот же текст по той же сделке за 10 минут) или `failed` (Телеграм не принял). Не бросает.
-    Переменные шаблона (каталог Team, 23.11.2026): `{{текст_события}}` (текст ИИ), `{{сделка}}` (адрес сделки), `{{ссылка_на_сделку}}`,
-    `{{клиент}}` (имя из чата ИИ, нет - пусто), `{{теги}}`; плюс `{{текст}}` с тем же текстом ИИ.
+    Переменные шаблона (каталог Team, 23.11.2026): `{{текст_события}}` (текст ИИ), `{{сделка}}` (название сделки из amo, не
+    прочиталось - «Сделка №<номер>»), `{{ссылка_на_сделку}}` (адрес только здесь), `{{клиент}}` (имя из чата ИИ, нет - пусто), `{{теги}}`; плюс `{{текст}}` с тем же текстом ИИ.
     ⚠️ `текст_события` в `alert_templates.HTML_VARIABLES`: рендер его не экранирует, поэтому экранируем здесь, иначе угловая скобка
     в словах клиента уронит сообщение в HTML-разметке."""
     now = _now()
@@ -1596,6 +1596,11 @@ async def duty_alert(deal_id: int, event: str, text: str) -> str:
         except Exception:  # noqa: BLE001
             s = None                        # имя клиента не главное: без него алерт всё равно нужен
         client_name = " ".join(str((s or {}).get("contact_name") or "").split())
+        try:
+            lead = await asyncio.wait_for(amo_service.get_lead_full(int(deal_id), with_=()), timeout=5)
+        except Exception:  # noqa: BLE001
+            lead = None                     # amo молчит: алерт важнее названия сделки
+        deal_name = " ".join(str((lead or {}).get("name") or "").split()) or f"Сделка №{int(deal_id)}"
         head = DUTY_EVENTS[event] + (" (тест)" if settings.effective_mode() == "test" else "")
         mention = mentions_for(None)
         if cfg.ALERT_EXTRA_TAG and cfg.ALERT_EXTRA_TAG not in mention.split():
@@ -1605,7 +1610,8 @@ async def duty_alert(deal_id: int, event: str, text: str) -> str:
         ) if line)
         d = alerts.decide(
             event, legacy_text=legacy, parse_mode="HTML", chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
-            values={"сделка": f"{BASE_URL}/leads/detail/{int(deal_id)}", "ссылка_на_сделку": _link(int(deal_id)),
+            lead=lead if isinstance(lead, dict) and lead.get("custom_fields_values") is not None else None,
+            values={"сделка": deal_name, "ссылка_на_сделку": _link(int(deal_id)),
                     "клиент": client_name, "текст_события": html.escape(text, quote=False), "текст": text, "теги": mention},
         )
         if d is None:
