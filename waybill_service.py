@@ -10,12 +10,14 @@ from typing import Awaitable, Callable
 import cdek_client
 import picking_pdf
 import amo_service
+import ms_client
 import waybill_pending_store
 from waybill_config import (
     FIELD_CDEK_ORDER_NUMBER,
     FIELD_COMPOSITION,
     FIELD_DELIVERY_ADDRESS,
     FIELD_EMAIL,
+    FIELD_MOYSKLAD_ORDER_UUID,
     FIELD_ORDER_TOTAL,
     FIELD_PACKAGE_NUMBER,
     FIELD_PAYMENT_METHOD,
@@ -23,6 +25,7 @@ from waybill_config import (
     FIELD_PVZ_CODE,
     FIELD_PVZ_CODE_FALLBACK,
     FIELD_SENDER_COMPANY,
+    MS_ATTR_TREK,
     PUBLIC_BASE_URL,
     SENDER,
     STATUS_CREATE_WAYBILL,
@@ -466,11 +469,55 @@ async def create_waybill_for_lead(lead_id: int | str, *, source: str = "webhook"
     return {"ok": True, "lead_id": lead_id, "reason": None, "cdek_number": cdek_value, "skipped": False}
 
 
+async def _sync_track_to_moysklad(lead_id, track: str) -> None:
+    """Зеркалируем трек в заказе МойСклада, откуда его читает синхронизация."""
+    # Дочитать связь после создания накладной: сотрудник мог поменять
+    # привязанный заказ, пока СДЭК присваивал номер.
+    lead = await amo_service.get_lead_full(lead_id, with_=())
+    if not lead:
+        logger.warning("Lead %s: could not read the linked order for CDEK tracking", lead_id)
+        return
+    current = str(amo_service.get_custom_field_value(lead, FIELD_CDEK_ORDER_NUMBER) or "").strip()
+    if current and current != track:
+        logger.warning("Lead %s: the CRM tracking number changed before the MoySklad update", lead_id)
+        return
+    order_uuid = str(amo_service.get_custom_field_value(lead, FIELD_MOYSKLAD_ORDER_UUID) or "").strip()
+    if not looks_like_uuid(order_uuid):
+        return
+
+    path = f"entity/customerorder/{order_uuid}"
+    order = await ms_client.get(path)
+    if not order or order.get("id") != order_uuid:
+        logger.warning("Lead %s: could not read the linked MoySklad order for CDEK tracking", lead_id)
+        return
+    attribute = next((a for a in order.get("attributes") or [] if a.get("id") == MS_ATTR_TREK), {})
+    previous = str(attribute.get("value") or "").strip()
+    if previous:
+        if previous != track:
+            logger.warning("Lead %s: the linked MoySklad order already has a different CDEK number", lead_id)
+        return
+
+    metadata = attribute.get("meta")
+    if not metadata:
+        field = await ms_client.get(f"entity/customerorder/metadata/attributes/{MS_ATTR_TREK}")
+        metadata = (field or {}).get("meta")
+    if not metadata:
+        logger.warning("Lead %s: MoySklad tracking field metadata is unavailable", lead_id)
+        return
+    updated = await ms_client.put(path, {"attributes": [{"meta": metadata, "value": track}]})
+    saved = any(
+        a.get("id") == MS_ATTR_TREK and str(a.get("value")) == track
+        for a in (updated or {}).get("attributes") or []
+    )
+    if not saved:
+        logger.warning("Lead %s: MoySklad did not confirm the CDEK tracking update", lead_id)
+
+
 async def _commit_success(
     lead_id, order_uuid: str, cdek_value: str, current_tags: list[dict], used_cost_placeholder: bool,
 ) -> bool:
     """Общий финал успешного создания накладной: запись трек-номера в AMO,
-    перевод этапа, снятие тега ошибки, примечания (заглушка цены + штрихкод).
+    перевод этапа, сохранение в МойСкладе, снятие тега ошибки и примечания.
     Используется и основным путём (номер пришёл за первые 60с), и фоновым
     дожиданием _resolve_pending_order (номер пришёл позже) — оба ведут себя
     идентично, разница только в том, кто и когда позвал."""
@@ -491,6 +538,10 @@ async def _commit_success(
         return False
 
     asyncio.create_task(_verify_trek_after_delay(lead_id, cdek_value))
+    try:
+        await _sync_track_to_moysklad(lead_id, cdek_value)
+    except Exception:
+        logger.exception("Lead %s: failed to save the CDEK number to MoySklad", lead_id)
 
     # Прозрачность: если объявленная ценность СДЭК проставлена заглушкой —
     # примечание в сделку, чтобы офис видел (сумма заказа была 0).

@@ -174,3 +174,67 @@ def test_retry_istochnik_ne_shumit_v_tg():
 
     assert len(_patched) == 1, "тег ошибки ставится независимо от source"
     assert _alerted == [], "source=retry не должен слать алерт в TG"
+
+
+def test_waybill_confirmed_after_pending_also_persists_tracking_in_moysklad(monkeypatch):
+    order_id = "d88f800d-108f-483c-8818-72126fcda180"
+    tracking_id = waybill_service.MS_ATTR_TREK
+    track = "10306104834"
+    path = f"entity/customerorder/{order_id}"
+    metadata = {"type": "attributemetadata", "href": f"field/{tracking_id}"}
+    calls = []
+
+    async def lead_full(lead_id, with_=()):
+        return {
+            "id": lead_id,
+            "custom_fields_values": [{
+                "field_id": waybill_service.FIELD_MOYSKLAD_ORDER_UUID,
+                "values": [{"value": order_id}],
+            }],
+        }
+
+    async def ms_get(request_path):
+        if request_path == path:
+            return {"id": order_id, "attributes": []}
+        assert request_path == f"entity/customerorder/metadata/attributes/{tracking_id}"
+        return {"meta": metadata}
+
+    async def ms_put(request_path, body):
+        calls.append((request_path, body))
+        return {"attributes": [{"id": tracking_id, "value": track}]}
+
+    _stub([_with_number(track)])
+    monkeypatch.setattr(waybill_service.amo_service, "get_lead_full", lead_full)
+    monkeypatch.setattr(waybill_service.ms_client, "get", ms_get)
+    monkeypatch.setattr(waybill_service.ms_client, "put", ms_put)
+    asyncio.run(waybill_service._resolve_pending_order(
+        LEAD_ID, "carrier-uuid", "webhook", _tags(), False,
+    ))
+
+    assert _commits == [(LEAD_ID, track)]
+    assert calls == [(path, {"attributes": [{"meta": metadata, "value": track}]})]
+
+
+@pytest.mark.parametrize("previous", ["10306104834", "10306104835"])
+def test_existing_moysklad_tracking_is_preserved(monkeypatch, previous):
+    order_id = "d88f800d-108f-483c-8818-72126fcda180"
+    lead = {
+        "custom_fields_values": [{
+            "field_id": waybill_service.FIELD_MOYSKLAD_ORDER_UUID,
+            "values": [{"value": order_id}],
+        }],
+    }
+
+    async def ms_get(path):
+        return {"id": order_id, "attributes": [{"id": waybill_service.MS_ATTR_TREK, "value": previous}]}
+
+    async def unexpected_put(*args):
+        pytest.fail("Existing tracking triggered a write")
+
+    async def lead_full(lead_id, with_=()):
+        return lead
+
+    monkeypatch.setattr(waybill_service.amo_service, "get_lead_full", lead_full)
+    monkeypatch.setattr(waybill_service.ms_client, "get", ms_get)
+    monkeypatch.setattr(waybill_service.ms_client, "put", unexpected_put)
+    asyncio.run(waybill_service._sync_track_to_moysklad(LEAD_ID, "10306104834"))
