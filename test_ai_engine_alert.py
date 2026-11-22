@@ -1,4 +1,4 @@
-"""Дежурные алерты ИИ-сервиса (`POST /internal/ai/v1/alert` с токеном сервиса, 23.11.2026): «нужен руководитель» (`ai_alert_head`)
+"""Дежурные алерты ИИ-сервиса (`POST /internal/ai/v1/team_alert`, 23.11.2026): «нужен руководитель» (`ai_alert_head`)
 и «не работает сайт или приложение» (`ai_alert_tech`). Настройки события берутся из панели Team через `alerts.decide`; одинаковый
 алерт по сделке за 10 минут не повторяется. Сети нет: подставный мир из test_ai_engine.py.
 Запуск: python -m pytest test_ai_engine_alert.py -q
@@ -36,7 +36,7 @@ def panel(monkeypatch, event, **over):
 
 
 def call(body: dict, token="engine-token", contract="2"):
-    resp = asyncio.run(API.alert(API.AlertIn(**body), "", token, contract))
+    resp = asyncio.run(API.team_alert(API.TeamAlertIn(**body), token, contract))
     return resp.status_code, json.loads(resp.body)
 
 
@@ -87,10 +87,8 @@ def test_same_alert_within_10_minutes_is_a_duplicate_but_other_text_event_or_tim
 
 def test_unknown_event_missing_deal_and_empty_text_are_422(env):
     assert call({"deal_id": DEAL, "event": "ai_alert_boss", "text": TEXT}) == (422, {"detail": "unknown_event"})
-    assert call({"deal_id": DEAL, "text": TEXT}) == (422, {"detail": "unknown_event"})
-    assert call({"event": "ai_alert_head", "text": TEXT}) == (422, {"detail": "deal_id"})
+    assert call({"deal_id": 0, "event": "ai_alert_head", "text": TEXT}) == (422, {"detail": "deal_id"})
     assert call({"deal_id": DEAL, "event": "ai_alert_head", "text": "   "}) == (422, {"detail": "text"})
-    assert call({"deal_id": DEAL, "event": "ai_alert_head"}) == (422, {"detail": "text"})
     assert env.alerts == []
 
 
@@ -133,7 +131,8 @@ def test_route_needs_the_service_token_and_contract_version(env):
     assert env.alerts == []
     assert call(body) == (200, {"status": "sent"})
     import webhooks
-    assert "/internal/ai/v1/alert" in {getattr(r, "path", "") for r in webhooks.app.routes}
+    paths = {getattr(r, "path", "") for r in webhooks.app.routes}
+    assert "/internal/ai/v1/team_alert" in paths and "/internal/ai/v1/alert" in paths
 
 
 def test_engine_off_is_503(env, monkeypatch):
@@ -141,30 +140,34 @@ def test_engine_off_is_503(env, monkeypatch):
     assert call({"deal_id": DEAL, "event": "ai_alert_head", "text": TEXT})[0] == 503
 
 
-def test_human_alert_with_admin_token_still_works(env):
+def test_human_alert_route_is_untouched(env):
     resp = asyncio.run(API.alert(API.AlertIn(key="manual", lines=["Проверка связи"]), "admin-token"))
     assert resp == {"ok": True}
     assert "Проверка связи" in env.alerts[-1]
-    bad = asyncio.run(API.alert(API.AlertIn(deal_id=DEAL, event="ai_alert_head", text=TEXT), "admin-token"))
-    assert bad.status_code == 422                                        # у человека старое тело: без `lines` нечего слать
+    assert asyncio.run(API.alert(API.AlertIn(lines=["x"]), "engine-token")).status_code == 403     # токен сервиса туда не подходит
 
 
-def test_over_http_headers_pick_the_owner_of_the_request(env):
+def test_over_http(env):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     app = FastAPI()
     app.include_router(API.router)
     http = TestClient(app)
-    url = "/internal/ai/v1/alert"
+    url = "/internal/ai/v1/team_alert"
     svc = {"X-Service-Token": "engine-token", "X-Contract": "2"}
-    r = http.post(url, json={"deal_id": DEAL, "event": "ai_alert_tech", "text": TEXT}, headers=svc)
+    body = {"deal_id": DEAL, "event": "ai_alert_tech", "text": TEXT}
+    r = http.post(url, json=body, headers=svc)
     assert (r.status_code, r.json()) == (200, {"status": "sent"})
-    r = http.post(url, json={"deal_id": DEAL, "event": "ai_alert_tech", "text": TEXT}, headers=svc)
+    r = http.post(url, json=body, headers=svc)
     assert (r.status_code, r.json()) == (200, {"status": "duplicate"})
-    assert http.post(url, json={"deal_id": DEAL, "event": "ai_alert_x", "text": TEXT}, headers=svc).status_code == 422
-    assert http.post(url, json={"deal_id": "не число", "event": "ai_alert_tech", "text": TEXT}, headers=svc).status_code == 422
-    r = http.post(url, json={"lines": ["Проверка связи"]}, headers={"X-Admin-Token": "admin-token"})
-    assert (r.status_code, r.json()) == (200, {"ok": True})
-    assert http.post(url, json={"deal_id": DEAL, "event": "ai_alert_tech", "text": TEXT}).status_code in (403, 426)
+    assert http.post(url, json={**body, "event": "ai_alert_x"}, headers=svc).status_code == 422
+    assert http.post(url, json={**body, "deal_id": "не число"}, headers=svc).status_code == 422
+    assert http.post(url, json={"deal_id": DEAL, "event": "ai_alert_tech"}, headers=svc).status_code == 422     # text обязателен
+    assert http.post(url, json={"event": "ai_alert_tech", "text": TEXT}, headers=svc).status_code == 422       # deal_id обязателен
+    assert http.post(url, json=body).status_code in (403, 426)
+    assert http.post(url, json=body, headers={"X-Admin-Token": "admin-token"}).status_code in (403, 426)
+    r = http.post("/internal/ai/v1/alert", json={"lines": ["Проверка связи"]}, headers={"X-Admin-Token": "admin-token"})
+    assert (r.status_code, r.json()) == (200, {"ok": True})                                                    # старая ручка человека
+    assert http.post("/internal/ai/v1/alert", json=body, headers=svc).status_code in (403, 422)                # туда сервису ходу нет
     assert len(env.alerts) == 2

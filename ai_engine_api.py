@@ -81,6 +81,13 @@ class FollowupIn(BaseModel):
     draft: str = ""
 
 
+class TeamAlertIn(BaseModel):
+    """Дежурный алерт ИИ-сервиса (`ai_engine.duty_alert`): `event` - ключ события панели (`ai_engine.DUTY_EVENTS`), `text` до 500 знаков."""
+    deal_id: int
+    event: str
+    text: str
+
+
 OUTCOMES = {"continue", "handoff_to_human", "release_to_engine", "aborted", "failed"}
 
 
@@ -176,6 +183,28 @@ async def send_failed(body: SendFailedIn, x_service_token: str = Header(default=
     return JSONResponse(out)
 
 
+@router.post("/team_alert")
+async def team_alert(body: TeamAlertIn, x_service_token: str = Header(default=""), x_contract: str = Header(default="")):
+    """Дежурный алерт ИИ-сервиса по событию панели (`ai_engine.duty_alert`). Токен сервиса, как у `send_failed`.
+
+    Ответ `{"status": "sent" | "disabled" | "duplicate"}`, Телеграм не принял - 502 `{"status": "failed"}`. Незнакомое событие,
+    пустой текст или сделка не больше нуля - 422; текст длиннее 500 знаков обрезается."""
+    bad = _check_service(x_service_token, x_contract)
+    if bad is not None:
+        return bad
+    if body.event not in ai_engine.DUTY_EVENTS:
+        return _deny(422, "unknown_event")
+    if body.deal_id <= 0:
+        return _deny(422, "deal_id")
+    text = " ".join(body.text.split())
+    if not text:
+        return _deny(422, "text")
+    if len(text) > ai_engine.DUTY_TEXT_MAX:
+        text = text[:ai_engine.DUTY_TEXT_MAX - 1].rstrip() + "…"
+    status = await ai_engine.duty_alert(body.deal_id, body.event, text)
+    return JSONResponse({"status": status}, status_code=502 if status == "failed" else 200)
+
+
 @router.post("/return_dialog")
 async def return_dialog(body: ReturnIn, x_admin_token: str = Header(default="")):
     """Человек вернул диалог ИИ. Движок ставит `owner = ai` и шлёт ходом событие `dialog_returned`."""
@@ -203,48 +232,18 @@ async def give_deal(body: GiveIn, x_admin_token: str = Header(default=""), x_giv
 
 
 class AlertIn(BaseModel):
-    """Одна ручка, два хозяина. ИИ-сервис (токен сервиса и версия контракта, как у `send_failed`): `deal_id`, `event`, `text` -
-    дежурный алерт по событию панели (`ai_engine.duty_alert`). Человек (админский токен): `key`, `lines` - алерт как раньше."""
-    deal_id: int | None = None
-    event: str | None = None
-    text: str | None = None
     key: str = "manual"
-    lines: list[str] | None = None
+    lines: list[str]
 
 
 @router.post("/alert")
-async def alert(body: AlertIn, x_admin_token: str = Header(default=""), x_service_token: str = Header(default=""),
-                x_contract: str = Header(default="")):
-    """Алерт ИИ-менеджера в чат ОП.
-
-    С `X-Admin-Token` (и без токена сервиса) - по требованию человека: шапка и пинги, как у обычных алертов, ответ `{"ok": true}`.
-    Иначе - запрос ИИ-сервиса: `{"deal_id", "event": "ai_alert_head" | "ai_alert_tech", "text"}`, ответ `{"status": "sent" |
-    "disabled" | "duplicate"}`, Телеграм не принял - 502 `{"status": "failed"}`. Незнакомое событие, пустой текст или нет сделки - 422;
-    текст длиннее 500 знаков обрезается."""
-    # Прямой вызов из тестов без заголовков приносит объекты Header, а не строки: считаем их пустыми.
-    x_admin_token, x_service_token, x_contract = (v if isinstance(v, str) else "" for v in (x_admin_token, x_service_token, x_contract))
-    if x_admin_token and not x_service_token:
-        bad = _check_admin(x_admin_token)
-        if bad is not None:
-            return bad
-        if not body.lines:
-            return _deny(422, "lines")
-        await ai_engine.raise_alert(body.key, body.lines[:8])
-        return {"ok": True}
-    bad = _check_service(x_service_token, x_contract)
+async def alert(body: AlertIn, x_admin_token: str = Header(default="")):
+    """Алерт ИИ-менеджера в чат ОП по требованию человека (шапка и пинги, как у обычных алертов). Закрыт админским токеном."""
+    bad = _check_admin(x_admin_token)
     if bad is not None:
         return bad
-    if body.event not in ai_engine.DUTY_EVENTS:
-        return _deny(422, "unknown_event")
-    if body.deal_id is None or body.deal_id <= 0:
-        return _deny(422, "deal_id")
-    text = " ".join((body.text or "").split())
-    if not text:
-        return _deny(422, "text")
-    if len(text) > ai_engine.DUTY_TEXT_MAX:
-        text = text[:ai_engine.DUTY_TEXT_MAX - 1].rstrip() + "…"
-    status = await ai_engine.duty_alert(body.deal_id, body.event, text)
-    return JSONResponse({"status": status}, status_code=502 if status == "failed" else 200)
+    await ai_engine.raise_alert(body.key, body.lines[:8])
+    return {"ok": True}
 
 
 @router.get("/state/{deal_id}")
