@@ -999,15 +999,28 @@ def _extract_status(data: dict) -> tuple[str, int | None]:
         order = data.get("order") or {}
         node = details or payment or order or data
 
-    status = node.get("status") or ""
+    status = str(node.get("status") or "")
     amount_raw = node.get("amount")
+    payment_confirmed = status.strip().upper() == "PAYMENT_CONFIRMED"
+    if payment_confirmed:
+        # getPaymentDetails also returns refund operations. Only a live
+        # payment in the invoiced currency can trigger payment recovery.
+        if (
+            node.get("operationType") != "PAYMENT"
+            or node.get("isTestMode") is True
+            or not isinstance(amount_raw, dict)
+            or str(amount_raw.get("currencyCode")) != "643"
+        ):
+            return "", None
     if isinstance(amount_raw, dict):
         amount_raw = amount_raw.get("value")
     try:
         kopecks = int(round(float(amount_raw))) if amount_raw is not None else None
     except (TypeError, ValueError):
         kopecks = None
-    return str(status), kopecks
+    if payment_confirmed and (kopecks is None or kopecks <= 0):
+        return "", None
+    return status, kopecks
 
 
 def is_paid_status(status: str) -> bool:
@@ -1016,7 +1029,7 @@ def is_paid_status(status: str) -> bool:
     незнакомое считаем НЕоплаченным и логируем — лучше не двинуть сделку, чем
     объявить оплаченной неоплаченную."""
     return status.strip().upper() in {
-        "COMPLETED", "PAYMENT_COMPLETED", "PAYMENT_COMPLETE",
+        "COMPLETED", "PAYMENT_COMPLETED", "PAYMENT_COMPLETE", "PAYMENT_CONFIRMED",
         "SUCCESS", "PAYMENT_SUCCESS", "PAID", "PAYMENT_PAID",
     }
 

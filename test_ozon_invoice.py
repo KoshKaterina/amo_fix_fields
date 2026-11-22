@@ -1023,6 +1023,27 @@ def test_razbor_otveta_status_iz_items_0_pustoy_items_platezha_net():
     assert ozon_invoice._extract_status({"paymentDetails": {"status": "Completed"}})[0] == "Completed"
 
 
+def test_get_payment_details_confirmed_payment_counts_as_paid():
+    operation = {
+        "operationType": "PAYMENT",
+        "status": "PAYMENT_CONFIRMED",
+        "amount": {"currencyCode": "643", "value": "50100"},
+    }
+    status, amount = ozon_invoice._extract_status({"items": [operation]})
+    assert (status, amount) == ("PAYMENT_CONFIRMED", 50100)
+    assert ozon_invoice.is_paid_status(status)
+
+    for invalid_operation in (
+        {**operation, "operationType": "REFUND"},
+        {**operation, "isTestMode": True},
+        {**operation, "amount": {"currencyCode": "840", "value": "50100"}},
+        {**operation, "amount": {"currencyCode": "643", "value": "0"}},
+    ):
+        status, amount = ozon_invoice._extract_status({"items": [invalid_operation]})
+        assert not ozon_invoice.is_paid_status(status)
+        assert amount is None
+
+
 def test_statusy_completed_i_payment_completed_oplachen_rejected_ne():
     """статусы: Completed и PAYMENT_COMPLETED = оплачен, REJECTED/NEW/пусто = нет"""
     # ── 24) словарь статусов: PAYMENT_* и Completed ────────────────────────────
