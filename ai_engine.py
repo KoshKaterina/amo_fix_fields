@@ -1577,7 +1577,10 @@ _duty_seen: dict[str, float] = {}       # «сделка:событие:текс
 async def duty_alert(deal_id: int, event: str, text: str) -> str:
     """Дежурный алерт по событию панели `event` (`DUTY_EVENTS`). Возвращает `sent`, `disabled` (выключено в панели или её канал
     у интеграции не настроен), `duplicate` (тот же текст по той же сделке за 10 минут) или `failed` (Телеграм не принял). Не бросает.
-    Переменные шаблона: `{{сделка}}` (адрес сделки), `{{ссылка_на_сделку}}`, `{{клиент}}` (имя из чата ИИ, нет - пусто), `{{текст}}`, `{{теги}}`."""
+    Переменные шаблона (каталог Team, 23.11.2026): `{{текст_события}}` (текст ИИ), `{{сделка}}` (адрес сделки), `{{ссылка_на_сделку}}`,
+    `{{клиент}}` (имя из чата ИИ, нет - пусто), `{{теги}}`; плюс `{{текст}}` с тем же текстом ИИ.
+    ⚠️ `текст_события` в `alert_templates.HTML_VARIABLES`: рендер его не экранирует, поэтому экранируем здесь, иначе угловая скобка
+    в словах клиента уронит сообщение в HTML-разметке."""
     now = _now()
     key = f"{int(deal_id)}:{event}:{text}"
     if now - _duty_seen.get(key, 0) < DUTY_DEDUPE_S:
@@ -1603,7 +1606,7 @@ async def duty_alert(deal_id: int, event: str, text: str) -> str:
         d = alerts.decide(
             event, legacy_text=legacy, parse_mode="HTML", chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
             values={"сделка": f"{BASE_URL}/leads/detail/{int(deal_id)}", "ссылка_на_сделку": _link(int(deal_id)),
-                    "клиент": client_name, "текст": text, "теги": mention},
+                    "клиент": client_name, "текст_события": html.escape(text, quote=False), "текст": text, "теги": mention},
         )
         if d is None:
             _duty_seen.pop(key, None)

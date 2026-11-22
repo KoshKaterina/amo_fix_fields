@@ -62,6 +62,32 @@ def test_panel_template_gets_deal_client_and_text(env, monkeypatch):
     assert env.alerts[-1] == f"Руководитель нужен\nТиана\n{TEXT}\nhttps://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{DEAL}"
 
 
+# Шаблоны каталога Team (team-panel, ветка feat/ai-duty-alerts, коммит cd0d853, backend/app/alerts/catalog.py) дословно.
+TEAM_TEMPLATES = {
+    "ai_alert_head": "🆘 ИИ-менеджер: нужен руководитель\n{{текст_события}}\n👤 {{клиент}}\n📝 {{сделка}}\n{{теги}}\n🔗 {{ссылка_на_сделку}}",
+    "ai_alert_tech": "🛠 ИИ-менеджер: не работает сайт или приложение\n{{текст_события}}\n👤 {{клиент}}\n📝 {{сделка}}\n{{теги}}\n🔗 {{ссылка_на_сделку}}",
+}
+
+
+@pytest.mark.parametrize("event", sorted(TEAM_TEMPLATES))
+def test_team_catalog_template_is_rendered_not_the_code_text(env, monkeypatch, event):
+    store.put_session(CHAT_KEY, channel_id=CHAN, chat_id="1920391385", contact_name="Тиана", deal_id=DEAL, state=store.S_AI)
+    panel(monkeypatch, event, template=TEAM_TEMPLATES[event], recipients_mode="listed",
+          recipients=[{"name": "Саша", "handle": "@rop_test", "amo_user_id": 1}])
+    assert call({"deal_id": DEAL, "event": event, "text": "Клиент: оплата <b>не</b> проходит & всё"})[1] == {"status": "sent"}
+    url = f"https://new5a2e8ea7b16b4.amocrm.ru/leads/detail/{DEAL}"
+    head = TEAM_TEMPLATES[event].split("\n")[0]
+    assert env.alerts[-1] == "\n".join([
+        head,
+        "Клиент: оплата &lt;b&gt;не&lt;/b&gt; проходит &amp; всё",            # текст ИИ экранирован, хоть переменная и «с разметкой»
+        "👤 Тиана",
+        f"📝 {url}",
+        "@rop_test",
+        f'🔗 <a href="{url}">Открыть сделку</a>',
+    ])
+    assert "(тест)" not in env.alerts[-1] and "💬" not in env.alerts[-1]        # кодового текста нет
+
+
 def test_event_disabled_in_panel_sends_nothing(env, monkeypatch):
     panel(monkeypatch, "ai_alert_tech", enabled=False)
     body = {"deal_id": DEAL, "event": "ai_alert_tech", "text": TEXT}
