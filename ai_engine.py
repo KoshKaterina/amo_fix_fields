@@ -40,6 +40,7 @@ import sys
 import time
 from typing import Any
 
+import ai_engine_approval as approval
 import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
@@ -534,6 +535,7 @@ async def tick_once() -> None:
     await _silence_tick()
     await _ur_tick()
     await intercept.tick(sys.modules[__name__])
+    await approval.tick(sys.modules[__name__], now)          # предложения смены ответственного: устаревание и доставка в панель (`ai_engine_approval`)
     if now - _last_off_sweep >= 10:
         _last_off_sweep = now
         async with _get_lock():
@@ -598,6 +600,11 @@ async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str) -> dedup.Reso
         return dedup.Resolution(dedup.K_REFUSED, deal=deal, note="сбой проверки фильтров")
     if not decision.allow:
         return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=decision.reason, retry_at=decision.retry_at)
+    if decision.propose:
+        # Смену ответственного нужно подтвердить человеку: открытое предложение по сделке уже ждёт решения либо недавно отклонено: не создаём второе
+        why = await _db(approval.block_reason, int(deal["id"]), _now())
+        if why:
+            return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=why)
     res.gate = decision
     return res
 
@@ -697,6 +704,11 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
             await _db(store.discard_pending, chat_key)
         else:
             await _db(store.put_session, chat_key, next_at=now + cfg.HEALTH_POLL_S)
+        return
+
+    if owner is None and res.gate is not None and res.gate.propose:
+        # «Перераспределить существующие» при включённом пилоте: ИИ просит разрешения, сделку пока не берёт и ничего не пишет в amo (`ai_engine_approval`)
+        await approval.propose(sys.modules[__name__], s, deal, res.gate, mode_id)
         return
 
     if await _db(store.pending_inbox, chat_key):                # настоящее сообщение клиента (в любом канале), а не служебное событие:
@@ -1499,6 +1511,8 @@ async def _lead_event_under_lock(ev: dict) -> bool:
     """Закрытие, уход из воронки, оплата: всё на базе, без сети. True - событие разобрано, правило C не нужно
     (сделка уже в нашей базе: закрыта, ведётся ИИ или лежит у человека)."""
     lead_id = ev["lead_id"]
+    if ev["status_id"] in cfg.CLOSED_STATUS_IDS:
+        await approval.cancel_for_closed_deal(sys.modules[__name__], lead_id)       # открытое предложение смены ответственного по закрытой сделке снимается
     owner = await _db(store.get_owner, lead_id)
     if owner is not None and not owner["closed"] and ev["status_id"] in cfg.CLOSED_STATUS_IDS:
         await _deal_closed(lead_id, "deal_closed")
@@ -1661,6 +1675,11 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
 # =============================================================================================
 # лестница тишины (ai_engine_silence)
 # =============================================================================================
+
+async def reassign_decision(ref: str, deal_id: int, decision: str, decided_by: str) -> tuple[int, dict]:
+    """Решение человека по предложению смены ответственного (`POST /internal/ai/v1/reassign/decision`): `approve` или `reject`. Вся логика в `ai_engine_approval`."""
+    return await approval.decide(sys.modules[__name__], ref, deal_id, decision, decided_by)
+
 
 async def silence_arm(deal_id: int) -> None:
     """ИИ получил разрешение написать клиенту: с этого момента идёт отсчёт тишины (первое сообщение отсчёт задаёт, остальные не сдвигают).
@@ -1875,7 +1894,7 @@ def _contact_task(deal_id: int | None, reason: str, why_lines: list[str]) -> Non
     _spawn(ai_engine_tasks.create_contact_task(int(deal_id), reason, _plain(why_lines[0])))
 
 
-async def _alert(key: str, lines: list[str], *, dedupe: str | None = None, return_deal: int | None = None) -> None:
+async def _alert(key: str, lines: list[str], *, dedupe: str | None = None, return_deal: int | None = None, ping: bool = True) -> None:
     """Алерт в чат ОП. Сбой отправки не должен ломать разбор: пишем в лог и живём дальше.
     `return_deal` - алерт о передаче диалога по этой сделке: под ним бот ставит метку, и реакция тегнутого менеджера
     возвращает диалог ИИ (`ai_engine_return`)."""
@@ -1888,10 +1907,10 @@ async def _alert(key: str, lines: list[str], *, dedupe: str | None = None, retur
             if len(_alert_seen) > 2000:
                 _alert_seen.clear()
         head = "🤖 ИИ-менеджер" + (" (тест)" if settings.effective_mode() == "test" else "")
-        mention = mentions_for(None)
-        if cfg.ALERT_EXTRA_TAG and cfg.ALERT_EXTRA_TAG not in mention.split():
+        mention = mentions_for(None) if ping else ""                 # `ping=False`: сообщение в чат ОП без шапки и пингов, одной строкой
+        if ping and cfg.ALERT_EXTRA_TAG and cfg.ALERT_EXTRA_TAG not in mention.split():
             mention = f"{mention} {cfg.ALERT_EXTRA_TAG}"            # пинг Кати во всех алертах ИИ-менеджера
-        text = "\n".join([head, mention, *[line for line in lines if line]])
+        text = "\n".join([head, mention, *[line for line in lines if line]]) if ping else chr(10).join(line for line in lines if line)
         d = alerts.decide(
             f"ai_{key}", legacy_text=text, parse_mode="HTML", chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
             values={"сообщение": text},
@@ -1939,4 +1958,8 @@ def status() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         out["functions"] = "ошибка чтения настроек"
     out["return_by_reaction"] = ai_engine_return.stats()
+    try:
+        out["reassign_proposals_open"] = approval.count_open()       # предложения смены ответственного, ждущие решения человека (`ai_engine_approval`)
+    except Exception:  # noqa: BLE001
+        out["reassign_proposals_open"] = "ошибка чтения базы"
     return out

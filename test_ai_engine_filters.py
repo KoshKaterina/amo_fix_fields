@@ -90,7 +90,7 @@ def _clean(monkeypatch):
     F._inflight.clear()
     F._warned.clear()
     settings.set_document(None)
-    monkeypatch.setattr(F, "REASSIGN_ENABLED", False)
+    monkeypatch.setattr(F, "REASSIGN_DISABLED", False)
     yield
     F._cache.clear()
     F._inflight.clear()
@@ -1156,7 +1156,6 @@ def redistribute(env, **over):
     block = {"policy": "redistribute", "since": env.t - 100, "manager_quiet_min": 15}
     block.update(over)
     set_full(env, existing=block, ai_user=AI_USER)
-    env.mp.setattr(F, "REASSIGN_ENABLED", True)
 
 
 def test_redistribute_takes_an_existing_deal_and_assigns_the_ai_user(env):
@@ -1216,31 +1215,17 @@ def test_redistribute_takes_a_new_deal_without_touching_the_responsible(env):
     run(go())
 
 
-def test_redistribute_with_the_pilot_on_does_not_take_the_deal_and_does_not_assign(env, caplog):
+def test_redistribute_with_the_emergency_switch_does_not_take_the_deal(env, caplog):
     caplog.set_level(logging.INFO, logger="uvicorn")
 
     async def go():
         amo = Amo(env)
         redistribute(env)
-        set_full(env, existing={"policy": "redistribute", "since": env.t - 100, "manager_quiet_min": 15}, ai_user=AI_USER, review={"enabled": True})
+        env.mp.setattr(F, "REASSIGN_DISABLED", True)
         put_lead(env, created_at=int(env.t) - 3600, responsible=OLD_MANAGER)
         await client_writes(env)
         assert amo.patches == [] and store.get_owner(DEAL) is None and quiet(env)
-        assert any("пилот" in r.getMessage() and "не взята" in r.getMessage() for r in caplog.records)
-    run(go())
-
-
-def test_redistribute_without_the_write_flag_does_not_take_the_deal(env, caplog):
-    caplog.set_level(logging.INFO, logger="uvicorn")
-
-    async def go():
-        amo = Amo(env)
-        redistribute(env)
-        env.mp.setattr(F, "REASSIGN_ENABLED", False)
-        put_lead(env, created_at=int(env.t) - 3600, responsible=OLD_MANAGER)
-        await client_writes(env)
-        assert amo.patches == [] and store.get_owner(DEAL) is None and quiet(env)
-        assert any("AI_REASSIGN_ENABLED" in r.getMessage() for r in caplog.records)
+        assert any("AI_REASSIGN_DISABLED" in r.getMessage() for r in caplog.records)
     run(go())
 
 

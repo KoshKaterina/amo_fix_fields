@@ -63,6 +63,14 @@ class GiveIn(BaseModel):
     retrigger: bool = False     # сделку ИИ уже ведёт: поставить ход-событие заново
 
 
+class ReassignDecisionIn(BaseModel):
+    """Решение человека по предложению смены ответственного (`ai_engine_approval`): подтвердить или отклонить. Имена и формы согласованы с панелью."""
+    ref: str
+    deal_id: int
+    decision: str               # approve | reject
+    decided_by: str = ""
+
+
 class SendFailedIn(BaseModel):
     """ИИ-сервис не смог отправить сообщение клиенту: `code` короткий код причины (для дедупликации), `reason` читаемая причина по-русски."""
     deal_id: int
@@ -200,6 +208,22 @@ async def give_deal(body: GiveIn, x_admin_token: str = Header(default=""), x_giv
         code, out = await ai_engine.give_deal(body.deal_id, body.chat_id, body.chat_type, body.channel_id, body.phone, body.contact_name, body.force, body.retrigger)
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: сделка %s не передана ИИ", body.deal_id)
+        return JSONResponse({"detail": "engine_error"}, status_code=500)
+    return JSONResponse(out, status_code=code)
+
+
+@router.post("/reassign/decision")
+async def reassign_decision(body: ReassignDecisionIn, x_admin_token: str = Header(default=""), x_give_token: str = Header(default="")):
+    """Решение человека по предложению «сменить ответственного и взять сделку»: движок исполняет (`ai_engine_approval.decide`). Тот же узкий токен панели
+    `X-Give-Token` (`AI_GIVE_TOKEN`), что у `give_deal`: он открывает ТОЛЬКО эти две ручки; админский токен тоже подходит. Ответ 200 `{ok, state, detail}`;
+    повтор по решённому предложению безопасен (текущее состояние без действий). 403: токен не тот, 404: нет такого предложения, 409: сделка не та."""
+    bad = _check_give(x_give_token) if x_give_token else _check_admin(x_admin_token)
+    if bad is not None:
+        return bad
+    try:
+        code, out = await ai_engine.reassign_decision(body.ref, body.deal_id, body.decision, body.decided_by)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: решение по предложению %s не обработано", body.ref)
         return JSONResponse({"detail": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
 

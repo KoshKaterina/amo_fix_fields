@@ -24,9 +24,10 @@
 разрешённых контактов (явное разрешение сильнее переключателя) и отданные вручную. `redistribute`: берёт и существующие открытые сделки, подходящие
 под фильтры и бюджет, и назначает им ответственным пользователя ИИ (`ai_user`): запись `responsible_user_id` в amo, примечание «Ответственный
 изменён с ... на ... (ИИ, режим Полный)», строка в таблице `reassign_log`; прежнему ответственному пинг не уходит. Условия:
-  • пилот (`review.enabled`) включён: смена ответственного без подтверждения человека недопустима, а у движка механизма «действие ждёт проверки»
-    нет (проверка живёт в ИИ-сервисе и касается ответов клиенту), поэтому такую сделку ИИ НЕ берёт (безопасный отказ);
-  • запись в боевую amo стоит за флагом `AI_REASSIGN_ENABLED=1` (по умолчанию выключен): без него `redistribute` существующих сделок не берёт;
+  • пилот (`review.enabled`) включён: смена ответственного без подтверждения человека недопустима, поэтому вместо смены создаётся ПРЕДЛОЖЕНИЕ
+    (`TakeDecision.propose`, `ai_engine_approval`): сделка ждёт решения человека в панели, ИИ её не берёт, в amo ничего не пишется. Пилот выключен:
+    ответственный назначается сразу;
+  • аварийный рубильник `AI_REASSIGN_DISABLED=1` (по умолчанию не задан): с ним `redistribute` существующих сделок не берёт и не предлагает;
   • менеджер писал клиенту менее `existing.manager_quiet_min` минут назад: ждём (`retry_at`), 0 значит не проверять;
   • смена не удалась: сделку не берём, причина в логе.
 
@@ -80,7 +81,9 @@ POLICIES = ("leave", "redistribute")
 DEFAULT_AI_USER = {"id": 11513202, "name": "Гладков Александер"}
 DEFAULT_QUIET_MIN = 15
 
-REASSIGN_ENABLED = os.getenv("AI_REASSIGN_ENABLED", "").strip() == "1"     # запись ответственного в боевую amo: по умолчанию выключена
+# Аварийный рубильник смены ответственного: `AI_REASSIGN_DISABLED=1` в .env, и «перераспределить существующие» ничего не берёт и не предлагает.
+# Обычно не нужен: при включённом пилоте смену подтверждает человек (`ai_engine_approval`), без пилота она идёт сразу, как решила Катя настройкой.
+REASSIGN_DISABLED = os.getenv("AI_REASSIGN_DISABLED", "").strip() == "1"
 REASSIGN_TIMEOUT_S = 15
 MS_CALL_TIMEOUT_S = 6                  # один запрос к МойСклад (без повторов)
 MS_WAIT_S = 7                          # сколько проверка ждёт результат одного запроса (чуть дольше самого запроса); дальше «нераспознана»
@@ -701,6 +704,7 @@ class TakeDecision:
     retry_at: float | None = None    # раньше этого момента решение не пересматриваем (менеджер активен)
     reassign: dict[str, Any] | None = None   # {"to_id", "to_name", "from_id"}: перед взятием назначить ответственным пользователя ИИ
     existing: bool = False           # сделка существующая: после взятия охрана инициативы
+    propose: bool = False            # смену ответственного нужно подтвердить человеку (пилот включён): сделку не берём, создаём предложение
 
 
 def _refuse(reason: str, retry_at: float | None = None) -> TakeDecision:
@@ -720,6 +724,7 @@ async def decide_take(lead: dict, *, mode_id: str, chat_key: str = "", explicit:
             return _refuse(why)
     existing = False
     reassign = None
+    propose = False
     ex = existing_config() if mode_id in EXISTING_MODES and not intercept else None
     if ex is not None and lead_is_existing(lead, _boundary(ex)):
         existing = True
@@ -727,10 +732,8 @@ async def decide_take(lead: dict, *, mode_id: str, chat_key: str = "", explicit:
             user = ai_user()
             if user is None:
                 return _refuse("«перераспределить»: пользователь ИИ в настройках не задан")
-            if settings.review_enabled():
-                return _refuse("«перераспределить» при включённом пилоте: смена ответственного без подтверждения человека не выполняется")
-            if not REASSIGN_ENABLED:
-                return _refuse("«перераспределить»: запись ответственного выключена флагом AI_REASSIGN_ENABLED")
+            if reassign_disabled():
+                return _refuse("«перераспределить»: смена ответственного выключена аварийным флагом AI_REASSIGN_DISABLED")
             quiet = ex["manager_quiet_min"]
             if quiet > 0:
                 last = manager_last_out(chat_key)
@@ -742,7 +745,22 @@ async def decide_take(lead: dict, *, mode_id: str, chat_key: str = "", explicit:
                 current = 0
             if current != user["id"]:
                 reassign = {"to_id": user["id"], "to_name": user["name"], "from_id": current or None}
-    return TakeDecision(True, existing=existing, reassign=reassign)
+                propose = settings.review_enabled()           # пилот включён: смену подтверждает человек (`ai_engine_approval`), без пилота идёт сразу
+    return TakeDecision(True, existing=existing, reassign=reassign, propose=propose)
+
+
+def reassign_disabled() -> bool:
+    """Аварийный рубильник `AI_REASSIGN_DISABLED=1`: «перераспределить существующие» не берёт сделки и не предлагает."""
+    return bool(REASSIGN_DISABLED)
+
+
+async def recheck_for_approval(lead: dict, *, explicit: bool = False) -> str | None:
+    """Перепроверка сделки в момент подтверждения человеком (`ai_engine_approval`): те же фильтры, бюджет и товары, что при взятии. Причина отказа
+    или None. Менеджера, политику и режим проверяет вызывающий."""
+    why = cheap_refusal(lead, mode_id="full", explicit=explicit)
+    if why:
+        return why
+    return await products_refusal(lead)
 
 
 async def intercept_refusal(deal: dict, phones: list[Any]) -> str:
@@ -776,9 +794,10 @@ async def _user_name(user_id: int | None) -> str:
     return name or f"пользователь {user_id}"
 
 
-async def reassign_responsible(deal_id: int, plan: dict[str, Any]) -> bool:
+async def reassign_responsible(deal_id: int, plan: dict[str, Any], confirmed_by: str | None = None) -> bool:
     """Назначить сделке ответственным пользователя ИИ: PATCH `responsible_user_id`, примечание, строка журнала. True только если amo приняла смену.
-    Не бросает. Прежнему ответственному пинг не уходит (задач и сообщений этот код не создаёт)."""
+    `confirmed_by`: имя человека, подтвердившего смену в панели (попадает в примечание). Не бросает. Прежнему ответственному пинг не уходит
+    (задач и сообщений этот код не создаёт)."""
     to_id, to_name, from_id = int(plan["to_id"]), str(plan["to_name"]), plan.get("from_id")
     try:
         result = await asyncio.wait_for(amo_service.patch_lead(int(deal_id), responsible_user_id=to_id), timeout=REASSIGN_TIMEOUT_S)
@@ -793,7 +812,7 @@ async def reassign_responsible(deal_id: int, plan: dict[str, Any]) -> bool:
         await asyncio.to_thread(_log_reassign_quiet, deal_id, from_id, to_id, False, "не удалась")
         return False
     from_name = await _user_name(from_id)
-    text = f"Ответственный изменён с {from_name} на {to_name} (ИИ, режим Полный)"
+    text = f"Ответственный изменён с {from_name} на {to_name} (ИИ, режим Полный" + (f", подтвердил {confirmed_by})" if confirmed_by else ")")
     try:
         await asyncio.wait_for(amo_service.add_note(int(deal_id), text), timeout=REASSIGN_TIMEOUT_S)
     except asyncio.CancelledError:
