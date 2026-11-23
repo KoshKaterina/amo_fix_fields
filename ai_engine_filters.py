@@ -419,13 +419,14 @@ def _is_cdek(text: str) -> bool:
 
 
 def delivery_type_code(lead: dict) -> str:
-    """СДЭК (CDEK/СДЭК в тексте: пункт, постамат, курьер, склад-дверь) | шоурум | офис | курьер по Москве | other | unset."""
+    """СДЭК (CDEK/СДЭК в тексте: пункт, постамат, курьер, склад-дверь) | шоурум («Самовывоз со склада» то же самое, решение Кати 23.11.2026) | офис |
+    курьер по Москве | other | unset."""
     raw = norm(_field(lead, FIELD_DELIVERY))
     if not raw:
         return "unset"
     if _is_cdek(raw):
         return "cdek"
-    if "шоурум" in raw:
+    if "шоурум" in raw or "самовывоз со склада" in raw:
         return "showroom"
     if "самовывоз" in raw and "офис" in raw:
         return "office"
