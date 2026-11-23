@@ -2,9 +2,11 @@
 независимо от настроек режима (`pipelines_any`, воронки режима).
 
 Что проверяем:
-  • разбор ответа `GET /v1/funnels`: объединение `pipelines` у воронок с `has_prompt: true`; мусор не принимается целиком;
+  • разбор ответа `GET /v1/funnels`: объединение `pipelines` у воронок с `has_prompt: true`; мусор и пустой итог не принимаются целиком;
   • отказоустойчивость, строго «не шире, чем сейчас»: сервис не ответил или ответил мусором - последний удачный ответ, удачного не было - статический запас
     (две воронки розницы); ни одна ошибка множество не расширяет; опрос не чаще раза в минуту;
+  • пустой итог ответа это сбой сервиса, а не «ИИ нигде не пишет»; сужение (воронка пропала) применяется только после двух одинаковых удачных опросов подряд,
+    расширение сразу; срез показывает `pending_narrowing`;
   • шлюз `settings.pipeline_allowed` и всё, что за ним: `pipelines_any` не открывает воронку без промпта, воронка с промптом открывается только если её пускает режим;
     сделка в воронке без промпта не берётся (сообщение клиента, `give_deal`, `return_dialog`), перенос взятой сделки в такую воронку снимает её (`left_pipeline`),
     `permit` отказывает, «Тест» в режиме `test` работает всегда, перехват живёт по своим правилам;
@@ -91,6 +93,13 @@ def known(env, *pipelines, test=()):
     env.mp.setattr(prompts, "_last_ok", True)
 
 
+async def narrow(svc, body):
+    """Сервис отдал суженный ответ ДВАЖДЫ подряд: сужение подтверждено и применено."""
+    svc.body = body
+    assert await svc.poll() is True
+    assert await svc.poll() is True
+
+
 def moved(pipeline, lead_id=DEAL):
     return {"lead_id": lead_id, "pipeline_id": pipeline, "status_id": 1000, "added": False, "paid": False, "work_touched": False}
 
@@ -114,12 +123,24 @@ def test_one_funnel_may_have_several_pipelines_and_a_pipeline_may_repeat():
     assert prompts.parse(body).prompt == frozenset({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER})
 
 
-def test_parse_accepts_an_answer_without_contract_and_an_empty_dictionary():
+def test_parse_accepts_an_answer_without_contract():
     body = answer()
     del body["contract"]
     assert prompts.parse(body).prompt == frozenset(TWO)
-    empty = prompts.parse({"contract": "2", "funnels": [], "test_pipelines": []})
-    assert empty is not None and empty.prompt == frozenset() and empty.test == frozenset()      # «нигде» это сужение, а не мусор
+
+
+EMPTY = [
+    pytest.param({"contract": "2", "funnels": [], "test_pipelines": []}, id="funnels пуст"),
+    pytest.param(answer(retail=False, tangem=False), id="ни у кого has_prompt"),
+    pytest.param(answer(retail=False, tangem=False, extra=({**OPT, "has_prompt": False},)), id="has_prompt ложь у всех"),
+    pytest.param(answer(retail=False, tangem=False, extra=({"slug": "t", "pipelines": [PIPE_TEST], "has_prompt": True},)), id="остались одни тестовые"),
+    pytest.param(answer(retail=False, tangem=False, extra=({"slug": "t", "pipelines": [PIPE_OTHER], "has_prompt": True},), test=(PIPE_OTHER,)), id="единственная воронка названа тестовой"),
+]
+
+
+@pytest.mark.parametrize("body", EMPTY)
+def test_an_empty_result_is_not_understood_and_not_accepted(body):
+    assert prompts.parse(body) is None                       # пустой итог это сбой сервиса, а не «ИИ нигде не пишет»
 
 
 def test_parse_accepts_an_answer_without_test_pipelines():
@@ -180,11 +201,186 @@ def test_a_good_answer_replaces_the_reserve_and_the_request_has_the_agreed_shape
     run(go())
 
 
-def test_the_answer_may_narrow_the_set_below_the_reserve(env):
+# --- сужение с задержкой: пропавшая воронка перестаёт действовать только после двух одинаковых удачных опросов подряд ----------------
+
+def test_a_narrowing_waits_for_the_second_poll_and_then_applies(env):
+    async def go():
+        svc = Svc(env)
+        await svc.poll()                                                            # действует ответ, равный запасу: две воронки
+        v2(env, "full")
+        svc.body = answer(tangem=False)                                             # TangemShop лишился промпта
+        assert await svc.poll() is True                                             # первый опрос: ответ удачный, но сужение только запоминается
+        assert prompts.pipelines_for("prod") == frozenset(TWO) and prompts.pending_narrowing() == [PIPE_TANGEM]
+        assert prompts.source() == "service" and settings.pipeline_allowed(PIPE_TANGEM)       # сделки TangemShop пока ведутся
+        assert await svc.poll() is True                                             # второй такой же подряд: сужение подтверждено
+        assert prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL}) and prompts.pending_narrowing() == []
+        assert not settings.pipeline_allowed(PIPE_TANGEM) and settings.pipeline_allowed(PIPE_RETAIL)
+    run(go())
+
+
+def test_a_one_poll_blip_does_not_narrow_anything(env):
+    """Промпт на мгновение пропал (скрипт `funnel_prompt.py push` перезаписывает файл): следующий опрос вернул прежнее, ничего не менялось."""
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        svc.body = answer(tangem=False)
+        await svc.poll()
+        assert prompts.pending_narrowing() == [PIPE_TANGEM]
+        svc.body = answer()
+        await svc.poll()
+        assert prompts.pending_narrowing() == [] and prompts.pipelines_for("prod") == frozenset(TWO)
+        svc.body = answer(tangem=False)                                             # и новая пропажа снова начинает отсчёт с первого опроса
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset(TWO) and prompts.pending_narrowing() == [PIPE_TANGEM]
+    run(go())
+
+
+@pytest.mark.parametrize("between", ["down", "garbage", "empty"])
+def test_a_failed_or_rejected_poll_between_two_narrow_answers_resets_the_wait(env, between):
+    """Подтверждение это ДВА УДАЧНЫХ опроса ПОДРЯД: неудачный или отброшенный опрос между ними обнуляет ожидание."""
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        svc.body = answer(tangem=False)
+        await svc.poll()
+        assert prompts.pending_narrowing() == [PIPE_TANGEM]
+        if between == "down":
+            svc.down = True
+        elif between == "garbage":
+            svc.body = {"contract": "2", "funnels": "много"}
+        else:
+            svc.body = answer(retail=False, tangem=False)
+        assert await svc.poll() is False
+        assert prompts.pending_narrowing() == [] and prompts.pipelines_for("prod") == frozenset(TWO)
+        svc.down = False
+        svc.body = answer(tangem=False)
+        await svc.poll()                                                            # снова первый такой ответ: сужения ещё нет
+        assert prompts.pipelines_for("prod") == frozenset(TWO) and prompts.pending_narrowing() == [PIPE_TANGEM]
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL}) and prompts.pending_narrowing() == []
+    run(go())
+
+
+def test_a_different_narrowing_restarts_the_wait(env):
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        svc.body = answer(tangem=False)
+        await svc.poll()
+        svc.body = answer(retail=False)                                             # теперь пропала другая воронка: это не то же суженное множество
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset(TWO) and prompts.pending_narrowing() == [PIPE_RETAIL]
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset({PIPE_TANGEM}) and prompts.pending_narrowing() == []
+    run(go())
+
+
+def test_an_expansion_is_applied_at_once(env):
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        svc.body = answer(extra=(OPT,))
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}) and prompts.pending_narrowing() == []
+    run(go())
+
+
+def test_in_a_mixed_answer_the_new_pipeline_is_applied_at_once_and_the_lost_one_waits(env):
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        svc.body = answer(tangem=False, extra=(OPT,))                               # пропал TangemShop, появился «Опт»
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}) and prompts.pending_narrowing() == [PIPE_TANGEM]
+        await svc.poll()
+        assert prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL, PIPE_OTHER}) and prompts.pending_narrowing() == []
+    run(go())
+
+
+def test_the_first_answer_is_compared_with_the_static_reserve(env):
+    """После рестарта первый ответ тоже может мигнуть: сужение относительно запаса так же ждёт второго опроса, пока действует запас."""
     async def go():
         svc = Svc(env, answer(tangem=False))
-        assert await svc.poll() is True
-        assert prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL})            # TangemShop лишился промпта: сужение принимается сразу
+        await svc.poll()
+        assert prompts.source() == "static" and prompts.pipelines_for("prod") == frozenset(TWO) and prompts.pending_narrowing() == [PIPE_TANGEM]
+        await svc.poll()
+        assert prompts.source() == "service" and prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL}) and prompts.pending_narrowing() == []
+    run(go())
+
+
+def test_the_age_follows_the_answers_while_a_narrowing_waits(env):
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        clock = [prompts._good.at]
+        env.mp.setattr(prompts, "_now", lambda: clock[0])
+        clock[0] += 60
+        svc.body = answer(tangem=False)
+        await svc.poll()
+        assert prompts.pending_narrowing() == [PIPE_TANGEM] and prompts.source() == "service" and prompts.age_s() == 0     # ответ свежий, хотя множество прежнее
+    run(go())
+
+
+def test_the_engines_own_test_pipeline_is_never_a_narrowing(env):
+    """«Тест» движка в режиме `test` есть всегда: ответ без `test_pipelines` после ответа с ними ничего не сужает."""
+    async def go():
+        svc = Svc(env, answer(test=(PIPE_TEST,)))
+        await svc.poll()
+        svc.body = answer(test=())
+        await svc.poll()
+        assert prompts.pending_narrowing() == [] and PIPE_TEST in prompts.pipelines_for("test")
+    run(go())
+
+
+def test_the_test_pipelines_of_the_answer_narrow_the_same_way(env):
+    async def go():
+        svc = Svc(env, answer(test=(PIPE_TEST, PIPE_OTHER)))
+        await svc.poll()
+        assert PIPE_OTHER in prompts.pipelines_for("test")
+        svc.body = answer(test=(PIPE_TEST,))
+        await svc.poll()
+        assert PIPE_OTHER in prompts.pipelines_for("test") and prompts.pending_narrowing() == [PIPE_OTHER]
+        await svc.poll()
+        assert PIPE_OTHER not in prompts.pipelines_for("test") and PIPE_TEST in prompts.pipelines_for("test")
+    run(go())
+
+
+@pytest.mark.parametrize("body", EMPTY)
+def test_an_empty_result_is_a_service_failure_and_keeps_what_was_in_force(env, body, caplog):
+    """Пустой итог не снимает сделки и не останавливает ИИ: действует прежнее множество, срез честно говорит `cached`, в логе предупреждение."""
+    async def go():
+        svc = Svc(env, answer(extra=(OPT,)))
+        await svc.poll()
+        svc.body = body
+        with caplog.at_level("WARNING", logger="uvicorn"):
+            assert await svc.poll() is False
+        assert prompts.source() == "cached" and prompts.pipelines_for("prod") == frozenset({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER})
+        assert "не принят" in caplog.text
+    run(go())
+
+
+def test_an_empty_result_before_any_good_answer_leaves_the_static_reserve(env, caplog):
+    async def go():
+        svc = Svc(env, {"contract": "2", "funnels": [], "test_pipelines": [PIPE_TEST]})
+        with caplog.at_level("WARNING", logger="uvicorn"):
+            assert await svc.poll() is False
+        assert prompts.source() == "static" and prompts.pipelines_for("prod") == frozenset(TWO)
+        assert "пустой итог" in caplog.text
+    run(go())
+
+
+def test_an_empty_result_releases_no_deal(env):
+    async def go():
+        svc = Svc(env)
+        await svc.poll()
+        v2(env, "full")
+        env.lead(pipeline=PIPE_TANGEM)
+        await take(env)
+        svc.body = {"contract": "2", "generated_at": "2026-11-23T10:00:00Z", "funnels": [], "test_pipelines": []}
+        for _ in range(3):
+            await svc.poll()
+        await E._handle_lead_event({**moved(PIPE_TANGEM), "work_touched": True})
+        assert store.get_owner(DEAL)["owner"] == "ai" and not store.get_owner(DEAL)["closed"]
     run(go())
 
 
@@ -214,6 +410,8 @@ FAILURES = [
     pytest.param(dict(body={"contract": "2", "funnels": "много"}), id="мусор в funnels"),
     pytest.param(dict(body=answer(extra=({"slug": "x", "pipelines": ["7000002"], "has_prompt": True},))), id="мусор в номере"),
     pytest.param(dict(body=answer(contract="9", extra=(OPT,))), id="чужой contract"),
+    pytest.param(dict(body={"contract": "2", "funnels": [], "test_pipelines": []}), id="пустой funnels"),
+    pytest.param(dict(body=answer(retail=False, tangem=False)), id="ни у кого has_prompt"),
 ]
 
 
@@ -221,15 +419,16 @@ FAILURES = [
 def test_a_failure_never_widens_the_set_after_a_narrow_answer(env, fail):
     """Последний удачный ответ уже уже запаса (только розница): любой сбой оставляет ЕГО, а не расширяет до запаса или до того, что в мусоре."""
     async def go():
-        svc = Svc(env, answer(tangem=False))
+        svc = Svc(env)
         await svc.poll()
-        narrow = prompts.pipelines_for("prod")
-        assert narrow == frozenset({PIPE_RETAIL})
+        await narrow(svc, answer(tangem=False))
+        narrowed = prompts.pipelines_for("prod")
+        assert narrowed == frozenset({PIPE_RETAIL})
         for key, value in fail.items():
             setattr(svc, key, value)
         assert await svc.poll() is False
-        assert prompts.pipelines_for("prod") == narrow and prompts.source() == "cached"
-        assert prompts.pipelines_for("test") <= narrow | {PIPE_TEST}
+        assert prompts.pipelines_for("prod") == narrowed and prompts.source() == "cached"
+        assert prompts.pipelines_for("test") <= narrowed | {PIPE_TEST}
         assert not settings.pipeline_allowed(PIPE_OTHER)
     run(go())
 
@@ -476,6 +675,9 @@ def test_a_prompt_withdrawn_from_the_pipeline_of_a_taken_deal_stops_the_reply_an
         assert E.decide_permit(*args) == (200, {"allowed": True})
         svc.body = answer(tangem=False)                                                    # промпт tangem убрали, пока ход шёл
         await svc.poll()
+        await E._handle_lead_event({**moved(PIPE_TANGEM), "work_touched": True})
+        assert E.decide_permit(*args) == (200, {"allowed": True}) and store.get_owner(DEAL)["owner"] == "ai"     # один опрос: ничего не снято и не отказано
+        await svc.poll()                                                                   # второй такой же: сужение подтверждено
         assert E.decide_permit(*args) == (200, {"allowed": False, "reason": "owner_changed"})      # клиенту ничего не уходит
         assert store.get_owner(DEAL)["owner"] == "ai"                                      # снимает уже событие сделки или следующее сообщение клиента
         await E._handle_lead_event({**moved(PIPE_TANGEM), "work_touched": True})
@@ -491,8 +693,7 @@ def test_a_prompt_withdrawn_releases_the_deal_at_the_next_client_message(env):
         v2(env, "full")
         env.lead(pipeline=PIPE_TANGEM)
         turn = await take(env)
-        svc.body = answer(tangem=False)
-        await svc.poll()
+        await narrow(svc, answer(tangem=False))
         await env.say(env.msg("ещё вопрос", mid="again"))
         await env.advance(70)
         assert env.turn_requests == []                                                     # нового хода нет: сделка уже не подходящая
@@ -508,8 +709,7 @@ def test_a_prompt_pipeline_is_not_affected_when_another_one_loses_its_prompt(env
         v2(env, "full")
         env.lead(pipeline=PIPE_RETAIL)
         turn = await env.start_turn()
-        svc.body = answer(tangem=False)
-        await svc.poll()
+        await narrow(svc, answer(tangem=False))
         assert E.decide_permit(DEAL, turn["epoch"], turn["turn_id"], turn["up_to_message_id"]) == (200, {"allowed": True})
         await E._handle_lead_event({**moved(PIPE_RETAIL), "work_touched": True})
         assert store.get_owner(DEAL)["owner"] == "ai"
@@ -589,6 +789,7 @@ def test_the_status_shows_the_prompt_pipelines_their_source_and_age(env):
         v2(env, "full")
         out = E.status()
         assert out["prompt_pipelines"] == sorted(TWO) and out["prompt_pipelines_source"] == "static" and out["prompt_pipelines_age_s"] is None
+        assert out["pending_narrowing"] == []
         svc = Svc(env, answer(extra=(OPT,)))
         await svc.poll()
         env.mp.setattr(prompts, "_now", lambda: prompts._good.at + 12.34)
@@ -599,7 +800,23 @@ def test_the_status_shows_the_prompt_pipelines_their_source_and_age(env):
         await svc.poll()
         out = E.status()
         assert out["prompt_pipelines_source"] == "cached" and out["prompt_pipelines"] == sorted({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER})
-        assert out["prompt_pipelines_age_s"] == 12.3
+        assert out["prompt_pipelines_age_s"] == 12.3 and out["pending_narrowing"] == []
+
+
+def test_the_status_shows_the_pipelines_that_wait_for_the_second_poll(env):
+    async def go():
+        v2(env, "full")
+        svc = Svc(env, answer(extra=(OPT,)))
+        await svc.poll()
+        svc.body = answer(tangem=False)                                                    # пропали TangemShop и «Опт»
+        await svc.poll()
+        out = E.status()
+        assert out["pending_narrowing"] == sorted([PIPE_TANGEM, PIPE_OTHER]) and out["prompt_pipelines_source"] == "service"
+        assert out["prompt_pipelines"] == sorted({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER})   # пока действует прежнее
+        await svc.poll()
+        out = E.status()
+        assert out["pending_narrowing"] == [] and out["prompt_pipelines"] == [PIPE_RETAIL]
+    run(go())
     run(go())
 
 
