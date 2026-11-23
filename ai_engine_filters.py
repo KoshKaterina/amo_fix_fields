@@ -84,6 +84,7 @@ DEFAULT_QUIET_MIN = 15
 REASSIGN_ENABLED = os.getenv("AI_REASSIGN_ENABLED", "").strip() == "1"     # запись ответственного в боевую amo: по умолчанию выключена
 REASSIGN_TIMEOUT_S = 15
 MS_CALL_TIMEOUT_S = 6                  # один запрос к МойСклад (без повторов)
+MS_WAIT_S = 7                          # сколько проверка ждёт результат одного запроса (чуть дольше самого запроса); дальше «нераспознана»
 PRODUCTS_DEADLINE_S = 10               # вся проверка товаров одной сделки
 PRODUCTS_MAX_LOOKUPS = 6               # названий из корзины, которые ищем в каталоге за одну сделку; остальные «нераспознаны»
 ORDER_TTL_S, ORDER_FAIL_TTL_S = 300, 30
@@ -178,13 +179,15 @@ def guard_row(deal_id: int) -> dict[str, Any] | None:
 
 def initiative_allowed_for_deal(deal_row: dict[str, Any] | None, guard: dict[str, Any] | None = None) -> bool:
     """Можно ли запускать по сделке инициативные функции (лестница тишины, напоминание, окна УР, касания). `deal_row` это строка `deal_owner`
-    (нужен `deal_id`). Нет охраны (сделка не из «существующих», либо настройки без блока `existing`) или ИИ уже писал клиенту: можно. Охрана
+    (нужен `deal_id`; закрытая сделка и сделка не у ИИ не охраняются). Нет охраны (сделка не из «существующих», либо настройки без блока `existing`) или ИИ уже писал клиенту: можно. Охрана
     есть, а первого сообщения ИИ ещё не было: нельзя. `guard` для проверок без базы (строка `existing_guard` или None). Не бросает: на сбое базы
     отвечает «можно» (прежнее поведение)."""
     try:
         deal_id = int((deal_row or {}).get("deal_id"))
     except (TypeError, ValueError):
         return True
+    if deal_row.get("closed") or deal_row.get("owner") not in (None, store.OWNER_AI):
+        return True                                         # охрана касается только живой сделки ИИ; у закрытой или человеческой свои правила
     try:
         row = guard if guard is not None else guard_row(deal_id)
     except Exception:  # noqa: BLE001
@@ -563,7 +566,7 @@ async def _ms_get(path: str, params: dict | None = None) -> dict | None:
 
 
 async def _cached(key: Any, factory, *, ok_ttl: float, fail_ttl: float) -> Any:
-    """Результат запроса с кэшем на минуты. Ждём не дольше `MS_CALL_TIMEOUT_S + 1`: при таймауте отвечаем None (безопасный отказ), а сам запрос
+    """Результат запроса с кэшем на минуты. Ждём не дольше `MS_WAIT_S`: при таймауте отвечаем None (безопасный отказ), а сам запрос
     дописывает кэш в фоне, и следующая проверка той же сделки идёт быстро."""
     hit = _cache.get(key)
     if hit is not None and hit[0] > _mono():
@@ -589,7 +592,7 @@ async def _cached(key: Any, factory, *, ok_ttl: float, fail_ttl: float) -> Any:
         task = asyncio.ensure_future(fill())
         _inflight[key] = task
     try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=MS_CALL_TIMEOUT_S + 1)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=MS_WAIT_S)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 (в том числе TimeoutError)

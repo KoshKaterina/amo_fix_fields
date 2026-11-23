@@ -918,12 +918,12 @@ async def _fire_followup(f: dict) -> None:
         why = "deal_closed"
     elif owner["owner"] != store.OWNER_AI or int(owner["epoch"]) != int(f["epoch"]):
         why = "owner_changed"
+    elif not filters.initiative_allowed_for_deal(owner):
+        why = "ИИ ещё не писал клиенту в этой существующей сделке"      # охрана инициативы (`ai_engine_filters`)
     elif settings.effective_mode() == "off":
         why = "mode_off"
     elif owner["pipeline_id"] not in settings.allowed_pipelines() and not await _db(intercept.is_taken, deal_id):
         why = "pipeline_not_allowed"
-    elif not filters.initiative_allowed_for_deal(owner):
-        why = "ИИ ещё не писал клиенту в этой существующей сделке"      # охрана инициативы (`ai_engine_filters`)
     else:
         ids = [int(c) for c in json.loads(owner.get("contact_ids") or "[]")]
         if not settings.contact_allowed(ids, [owner.get("chat_id") or ""]):
@@ -1654,11 +1654,11 @@ async def _silence_step(row: dict) -> None:
     if modes.is_stale(owner, settings.active_mode_id()):
         await _release_for_mode(owner, settings.active_mode_id())
         return
+    if not filters.initiative_allowed_for_deal(owner):
+        return                                              # существующая сделка: ИИ ещё не писал клиенту, лестница ждёт (`ai_engine_filters`)
     if owner is None or owner["closed"] or owner["owner"] != store.OWNER_AI or settings.effective_mode() == "off":
         await _db(silence.clear, deal_id)
         return
-    if not filters.initiative_allowed_for_deal(owner):
-        return                                              # существующая сделка: ИИ ещё не писал клиенту, лестница ждёт (`ai_engine_filters`)
     if not settings.send_window()["open_now"]:
         return                                              # вне рабочих часов ИИ отсчёт ждёт
     if row["stage"] == 0:
@@ -1701,10 +1701,10 @@ async def _ur_tick() -> None:
             if modes.is_stale(owner, active):
                 await _release_for_mode(owner, active)      # сделка из другого режима окон УР не получает: её снимаем
                 continue
-            if await _db(intercept.is_taken, deal_id):
-                continue                                    # перехваченная сделка: окна УР не её дело
             if not filters.initiative_allowed_for_deal(owner):
                 continue                                    # существующая сделка: ИИ ещё не писал клиенту, окна УР ждут (`ai_engine_filters`)
+            if await _db(intercept.is_taken, deal_id):
+                continue                                    # перехваченная сделка: окна УР не её дело
             try:
                 w1 = await _db(ur_wave.state, day, deal_id, 1)
                 if w1 is None:
