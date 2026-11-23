@@ -18,6 +18,11 @@
 
 ⚠️ Документ бывает версий 1 и 2 (`settings_version`). Версия 2 только дополняет первую (`mode_id`, `review`, справочный `deals`),
 старые ключи значат то же, поэтому движок можно выкатывать в любом порядке с панелью. Нет `settings_version` или он 1: читаем как раньше.
+
+⚠️ Этап 2 (план «режимы ИИ-менеджера»): версия 2 несёт ещё `functions` (лестница тишины, напоминание, окна УР, срок касания), `call`, `eta`,
+`pipelines_any` и `initiative_pipelines`. Функции со временем берут значения и включение отсюда (запас: прежние переменные окружения), а
+воронку сделки решают ТОЛЬКО `pipeline_allowed` (можно ли вести) и `initiative_allowed` (можно ли инициативные события); голый
+`allowed_pipelines()` для этого не используется.
 """
 import asyncio
 import datetime
@@ -122,8 +127,58 @@ def effective_mode() -> str:
 
 
 def allowed_pipelines() -> frozenset[int]:
+    """Воронки режима из зашитого в движке списка. Для решения «можно ли вести сделку этой воронки» НЕ годится: при `pipelines_any` ИИ ведёт
+    сделку любой воронки, и это решает `pipeline_allowed`. Здесь остаётся справочный набор (срез состояния, тесты)."""
     mode = effective_mode()
     return cfg.MODE_PIPELINES.get(mode, frozenset())
+
+
+def pipelines_any() -> bool:
+    """`pipelines_any` документа версии 2: ИИ может вести сделку ЛЮБОЙ воронки (взятие по сообщению клиента). Только настоящее `true`; нет ключа,
+    мусор или документ версии 1: нет, то есть поведение этапа 1 (воронки режима). Режим `off` проверяет `pipeline_allowed`."""
+    return is_v2() and (_doc or {}).get("pipelines_any") is True
+
+
+def pipeline_allowed(pipeline_id: Any) -> bool:
+    """Можно ли ИИ вести сделку этой воронки. Режим `off` и ошибки чтения (`effective_mode`): нет. `pipelines_any`: любая воронка (известный
+    номер). Иначе воронки режима (`cfg.MODE_PIPELINES`), как до этапа 2. Единственное место этого решения: следить, чтобы не появилось второе."""
+    mode = effective_mode()
+    if mode == "off":
+        return False
+    pid = _pos_int(pipeline_id)
+    if pid is None:
+        return False
+    return True if pipelines_any() else pid in cfg.MODE_PIPELINES.get(mode, frozenset())
+
+
+def _initiative_list() -> frozenset[int] | None:
+    """`initiative_pipelines` документа версии 2 как множество. Нет ключа, не список или в непустом списке ни одного номера: None (панель
+    ничего не сказала, действует умолчание). Пустой список это ответ «нигде». Мусорные элементы списка пропускаются."""
+    raw = (_doc or {}).get("initiative_pipelines") if is_v2() else None
+    if not isinstance(raw, list):
+        return None
+    ids = {pid for pid in (_pos_int(x) for x in raw) if pid is not None}
+    return frozenset(ids) if ids or not raw else None
+
+
+def initiative_pipelines() -> frozenset[int]:
+    """Воронки, где разрешены инициативные события: список панели, иначе две розничные воронки."""
+    listed = _initiative_list()
+    return cfg.INITIATIVE_PIPELINES_DEFAULT if listed is None else listed
+
+
+def initiative_allowed(pipeline_id: Any) -> bool:
+    """Можно ли запускать ИНИЦИАТИВНЫЕ события по сделке этой воронки: лестница тишины, окна УР, отложенные касания, напоминание, и ход
+    получает `initiative: true`. Воронка вне `initiative_pipelines` значит «только отвечаем». Условия: воронку вообще можно вести
+    (`pipeline_allowed`) и она в списке панели; нет списка: воронки самого режима (до этапа 2 так и было: везде, где ИИ ведёт сделки; для
+    «Теста» это «Тест») либо две розничные воронки. Режим `off` и ошибки чтения: нигде."""
+    if not pipeline_allowed(pipeline_id):
+        return False
+    pid = _pos_int(pipeline_id)
+    listed = _initiative_list()
+    if listed is not None:
+        return pid in listed
+    return pid in cfg.MODE_PIPELINES.get(effective_mode(), frozenset()) or pid in cfg.INITIATIVE_PIPELINES_DEFAULT
 
 
 # ---------------------------------------------------------------------------------------------
@@ -190,15 +245,171 @@ def _pos_int(value: Any) -> int | None:
     return number if number > 0 else None
 
 
-def mode_settings() -> dict[str, Any] | None:
-    """Блок `mode_settings` хода (`POST /v1/turn`, необязательное поле): `{"mode_id": ..., "review": {"enabled": ...}}`. Нет настроек
-    версии 2 или режим выключен: None, и поле в ход не кладётся. Форма и имя поля договорены с ИИ-сервисом, не менять."""
+def mode_settings(pipeline_id: Any = None, *, initiative: bool | None = None) -> dict[str, Any] | None:
+    """Блок `mode_settings` хода (`POST /v1/turn`, необязательное поле). Форма и имена договорены с ИИ-сервисом, не менять:
+
+        {"mode_id": ..., "review": {"enabled": ...}, "initiative": <bool>,
+         "functions": {"silence": {...}, "reminder": {"enabled", "after_h"}, "ur": {...}, "touch_max_days": N},      # только если есть в документе
+         "call": {"route_to_mop": ...}, "eta": {"source": ..., "person": {"id", "name"}}}                           # только если есть в документе
+
+    `initiative` кладётся всегда при версии 2: можно ли по сделке этой воронки (`pipeline_id`) инициативные действия; нет воронки: нет.
+    Вызывающий, у которого есть особые правила (перехваченная сделка), решает сам и передаёт `initiative`. Блоки `functions`, `call`, `eta`
+    собираются из эффективных значений (мусор и пропуски заменены умолчаниями), в Перехвате из функций остаётся лестница тишины. Нет
+    настроек версии 2 или режим выключен: None, и поле в ход не кладётся."""
     if not is_v2():
         return None
     mode_id = active_mode_id()
     if mode_id == "off":
         return None
-    return {"mode_id": mode_id, "review": {"enabled": review_enabled()}}
+    out: dict[str, Any] = {
+        "mode_id": mode_id, "review": {"enabled": review_enabled()},
+        "initiative": bool(initiative) if initiative is not None else initiative_allowed(pipeline_id),
+    }
+    if _block("functions") is not None:
+        out["functions"] = functions_wire()
+    if _block("call") is not None:
+        out["call"] = call_config()
+    if _block("eta") is not None:
+        out["eta"] = eta_config()
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# функции со временем, звонок, «когда прибудет товар» (этап 2 плана «режимы ИИ-менеджера», схема 3.4 и 3.5)
+# ---------------------------------------------------------------------------------------------
+# Блоки документа версии 2: `functions {silence, reminder, ur, touch_max_days}`, `call`, `eta`. Читаются КАЖДЫЙ РАЗ из последнего документа
+# панели, поэтому правка в панели действует через один опрос (30 с) без перезапуска. Нет блока, нет ключа или мусор (не тот тип, вне
+# границ): ЗАПАСНОЕ значение, оно равно сегодняшнему поведению; для лестницы тишины и окон УР запасное значение это прежние переменные
+# окружения `AI_SILENCE_ALT_S`, `AI_SILENCE_ALERT_S`, `AI_UR_WAVE_1`, `AI_UR_WAVE_2`, `AI_UR_LATE_FROM` (`cfg`). Документ версии 1 блоков не читает.
+# Времена суток московские, `ЧЧ:ММ`.
+
+DEFAULT_ETA_PERSON = {"id": 13963494, "name": "Екатерина Зубалий"}
+ETA_SOURCES = ("stock_date", "call_person")
+DEFAULT_REMINDER_AFTER_H = 3
+DEFAULT_TOUCH_MAX_DAYS = 7
+TOUCH_SLACK_S = 3600                         # запас на расхождение часов: касание «через N суток» может прийти чуть позже
+UR_DEFAULT_TIMES = {"wave1": "17:50", "wave2": "18:45", "late_from": "17:00"}
+
+
+def _block(name: str) -> dict[str, Any] | None:
+    """Блок документа версии 2 словарём. Версия 1, нет ключа или не словарь: None."""
+    raw = (_doc or {}).get(name) if is_v2() else None
+    return raw if isinstance(raw, dict) else None
+
+
+def _sub(block: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    raw = (block or {}).get(name)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _bool_or(value: Any, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _int_in(value: Any, low: int, high: int) -> int | None:
+    """Целое в границах; булево, дробное, строка и выход за границы: None (мусор)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high else None
+
+
+def _clock(value: Any) -> str | None:
+    """Время суток `ЧЧ:ММ` в нормальном виде (`7:05` -> `07:05`); не время: None. Нормальный вид сравнивается как строка."""
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", value)
+    if m is None or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def silence_config() -> dict[str, Any]:
+    """`functions.silence`: лестница тишины. `enabled` (да), `alt_after_s` (через сколько писать в другом канале, 5-1440 мин в панели),
+    `alert_after_s` (ещё через сколько алерт менеджерам), `alert_on_failed_send` (алерт сразу, если отправка не вышла, да). Запасные
+    значения секунд: `AI_SILENCE_ALT_S`, `AI_SILENCE_ALERT_S` (по 3600)."""
+    block = _sub(_block("functions"), "silence")
+    alt, alert = _int_in(block.get("alt_after_min"), 5, 1440), _int_in(block.get("alert_after_min"), 5, 1440)
+    return {
+        "enabled": _bool_or(block.get("enabled"), True),
+        "alt_after_s": alt * 60 if alt is not None else cfg.SILENCE_ALT_S,
+        "alert_after_s": alert * 60 if alert is not None else cfg.SILENCE_ALERT_S,
+        "alert_on_failed_send": _bool_or(block.get("alert_on_failed_send"), True),
+    }
+
+
+def reminder_config() -> dict[str, Any]:
+    """`functions.reminder`: напоминание «жду подтверждения заказа». Живёт в промпте ИИ-сервиса, движок только передаёт значение в ход.
+    В Перехвате напоминания нет."""
+    block = _sub(_block("functions"), "reminder")
+    after = _int_in(block.get("after_h"), 1, 72)
+    return {
+        "enabled": _bool_or(block.get("enabled"), True) and active_mode_id() != "intercept",
+        "after_h": after if after is not None else DEFAULT_REMINDER_AFTER_H,
+    }
+
+
+def ur_config() -> dict[str, Any]:
+    """`functions.ur`: окна перевода в УР. `enabled`; `wave1`, `wave2`, `late_from` (`ЧЧ:ММ`, `wave2` позже `wave1`, `late_from` не позже
+    `wave1`). Три времени связаны, поэтому берутся все вместе: пропущено, мусор или связь нарушена, значит все три запасные
+    (`AI_UR_WAVE_1`, `AI_UR_WAVE_2`, `AI_UR_LATE_FROM`, при мусоре в них 17:50, 18:45, 17:00). Запасное включение: пусто в `AI_UR_WAVE_1`
+    значит окна выключены, как было. В Перехвате окон УР нет."""
+    block = _sub(_block("functions"), "ur")
+    env = {
+        "wave1": _clock(cfg.UR_WAVE_1) or UR_DEFAULT_TIMES["wave1"],
+        "wave2": _clock(cfg.UR_WAVE_2) or UR_DEFAULT_TIMES["wave2"],
+        "late_from": _clock(cfg.UR_LATE_FROM) or UR_DEFAULT_TIMES["late_from"],
+    }
+    mine = {key: _clock(block.get(key)) for key in env}
+    ok = all(mine.values()) and mine["wave2"] > mine["wave1"] and mine["late_from"] <= mine["wave1"]
+    return {
+        "enabled": _bool_or(block.get("enabled"), bool(cfg.UR_WAVE_1)) and active_mode_id() != "intercept",
+        **(mine if ok else env),
+    }
+
+
+def touch_max_days() -> int:
+    """`functions.touch_max_days`: самый дальний срок отложенного касания, 1-30 суток (7)."""
+    value = _int_in((_block("functions") or {}).get("touch_max_days"), 1, 30)          # ключ лежит прямо в `functions`, не в подблоке
+    return value if value is not None else DEFAULT_TOUCH_MAX_DAYS
+
+
+def touch_max_ahead_s() -> int:
+    """Дальше скольких секунд от сейчас касание не регистрируется: `touch_max_days` суток и час запаса."""
+    return touch_max_days() * 86400 + TOUCH_SLACK_S
+
+
+def touches_available() -> bool:
+    """Есть ли отложенные касания в этом режиме. В Перехвате нет: ИИ там только отвечает на неотвеченное."""
+    return active_mode_id() != "intercept"
+
+
+def functions_wire() -> dict[str, Any]:
+    """Блок `functions` для `mode_settings`: эффективные значения (минуты и часы, как в панели). В Перехвате только лестница тишины."""
+    sil = silence_config()
+    out: dict[str, Any] = {"silence": {
+        "enabled": sil["enabled"], "alt_after_min": max(1, round(sil["alt_after_s"] / 60)),
+        "alert_after_min": max(1, round(sil["alert_after_s"] / 60)), "alert_on_failed_send": sil["alert_on_failed_send"],
+    }}
+    if touches_available():
+        rem, ur = reminder_config(), ur_config()
+        out["reminder"] = {"enabled": rem["enabled"], "after_h": rem["after_h"]}
+        out["ur"] = {key: ur[key] for key in ("enabled", "wave1", "wave2", "late_from")}
+        out["touch_max_days"] = touch_max_days()
+    return out
+
+
+def call_config() -> dict[str, Any]:
+    """`call.route_to_mop`: выводить клиента на звонок с МОПом (шаблон А) или предлагать время звонка (шаблон Б). Умолчание: да."""
+    return {"route_to_mop": _bool_or((_block("call") or {}).get("route_to_mop"), True)}
+
+
+def eta_config() -> dict[str, Any]:
+    """`eta`: откуда брать «когда прибудет товар»: `stock_date` (дата приёмки из МойСклад) или `call_person` (звать сотрудника `person`).
+    Умолчание: `stock_date`, Екатерина Зубалий 13963494. Человек с мусорным `id` или пустым именем заменяется умолчанием целиком."""
+    block = _block("eta") or {}
+    source = block.get("source") if block.get("source") in ETA_SOURCES else "stock_date"
+    person = block.get("person") if isinstance(block.get("person"), dict) else {}
+    pid, name = _pos_int(person.get("id")), person.get("name")
+    ok = pid is not None and isinstance(name, str) and bool(name.strip())
+    return {"source": source, "person": {"id": pid, "name": name.strip()} if ok else dict(DEFAULT_ETA_PERSON)}
 
 
 def timers() -> dict[str, int]:

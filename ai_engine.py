@@ -731,7 +731,8 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     mode_id = settings.active_mode_id()
     manager_cutoff = (await _db(intercept.cutoff_iso, deal_id)) or await _db(give.cutoff_iso, deal_id, mode_id)   # сделку отдали ИИ явно: сообщения менеджера до этого не останавливают
     given_forced = bool(await _db(give.is_forced, deal_id, mode_id)) or intercepted      # отдали вопреки параллельной сделке: ИИ её не учитывает
-    mode_settings = settings.mode_settings()                                         # только при настройках версии 2 (`mode_id`, `review`)
+    # только при настройках версии 2 (`mode_id`, `review`, `initiative` по воронке сделки, блоки функций); перехваченная сделка: initiative как у перехвата
+    mode_settings = settings.mode_settings(initiative=settings.initiative_allowed(owner.get("pipeline_id")) or intercepted)
 
     def build(turn_id: int) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -769,12 +770,38 @@ async def _enqueue_turn(s: dict, owner: dict, mode: str, *, event: dict | None =
     logger.info("ai_engine: ход %s по сделке %s (%s, сообщений %s)", turn["turn_id"], deal_id, reason, len(pending))
 
 
+async def _initiative_ok(owner: dict) -> bool:
+    """Можно ли по сделке инициативные действия: её воронка в `initiative_pipelines` (`settings.initiative_allowed`), иначе ИИ только
+    отвечает. Перехваченная сделка живёт по правилам перехвата (лестницы тишины и окон УР у неё нет, воронка любая), для неё да."""
+    return settings.initiative_allowed(owner.get("pipeline_id")) or bool(await _db(intercept.is_taken, int(owner["deal_id"])))
+
+
+async def _event_blocked(owner: dict, event_type: str) -> str | None:
+    """Служебное событие, которое ИИ по этой сделке получать не должен: функцию выключили в панели или воронка «только отвечаем».
+    Страховка в общей точке постановки; сами таймеры (`_silence_step`, `_ur_tick`) отсекают это раньше и ещё снимают своё состояние.
+    Причина словами или None, если событие можно ставить."""
+    if event_type == "silent_alt":
+        if not settings.silence_config()["enabled"]:
+            return "лестница тишины выключена в настройках"
+    elif event_type == "ur_wave":
+        if not settings.ur_config()["enabled"]:
+            return "окна УР выключены в настройках"
+    else:
+        return None
+    return None if await _initiative_ok(owner) else "в воронке сделки ИИ только отвечает"
+
+
 async def _queue_event(owner: dict, event_type: str, extra: dict | None = None) -> None:
     """Поставить служебное событие: оно идёт отдельным ходом, как только предыдущий закончился.
     Сделке, взятой в другом режиме, событий не ставим (её снимет `_release_for_mode`): это общая точка оплаты, возврата диалога,
-    касаний, лестницы тишины, окон УР и перехвата."""
+    касаний, лестницы тишины, окон УР и перехвата. Инициативные события (`silent_alt`, `ur_wave`) не ставятся и тогда, когда функцию
+    выключили или воронка сделки «только отвечаем» (`_event_blocked`)."""
     if modes.is_stale(owner, settings.active_mode_id()):
         logger.warning("ai_engine: событие %s по сделке %s не поставлено: сделка взята в другом режиме", event_type, owner.get("deal_id"))
+        return
+    blocked = await _event_blocked(owner, event_type)
+    if blocked:
+        logger.info("ai_engine: событие %s по сделке %s не поставлено: %s", event_type, owner.get("deal_id"), blocked)
         return
     s = await _db(store.session_for_deal, int(owner["deal_id"]))
     if s is None:
@@ -831,12 +858,16 @@ async def schedule_followup(deal_id: int, epoch: int, turn_id: int, up_to_messag
         code, out = decide_permit(deal_id, epoch, turn_id, up_to_message_id)
         if not out.get("allowed"):
             return code, out
+        owner = await _db(store.get_owner, deal_id)
+        if not settings.touches_available():
+            return 422, {"allowed": False, "reason": "touch_unavailable"}              # Перехват: ИИ только отвечает, касаний нет
+        if owner is not None and not await _initiative_ok(owner):
+            return 422, {"allowed": False, "reason": "initiative_off"}                 # воронка «только отвечаем»: обещать клиенту сообщение нельзя
         ahead = float(due_at) - _now()
         if ahead < followup.MIN_AHEAD_S:
             return 422, {"allowed": False, "reason": "too_soon"}
-        if ahead > followup.MAX_AHEAD_S:
+        if ahead > settings.touch_max_ahead_s():                                     # `touch_max_days` из настроек режима (7 по умолчанию)
             return 422, {"allowed": False, "reason": "too_far"}
-        owner = await _db(store.get_owner, deal_id)
         chat_key = (owner or {}).get("chat_key") or ""
         if not chat_key:
             return 200, {"allowed": False, "reason": "owner_changed"}
@@ -876,8 +907,12 @@ async def _fire_followup(f: dict) -> None:
         why = "owner_changed"
     elif settings.effective_mode() == "off":
         why = "mode_off"
-    elif owner["pipeline_id"] not in settings.allowed_pipelines() and not await _db(intercept.is_taken, deal_id):
+    elif not settings.pipeline_allowed(owner["pipeline_id"]) and not await _db(intercept.is_taken, deal_id):
         why = "pipeline_not_allowed"
+    elif not settings.touches_available():
+        why = "mode_no_touch"                           # Перехват: касаний нет (сменили режим, пока касание ждало)
+    elif not await _initiative_ok(owner):
+        why = "initiative_off"                          # воронка «только отвечаем»: инициативного сообщения клиенту не будет
     else:
         ids = [int(c) for c in json.loads(owner.get("contact_ids") or "[]")]
         if not settings.contact_allowed(ids, [owner.get("chat_id") or ""]):
@@ -943,7 +978,7 @@ async def _send_turn(turn: dict) -> None:
         return
     payload = json.loads(turn["payload"])
     # Настройки режима берём на момент отправки, а не создания хода: ход мог лежать в очереди, пока включали «пилот».
-    ms = settings.mode_settings()
+    ms = settings.mode_settings(initiative=await _initiative_ok(owner))
     if ms is not None:
         payload["mode_settings"] = ms
     else:
@@ -1426,10 +1461,15 @@ async def _lead_event_under_lock(ev: dict) -> bool:
         await _release_for_mode(owner, settings.active_mode_id())
         return True
     if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]:
-        if (ev["pipeline_id"] is not None and ev["pipeline_id"] not in settings.allowed_pipelines()
+        if (ev["pipeline_id"] is not None and not settings.pipeline_allowed(ev["pipeline_id"])
                 and not await _db(intercept.is_taken, lead_id)):
             await _deal_closed(lead_id, "left_pipeline")
             return True
+        if ev["pipeline_id"] is not None and settings.pipelines_any() and owner.get("pipeline_id") != ev["pipeline_id"]:
+            # Сделку перенесли в другую воронку, а ИИ ведёт любые: запомнить новую, от неё зависит «инициатива» (лестница, УР, касания).
+            # Без `pipelines_any` сюда не доходим: другая воронка значила бы «ушла из воронок режима» (выше).
+            await _db(store.set_pipeline, lead_id, int(ev["pipeline_id"]))
+            owner = dict(owner, pipeline_id=int(ev["pipeline_id"]))
         if _is_payment_event(ev, owner) and await _db(store.claim_event, lead_id, "payment_received"):
             logger.info("ai_engine: сделка %s оплачена - служебное событие payment_received", lead_id)
             await _queue_event(owner, "payment_received")
@@ -1495,7 +1535,7 @@ async def return_dialog(deal_id: int) -> tuple[int, dict]:
             owner = await _db(store.get_owner, deal_id)
         if owner is None or owner["closed"] or owner["owner"] == store.OWNER_AI:
             return 409, {"detail": "not_returnable"}
-        if owner["pipeline_id"] not in settings.allowed_pipelines() and not await _db(intercept.is_taken, deal_id):
+        if not settings.pipeline_allowed(owner["pipeline_id"]) and not await _db(intercept.is_taken, deal_id):
             return 409, {"detail": "pipeline_not_allowed"}
         if not await _ai_is_up():
             return 503, {"detail": "ai_unavailable"}
@@ -1576,21 +1616,36 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
 # =============================================================================================
 
 async def silence_arm(deal_id: int) -> None:
-    """ИИ получил разрешение написать клиенту: с этого момента идёт отсчёт тишины (первое сообщение отсчёт задаёт, остальные не сдвигают)."""
+    """ИИ получил разрешение написать клиенту: с этого момента идёт отсчёт тишины (первое сообщение отсчёт задаёт, остальные не сдвигают).
+    Отсчёт не взводится, если лестницу выключили в панели или воронка сделки «только отвечаем»; время сообщения для окон УР пишется всегда."""
     try:
         owner = await _db(store.get_owner, int(deal_id))
         if await _db(intercept.is_taken, int(deal_id)):
             return                                          # перехваченная сделка: только консультация, лестницы тишины и окон УР нет
         if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] and owner.get("chat_key"):
-            await _db(silence.arm, int(deal_id), owner["chat_key"], _now())
+            if settings.silence_config()["enabled"] and settings.initiative_allowed(owner.get("pipeline_id")):
+                await _db(silence.arm, int(deal_id), owner["chat_key"], _now())
             await _db(ur_wave.note_sent, int(deal_id), _now())
     except Exception:  # noqa: BLE001 - отсчёт тишины не должен ломать отправку
         logger.exception("ai_engine: отсчёт тишины по сделке %s не взведён", deal_id)
 
 
+def _span_text(seconds: float) -> str:
+    """Срок словами для алерта: два часа это «двух часов» (так было всегда), остальное минутами."""
+    minutes = round(seconds / 60)
+    return "двух часов" if minutes == 120 else f"{minutes} мин"
+
+
 async def _silence_tick() -> None:
+    sil = settings.silence_config()
+    if not sil["enabled"]:
+        # Функцию выключили в панели: стоящие отсчёты снимаются (при включении отсчёт начнётся заново с первого сообщения ИИ, а не поднимет
+        # лестницу по всем старым сделкам разом). События не создаются, алерт «клиент молчит» не уходит. Как при смене режима, клиенту и в amo ничего не пишется.
+        if await _db(silence.clear_all):
+            logger.info("ai_engine: лестница тишины выключена в настройках, стоящие отсчёты сняты")
+        return
     now = _now()
-    for row in await _db(silence.due, now, cfg.SILENCE_ALT_S, cfg.SILENCE_ALERT_S):
+    for row in await _db(silence.due, now, sil["alt_after_s"], sil["alert_after_s"]):
         try:
             async with _get_lock():
                 await _silence_step(row)
@@ -1610,17 +1665,24 @@ async def _silence_step(row: dict) -> None:
     if owner is None or owner["closed"] or owner["owner"] != store.OWNER_AI or settings.effective_mode() == "off":
         await _db(silence.clear, deal_id)
         return
+    sil = settings.silence_config()
+    if not sil["enabled"] or not await _initiative_ok(owner):
+        await _db(silence.clear, deal_id)                   # функцию выключили или сделку перенесли в воронку «только отвечаем»: отсчёт снят
+        return
     if not settings.send_window()["open_now"]:
         return                                              # вне рабочих часов ИИ отсчёт ждёт
     if row["stage"] == 0:
         await _db(silence.set_stage, deal_id, 1, now)
         if await _ai_is_up():
-            await _queue_event(owner, "silent_alt", extra={"reason": "клиент молчит час после нашего сообщения"})
-            logger.info("ai_engine: сделка %s: клиент молчит час, ИИ пробует другой канал", deal_id)
+            alt_min = round(sil["alt_after_s"] / 60)
+            await _queue_event(owner, "silent_alt", extra={
+                "reason": "клиент молчит час после нашего сообщения" if alt_min == 60 else f"клиент молчит {alt_min} мин после нашего сообщения"})
+            logger.info("ai_engine: сделка %s: клиент молчит %s мин, ИИ пробует другой канал", deal_id, alt_min)
         return
     await _db(silence.set_stage, deal_id, 2, now)
     s = await _db(store.session_for_deal, deal_id)
-    await _alert("silent_alert", ["Клиент не отвечает на сообщения ИИ уже больше двух часов, другой канал пробовали.",
+    total = _span_text(sil["alt_after_s"] + sil["alert_after_s"])
+    await _alert("silent_alert", [f"Клиент не отвечает на сообщения ИИ уже больше {total}, другой канал пробовали.",
                                   "Нужно связаться с клиентом вручную.", _client_line(s), _link(deal_id)],
                  dedupe=f"silent_alert:{deal_id}")
 
@@ -1637,12 +1699,17 @@ def _msk_at(ts: float, hhmm: str) -> float:
 
 async def _ur_tick() -> None:
     """Окна перевода в УР: событие `ur_wave` всем сделкам ИИ в 17:50, а тем, кому ИИ писал в 17:00 и позже, во втором окне в 18:45."""
-    if not cfg.UR_WAVE_1:
-        return                                              # окна выключены (пусто в AI_UR_WAVE_1)
+    ur = settings.ur_config()                                 # включение и времена из настроек режима (запас: AI_UR_WAVE_1, AI_UR_WAVE_2, AI_UR_LATE_FROM)
     now = _now()
     day = datetime.datetime.fromtimestamp(now, _MSK).strftime("%Y-%m-%d")
-    first_at = cfg.UR_WAVE_1_BY_DAY.get(day) or cfg.UR_WAVE_1
-    t1, t2, late = _msk_at(now, first_at), _msk_at(now, cfg.UR_WAVE_2), _msk_at(now, cfg.UR_LATE_FROM)
+    if not ur["enabled"]:
+        # Окна выключены (панель, Перехват или пусто в AI_UR_WAVE_1): события не создаются, ждавшие второго окна сегодня его не получат,
+        # даже если окна включат снова до вечера. Клиенту и в amo ничего не пишется.
+        if await _db(ur_wave.cancel_deferred, day, now):
+            logger.info("ai_engine: окна УР выключены в настройках, ожидавшие второго окна сняты")
+        return
+    first_at = cfg.UR_WAVE_1_BY_DAY.get(day) or ur["wave1"]
+    t1, t2, late = _msk_at(now, first_at), _msk_at(now, ur["wave2"]), _msk_at(now, ur["late_from"])
     if now < t1 or settings.effective_mode() == "off":
         return
     async with _get_lock():
@@ -1654,6 +1721,8 @@ async def _ur_tick() -> None:
                 continue
             if await _db(intercept.is_taken, deal_id):
                 continue                                    # перехваченная сделка: окна УР не её дело
+            if not settings.initiative_allowed(owner.get("pipeline_id")):
+                continue                                    # воронка «только отвечаем»: окон УР по ней нет
             try:
                 w1 = await _db(ur_wave.state, day, deal_id, 1)
                 if w1 is None:
@@ -1663,7 +1732,7 @@ async def _ur_tick() -> None:
                     elif await _fire_ur_wave(owner, 1, first_at):
                         await _db(ur_wave.mark, day, deal_id, 1, "fired", now)
                 elif w1 == "deferred" and now >= t2 and await _db(ur_wave.state, day, deal_id, 2) is None:
-                    if await _fire_ur_wave(owner, 2, cfg.UR_WAVE_2):
+                    if await _fire_ur_wave(owner, 2, ur["wave2"]):
                         await _db(ur_wave.mark, day, deal_id, 2, "fired", now)
             except asyncio.CancelledError:
                 raise
@@ -1682,7 +1751,13 @@ async def _fire_ur_wave(owner: dict, wave: int, hhmm: str) -> bool:
 async def send_failed(deal_id: int, code: str, reason: str) -> dict[str, Any]:
     """ИИ-сервис не смог отправить клиенту сообщение (Wazzup отказал, канала нет): примечание в сделку, алерт в чат ОП с пингами и срочная задача
     «Связаться с клиентом» на ответственного. Владелец сделки НЕ меняется, ИИ остаётся ведущим. Один раз на сделку и причину за 15 минут:
-    повторы (повторное одобрение, повтор хода) ничего не дублируют. Не бросает: сбой одной части не мешает остальным."""
+    повторы (повторное одобрение, повтор хода) ничего не дублируют. Не бросает: сбой одной части не мешает остальным.
+
+    Выключено «алерт сразу при неудачной отправке» (`functions.silence.alert_on_failed_send`): примечание, алерт и задача не создаются,
+    остаётся строка в логе; о молчании клиента менеджеров предупредит лестница тишины, пока она включена. Не зависит от самой лестницы."""
+    if not settings.silence_config()["alert_on_failed_send"]:
+        logger.warning("ai_engine: сделка %s: отказ отправки клиенту (%s), алерт сразу выключен в настройках режима", deal_id, str(code)[:80])
+        return {"ok": True, "deduped": False, "skipped": "alert_on_failed_send_off"}
     now = _now()
     key = f"{int(deal_id)}:{str(code)[:80]}"
     if now - _send_failed_seen.get(key, 0) < SEND_FAILED_DEDUPE_S:
@@ -1805,5 +1880,12 @@ def status() -> dict[str, Any]:
         out["counts"] = store.counts()
     except Exception:  # noqa: BLE001
         out["counts"] = "ошибка чтения базы"
+    try:
+        # Что движок СЕЙЧАС берёт из настроек (этап 2): после выката сверить с панелью без чтения логов.
+        out["pipelines_any"] = settings.pipelines_any()
+        out["initiative_pipelines"] = sorted(settings.initiative_pipelines())
+        out["functions"] = settings.functions_wire()
+    except Exception:  # noqa: BLE001
+        out["functions"] = "ошибка чтения настроек"
     out["return_by_reaction"] = ai_engine_return.stats()
     return out

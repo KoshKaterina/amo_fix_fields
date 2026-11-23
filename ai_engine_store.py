@@ -309,6 +309,12 @@ def set_owner(
         return dict(conn.execute("SELECT * FROM deal_owner WHERE deal_id=?", (int(deal_id),)).fetchone())
 
 
+def set_pipeline(deal_id: int, pipeline_id: int) -> None:
+    """Запомнить воронку, в которую перенесли сделку (событие сделки из amo). Владельца и эпоху не трогает."""
+    with _connect() as conn:
+        conn.execute("UPDATE deal_owner SET pipeline_id=? WHERE deal_id=?", (int(pipeline_id), int(deal_id)))
+
+
 def mark_closed(deal_id: int) -> None:
     with _connect() as conn:
         conn.execute("UPDATE deal_owner SET closed=1 WHERE deal_id=?", (int(deal_id),))

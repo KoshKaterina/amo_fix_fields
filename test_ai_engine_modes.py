@@ -215,12 +215,13 @@ def test_deals_block_is_a_reference_only_and_survives_garbage(env):
 
 
 def test_mode_settings_has_exactly_the_agreed_shape(env):
+    # этап 2: `initiative` кладётся всегда при версии 2 (по воронке сделки); блоки `functions`, `call`, `eta` только если они есть в документе
     apply(env, "test", 2)
-    assert settings.mode_settings() == {"mode_id": "test", "review": {"enabled": True}}
+    assert settings.mode_settings(PIPE_TEST) == {"mode_id": "test", "review": {"enabled": True}, "initiative": True}
     apply(env, "full", 2, review={"enabled": False}, mode_id="help")
-    assert settings.mode_settings() == {"mode_id": "help", "review": {"enabled": False}}
+    assert settings.mode_settings(PIPE_RETAIL) == {"mode_id": "help", "review": {"enabled": False}, "initiative": True}
     apply(env, "full", 2, review={"enabled": "junk"})
-    assert settings.mode_settings() == {"mode_id": "full", "review": {"enabled": True}}
+    assert settings.mode_settings(PIPE_RETAIL) == {"mode_id": "full", "review": {"enabled": True}, "initiative": True}
     apply(env, "off", 2)
     assert settings.mode_settings() is None
     apply(env, "full", 1)
@@ -239,7 +240,7 @@ def test_garbage_in_every_block_gives_safe_defaults_and_does_not_raise(env):
     assert settings.review_enabled() is True and settings.deal_items() == []
     assert settings.post_sale_window_days() == 7
     assert settings.intercept_enabled() is False and settings.intercept_config()["managers"]
-    assert settings.mode_settings() == {"mode_id": "full", "review": {"enabled": True}}
+    assert settings.mode_settings(PIPE_RETAIL) == {"mode_id": "full", "review": {"enabled": True}, "initiative": True}
     env.set_settings(contacts={"scope": "full", "restricted": True, "items": "junk"}, work_hours=[{"start": "10:00"}, {"start": "x", "end": "y"}, 5, "10-19"])
     assert settings.contact_items() == [] and settings.work_hours() == []
     env.set_settings(timers={"debounce_s": "soon", "first_reply_wait_s": None, "debounce_cap_s": -5, "ai_down_release_s": 30})
@@ -404,7 +405,7 @@ def test_interception_records_the_active_mode_and_the_next_mode_releases_the_dea
         await env.advance(16 * 60)
         await env.advance(5)
         ev = intercepts(env)[0]
-        assert ev["mode_settings"] == {"mode_id": "full", "review": {"enabled": True}}
+        assert ev["mode_settings"] == {"mode_id": "full", "review": {"enabled": True}, "initiative": True}
         assert store.get_owner(DEAL)["mode"] == "full" and I.is_taken(DEAL)
         env.turn_requests.clear()
         intercept_setup(env, mode="test", pipelines=[PIPE_TEST], settings_version=2, mode_id="test", review={"enabled": True})
@@ -849,8 +850,8 @@ def test_turn_has_mode_settings_for_version_2_and_has_none_for_version_1(env):
         await env.say(env.msg("ещё", mid="v2-1"))
         await env.advance(11)
         second = env.turn_requests[-1]
-        assert second["mode_settings"] == {"mode_id": "test", "review": {"enabled": True}} and second["mode"] == "test"
-        assert sorted(second["mode_settings"]) == ["mode_id", "review"] and sorted(second["mode_settings"]["review"]) == ["enabled"]
+        assert second["mode_settings"] == {"mode_id": "test", "review": {"enabled": True}, "initiative": True} and second["mode"] == "test"
+        assert sorted(second["mode_settings"]) == ["initiative", "mode_id", "review"] and sorted(second["mode_settings"]["review"]) == ["enabled"]
     run(go())
 
 
@@ -860,7 +861,7 @@ def test_turn_mode_settings_follow_the_document_in_prod(env, mode_id, review):
         apply(env, "full", 2, mode_id=mode_id, review={"enabled": review})
         env.lead(pipeline=PIPE_RETAIL)
         turn = await env.start_turn()
-        assert turn["mode"] == "prod" and turn["mode_settings"] == {"mode_id": mode_id, "review": {"enabled": review}}
+        assert turn["mode"] == "prod" and turn["mode_settings"] == {"mode_id": mode_id, "review": {"enabled": review}, "initiative": True}
     run(go())
 
 
@@ -879,7 +880,7 @@ def test_version_2_without_mode_id_still_sends_the_derived_mode(env):
     async def go():
         env.set_settings(settings_version=2)
         turn = await env.start_turn()
-        assert turn["mode_settings"] == {"mode_id": "test", "review": {"enabled": True}}
+        assert turn["mode_settings"] == {"mode_id": "test", "review": {"enabled": True}, "initiative": True}
     run(go())
 
 
@@ -894,7 +895,7 @@ def test_mode_settings_are_taken_at_send_time_not_at_creation(env):
         assert json.loads(queued["payload"])["mode_settings"]["review"] == {"enabled": True}
         apply(env, "test", 2, review={"enabled": False})                      # пока он лежал, «пилот» выключили
         await E.dispatch_once()
-        assert env.turn_requests[-1]["mode_settings"] == {"mode_id": "test", "review": {"enabled": False}}
+        assert env.turn_requests[-1]["mode_settings"] == {"mode_id": "test", "review": {"enabled": False}, "initiative": True}
     run(go())
 
 

@@ -5,7 +5,8 @@
 (63% дублей идут в паре с проданной сделкой, закрытие меняет заказ в МойСклад).
 
 Что считается чем:
-  • «подходящая» - открытая сделка воронки текущего режима (тест: «Тест»; прод: «ОП розница», TangemShop);
+  • «подходящая» - открытая сделка воронки текущего режима (тест: «Тест»; прод: «ОП розница», TangemShop; при `pipelines_any` любая
+    воронка: решает `settings.pipeline_allowed`);
   • «признак работы» - бюджет больше нуля, заказ (UUID, номер или состав), этап дальше «Взят в работу» в
     «ОП розница» или TangemShop, либо сделкой уже владеет человек.
 
@@ -143,9 +144,8 @@ async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None,
     if leads is None:
         return Resolution(K_ERROR, note="amoCRM не ответила на поиск сделок")
 
-    allowed = settings.allowed_pipelines()
     open_leads = [ld for ld in leads if is_open(ld)]
-    suitable = [ld for ld in open_leads if _pipeline(ld) in allowed or int(ld["id"]) in any_pipeline_ids]
+    suitable = [ld for ld in open_leads if settings.pipeline_allowed(_pipeline(ld)) or int(ld["id"]) in any_pipeline_ids]
 
     if known_deal_id is not None:
         mine = next((ld for ld in suitable if int(ld["id"]) == int(known_deal_id)), None)

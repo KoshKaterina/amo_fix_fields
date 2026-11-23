@@ -46,6 +46,13 @@ def state(day: str, deal_id: int, wave: int) -> str | None:
         return row["state"] if row else None
 
 
+def cancel_deferred(day: str, now: float) -> int:
+    """Окна УР выключили в панели: сделки, ждавшие второго окна сегодня (`deferred`), его не получат, даже если окна включат снова до
+    вечера: стоящий таймер снят, а не отложен. Возвращает, сколько снято. Сегодняшние `fired` и `cancelled` не трогает."""
+    with _Db() as conn:
+        return conn.execute("UPDATE ur_wave SET state='cancelled', at=? WHERE day=? AND state='deferred'", (float(now), day)).rowcount
+
+
 def mark(day: str, deal_id: int, wave: int, st: str, now: float) -> None:
     with _Db() as conn:
         conn.execute("INSERT OR REPLACE INTO ur_wave (day, deal_id, wave, state, at) VALUES (?,?,?,?,?)", (day, int(deal_id), int(wave), st, float(now)))

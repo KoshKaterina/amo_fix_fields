@@ -71,6 +71,9 @@ MODE_PIPELINES: dict[str, frozenset[int]] = {
     "test": frozenset({PIPELINE_TEST}),
     "prod": frozenset({int(PIPELINE_CLEVER_MAIN), int(PIPELINE_TANGEMSHOP)}),
 }
+# Воронки, где ИИ вправе проявлять ИНИЦИАТИВУ (лестница тишины, окна УР, отложенные касания, напоминание), когда панель не прислала
+# `initiative_pipelines`: две розничные воронки (этап 2 плана «режимы ИИ-менеджера»). В остальных воронках при `pipelines_any` ИИ только отвечает.
+INITIATIVE_PIPELINES_DEFAULT: frozenset[int] = MODE_PIPELINES["prod"]
 CLOSED_STATUS_IDS = frozenset({int(STATUS_SUCCESS), int(STATUS_CLOSED_LOST)})
 
 # Режимы работы ИИ-менеджера (план 20.11.2026, этап 1): один активный `mode_id`. Старый ключ `mode` остаётся с прежним смыслом

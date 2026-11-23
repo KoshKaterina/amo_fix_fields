@@ -35,8 +35,16 @@ def clear(deal_id: int) -> None:
         conn.execute("DELETE FROM silence WHERE deal_id=?", (int(deal_id),))
 
 
+def clear_all() -> int:
+    """Снять отсчёт у всех сделок (функцию выключили в панели). При включении отсчёт начнётся заново с первого сообщения ИИ: старые
+    `armed_at` не должны разом поднять лестницу по всем сделкам. Возвращает, сколько отсчётов снято."""
+    with _Db() as conn:
+        return conn.execute("DELETE FROM silence").rowcount
+
+
 def due(now: float, alt_after_s: float, alert_after_s: float) -> list[dict]:
-    """Сделки, у которых пора на следующую ступень: stage 0 и прошёл час, либо stage 1 и прошёл ещё час."""
+    """Сделки, у которых пора на следующую ступень: stage 0 и прошёл срок до другого канала (час), либо stage 1 и прошёл ещё срок до
+    алерта (ещё час). Сроки приходят из настроек режима, значения по умолчанию по часу."""
     with _Db() as conn:
         rows = conn.execute("SELECT * FROM silence WHERE (stage=0 AND armed_at<=?) OR (stage=1 AND stage_at<=?)",
                             (float(now) - alt_after_s, float(now) - alert_after_s)).fetchall()
