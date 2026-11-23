@@ -1865,6 +1865,74 @@ async def raise_alert(key: str, lines: list[str]) -> None:
     await _alert(key, lines)
 
 
+# Дежурные алерты ИИ-сервиса (`POST /team_alert`, 23.11.2026): ИИ зовёт руководителя или передаёт, что у клиента
+# не работает сайт или приложение. Ключи совпадают с каталогом «Уведомлений» панели Team: панель решает выключатель, канал,
+# шаблон и получателей; пока она про ключ не знает, уходит текст ниже в «Отдел продаж, Уведомления».
+DUTY_EVENTS: dict[str, str] = {
+    "ai_alert_head": "🙋 ИИ-менеджер: нужен руководитель",
+    "ai_alert_tech": "🛠 ИИ-менеджер: не работает сайт или приложение",
+}
+DUTY_TEXT_MAX = 500
+DUTY_DEDUPE_S = 600
+_duty_seen: dict[str, float] = {}       # «сделка:событие:текст» -> когда отправили; повтор за 10 минут не шлём
+
+
+async def duty_alert(deal_id: int, event: str, text: str) -> str:
+    """Дежурный алерт по событию панели `event` (`DUTY_EVENTS`). Возвращает `sent`, `disabled` (выключено в панели или её канал
+    у интеграции не настроен), `duplicate` (тот же текст по той же сделке за 10 минут) или `failed` (Телеграм не принял). Не бросает.
+    Переменные шаблона (каталог Team, 23.11.2026): `{{текст_события}}` (текст ИИ), `{{сделка}}` (название сделки из amo, не
+    прочиталось - «Сделка №<номер>»), `{{ссылка_на_сделку}}` (адрес только здесь), `{{клиент}}` (имя из чата ИИ, нет - пусто), `{{теги}}`; плюс `{{текст}}` с тем же текстом ИИ.
+    ⚠️ `текст_события` в `alert_templates.HTML_VARIABLES`: рендер его не экранирует, поэтому экранируем здесь, иначе угловая скобка
+    в словах клиента уронит сообщение в HTML-разметке."""
+    now = _now()
+    key = f"{int(deal_id)}:{event}:{text}"
+    if now - _duty_seen.get(key, 0) < DUTY_DEDUPE_S:
+        return "duplicate"
+    if len(_duty_seen) > 500:
+        for k, at in list(_duty_seen.items()):
+            if now - at >= DUTY_DEDUPE_S:
+                _duty_seen.pop(k, None)
+    _duty_seen[key] = now                   # до отправки: параллельный повтор того же запроса вторым сообщением не уйдёт
+    try:
+        try:
+            s = await _db(store.session_for_deal, int(deal_id))
+        except Exception:  # noqa: BLE001
+            s = None                        # имя клиента не главное: без него алерт всё равно нужен
+        client_name = " ".join(str((s or {}).get("contact_name") or "").split())
+        try:
+            lead = await asyncio.wait_for(amo_service.get_lead_full(int(deal_id), with_=()), timeout=5)
+        except Exception:  # noqa: BLE001
+            lead = None                     # amo молчит: алерт важнее названия сделки
+        deal_name = " ".join(str((lead or {}).get("name") or "").split()) or f"Сделка №{int(deal_id)}"
+        head = DUTY_EVENTS[event] + (" (тест)" if settings.effective_mode() == "test" else "")
+        mention = mentions_for(None)
+        if cfg.ALERT_EXTRA_TAG and cfg.ALERT_EXTRA_TAG not in mention.split():
+            mention = f"{mention} {cfg.ALERT_EXTRA_TAG}"
+        legacy = "\n".join(line for line in (
+            head, mention, f"👤 {html.escape(client_name)}" if client_name else "", f"💬 {html.escape(text)}", _link(int(deal_id)),
+        ) if line)
+        d = alerts.decide(
+            event, legacy_text=legacy, parse_mode="HTML", chat_id=NOTIFY_CHAT_ID, thread_id=NOTIFY_THREAD_ID,
+            lead=lead if isinstance(lead, dict) and lead.get("custom_fields_values") is not None else None,
+            values={"сделка": deal_name, "ссылка_на_сделку": _link(int(deal_id)),
+                    "клиент": client_name, "текст_события": html.escape(text, quote=False), "текст": text, "теги": mention},
+        )
+        if d is None:
+            _duty_seen.pop(key, None)
+            logger.info("ai_engine: сделка %s: алерт %s выключен в панели", deal_id, event)
+            return "disabled"
+        ok = await asyncio.wait_for(_deliver_alert(d), timeout=10)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: сделка %s: алерт %s не ушёл", deal_id, event)
+        ok = False
+    if not ok:
+        _duty_seen.pop(key, None)           # не дошло: повтор сервиса должен пройти, а не упереться в дубль
+        logger.warning("ai_engine: сделка %s: алерт %s не принят Телеграмом", deal_id, event)
+        return "failed"
+    logger.info("ai_engine: сделка %s: алерт %s отправлен", deal_id, event)
+    return "sent"
+
+
 # =============================================================================================
 # алерты
 # =============================================================================================

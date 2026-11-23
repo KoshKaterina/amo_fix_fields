@@ -90,6 +90,13 @@ class FollowupIn(BaseModel):
     draft: str = ""
 
 
+class TeamAlertIn(BaseModel):
+    """Дежурный алерт ИИ-сервиса (`ai_engine.duty_alert`): `event` - ключ события панели (`ai_engine.DUTY_EVENTS`), `text` до 500 знаков."""
+    deal_id: int
+    event: str
+    text: str
+
+
 OUTCOMES = {"continue", "handoff_to_human", "release_to_engine", "aborted", "failed"}
 
 
@@ -184,6 +191,28 @@ async def send_failed(body: SendFailedIn, x_service_token: str = Header(default=
         logger.exception("ai_engine: отказ отправки по сделке %s не обработан", body.deal_id)
         return JSONResponse({"detail": "engine_error"}, status_code=500)
     return JSONResponse(out)
+
+
+@router.post("/team_alert")
+async def team_alert(body: TeamAlertIn, x_service_token: str = Header(default=""), x_contract: str = Header(default="")):
+    """Дежурный алерт ИИ-сервиса по событию панели (`ai_engine.duty_alert`). Токен сервиса, как у `send_failed`.
+
+    Ответ `{"status": "sent" | "disabled" | "duplicate"}`, Телеграм не принял - 502 `{"status": "failed"}`. Незнакомое событие,
+    пустой текст или сделка не больше нуля - 422; текст длиннее 500 знаков обрезается."""
+    bad = _check_service(x_service_token, x_contract)
+    if bad is not None:
+        return bad
+    if body.event not in ai_engine.DUTY_EVENTS:
+        return _deny(422, "unknown_event")
+    if body.deal_id <= 0:
+        return _deny(422, "deal_id")
+    text = " ".join(body.text.split())
+    if not text:
+        return _deny(422, "text")
+    if len(text) > ai_engine.DUTY_TEXT_MAX:
+        text = text[:ai_engine.DUTY_TEXT_MAX - 1].rstrip() + "…"
+    status = await ai_engine.duty_alert(body.deal_id, body.event, text)
+    return JSONResponse({"status": status}, status_code=502 if status == "failed" else 200)
 
 
 @router.post("/return_dialog")
