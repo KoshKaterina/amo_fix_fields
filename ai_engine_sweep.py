@@ -38,7 +38,18 @@
 создаётся при первом обращении). Взятой считается и сделка с открытым предложением смены ответственного при пилоте (`reassign_pending`): иначе при пилоте лимит ничего бы не
 ограничивал, а очередь подтверждений заливало бы. Дальше жёсткие потолки: не больше `MAX_PER_RUN` взятых за прогон, не больше `MAX_EXAMINE` просмотренных кандидатов, дошедших
 до сети (поиск в amo, МойСклад), не больше `MAX_OPEN_PROPOSALS` открытых предложений в очереди пилота. Всё состояние в sqlite: рестарт контейнера ничего не теряет и не повторяет,
-память хранит только время следующего прогона и последнюю сводку для среза.
+память хранит только время следующего прогона и последнюю сводку для среза. Потолки прогона следуют из `per_hour` (прогон раз в 5 минут, 12 в час): `per_run = max(MAX_PER_RUN, ceil(per_hour / 12))`,
+просмотров `max(MAX_EXAMINE, 3 * per_run)` (`per_run`, `max_examine`); без этого потолок в 2 сделки ограничивал бы 24 в час при `per_hour` до 60. Главный ограничитель остаётся бюджет `per_hour`.
+
+ПЕРВЫЙ ПРОХОД по всем старым сделкам (просьба Кати 23.11.2026: «проверять старые сделки при включении режима одним потоком, 10 в час мало, сделки будут теряться»). Состояние в таблице `sweep_pass`
+(одна строка, sqlite): `armed`, `pass_active`, `started_at`, `taken`, `examined`, `finished_at`. Проход ВЗВЕДЁН на свежей таблице (подбор ещё не включали) и каждый раз, когда движок видит подбор выключенным
+в настройках (`_watch_disabled`: свежий документ версии 2, `config()` пуст; запись один раз на выключение). Пока проход взведён и подбор разрешён (`blocked_by()` пуст: режим «Полный», рабочие часы, нет
+рубильника), `_run_pass` берёт ВСЁ подряд: без `per_hour`, без `per_run`, без `max_examine`, без `MAX_OPEN_PROPOSALS` (одна общая очередь предложений в «Пилоте»). Кандидатов просит у панели порциями по
+`PASS_LIMIT = 50` (потолок ручки панели; 422 от прежней панели сужает порцию до 30), каждый раз с новым `exclude` (журнал и записи владельцев не дают повторов), в порядке панели (ждущие ответа первыми, дольше
+всех ждущие в начале), сделки по одной и по порядку, без параллели, каждая тем же путём `_take`: `dedup.resolve`, `_gate_take`, предложение пилота или смена ответственного, `_hand_over`; отметки людей и
+исключения действуют. Предложения пилота в проходе НЕ шлют по строке в чат ОП (их сотни): один итог в конце. Окно рабочих часов закрылось, настройки сменились, сработал `AI_SWEEP_DISABLED` или упал
+ИИ-сервис: проход встаёт и продолжится в следующее окно с того же места. Две неудачи подряд (amo, ИИ-сервис): пауза `RETRY_ERROR_S`. Конец: порция пуста (остались только отложенные `too_early`,
+`blocked_by_task`, отказанные) или просмотрено `PASS_MAX = 400`: `armed = 0`, `finished_at`, строка итога в лог и в чат ОП; дальше обычный режим с `per_hour` (взятые в проходе сделки входят в бюджет часа).
 
 Кандидаты. `POST <AI_PANEL_URL>/api/ingest/ai/sweep-candidates` (`X-Ingest-Token`, как у `engine-event` и `reassign-proposal`), тело (контракт с панелью, не менять)
 `{"retail_pipelines": [...], "other_pipelines": [...], "ai_user_id", "other_days", "exclude": [...до 3000], "limit": 30}`, ответ `{"candidates": [{deal_id, pool, pipeline_id, status_id,
@@ -93,6 +104,9 @@ RETRY_TASK_S = 6 * 3600                 # у сделки открытая за�
 WARN_EVERY_S = 3600                     # один вид сбоя панели в лог не чаще раза в час
 EXCLUDE_MAX = 3000                      # потолок размера `exclude` в запросе
 DEFAULT_PER_HOUR, DEFAULT_OTHER_DAYS = 10, 3
+RUNS_PER_HOUR = 12                      # прогонов в час при `INTERVAL_S = 300`: от него `per_run` (`max(MAX_PER_RUN, ceil(per_hour / 12))`)
+PASS_MAX = 400                          # потолок первого прохода: просмотрено кандидатов за весь проход; остальное берёт обычный подбор
+PASS_LIMIT = 50                         # порция кандидатов у панели в проходе (потолок ручки панели `LIMIT_MAX`); прежняя панель с меньшим потолком даёт 422: порция сужается до `CANDIDATES_LIMIT`
 
 GIVEN, REASSIGN_PENDING, NEEDS_HUMAN, REFUSED, CLOSED, ERROR = "given", "reassign_pending", "needs_human", "refused", "closed", "error"
 MARKED, TOO_EARLY, BLOCKED_BY_TASK, AMO_UNAVAILABLE = "marked", "too_early", "blocked_by_task", "amo_unavailable"
@@ -110,6 +124,8 @@ _task: asyncio.Task | None = None
 _next_run_at = 0.0                       # не раньше этого момента следующий прогон (память: после рестарта первый прогон сразу, бюджет в sqlite)
 _state: dict[str, Any] = {"last_run_at": None, "last_candidates": None, "total_open": None, "last_result": ""}
 _warn_seen: dict[str, float] = {}
+_disabled_noted = False                  # подбор уже замечен выключенным и первый проход взведён (память: после рестарта одна проверка, `pass_arm` пишет только при перемене)
+_last_status = 0                         # код ответа панели на последний запрос кандидатов (0: сети не было)
 
 
 # =============================================================================================
@@ -120,7 +136,9 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS sweep_log (id INTEGER PRIMARY KEY AUTOINCREMENT, deal_id INTEGER NOT NULL, at REAL NOT NULL, "
     "outcome TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', retry_at REAL);"
     "CREATE INDEX IF NOT EXISTS ix_sweep_log_at ON sweep_log (at);"
-    "CREATE INDEX IF NOT EXISTS ix_sweep_log_deal ON sweep_log (deal_id, at)"
+    "CREATE INDEX IF NOT EXISTS ix_sweep_log_deal ON sweep_log (deal_id, at);"
+    "CREATE TABLE IF NOT EXISTS sweep_pass (id INTEGER PRIMARY KEY, armed INTEGER NOT NULL DEFAULT 1, pass_active INTEGER NOT NULL DEFAULT 0, "
+    "started_at REAL, taken INTEGER NOT NULL DEFAULT 0, examined INTEGER NOT NULL DEFAULT 0, finished_at REAL)"
 )
 
 
@@ -168,6 +186,49 @@ def outcomes_24h(now: float) -> dict[str, int]:
 def prune(now: float) -> None:
     with _Db() as conn:
         conn.execute("DELETE FROM sweep_log WHERE at<?", (float(now) - LOG_KEEP_S,))
+
+
+def _ensure_pass(conn) -> None:
+    """Строка прохода появляется при первом обращении (`armed = 1`: подбор ещё не включали). Пишет только когда строки нет: срез `GET /` читает её часто и базу не трогает."""
+    if conn.execute("SELECT 1 FROM sweep_pass WHERE id=1").fetchone() is None:
+        conn.execute("INSERT OR IGNORE INTO sweep_pass (id, armed) VALUES (1, 1)")
+
+
+def pass_state() -> dict[str, Any]:
+    """Первый проход по старым сделкам: `armed` (взведён: ждёт включения подбора или идёт), `active` (идёт сейчас), `started_at`, `taken`, `examined`, `finished_at`. Одна строка в таблице
+    `sweep_pass`; на свежей таблице (подбор ещё не включали) `armed = 1`. Строка переживает рестарт."""
+    with _Db() as conn:
+        _ensure_pass(conn)
+        row = conn.execute("SELECT armed, pass_active, started_at, taken, examined, finished_at FROM sweep_pass WHERE id=1").fetchone()
+    return {"armed": bool(row["armed"]), "active": bool(row["pass_active"]), "started_at": row["started_at"], "taken": int(row["taken"]),
+            "examined": int(row["examined"]), "finished_at": row["finished_at"]}
+
+
+def pass_begin(now: float) -> None:
+    """Проход начался (счётчики с нуля). Уже идущий не трогает: продолжение после паузы или рестарта считает дальше."""
+    with _Db() as conn:
+        _ensure_pass(conn)
+        conn.execute("UPDATE sweep_pass SET pass_active=1, started_at=?, taken=0, examined=0, finished_at=NULL WHERE id=1 AND pass_active=0", (float(now),))
+
+
+def pass_progress(taken: int, examined: int) -> None:
+    with _Db() as conn:
+        _ensure_pass(conn)
+        conn.execute("UPDATE sweep_pass SET taken=taken+?, examined=examined+? WHERE id=1", (int(taken), int(examined)))
+
+
+def pass_finish(now: float) -> None:
+    """Конец прохода: `armed = 0`, `pass_active = 0`, `finished_at`. Дальше обычный режим с `per_hour`."""
+    with _Db() as conn:
+        _ensure_pass(conn)
+        conn.execute("UPDATE sweep_pass SET armed=0, pass_active=0, finished_at=? WHERE id=1", (float(now),))
+
+
+def pass_arm() -> int:
+    """Подбор выключен в настройках: проход взводится заново (идущий прерывается, его сделки в журнале и в `exclude` повторов не дадут). Пишет только при перемене; возвращает число изменённых строк."""
+    with _Db() as conn:
+        _ensure_pass(conn)
+        return conn.execute("UPDATE sweep_pass SET armed=1, pass_active=0 WHERE id=1 AND (armed=0 OR pass_active=1)").rowcount
 
 
 def excluded_ids(now: float) -> list[int]:
@@ -330,12 +391,15 @@ def _warn(kind: str, message: str, *args: Any) -> None:
 async def fetch_candidates(body: dict[str, Any]) -> dict[str, Any] | None:
     """Один запрос кандидатов (без повторов: следующая попытка через `INTERVAL_S`). Ответ целиком (`candidates` список, `total_open`) или None: панель не
     выкачена (404), недоступна, отказала или ответила не JSON-объектом с `candidates`."""
+    global _last_status
     if not may_send():
         return None
     url = f"{cfg.PANEL_URL}{PATH}"
+    _last_status = 0
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_S, transport=_transport) as http:
             resp = await http.post(url, json=body, headers={"X-Ingest-Token": cfg.PANEL_TOKEN})
+        _last_status = resp.status_code
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - сеть, таймаут, что угодно: прогон пропускается
@@ -504,7 +568,7 @@ def _classify(res: dedup.Resolution, deal_id: int, now: float) -> Result | None:
     return None
 
 
-async def _take(eng, cand: dict[str, Any], pool: str, ai_user_id: int) -> Result:
+async def _take(eng, cand: dict[str, Any], pool: str, ai_user_id: int, quiet: bool = False) -> Result:
     now = eng._now()
     deal_id = cand["deal_id"]
     mode_id = settings.active_mode_id()
@@ -553,7 +617,7 @@ async def _take(eng, cand: dict[str, Any], pool: str, ai_user_id: int) -> Result
             # Пилот: смену ответственного подтверждает человек, тот же путь предложений, что при сообщении клиента (`ai_engine_approval`).
             await eng._db(store.put_session, chat_key, channel_id=cand["channel_id"], chat_id=cand["chat_id"], chat_type=cand["chat_type"],
                           phone=cand["phone"], contact_name=cand["contact_name"], state=approval.AWAITING, deal_id=deal_id, next_at=None)
-            if await approval.propose(eng, s, deal, gate, mode_id, source=approval.SOURCE_SWEEP):
+            if await approval.propose(eng, s, deal, gate, mode_id, source=approval.SOURCE_SWEEP, notify=not quiet):
                 return REASSIGN_PENDING, "создано предложение смены ответственного, ждёт решения человека", None
             return REFUSED, "по сделке уже есть открытое предложение смены ответственного", None
         if gate is not None and gate.reassign and not await filters.reassign_responsible(deal_id, gate.reassign):
@@ -564,9 +628,9 @@ async def _take(eng, cand: dict[str, Any], pool: str, ai_user_id: int) -> Result
         return GIVEN, f"взята, эпоха {owner['epoch']}", None
 
 
-async def _attempt(eng, cand: dict[str, Any], pool: str, ai_user_id: int) -> Result:
+async def _attempt(eng, cand: dict[str, Any], pool: str, ai_user_id: int, quiet: bool = False) -> Result:
     try:
-        return await _take(eng, cand, pool, ai_user_id)
+        return await _take(eng, cand, pool, ai_user_id, quiet)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - сбой одной сделки не должен остановить остальные и уронить цикл
@@ -577,6 +641,77 @@ async def _attempt(eng, cand: dict[str, Any], pool: str, ai_user_id: int) -> Res
 # =============================================================================================
 # прогон
 # =============================================================================================
+
+def per_run(per_hour: int) -> int:
+    """Сколько сделок брать за прогон: `max(MAX_PER_RUN, ceil(per_hour / 12))` (прогон раз в 5 минут, 12 в час). Без этого потолок прогона (2) ограничивал бы 24 в час, хотя панель
+    разрешает `per_hour` до 60. Главный ограничитель всё равно бюджет `per_hour` по скользящему часу."""
+    return max(MAX_PER_RUN, -(-int(per_hour) // RUNS_PER_HOUR))
+
+
+def max_examine(per_hour: int) -> int:
+    """Сколько кандидатов за прогон может дойти до сети (поиск в amo, МойСклад): `max(MAX_EXAMINE, 3 * per_run)`."""
+    return max(MAX_EXAMINE, 3 * per_run(per_hour))
+
+
+async def _portion(eng, conf: dict[str, Any], now: float, out: dict[str, Any], limit: int):
+    """Порция кандидатов у панели: (кандидаты, воронки «розницы», воронки «остальных», пользователь ИИ). Нет воронок, пользователя ИИ или ответа панели: None и причина в `out`.
+    Ручка панели принимает `limit` до 50; прежняя версия панели с меньшим потолком отвечает 422, тогда порция сужается до `CANDIDATES_LIMIT` и так остаётся."""
+    retail_all, other_all = pools()
+    retail_req = retail_all if conf[POOL_RETAIL] else []
+    other_req = other_all if conf[POOL_OTHER] else []
+    if not retail_req and not other_req:
+        out["skipped"] = "нет воронок, где ИИ вправе вести сделки"
+        return None
+    user = filters.ai_user()
+    if user is None:
+        out["skipped"] = "пользователь ИИ в настройках не задан"
+        return None
+    body = {"retail_pipelines": retail_req, "other_pipelines": other_req, "ai_user_id": int(user["id"]), "other_days": conf["other_days"],
+            "exclude": await eng._db(excluded_ids, now), "limit": limit}
+    data = await fetch_candidates(body)
+    if data is None and _last_status == 422 and limit > CANDIDATES_LIMIT:
+        _state["portion_limit"] = CANDIDATES_LIMIT
+        body["limit"] = CANDIDATES_LIMIT
+        data = await fetch_candidates(body)
+    if data is None:
+        out["skipped"] = "панель не отдала кандидатов"
+        return None
+    seen: set[int] = set()
+    cands = []
+    for raw in data["candidates"]:
+        cand = _clean(raw)
+        if cand is not None and cand["deal_id"] not in seen:
+            seen.add(cand["deal_id"])
+            cands.append(cand)
+    _state["last_candidates"] = len(cands)
+    _state["total_open"] = _pos_int(data.get("total_open"))
+    return cands, set(retail_all), set(other_all), int(user["id"])
+
+
+async def _judge(eng, cand: dict[str, Any], retail: set[int], other: set[int], conf: dict[str, Any], user_id: int, *, can_examine: bool,
+                 quiet: bool = False) -> tuple[Result | None, bool]:
+    """Решение по одному кандидату: (исход, дошёл ли до сети). Исход None: до сети дело дошло бы, а лимит просмотров исчерпан. `quiet`: предложения пилота без строки в чат ОП."""
+    pool, verdict = _pool_of(cand, retail, other, conf)
+    if verdict is None:
+        verdict = await _local(eng, cand, pool, conf, eng._now())
+    if verdict is not None:
+        return verdict, False
+    if not can_examine:
+        return None, False
+    return await _attempt(eng, cand, pool, user_id, quiet), True
+
+
+async def _record(eng, cand: dict[str, Any], verdict: Result, out: dict[str, Any]) -> str:
+    """Исход в журнал `sweep_log`, в сводку прогона и в лог (номер сделки, без личных данных). Сбой журнала прогон не ломает."""
+    outcome, note, retry_at = verdict
+    try:
+        await eng._db(log, cand["deal_id"], outcome, note, eng._now(), retry_at)
+    except Exception:  # noqa: BLE001 - журнал не должен ломать прогон; сделка уже взята или отказана
+        logger.exception("ai_engine_sweep: не записал исход по сделке %s в журнал", cand["deal_id"])
+    out["outcomes"][outcome] = out["outcomes"].get(outcome, 0) + 1
+    logger.info("ai_engine_sweep: сделка %s: %s%s", cand["deal_id"], outcome, f" ({note})" if note else "")
+    return outcome
+
 
 async def _run(eng, now: float, out: dict[str, Any]) -> None:
     why = blocked_by()
@@ -591,6 +726,10 @@ async def _run(eng, now: float, out: dict[str, Any]) -> None:
     if not await eng._ai_is_up():
         out["skipped"] = "ИИ-сервис недоступен"
         return
+    st = await eng._db(pass_state)
+    if st["armed"]:
+        await _run_pass(eng, out, conf, st)                      # первый проход по старым сделкам: одним потоком, без почасового лимита
+        return
     taken = await eng._db(count_taken, now)
     budget = conf["per_hour"] - taken
     if budget <= 0:
@@ -600,35 +739,14 @@ async def _run(eng, now: float, out: dict[str, Any]) -> None:
     if open_proposals >= MAX_OPEN_PROPOSALS:
         out["skipped"] = f"в очереди пилота уже {open_proposals} предложений, новые не создаю"
         return
-    retail_all, other_all = pools()
-    retail_req = retail_all if conf[POOL_RETAIL] else []
-    other_req = other_all if conf[POOL_OTHER] else []
-    if not retail_req and not other_req:
-        out["skipped"] = "нет воронок, где ИИ вправе вести сделки"
+    portion = await _portion(eng, conf, now, out, CANDIDATES_LIMIT)
+    if portion is None:
         return
-    user = filters.ai_user()
-    if user is None:
-        out["skipped"] = "пользователь ИИ в настройках не задан"
-        return
-    body = {"retail_pipelines": retail_req, "other_pipelines": other_req, "ai_user_id": int(user["id"]), "other_days": conf["other_days"],
-            "exclude": await eng._db(excluded_ids, now), "limit": CANDIDATES_LIMIT}
-    data = await fetch_candidates(body)
-    if data is None:
-        out["skipped"] = "панель не отдала кандидатов"
-        return
-    seen: set[int] = set()
-    cands = []
-    for raw in data["candidates"]:
-        cand = _clean(raw)
-        if cand is not None and cand["deal_id"] not in seen:
-            seen.add(cand["deal_id"])
-            cands.append(cand)
+    cands, retail_set, other_set, user_id = portion
     out["candidates"] = len(cands)
-    _state["last_candidates"] = len(cands)
-    _state["total_open"] = _pos_int(data.get("total_open"))
-    want = min(budget, MAX_PER_RUN)
+    want = min(budget, per_run(conf["per_hour"]))
+    cap = max_examine(conf["per_hour"])
     given_now = failures = 0
-    retail_set, other_set = set(retail_all), set(other_all)
     for cand in cands:
         if given_now >= want:
             break
@@ -636,21 +754,11 @@ async def _run(eng, now: float, out: dict[str, Any]) -> None:
         if why:
             out["skipped"] = f"прогон прерван: {why}"
             break
-        pool, verdict = _pool_of(cand, retail_set, other_set, conf)
+        verdict, networked = await _judge(eng, cand, retail_set, other_set, conf, user_id, can_examine=out["examined"] < cap)
         if verdict is None:
-            verdict = await _local(eng, cand, pool, conf, eng._now())
-        if verdict is None:
-            if out["examined"] >= MAX_EXAMINE:
-                break                                            # дальше только сеть, а лимит просмотров на прогон исчерпан: остальные в следующий раз
-            out["examined"] += 1
-            verdict = await _attempt(eng, cand, pool, int(user["id"]))
-        outcome, note, retry_at = verdict
-        try:
-            await eng._db(log, cand["deal_id"], outcome, note, eng._now(), retry_at)
-        except Exception:  # noqa: BLE001 - журнал не должен ломать прогон; сделка уже взята или отказана
-            logger.exception("ai_engine_sweep: не записал исход по сделке %s в журнал", cand["deal_id"])
-        out["outcomes"][outcome] = out["outcomes"].get(outcome, 0) + 1
-        logger.info("ai_engine_sweep: сделка %s: %s%s", cand["deal_id"], outcome, f" ({note})" if note else "")
+            break                                                # дальше только сеть, а лимит просмотров на прогон исчерпан: остальные в следующий раз
+        out["examined"] += int(networked)
+        outcome = await _record(eng, cand, verdict, out)
         if outcome in TAKEN:
             given_now += 1
         failures = failures + 1 if outcome in FAILURES else 0
@@ -659,8 +767,80 @@ async def _run(eng, now: float, out: dict[str, Any]) -> None:
             break
 
 
+async def _run_pass(eng, out: dict[str, Any], conf: dict[str, Any], st: dict[str, Any]) -> None:
+    """Первый проход по ВСЕМ старым сделкам одним потоком (просьба Кати 23.11.2026): без `per_hour`, без потолков прогона и просмотров, без `MAX_OPEN_PROPOSALS`, пока кандидаты
+    не кончатся или проход не достигнет `PASS_MAX`. Порциями у панели, каждый раз с новым `exclude` (журнал `sweep_log` не даёт повторов), сделки по одной и по порядку панели (ждущие
+    ответа первыми), каждая тем же путём `_take`, что в обычном режиме: никаких обходов защит и фильтров. Стоит и продолжится с того же места, если закрылось окно рабочих часов, сменились
+    настройки, сработал рубильник или упал ИИ-сервис; две неудачи подряд (amo, ИИ-сервис): пауза `RETRY_ERROR_S`. Конец (порции пусты, остались только отложенные, или потолок): `armed = 0`,
+    одна строка итога в лог и одна строка в чат ОП; дальше обычный режим. Предложения пилота в проходе не шлют по строке в чат ОП на каждое: их сотни, итог одной строкой в конце."""
+    global _next_run_at
+    out["first_pass"] = True
+    begun = st["active"]                                             # идёт с прошлого прогона (пауза, рестарт): счётчики продолжаются; иначе начинается с первой удачной порции
+    seen: set[int] = set()
+    failures = 0
+    reason = "кандидаты кончились"
+    while True:
+        why = blocked_by()
+        if why:
+            out["skipped"] = f"проход приостановлен: {why}"
+            return
+        if not await eng._ai_is_up():
+            out["skipped"] = "проход приостановлен: ИИ-сервис недоступен"
+            return
+        if begun and st["examined"] >= PASS_MAX:
+            reason = f"достигнут потолок прохода {PASS_MAX}, остальное возьмёт обычный подбор по {conf['per_hour']} в час"
+            break
+        portion = await _portion(eng, conf, eng._now(), out, _state.get("portion_limit") or PASS_LIMIT)
+        if portion is None:
+            return                                                   # панель молчит или нет воронок: проход стоит (и не числится идущим), следующий прогон продолжит
+        if not begun:
+            await eng._db(pass_begin, eng._now())
+            st = await eng._db(pass_state)
+            begun = True
+            logger.info("ai_engine_sweep: первый проход по старым сделкам начат")
+        cands, retail_set, other_set, user_id = portion
+        fresh = [c for c in cands if c["deal_id"] not in seen]
+        out["candidates"] = (out["candidates"] or 0) + len(fresh)
+        if not fresh:
+            break                                                    # порция пуста (остались только отложенные и отказанные) или панель вернула уже виденное: конец
+        for cand in fresh:
+            if st["examined"] >= PASS_MAX:
+                break
+            why = blocked_by()
+            if why:
+                out["skipped"] = f"проход приостановлен: {why}"
+                return
+            if not await eng._ai_is_up():                            # упал посреди прохода: сделки не помечаем ошибкой, встаём и продолжим, когда сервис оживёт
+                out["skipped"] = "проход приостановлен: ИИ-сервис недоступен"
+                return
+            verdict, networked = await _judge(eng, cand, retail_set, other_set, conf, user_id, can_examine=True, quiet=True)
+            out["examined"] += int(networked)
+            outcome = await _record(eng, cand, verdict, out)
+            seen.add(cand["deal_id"])
+            st["examined"] += 1
+            st["taken"] += int(outcome in TAKEN)
+            await eng._db(pass_progress, int(outcome in TAKEN), 1)
+            failures = failures + 1 if outcome in FAILURES else 0
+            if failures >= 2:
+                out["skipped"] = f"проход приостановлен на {RETRY_ERROR_S // 60} мин: две неудачи подряд (amo или ИИ-сервис)"
+                _next_run_at = max(_next_run_at, eng._now() + RETRY_ERROR_S)
+                return
+    await eng._db(pass_finish, eng._now())
+    final = await eng._db(pass_state)
+    waiting = await eng._db(approval.count_open)
+    minutes = max(1, round((eng._now() - float(final["started_at"] or eng._now())) / 60))
+    summary = (f"первый проход по старым сделкам закончен ({reason}): просмотрено {final['examined']}, взято {final['taken']}, "
+               f"предложений ждёт решения в «Пилоте» {waiting}, заняло {minutes} мин")
+    logger.info("ai_engine_sweep: %s", summary)
+    out["pass_finished"] = True
+    try:
+        await eng._alert("sweep_first_pass", [f"ИИ-менеджер: {summary}."], dedupe=f"sweep_first_pass:{int(final['started_at'] or 0)}", ping=False)
+    except Exception:  # noqa: BLE001 - итог в чат не должен ломать конец прохода
+        logger.exception("ai_engine_sweep: итог первого прохода в чат ОП не ушёл")
+
+
 async def run_once(eng) -> dict[str, Any]:
-    """Один прогон подбора. Не бросает (кроме отмены). Возвращает сводку: `skipped` (почему ничего не делал или оборвался), `candidates`, `examined`, `outcomes`."""
+    """Один прогон подбора. Не бросает (кроме отмены). Возвращает сводку: `skipped` (почему ничего не делал или оборвался), `candidates`, `examined`, `outcomes`; в первом проходе ещё `first_pass`."""
     now = eng._now()
     out: dict[str, Any] = {"skipped": None, "candidates": None, "examined": 0, "outcomes": {}}
     _state["last_run_at"] = now
@@ -672,6 +852,8 @@ async def run_once(eng) -> dict[str, Any]:
         logger.exception("ai_engine_sweep: прогон упал")
         out["skipped"] = "прогон упал (см. лог движка)"
     summary = f"кандидатов {out['candidates'] if out['candidates'] is not None else '-'}, просмотрено {out['examined']}, исходы {out['outcomes'] or '-'}"
+    if out.get("first_pass"):
+        summary = "первый проход: " + summary
     if out["skipped"]:
         summary += f", {out['skipped']}"
     _state["last_result"] = summary
@@ -679,11 +861,29 @@ async def run_once(eng) -> dict[str, Any]:
     return out
 
 
+async def _watch_disabled(eng) -> None:
+    """Движок видит подбор выключенным в настройках (свежий документ версии 2, `config()` пуст): первый проход взводится заново. Запись один раз на выключение, не на каждом проходе таймеров
+    (в памяти метка, `pass_arm` сам пишет только при перемене). Протухшие или чужие настройки «выключено» не значат: состояние не трогаем."""
+    global _disabled_noted
+    if not (settings.is_fresh() and settings.is_v2()):
+        return
+    if config() is not None:
+        _disabled_noted = False
+        return
+    if _disabled_noted:
+        return
+    changed = await eng._db(pass_arm)
+    _disabled_noted = True
+    if changed:
+        logger.info("ai_engine_sweep: подбор выключен в настройках, первый проход взведён заново")
+
+
 async def tick(eng, now: float) -> None:
-    """Из `tick_once` каждый проход таймеров: дёшево. Раз в `INTERVAL_S`, если подбор вообще разрешён (`blocked_by`), запускает прогон фоновой задачей.
-    Не бросает: ошибка здесь не должна остановить остальные таймеры."""
+    """Из `tick_once` каждый проход таймеров: дёшево. Раз в `INTERVAL_S`, если подбор вообще разрешён (`blocked_by`), запускает прогон фоновой задачей. Попутно следит, не выключили ли подбор в
+    настройках (`_watch_disabled`: взвод первого прохода). Не бросает: ошибка здесь не должна остановить остальные таймеры."""
     global _task, _next_run_at
     try:
+        await _watch_disabled(eng)
         if (_task is not None and not _task.done()) or now < _next_run_at:
             return
         if blocked_by() is not None:
@@ -702,11 +902,13 @@ async def tick(eng, now: float) -> None:
 
 def status_block(now: float) -> dict[str, Any]:
     """Блок `sweep` среза `GET /`: `enabled`, `per_hour`, `pools` (`retail`, `other`, `other_days`), `taken_last_hour`, `budget_left`, `last_run_at`, `last_candidates`, `outcomes_24h`,
-    `marks` (число отметок людей по видам и всего); сверх того `blocked_by` (почему подбор сейчас не работает), `total_open` (открытых сделок у панели), `last_result` (сводка последнего прогона)."""
+    `marks` (число отметок людей по видам и всего), `first_pass` (`armed`, `active`, `started_at`, `taken`, `examined`, `finished_at`: первый проход по старым сделкам); сверх того `blocked_by`
+    (почему подбор сейчас не работает), `total_open` (открытых сделок у панели), `last_result` (сводка последнего прогона)."""
     conf = config()
     last = _state["last_run_at"]
     taken = count_taken(now)
     marks_now = marks.counts()
+    first = pass_state()
     return {
         "enabled": conf is not None,
         "per_hour": conf["per_hour"] if conf else None,
@@ -717,5 +919,7 @@ def status_block(now: float) -> dict[str, Any]:
         "last_candidates": _state["last_candidates"], "total_open": _state["total_open"], "last_result": _state["last_result"],
         "outcomes_24h": outcomes_24h(now),
         "marks": {**marks_now, "total": sum(marks_now.values())},
+        "first_pass": {"armed": first["armed"], "active": first["active"], "started_at": None if first["started_at"] is None else _iso(first["started_at"]),
+                       "taken": first["taken"], "examined": first["examined"], "finished_at": None if first["finished_at"] is None else _iso(first["finished_at"])},
         "blocked_by": blocked_by(),
     }

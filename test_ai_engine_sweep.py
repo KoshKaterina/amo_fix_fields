@@ -72,6 +72,8 @@ def _fresh(monkeypatch):
     monkeypatch.setattr(S, "_next_run_at", float("inf"))              # таймеры теста сами подбор не запускают; тесты `tick` включают его явно
     monkeypatch.setattr(S, "_state", {"last_run_at": None, "last_candidates": None, "total_open": None, "last_result": ""})
     monkeypatch.setattr(S, "_warn_seen", {})
+    monkeypatch.setattr(S, "_disabled_noted", False)
+    monkeypatch.setattr(S, "_last_status", 0)
     yield
     A._sending.clear()
     A._deciding.clear()
@@ -81,8 +83,9 @@ def iso(ts):
     return datetime.datetime.fromtimestamp(ts, UTC).isoformat()
 
 
-def setup(env, sweep=ON, policy="redistribute", review=False, **over):
-    """Документ версии 2 для Полного режима: `existing` с `sweep`, пилот выключен, рабочие часы круглосуточно. `sweep=None`: блока нет."""
+def setup(env, sweep=ON, policy="redistribute", review=False, armed=False, **over):
+    """Документ версии 2 для Полного режима: `existing` с `sweep`, пилот выключен, рабочие часы круглосуточно. `sweep=None`: блока нет. Первый проход по умолчанию уже закончен
+    (`armed=False`: тесты обычного режима с `per_hour`); `armed=True` взводит его, `armed=None` состояние не трогает."""
     existing = {"policy": policy, "since": env.t - 100, "manager_quiet_min": 15}
     if sweep is not None:
         existing["sweep"] = sweep
@@ -91,6 +94,10 @@ def setup(env, sweep=ON, policy="redistribute", review=False, **over):
     doc.update(over)
     env.set_settings(**doc)
     env.mp.setattr(F, "_now", lambda: env.t)
+    if armed is True:
+        S.pass_arm()
+    elif armed is False:
+        S.pass_finish(env.t)
 
 
 def allow_other(env):
@@ -114,6 +121,7 @@ class World:
         self.fail = False
         self.ignore_exclude = False
         self.raw_candidates = False                                                            # отдать список как есть, без отбора по воронкам и exclude (проверка защиты движка)
+        self.max_limit: int | None = None                                                      # прежняя панель с меньшим потолком `limit`: больше этого отвечает 422
         self.amo = Amo(env)
         self.chats = 0
 
@@ -131,6 +139,8 @@ class World:
             self.requests.append({"path": request.url.path, "token": request.headers.get("x-ingest-token"), "body": body})
             if self.status != 200:
                 return httpx.Response(self.status, json={"detail": "нет"})
+            if self.max_limit is not None and body["limit"] > self.max_limit:
+                return httpx.Response(422, json={"detail": "limit"})
             if self.raw is not None:
                 return httpx.Response(200, content=self.raw)
             skip = set() if self.ignore_exclude else set(body["exclude"])
@@ -401,12 +411,13 @@ def test_the_pilot_queue_cap_stops_new_proposals(env, w):
 def test_the_examine_cap_counts_only_candidates_that_reach_the_network(env, w):
     async def go():
         setup(env)
-        env.mp.setattr(S, "MAX_EXAMINE", 2)
-        for i in range(5):
+        for i in range(9):
             w.deal(DEAL + i)
         env.leads = []                                                                          # в amo сделок нет: каждый кандидат уходит в сеть и получает `closed`
         out = await S.run_once(E)
-        assert out["examined"] == 2 and out["outcomes"] == {"closed": 2}
+        assert out["examined"] == S.max_examine(10) == 6 and out["outcomes"] == {"closed": 6}  # per_hour 10: шесть просмотров, остальные в следующий раз
+        out = await S.run_once(E)
+        assert out["examined"] == 3 and out["outcomes"] == {"closed": 3}
     run(go())
 
 

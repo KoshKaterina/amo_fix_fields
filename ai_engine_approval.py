@@ -76,6 +76,9 @@ AWAITING = "awaiting"                    # состояние чата: ждём
 _transport: httpx.AsyncBaseTransport | None = None
 SENT, RETRY, REFUSED = "sent", "retry", "refused"
 
+SWEEP_FAST_MAX = 20                      # открытых предложений, пока устаревание проверяется каждый проход таймеров; больше: раз в `SWEEP_SLOW_EVERY_S`
+SWEEP_SLOW_EVERY_S = 10
+_last_sweep = 0.0
 _sending: set[str] = set()               # предложения, которые сейчас отправляются
 _deciding: set[str] = set()              # предложения, по которым сейчас выполняется решение человека
 _last_orphans = 0.0
@@ -300,10 +303,10 @@ async def _schedule_delivery(eng, now: float) -> None:
 # создание предложения
 # =============================================================================================
 
-async def propose(eng, s: dict[str, Any], deal: dict[str, Any], gate, mode_id: str, source: str = "") -> bool:
+async def propose(eng, s: dict[str, Any], deal: dict[str, Any], gate, mode_id: str, source: str = "", notify: bool = True) -> bool:
     """Сделку брать нужно со сменой ответственного, а пилот включён: создать предложение и поставить сделку «ждёт решения». Зовётся под общим замком из
     `ai_engine._apply_resolution` (и из `ai_engine_sweep` с `source=SOURCE_SWEEP`), после проверок «ИИ жив» и «не медиа». Сообщения клиента остаются во входящих.
-    True: предложение создано."""
+    `notify=False`: строка в чат ОП не уходит (первый проход подбора шлёт один итог в конце вместо сотни строк). True: предложение создано."""
     now = eng._now()
     plan = gate.reassign
     deal_id = int(deal["id"])
@@ -317,6 +320,8 @@ async def propose(eng, s: dict[str, Any], deal: dict[str, Any], gate, mode_id: s
         return False
     await eng._db(store.put_session, s["chat_key"], state=AWAITING, deal_id=deal_id, next_at=None)
     logger.info("ai_engine: сделка %s: ИИ просит разрешения сменить ответственного, предложение %s ждёт решения человека", deal_id, row["ref"])
+    if not notify:
+        return True
     link = f'<a href="{BASE_URL}/leads/detail/{deal_id}">{deal_id}</a>'
     old = html.escape(from_name or ("без ответственного" if not from_id else f"пользователь {from_id}"))
     await eng._alert("reassign_proposal", [
@@ -404,10 +409,15 @@ async def _fix_orphans(eng, now: float) -> None:
 
 
 async def tick(eng, now: float) -> None:
-    """Раз в проход таймеров: устаревание, доставка в панель, чаты в ожидании без предложения. Без открытых предложений это один лёгкий запрос."""
-    global _last_orphans
-    if await eng._db(count_open):
-        await sweep(eng, now)
+    """Раз в проход таймеров: устаревание, доставка в панель, чаты в ожидании без предложения. Без открытых предложений это один лёгкий запрос. Когда открытых больше `SWEEP_FAST_MAX`
+    (первый проход подбора создаёт их сотнями), устаревание проверяется раз в `SWEEP_SLOW_EVERY_S`, а не каждую секунду: проверка читает базу по каждому предложению; решение человека
+    всё равно перепроверяет актуальность само (`_approve`)."""
+    global _last_orphans, _last_sweep
+    opened = await eng._db(count_open)
+    if opened:
+        if opened <= SWEEP_FAST_MAX or now - _last_sweep >= SWEEP_SLOW_EVERY_S:
+            _last_sweep = now
+            await sweep(eng, now)
         await _schedule_delivery(eng, now)
     if now - _last_orphans >= 60:
         _last_orphans = now

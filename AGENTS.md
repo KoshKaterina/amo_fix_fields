@@ -74,7 +74,7 @@ GetCourse → сделки Академии, `getcourse_service.py`) и `/sipuni
 
 Сторона движка контракта v2 с ИИ-сервисом (репозиторий `Sanskrit-AI-Manager`, `docs/ENGINE_CONTRACT.md`): шестой
 потребитель вебхука Wazzup, таймеры, владелец сделки с `epoch`, выбор сделки (правила A, C, D), `permit` и
-`result` для ИИ-сервиса. Модули `ai_engine*.py`, тесты `test_ai_engine*.py` (основные: `test_ai_engine.py`, `test_ai_engine_parts.py`, `test_ai_engine_modes.py`); подбор существующих сделок и отметки людей: `test_ai_engine_sweep.py`, `test_ai_engine_marks.py`, `test_ai_engine_stage_not_served.py`).
+`result` для ИИ-сервиса. Модули `ai_engine*.py`, тесты `test_ai_engine*.py` (основные: `test_ai_engine.py`, `test_ai_engine_parts.py`, `test_ai_engine_modes.py`); подбор существующих сделок и отметки людей: `test_ai_engine_sweep.py`, `test_ai_engine_sweep_pass.py`, `test_ai_engine_marks.py`, `test_ai_engine_stage_not_served.py`).
 
 ⚠️ **Флаги этого контура читаются в `ai_engine_config.py`, не в `waybill_config.py`.** Два независимых рубильника:
 `AI_ENGINE_ENABLED=1` в `.env` (без него модуль не поднимает ни цикл, ни базу, а `/internal/ai/v1/*` отвечает 503)
@@ -205,8 +205,21 @@ sticker`, в `raw` виден `originalType`), `autopilot.inbox_notify`. SLA н�
     считается в `loops_alive`: их по-прежнему пять (`_ingest_loop`, `_tick_loop`, `_dispatch_loop`, `_health_loop`, `prompts.poll_loop`), скрипт выката ждёт пять. Прогон не перекрывается сам с собой и не задерживает таймеры
     ответов клиентам (ходит в панель, amo, МойСклад).
   - **Бюджет.** Не больше `per_hour` ВЗЯТЫХ сделок за скользящие 60 минут (таблица `sweep_log` в sqlite, считаются исходы `given` и `reassign_pending`: предложение при пилоте тоже расход, иначе лимит ничего не ограничивал бы), не больше
-    `MAX_PER_RUN = 2` за прогон (очередь пилота не заливает пачкой), не больше `MAX_EXAMINE = 6` просмотренных кандидатов, дошедших до сети (молчащие «рано», с отметкой, с владельцем просмотром не считаются), не больше
+    `per_run = max(2, ceil(per_hour / 12))` за прогон (прогон раз в 5 минут, 12 в час: при `per_hour` 10 это 2, при 60 это 5; прежний потолок «2 за прогон» давал бы не больше 24 в час), не больше
+    `max(6, 3 * per_run)` просмотренных кандидатов, дошедших до сети (молчащие «рано», с отметкой, с владельцем просмотром не считаются), не больше
     `MAX_OPEN_PROPOSALS = 10` открытых предложений в очереди пилота. Всё состояние в sqlite: рестарт ничего не теряет и не дублирует (в памяти только время следующего прогона и сводка для среза).
+  - **Первый проход по старым сделкам (просьба Кати 23.11.2026: «проверять старые сделки при включении режима одним потоком, 10 в час мало, сделки будут теряться»).** Таблица `sweep_pass` (одна строка в sqlite:
+    `armed`, `pass_active`, `started_at`, `taken`, `examined`, `finished_at`; создаётся сама). Проход ВЗВЕДЁН на свежей таблице (подбор ещё не включали) и каждый раз, когда движок видит подбор выключенным в настройках
+    (`_watch_disabled`: свежий документ версии 2, `config()` пуст; запись один раз на выключение, а не на каждом проходе таймеров; протухшие настройки «выключено» не значат; выключение посреди прохода прерывает его,
+    следующий начнётся с нуля, а сделки старого в журнале и в `exclude` повторов не дадут). Пока проход взведён и подбор разрешён (`blocked_by()` пуст: Полный, рабочие часы, нет рубильника), `_run_pass` берёт ВСЁ подряд:
+    без `per_hour`, `per_run`, потолка просмотров и `MAX_OPEN_PROPOSALS` (одна общая очередь в «Пилоте»). Порциями у панели (`PASS_LIMIT = 50`, потолок ручки панели; ответ 422 от прежней панели сужает порцию до 30 и так
+    остаётся), каждый раз с новым `exclude`; порядок панели (ждущие первыми, дольше всех ждущие в начале); сделки по одной и по порядку, без параллели; каждая тем же путём `_take` (`dedup.resolve`, `_gate_take`, предложение или
+    смена ответственного, `_hand_over`): отметки людей, владельцы, фильтры, бюджет, задачи, дубли действуют как в обычном режиме. Кандидат, которого панель вернула снова, повторно не берётся (`seen`), порция из одних виденных
+    это конец. Предложения пилота в проходе НЕ шлют по строке в чат ОП (их сотни, Telegram не любит поток): в конце ОДНА строка итога («просмотрено, взято, ждёт решения в «Пилоте»») плюс строка в лог. Проход встаёт и
+    продолжается с того же места в следующее окно (журнал `sweep_log`, счётчики в `sweep_pass`; рестарт тоже) при закрытом окне рабочих часов, смене настроек, рубильнике `AI_SWEEP_DISABLED`, упавшем ИИ-сервисе (проверка перед
+    каждой сделкой, сделки при этом ошибкой не помечаются); две неудачи подряд (amo, ИИ-сервис): пауза `RETRY_ERROR_S` (15 минут). Начинается с первой удачной порции панели (панель молчит: проход не числится идущим). Конец: порция пуста
+    (остались только отложенные `too_early`, `blocked_by_task`, отказанные) или просмотрено `PASS_MAX = 400`: `armed = 0`, `finished_at`, дальше обычный режим с `per_hour` (взятые в проходе сделки входят в бюджет часа). Устаревание
+    открытых предложений `approval.tick` при их числе больше 20 проверяет раз в 10 секунд, а не каждый проход таймеров.
   - **Панель.** `POST <AI_PANEL_URL>/api/ingest/ai/sweep-candidates` (`X-Ingest-Token`, как у `engine-event` и `reassign-proposal`). Тело (контракт, не менять): `{retail_pipelines, other_pipelines, ai_user_id, other_days, exclude, limit: 30}`;
     ответ `{candidates: [{deal_id, pool, pipeline_id, status_id, responsible_user_id, contact_id, contact_name, phone, chat_id, chat_type, channel_id, last_msg_at, last_client_at, last_out_at, waiting}], total_open, generated_at}`:
     сначала ждущие ответа, потом молчащие. Пул кандидата движок определяет сам по воронке (`pool` панели не решает). 404, недоступна, не JSON, не тот ответ: прогон ничего не делает, предупреждение не чаще раза в час. Движок
@@ -236,7 +249,7 @@ sticker`, в `raw` виден `originalType`), `autopilot.inbox_notify`. SLA н�
     новых событий нет. Отличить подбор от кнопки можно по `deal_owner.reason` (`sweep` или `reassign_approved`) и таблице `sweep_log`.
   - **Исходы (`sweep_log`: `deal_id, at, outcome, note, retry_at`).** `given`, `reassign_pending`, `needs_human`, `refused` (причина в `note`), `closed`, `marked`, `too_early`, `blocked_by_task`, `amo_unavailable`, `error`. Две неудачи подряд
     (`error`, `amo_unavailable`) обрывают прогон. Любая ошибка прогона не роняет цикл и не теряет сделки. Строка в лог на прогон: «кандидатов, просмотрено, исходы» (id сделок допустимы, личных данных нет).
-  - **Срез `GET /` → `sweep`.** `enabled, per_hour, pools {retail, other, other_days}, taken_last_hour, budget_left, last_run_at, last_candidates, total_open, last_result, outcomes_24h, marks {no_reply, removed, total}, blocked_by`.
+  - **Срез `GET /` → `sweep`.** `enabled, per_hour, pools {retail, other, other_days}, taken_last_hour, budget_left, last_run_at, last_candidates, total_open, last_result, outcomes_24h, marks {no_reply, removed, total}, first_pass {armed, active, started_at, taken, examined, finished_at}, blocked_by`.
 - **Отметки людей по сделке (решение Кати 23.11.2026, `ai_engine_marks.py`, `test_ai_engine_marks.py`).** Панель ставит их ручкой `POST /internal/ai/v1/deal_mark` с телом `{deal_id, kind: "no_reply" | "removed", by}`, авторизация как у
   `give_deal` (узкий `X-Give-Token` = `AI_GIVE_TOKEN`, админский тоже подходит; нет токена в окружении 503, не тот 403, незнакомый вид или номер 422). Ответ 200 `{ok, state: "marked" | "already_removed", kind, repeat, ...}`. Таблицы `deal_mark(deal_id, kind, at, by_user, note)` и журнал
   `deal_mark_log` в sqlite движка, создаются при первом обращении.
