@@ -72,6 +72,7 @@ import urgency_tag
 import wazzup_sla
 import wazzup_forward
 import wazzup_delivery
+import wazzup_sticker
 import woo_status_sync
 from api import init_api_pipeline, shutdown_api_pipeline
 from help_function import (
@@ -541,6 +542,13 @@ async def wazzup_webhook(secret: str, request: Request):
     if isinstance(payload, dict) and payload.get("test") is True:
         logger.info("Wazzup webhook: тестовый запрос — отвечаю 200")
         return {"ok": True}
+    # Стикер Telegram Wazzup присылает как `document` без подписи: настоящий тип узнаём ОДИН раз, здесь, до всех
+    # потребителей, и правим тело на месте (`type: sticker`). Ждём только ради редких «документов» без подписи, HEAD с
+    # жёстким потолком в 3 с; любой сбой оставляет всё как пришло. Подробности: wazzup_sticker.py.
+    try:
+        await wazzup_sticker.normalize_payload(payload)
+    except Exception:
+        logger.exception("Wazzup webhook: ошибка определения стикера")
     try:
         wazzup_sla.handle_webhook(payload)
     except Exception:
