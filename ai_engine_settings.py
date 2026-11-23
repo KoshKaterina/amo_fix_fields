@@ -133,10 +133,16 @@ def allowed_pipelines() -> frozenset[int]:
     return cfg.MODE_PIPELINES.get(mode, frozenset())
 
 
+def pipelines_any_allowed() -> bool:
+    """Разрешил ли оператор «любую воронку» на стороне движка: `AI_PIPELINES_ANY_ALLOWED=1` в .env (`ai_engine_config`). Без этого `pipelines_any` ложь."""
+    return bool(cfg.PIPELINES_ANY_ALLOWED)
+
+
 def pipelines_any() -> bool:
     """`pipelines_any` документа версии 2: ИИ может вести сделку ЛЮБОЙ воронки (взятие по сообщению клиента). Только настоящее `true`; нет ключа,
-    мусор или документ версии 1: нет, то есть поведение этапа 1 (воронки режима). Режим `off` проверяет `pipeline_allowed`."""
-    return is_v2() and (_doc or {}).get("pipelines_any") is True
+    мусор или документ версии 1: нет, то есть поведение этапа 1 (воронки режима). Пока движок не разрешил это переменной `AI_PIPELINES_ANY_ALLOWED=1`,
+    всегда нет, что бы ни прислала панель (все точки решения читают именно эту функцию). Режим `off` проверяет `pipeline_allowed`."""
+    return pipelines_any_allowed() and is_v2() and (_doc or {}).get("pipelines_any") is True
 
 
 def pipeline_allowed(pipeline_id: Any) -> bool:

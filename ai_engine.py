@@ -1953,6 +1953,7 @@ def status() -> dict[str, Any]:
     try:
         # Что движок СЕЙЧАС берёт из настроек (этап 2): после выката сверить с панелью без чтения логов.
         out["pipelines_any"] = settings.pipelines_any()
+        out["pipelines_any_allowed"] = settings.pipelines_any_allowed()          # разрешено ли «любая воронка» переменной движка `AI_PIPELINES_ANY_ALLOWED`
         out["initiative_pipelines"] = sorted(settings.initiative_pipelines())
         out["functions"] = settings.functions_wire()
     except Exception:  # noqa: BLE001

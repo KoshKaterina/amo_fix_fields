@@ -45,6 +45,7 @@ EVERY = {PIPE_TEST, PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}
 
 @pytest.fixture(autouse=True)
 def _fresh_state(monkeypatch):
+    monkeypatch.setattr(cfg, "PIPELINES_ANY_ALLOWED", True)           # «любая воронка» движок разрешает переменной AI_PIPELINES_ANY_ALLOWED=1 (см. test_ai_engine_pipelines_any.py)
     monkeypatch.setattr(E, "_last_mode_id", None)
     monkeypatch.setattr(E, "_send_failed_seen", {})
 
@@ -932,5 +933,5 @@ def test_a_waiting_touch_still_fires_in_the_two_pipelines(env):
 def test_status_shows_what_the_engine_takes_from_the_settings(env):
     v2(env, "full", pipelines_any=True, functions={"touch_max_days": 5, "silence": {"alt_after_min": 25}})
     out = E.status()
-    assert out["pipelines_any"] is True and out["initiative_pipelines"] == sorted(TWO)
+    assert out["pipelines_any"] is True and out["pipelines_any_allowed"] is True and out["initiative_pipelines"] == sorted(TWO)
     assert out["functions"]["touch_max_days"] == 5 and out["functions"]["silence"]["alt_after_min"] == 25
