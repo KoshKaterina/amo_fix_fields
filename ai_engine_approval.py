@@ -30,6 +30,11 @@ redistribute`, фильтры, бюджет и «менеджер не акти�
 Устаревание само (`sweep`, раз в проход таймеров): режим сменили или выключили, `redistribute` выключили или поменяли, включён аварийный рубильник
 `AI_REASSIGN_DISABLED=1`, менеджер написал клиенту после предложения (`stale`), по сделке появился владелец в базе движка; закрытая сделка снимает
 предложение событием сделки из amo (`cancel_for_closed_deal`). Пока настройки панели протухли, ничего не снимается.
+
+Источник предложения (`source`, только в базе, в панель не уходит): пусто, если ИИ просит взять сделку по сообщению клиента, `sweep`, если по подбору существующих
+сделок (`ai_engine_sweep`, решение Кати 23.11.2026). У подобранной сделки во входящих обычно ничего нет (клиент давно молчит или ждёт ответа в прошлом), поэтому после
+подтверждения ИИ получает не ход по накопленным сообщениям, а событие `deal_given`, как при кнопке «Дать сделку ИИ» (`ai_engine._hand_over`): он сам читает историю чата.
+Если клиент написал, пока предложение ждало решения, всё как обычно: ход по накопленным сообщениям.
 """
 import asyncio
 import datetime
@@ -45,6 +50,7 @@ import ai_engine_config as cfg
 import ai_engine_dedup as dedup
 import ai_engine_events as panel_events
 import ai_engine_filters as filters
+import ai_engine_marks as marks
 import ai_engine_settings as settings
 import ai_engine_store as store
 import amo_service
@@ -61,6 +67,7 @@ RETRY_EVERY_S = 60
 REFUSED_EVERY_S = 600                    # 404, 401, 403 и прочие 4xx: панель, видимо, не выкачена, стучимся редко
 AMO_TIMEOUT_S = 15
 
+SOURCE_SWEEP = "sweep"                  # предложение создал подбор существующих сделок (`ai_engine_sweep`); у предложений по сообщению клиента источник пуст
 PENDING, APPROVED, REJECTED, STALE, FAILED, CANCELLED = "pending", "approved", "rejected", "stale", "failed", "cancelled"
 OPEN_STATES = (PENDING, FAILED)
 AWAITING = "awaiting"                    # состояние чата: ждём решения человека (сообщения клиента копятся, ход не ставится)
@@ -96,6 +103,8 @@ class _Db:
         self._cm = store._connect()
         conn = self._cm.__enter__()
         conn.executescript(_SCHEMA)
+        if "source" not in {row[1] for row in conn.execute("PRAGMA table_info(reassign_proposal)")}:
+            conn.execute("ALTER TABLE reassign_proposal ADD COLUMN source TEXT NOT NULL DEFAULT ''")      # таблица из прежнего выката без колонки: идемпотентно, откат кода безопасен
         return conn
 
     def __exit__(self, *exc):
@@ -147,7 +156,14 @@ def block_reason(deal_id: int, now: float) -> str:
     return ""
 
 
-def create(*, deal_id: int, from_id: int | None, from_name: str, to_id: int, to_name: str, chat: dict[str, Any], now: float) -> dict[str, Any] | None:
+def recent_deal_ids(since: float) -> list[int]:
+    """Сделки, по которым предложения смены ответственного создавались не раньше `since` (любое состояние): подбор существующих (`ai_engine_sweep`) не предлагает
+    их снова, чтобы отклонённое человеком не возвращалось и открытое не дублировалось."""
+    with _Db() as conn:
+        return [int(r[0]) for r in conn.execute("SELECT DISTINCT deal_id FROM reassign_proposal WHERE proposed_at>=?", (float(since),))]
+
+
+def create(*, deal_id: int, from_id: int | None, from_name: str, to_id: int, to_name: str, chat: dict[str, Any], now: float, source: str = "") -> dict[str, Any] | None:
     """Новое предложение `pending`. None: по сделке уже есть открытое. `ref` вида `rp-<сделка>-<unix>` (при совпадении секунды с суффиксом)."""
     with _Db() as conn:
         if conn.execute("SELECT 1 FROM reassign_proposal WHERE deal_id=? AND state IN ('pending','failed')", (int(deal_id),)).fetchone():
@@ -159,10 +175,10 @@ def create(*, deal_id: int, from_id: int | None, from_name: str, to_id: int, to_
             ref = f"{base}-{n}"
         conn.execute(
             "INSERT INTO reassign_proposal (ref, deal_id, from_user_id, from_user_name, to_user_id, to_user_name, reason, proposed_at, state, "
-            "chat_key, chat_id, chat_type, channel_id, phone, contact_name, delivery_next_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "chat_key, chat_id, chat_type, channel_id, phone, contact_name, delivery_next_at, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ref, int(deal_id), from_id, from_name or "", int(to_id), to_name, REASON, float(now), PENDING,
              chat.get("chat_key") or "", chat.get("chat_id") or "", chat.get("chat_type") or "", chat.get("channel_id") or "",
-             chat.get("phone") or "", chat.get("contact_name") or "", float(now)))
+             chat.get("phone") or "", chat.get("contact_name") or "", float(now), source or ""))
         return dict(conn.execute("SELECT * FROM reassign_proposal WHERE ref=?", (ref,)).fetchone())
 
 
@@ -284,16 +300,17 @@ async def _schedule_delivery(eng, now: float) -> None:
 # создание предложения
 # =============================================================================================
 
-async def propose(eng, s: dict[str, Any], deal: dict[str, Any], gate, mode_id: str) -> bool:
+async def propose(eng, s: dict[str, Any], deal: dict[str, Any], gate, mode_id: str, source: str = "") -> bool:
     """Сделку брать нужно со сменой ответственного, а пилот включён: создать предложение и поставить сделку «ждёт решения». Зовётся под общим замком из
-    `ai_engine._apply_resolution`, после проверок «ИИ жив» и «не медиа». Сообщения клиента остаются во входящих. True: предложение создано."""
+    `ai_engine._apply_resolution` (и из `ai_engine_sweep` с `source=SOURCE_SWEEP`), после проверок «ИИ жив» и «не медиа». Сообщения клиента остаются во входящих.
+    True: предложение создано."""
     now = eng._now()
     plan = gate.reassign
     deal_id = int(deal["id"])
     from_id = plan.get("from_id")
     from_name = await filters._user_name(from_id) if from_id else ""
     row = await eng._db(create, deal_id=deal_id, from_id=from_id, from_name=from_name, to_id=int(plan["to_id"]), to_name=str(plan["to_name"]),
-                        chat=s, now=now)
+                        chat=s, now=now, source=source)
     if row is None:
         # Открытое предложение по сделке уже есть (второй путь к тому же решению): новое не создаём, чат ждёт, как и прежний
         await eng._db(store.put_session, s["chat_key"], state=AWAITING, deal_id=deal_id, next_at=None)
@@ -314,6 +331,9 @@ async def propose(eng, s: dict[str, Any], deal: dict[str, Any], gate, mode_id: s
 
 def _stale_reason(row: dict[str, Any]) -> tuple[str, str] | None:
     """Устарело ли открытое предложение без сети: (новое состояние, причина) или None. Протухшие настройки ничего не снимают."""
+    mark = marks.get(int(row["deal_id"]))                         # отметки людей (`ai_engine_marks`) от настроек панели не зависят
+    if mark is not None and (mark["kind"] == marks.KIND_REMOVED or float(mark["at"]) >= float(row["proposed_at"])):
+        return CANCELLED, "сделку убрали отметкой человека" + (" («удалить»)" if mark["kind"] == marks.KIND_REMOVED else " («не требует ответа»)")
     if not settings.is_fresh():
         return None
     if settings.effective_mode() == "off" or settings.active_mode_id() != "full":
@@ -359,11 +379,18 @@ async def sweep(eng, now: float) -> None:
                 await _close(eng, cur, why[0], why[1], now)
 
 
-async def cancel_for_closed_deal(eng, deal_id: int) -> None:
-    """Сделку закрыли (событие сделки из amo): открытое предложение по ней снимается."""
+async def cancel_for_deal(eng, deal_id: int, note: str) -> bool:
+    """Открытое предложение по сделке снимается решением человека или движка (отметки «удалить» и «не требует ответа», `ai_engine.mark_deal`). Идущее подтверждение
+    не трогаем: оно само проверит актуальность (`_stale_reason` видит отметку). True: предложение закрыто."""
     row = await eng._db(open_for_deal, int(deal_id))
     if row is not None and row["ref"] not in _deciding:
-        await _close(eng, row, CANCELLED, "сделка закрыта", eng._now())
+        return await _close(eng, row, CANCELLED, note, eng._now())
+    return False
+
+
+async def cancel_for_closed_deal(eng, deal_id: int) -> None:
+    """Сделку закрыли (событие сделки из amo): открытое предложение по ней снимается."""
+    await cancel_for_deal(eng, deal_id, "сделка закрыта")
 
 
 async def _fix_orphans(eng, now: float) -> None:
@@ -548,16 +575,27 @@ async def _approve(eng, row: dict[str, Any], by: str) -> tuple[int, dict[str, An
         mode_id = settings.active_mode_id()
         chat = {"chat_id": row["chat_id"], "chat_type": row["chat_type"], "channel_id": row["channel_id"], "chat_key": row["chat_key"]}
         await eng._db(eng.silence.clear, deal_id)
-        owner = await eng._db(store.set_owner, deal_id, store.OWNER_AI, reason="reassign_approved", chat=chat,
-                              pipeline_id=int(lead.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(lead), mode=mode_id)
-        await eng._db(filters.guard_on_take, deal_id)               # существующая сделка: инициатива ждёт первого сообщения ИИ клиенту
-        await eng._db(transition, row["ref"], APPROVED, decided_by=by, note="подтверждено человеком", now=now)
-        s = await eng._db(store.put_session, row["chat_key"], channel_id=row["channel_id"], chat_id=row["chat_id"], chat_type=row["chat_type"],
-                          phone=row["phone"], contact_name=row["contact_name"], state=store.S_COLLECTING, deal_id=deal_id,
-                          batch_start=now, first_batch=1, last_client_at=now, has_media=0, next_at=None, skip_until=None)
+        swept = row.get("source") == SOURCE_SWEEP
         pending = bool(await eng._db(store.pending_inbox, row["chat_key"]))
-        await eng._enqueue_turn(s, owner, settings.effective_mode())
-        eng._spawn(eng.ai_engine_tasks.release_intake(deal_id))     # системные «Связаться»/«Новый заказ с сайта»: теперь клиентом занят ИИ
+        if swept and not pending:
+            # Предложение создал подбор существующих сделок, клиент с тех пор не писал: хода по сообщениям нет, ИИ получает `deal_given` и сам читает историю
+            # (как после кнопки «Дать сделку ИИ»). Задачи amo при этом не закрываются (подбор их не трогает).
+            await eng._db(transition, row["ref"], APPROVED, decided_by=by, note="подтверждено человеком", now=now)
+            await eng._hand_over(lead, chat=chat, phone=row["phone"], contact_name=row["contact_name"], mode_id=mode_id, forced=False,
+                                 reason="reassign_approved", note=eng.sweep.SWEEP_NOTE, release_tasks=False)
+        else:
+            owner = await eng._db(store.set_owner, deal_id, store.OWNER_AI, reason="reassign_approved", chat=chat,
+                                  pipeline_id=int(lead.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(lead), mode=mode_id)
+            await eng._db(filters.guard_on_take, deal_id)               # существующая сделка: инициатива ждёт первого сообщения ИИ клиенту
+            await eng._db(transition, row["ref"], APPROVED, decided_by=by, note="подтверждено человеком", now=now)
+            s = await eng._db(store.put_session, row["chat_key"], channel_id=row["channel_id"], chat_id=row["chat_id"], chat_type=row["chat_type"],
+                              phone=row["phone"], contact_name=row["contact_name"], state=store.S_COLLECTING, deal_id=deal_id,
+                              batch_start=now, first_batch=1, last_client_at=now, has_media=0, next_at=None, skip_until=None)
+            await eng._enqueue_turn(s, owner, settings.effective_mode())
+            if not swept:
+                eng._spawn(eng.ai_engine_tasks.release_intake(deal_id))     # системные «Связаться»/«Новый заказ с сайта»: теперь клиентом занят ИИ
     logger.info("ai_engine: предложение %s по сделке %s подтверждено (%s): ответственный изменён, ИИ взял сделку", row["ref"], deal_id, by)
+    if swept and not pending:
+        return _out("approved", "Ответственный изменён, ИИ взял сделку, перечитает переписку и продолжит диалог.")
     return _out("approved", "Ответственный изменён, ИИ взял сделку и отвечает клиенту." if pending
                 else "Ответственный изменён, ИИ взял сделку и ответит на следующее сообщение клиента.")

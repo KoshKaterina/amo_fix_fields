@@ -20,7 +20,7 @@ import ai_engine_prompts as prompts
 import ai_engine_settings as settings
 import ai_engine_store as store
 from test_ai_engine import CHAN, CHAT, DEAL, PIPE_RETAIL, env, run  # noqa: F401  (env - фикстура)
-from test_ai_engine_functions import PIPE_OTHER, PIPE_TANGEM, TWO, take, v2
+from test_ai_engine_functions import INITIATIVE_DEFAULT, PIPE_OTHER, PIPE_TANGEM, TWO, take, v2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,7 +64,7 @@ def test_without_the_variable_pipelines_any_is_false_whatever_the_panel_sends(en
     assert settings.pipeline_allowed(PIPE_RETAIL) and settings.pipeline_allowed(PIPE_TANGEM)
     assert not settings.pipeline_allowed(PIPE_OTHER)                                  # как при документе без pipelines_any
     assert settings.initiative_allowed(PIPE_RETAIL) and not settings.initiative_allowed(PIPE_OTHER)
-    assert settings.initiative_pipelines() == frozenset(TWO)
+    assert settings.initiative_pipelines() == frozenset(INITIATIVE_DEFAULT)
 
 
 def test_with_the_variable_pipelines_any_works_as_the_panel_asks(env):

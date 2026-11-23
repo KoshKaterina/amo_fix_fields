@@ -15,6 +15,7 @@ import os
 
 from waybill_config import (
     PIPELINE_CLEVER_MAIN,
+    PIPELINE_DB_WORK,
     PIPELINE_TANGEMSHOP,
     RETAIL_GUARD_CHANNELS,
     STATUS_CLOSED_LOST,
@@ -72,14 +73,22 @@ MODE_PIPELINES: dict[str, frozenset[int]] = {
     "prod": frozenset({int(PIPELINE_CLEVER_MAIN), int(PIPELINE_TANGEMSHOP)}),
 }
 # Воронки, где ИИ вправе проявлять ИНИЦИАТИВУ (лестница тишины, окна УР, отложенные касания, напоминание), когда панель не прислала
-# `initiative_pipelines`: две розничные воронки (этап 2 плана «режимы ИИ-менеджера»). В остальных воронках при `pipelines_any` ИИ только отвечает.
-INITIATIVE_PIPELINES_DEFAULT: frozenset[int] = MODE_PIPELINES["prod"]
+# `initiative_pipelines`: «ОП розница», TangemShop и «Работа с базой» 11166334 (решение 23.11.2026: у неё инициатива как у розницы; множество задано явно, а не
+# через `MODE_PIPELINES`, которое остаётся двумя розничными воронками). В остальных воронках при `pipelines_any` ИИ только отвечает. ⚠️ Инициатива в «Работе с базой»
+# действует, только если ИИ вообще вправе вести сделки этой воронки: `pipeline_allowed` (`AI_PIPELINES_ANY_ALLOWED=1`, `pipelines_any` панели и промпт воронки).
+INITIATIVE_PIPELINES_DEFAULT: frozenset[int] = frozenset({int(PIPELINE_CLEVER_MAIN), int(PIPELINE_TANGEMSHOP), int(PIPELINE_DB_WORK)})
+# Пул 1 («розница») подбора существующих сделок (`ai_engine_sweep`): ровно эти две воронки, НЕ `initiative_pipelines`: иначе «Работа с базой» с её старыми сделками тихо попала бы
+# в пул, где берут и молчащих клиентов. «Работа с базой» в подборе это пул 2 (только ответ на неотвеченное). Переопределяется `existing.sweep.retail_pipelines` панели.
+SWEEP_RETAIL_PIPELINES: frozenset[int] = frozenset({int(PIPELINE_CLEVER_MAIN), int(PIPELINE_TANGEMSHOP)})
 # «Любая воронка» (`pipelines_any` документа панели) включается ТОЛЬКО здесь: `AI_PIPELINES_ANY_ALLOWED=1` в .env движка (по умолчанию не задан) и
 # перезапуск контейнера. Пока переменная не равна «1», `pipelines_any` из документа игнорируется и движок ведёт себя как при документе без него (две
 # воронки режима, поведение этапа 1): ИИ-сервис до своего выката отвечает `mode_mismatch` на воронки вне двух розничных, и включённый `pipelines_any`
 # породил бы передачу человеку и алерт на каждый ход. Включать вместе с выкатом сервиса, который принимает чужие воронки.
 PIPELINES_ANY_ALLOWED = os.getenv("AI_PIPELINES_ANY_ALLOWED", "").strip() == "1"
 CLOSED_STATUS_IDS = frozenset({int(STATUS_SUCCESS), int(STATUS_CLOSED_LOST)})
+# Подбор существующих сделок (`ai_engine_sweep`, режим «Полный», решение Кати 23.11.2026) включает панель (`existing.sweep.enabled`). Аварийный рубильник движка:
+# `AI_SWEEP_DISABLED=1` в .env (по умолчанию не задан) и перезапуск контейнера: подбор не запускается, что бы ни прислала панель.
+SWEEP_DISABLED = os.getenv("AI_SWEEP_DISABLED", "").strip() == "1"
 
 # Режимы работы ИИ-менеджера (план 20.11.2026, этап 1): один активный `mode_id`. Старый ключ `mode` остаётся с прежним смыслом
 # (`off`/`test`/`prod`): это то, чему воронки и движок верили до режимов. Словарь ниже сводит новый id к старому ключу: документ, в

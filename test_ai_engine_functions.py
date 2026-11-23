@@ -36,11 +36,13 @@ from test_ai_engine_silence import ai_owns_and_wrote
 from test_ai_engine_ur import at, owned_and_wrote, to, waves
 
 PIPE_TANGEM = 9822330
+PIPE_DB = 11166334                      # «Работа с базой»: инициатива по умолчанию как у розницы (`INITIATIVE_PIPELINES_DEFAULT`)
 PIPE_OTHER = 7_000_002                  # воронка вне двух розничных: при `pipelines_any` ИИ в ней только отвечает
 HOUR = 3600
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 OPEN_FULL = {"scope": "full", "restricted": False, "items": []}
 TWO = {PIPE_RETAIL, PIPE_TANGEM}
+INITIATIVE_DEFAULT = TWO | {PIPE_DB}         # воронки с инициативой, когда панель список не прислала
 EVERY = {PIPE_TEST, PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}
 EVERY_FULL = EVERY - {PIPE_TEST}            # в Полном «Тест» не воронка с промптом: тестовые воронки считаются только в режиме `test` (`ai_engine_prompts`)
 
@@ -94,7 +96,7 @@ def test_defaults_equal_todays_behaviour_when_the_blocks_are_missing(env, monkey
     assert (settings.touch_max_days(), settings.touch_max_ahead_s(), settings.touches_available()) == (7, 7 * 86400 + 3600, True)
     assert settings.call_config() == {"route_to_mop": True}
     assert settings.eta_config() == {"source": "stock_date", "person": {"id": 13963494, "name": "Екатерина Зубалий"}}
-    assert settings.pipelines_any() is False and settings.initiative_pipelines() == frozenset(TWO)
+    assert settings.pipelines_any() is False and settings.initiative_pipelines() == frozenset(INITIATIVE_DEFAULT)
     assert settings.mode_settings(PIPE_RETAIL) == {"mode_id": "full", "review": {"enabled": True}, "initiative": True}   # блоков нет, и в ходе их нет
 
 
@@ -124,7 +126,7 @@ def test_version_1_document_ignores_every_new_block(env, monkeypatch):
     assert settings.silence_config()["enabled"] is True and settings.silence_config()["alt_after_s"] == 3600
     assert settings.ur_config()["enabled"] is True and settings.touch_max_days() == 7
     assert settings.call_config() == {"route_to_mop": True} and settings.eta_config()["source"] == "stock_date"
-    assert settings.pipelines_any() is False and settings.initiative_pipelines() == frozenset(TWO)
+    assert settings.pipelines_any() is False and settings.initiative_pipelines() == frozenset(INITIATIVE_DEFAULT)
     assert settings.pipeline_allowed(PIPE_OTHER) is False and settings.mode_settings(PIPE_RETAIL) is None
 
 
@@ -256,7 +258,7 @@ def test_garbage_in_the_new_blocks_does_not_raise(env, monkeypatch):
         v2(env, "full", functions=junk, call=junk, eta=junk, pipelines_any=junk, initiative_pipelines=junk if not isinstance(junk, list) else "x")
         assert settings.silence_config()["alt_after_s"] == 3600 and settings.ur_config()["wave1"] == "17:50"
         assert settings.touch_max_days() == 7 and settings.call_config() == {"route_to_mop": True}
-        assert settings.pipelines_any() is False and settings.initiative_pipelines() == frozenset(TWO)
+        assert settings.pipelines_any() is False and settings.initiative_pipelines() == frozenset(INITIATIVE_DEFAULT)
     for junk in ("x", 100, None, [], True):
         v2(env, "full", functions={"silence": junk, "reminder": junk, "ur": junk, "touch_max_days": junk})
         assert settings.silence_config()["enabled"] is True and settings.reminder_config() == {"enabled": True, "after_h": 3}
@@ -937,5 +939,5 @@ def test_a_waiting_touch_still_fires_in_the_two_pipelines(env):
 def test_status_shows_what_the_engine_takes_from_the_settings(env):
     v2(env, "full", pipelines_any=True, functions={"touch_max_days": 5, "silence": {"alt_after_min": 25}})
     out = E.status()
-    assert out["pipelines_any"] is True and out["pipelines_any_allowed"] is True and out["initiative_pipelines"] == sorted(TWO)
+    assert out["pipelines_any"] is True and out["pipelines_any_allowed"] is True and out["initiative_pipelines"] == sorted(INITIATIVE_DEFAULT)
     assert out["functions"]["touch_max_days"] == 5 and out["functions"]["silence"]["alt_after_min"] == 25

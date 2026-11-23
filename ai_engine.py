@@ -34,6 +34,10 @@
 есть промпт в ИИ-сервисе (словарь `GET /v1/funnels`, опрос `prompts.poll_loop` раз в минуту). Сделка ИИ в воронке без промпта не берётся (`dedup.resolve`,
 `give_deal`, подтверждение смены ответственного), не получает событий и касаний, а уже взятая и оказавшаяся в такой воронке снимается как `left_pipeline`
 (событие сделки из amo) или теряется при следующем сообщении клиента (`dedup.resolve` отвечает `K_GONE`). Перехват (`ai_engine_intercept`) ведёт свои правила воронок.
+
+⚠️ Подбор существующих сделок (решение Кати 23.11.2026, `ai_engine_sweep`): раз в 5 минут из `tick_once` (не отдельный цикл, `loops_alive` по-прежнему пять) фоновый прогон берёт по одной-две
+сделки из списка панели теми же правилами, что при сообщении клиента, и отдаёт их ИИ событием `deal_given` через общую с `give_deal` часть `_hand_over`. Отметки людей по сделке
+(`ai_engine_marks`, `mark_deal`): «не требует ответа» снимает ждущий ход и выводит сделку из подбора, «удалить» навсегда освобождает её от ИИ без алертов и задач; «Дать сделку ИИ» снимает обе.
 """
 import asyncio
 import datetime
@@ -54,9 +58,11 @@ import ai_engine_filters as filters
 import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_intercept as intercept
+import ai_engine_marks as marks
 import ai_engine_modes as modes
 import ai_engine_prompts as prompts
 import ai_engine_silence as silence
+import ai_engine_sweep as sweep
 import ai_engine_ur as ur_wave
 import ai_engine_return
 import ai_engine_tasks
@@ -555,6 +561,7 @@ async def tick_once() -> None:
     if now - _last_housekeeping >= 3600:
         _last_housekeeping = now
         await _db(store.prune, cfg.RETENTION_DAYS * 86400)
+    await sweep.tick(sys.modules[__name__], now)         # подбор существующих сделок: раз в 5 минут, прогон фоновой задачей, не отдельный цикл (`ai_engine_sweep`)
 
 
 async def _process_collecting(s: dict) -> None:
@@ -677,6 +684,14 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
         await _db(store.put_session, chat_key, state=store.S_RELEASED, deal_id=deal_id, next_at=None)
         await _db(store.discard_pending, chat_key)
         return
+    if owner is None:
+        # Отметка человека («удалить» или «не требует ответа» поверх этого сообщения, `ai_engine_marks`): сделку не берём. Сообщение клиента ПОЗЖЕ отметки
+        # отметка не касается. Чат забывается целиком (не `skip`): иначе следующее сообщение клиента в ближайшие 10 минут было бы проигнорировано.
+        why_marked = await _db(marks.suppresses, deal_id, s.get("last_client_at"))
+        if why_marked:
+            logger.info("ai_engine: сделка %s не взята: %s", deal_id, why_marked)
+            await _db(store.drop_session, chat_key)
+            return
     if _autopilot_busy(s["chat_id"], s["phone"], deal_id):
         logger.info("ai_engine: сделку %s ведёт авто-режим - ИИ не входит", deal_id)
         await _db(store.put_session, chat_key, state=store.S_SKIP, deal_id=deal_id,
@@ -1341,6 +1356,13 @@ async def _after_abort(turn: dict, s: dict | None, owner: dict, reason: str | No
             _client_line(s) if s else "", _link(int(turn["deal_id"])),
         ])
         return
+    if str(reason or "").startswith("stage_not_served"):
+        # ИИ-сервис: на ЭТОМ этапе сделки (ОПТ, Академия) ИИ не отвечает. Ход закрыт без ответа клиенту, без алерта, без задачи и без передачи человеку, повтора нет
+        # (сообщения хода остаются потреблёнными): сделка остаётся у ИИ, чат ждёт следующего сообщения клиента (когда сделка перейдёт на этап, где ИИ отвечает, он
+        # ответит как обычно). В лог только код: текст причины пишет сервис, а ему личные данные не нужны, но и нам незачем.
+        logger.info("ai_engine: ход %s по сделке %s закрыт без ответа: этап сделки ИИ не обслуживает (stage_not_served), клиент ждёт", turn["turn_id"], turn["deal_id"])
+        await _after_turn(s)
+        return
     # Клиент написал ещё либо движок не ответил на permit: клиент остался без ответа, ход назначается заново.
     redo = reason is None or reason == "newer_client_message" or str(reason).startswith("engine_unavailable")
     if redo:
@@ -1659,6 +1681,7 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
             if not await _ai_is_up():
                 return 503, {"detail": "ai_unavailable"}
             await _queue_event(owner, "deal_given")
+            await _clear_marks(deal_id, "перезапуск хода кнопкой «Дать сделку ИИ»")
             logger.info("ai_engine: ход по сделке %s перезапущен вручную", deal_id)
             return 200, {"ok": True, "retriggered": True, "epoch": owner["epoch"], "deal_id": int(deal_id)}
         if _autopilot_busy(chat_id, phone, deal_id):
@@ -1667,20 +1690,114 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
             return 503, {"detail": "ai_unavailable"}
         chat_key = chat_key_of(channel_id, chat_id)
         chat = {"chat_id": chat_id, "chat_type": chat_type, "channel_id": channel_id, "chat_key": chat_key}
-        owner = await _db(
-            store.set_owner, deal_id, store.OWNER_AI, reason="deal_given", chat=chat,
-            pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
-        )
-        await _db(give.mark, deal_id, _now(), force, mode_id)
-        await _db(filters.guard_for_given, deal, mode_id)      # «существующая» сделка: инициатива по ней ждёт первого сообщения ИИ; фильтры к ручной передаче не применяются
-        await _db(store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id, chat_type=chat_type, phone=phone,
-                  contact_name=contact_name, state=store.S_AI, deal_id=deal_id, first_batch=0, last_message_id="",
-                  next_at=None, has_media=0)
-        await _queue_event(owner, "deal_given")
-    _spawn(ai_engine_tasks.release_intake(deal_id))       # системные «Связаться»/«Новый заказ с сайта»: клиентом теперь занят ИИ
-    _spawn(_followup_note(deal_id, "сделка передана ИИ-менеджеру, дальше переписку ведёт он"))
+        owner = await _hand_over(deal, chat=chat, phone=phone, contact_name=contact_name, mode_id=mode_id, forced=force,
+                                 reason="deal_given", note="сделка передана ИИ-менеджеру, дальше переписку ведёт он")
+        await _clear_marks(deal_id, "передача кнопкой «Дать сделку ИИ»")
     logger.info("ai_engine: сделка %s передана ИИ (эпоха %s, режим %s)", deal_id, owner["epoch"], mode_id)
     return 200, {"ok": True, "epoch": owner["epoch"], "deal_id": int(deal_id)}
+
+
+async def _hand_over(deal: dict, *, chat: dict[str, Any], phone: str, contact_name: str, mode_id: str, forced: bool, reason: str, note: str,
+                     release_tasks: bool = True) -> dict:
+    """Общая часть «сделку отдали ИИ без нового сообщения клиента»: `give_deal` (человек нажал «Дать сделку ИИ») и подбор существующих (`ai_engine_sweep`, и
+    подтверждение предложения, созданного подбором, `ai_engine_approval`). Зовётся под общим замком, когда все проверки уже пройдены. Делает то же самое, что делал
+    `give_deal`: `owner = ai` (эпоха + 1, `reason` в записи владельца: для журнала различать ручную передачу и подбор), отметка передачи `give.mark` (от неё
+    `manager_cutoff` хода: сообщения менеджера ДО передачи ИИ не останавливают), охрана инициативы для «существующей» сделки (`filters.guard_for_given`; фильтры и
+    бюджет здесь НЕ проверяются, их проверил вызывающий), сессия чата, служебное событие `deal_given` (ИИ-сервис его знает, нового события нет) и примечание
+    в сделку. `release_tasks`: закрыть системные задачи приёма лида («Связаться», «Новый заказ с сайта»); подбор их не трогает. Возвращает строку владельца."""
+    deal_id = int(deal["id"])
+    chat_key, chat_id, channel_id = chat["chat_key"], chat["chat_id"], chat["channel_id"]
+    owner = await _db(
+        store.set_owner, deal_id, store.OWNER_AI, reason=reason, chat=chat,
+        pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
+    )
+    await _db(give.mark, deal_id, _now(), forced, mode_id)
+    await _db(filters.guard_for_given, deal, mode_id)      # «существующая» сделка: инициатива по ней ждёт первого сообщения ИИ; фильтры к ручной передаче не применяются
+    await _db(store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id, chat_type=chat.get("chat_type") or "", phone=phone,
+              contact_name=contact_name, state=store.S_AI, deal_id=deal_id, first_batch=0, last_message_id="",
+              next_at=None, has_media=0)
+    await _queue_event(owner, "deal_given")
+    if release_tasks:
+        _spawn(ai_engine_tasks.release_intake(deal_id))   # системные «Связаться»/«Новый заказ с сайта»: клиентом теперь занят ИИ
+    _spawn(_followup_note(deal_id, note))
+    return owner
+
+
+async def _clear_marks(deal_id: int, why: str) -> None:
+    """Ручная передача ИИ снимает обе отметки людей со сделки (`ai_engine_marks`); в журнал отметок идёт строка `cleared`. Не бросает."""
+    try:
+        cleared = await _db(marks.clear, int(deal_id), why, _now())
+        if cleared:
+            logger.info("ai_engine: сделка %s: отметка человека (%s) снята: %s", deal_id, ", ".join(cleared), why)
+    except Exception:  # noqa: BLE001 - снятие отметки не должно отменять уже сделанную передачу
+        logger.exception("ai_engine: не снял отметки со сделки %s", deal_id)
+
+
+async def mark_deal(deal_id: int, kind: str, by: str = "") -> tuple[int, dict]:
+    """Отметка человека по сделке из панели (`POST /internal/ai/v1/deal_mark`, `ai_engine_marks`): «не требует ответа» (`no_reply`) и «удалить» (`removed`).
+
+    Ответ 200 `{"ok": true, "state": "marked" | "already_removed", "kind": <действующая отметка>, "repeat": bool, ...}`; повтор безопасен (см. `marks.put`).
+    422 `bad_kind` / `bad_deal`. Работает и при режиме `off`: отметка человека не зависит от режима, а ИИ-сделки в этом режиме и так уходят людям.
+    Действия:
+      • `no_reply`: ждущий ход и черновик по текущему сообщению снимаются (ход отменён у сервиса, ждущие сообщения и событие `deal_given` сброшены, открытое
+        предложение смены ответственного снято), владелец не меняется; сделка выпадает из подбора, пока клиент не напишет новое сообщение;
+      • `removed`: ИИ сделку больше не ведёт никогда. Ведёт ИИ: владелец `human` (причина `removed`) без алерта и без задачи, ход и касание отменены. Никто не ведёт:
+        запись владельца `human` создаётся, чтобы и вход по сообщению, и подбор считали сделку человеческой навсегда."""
+    if kind not in marks.KINDS:
+        return 422, {"detail": "bad_kind"}
+    try:
+        deal_id = int(deal_id)
+    except (TypeError, ValueError):
+        return 422, {"detail": "bad_deal"}
+    if deal_id <= 0:
+        return 422, {"detail": "bad_deal"}
+    async with _get_lock():
+        put = await _db(marks.put, deal_id, kind, _now(), by)
+        out: dict[str, Any] = {"ok": True, "state": put["state"], "kind": put["kind"], "repeat": put["repeat"]}
+        if put["state"] != "already_removed":
+            out.update(await (_mark_removed(deal_id) if put["kind"] == marks.KIND_REMOVED else _mark_no_reply(deal_id)))
+    logger.info("ai_engine: сделка %s: отметка человека «%s» %s", deal_id, put["kind"], "повторена" if put["repeat"] else "поставлена")
+    return 200, out
+
+
+async def _mark_removed(deal_id: int) -> dict[str, Any]:
+    """«Удалить»: ИИ эту сделку больше не ведёт. Под общим замком. Алертов и задач нет."""
+    owner = await _db(store.get_owner, deal_id)
+    s = await _db(store.session_for_deal, deal_id)
+    await approval.cancel_for_deal(sys.modules[__name__], deal_id, "сделку убрали отметкой «удалить»")
+    if owner is not None and owner["closed"]:
+        return {"released": False}                                   # сделка закрыта: владельца не трогаем, отметка записана
+    released = owner is not None and owner["owner"] == store.OWNER_AI
+    if released or s is not None:
+        await _to_human(s, "removed", deal_id=deal_id, alert=None)   # владелец `human`, ходы и касание сняты, лестница тишины снята, чат человеческий
+    elif owner is None or owner["owner"] == store.OWNER_ENGINE:
+        await _db(store.set_owner, deal_id, store.OWNER_HUMAN, reason="removed")
+    return {"released": released}
+
+
+async def _mark_no_reply(deal_id: int) -> dict[str, Any]:
+    """«Не требует ответа»: ждущий ход и черновик по текущему сообщению снимаются, владелец остаётся. Под общим замком."""
+    owner = await _db(store.get_owner, deal_id)
+    await approval.cancel_for_deal(sys.modules[__name__], deal_id, "отметка «не требует ответа»")
+    s = await _db(store.session_for_deal, deal_id)
+    if s is not None and s["state"] == store.S_SKIP:
+        await _db(store.drop_session, s["chat_key"])                 # предложение закрыто и оставило чат в `skip`: следующее сообщение клиента не должно теряться
+        s = None
+    cancelled = dropped = 0
+    if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]:
+        for t in await _db(store.cancel_active_turns, deal_id):
+            _spawn(client.post_cancel(int(t["turn_id"])))             # сервис не отправит ничего без `permit`, а `permit` по отменённому ходу отказывает
+            cancelled += 1
+        if s is not None and s["state"] in (store.S_COLLECTING, store.S_IN_TURN):
+            dropped = await _db(store.discard_pending, s["chat_key"])
+            fields: dict[str, Any] = {"state": store.S_AI, "next_at": None, "current_turn": None, "has_media": 0}
+            try:
+                if s.get("pending_event") and json.loads(s["pending_event"]).get("type") == "deal_given":
+                    fields["pending_event"] = None                  # ждущая передача «перечитай и ответь» тоже по этому сообщению
+            except ValueError:
+                fields["pending_event"] = None
+            await _db(store.put_session, s["chat_key"], **fields)
+    return {"released": False, "cancelled_turns": cancelled, "dropped_messages": dropped}
 
 
 # =============================================================================================
@@ -2047,4 +2164,8 @@ def status() -> dict[str, Any]:
         out["reassign_proposals_open"] = approval.count_open()       # предложения смены ответственного, ждущие решения человека (`ai_engine_approval`)
     except Exception:  # noqa: BLE001
         out["reassign_proposals_open"] = "ошибка чтения базы"
+    try:
+        out["sweep"] = sweep.status_block(_now())                     # подбор существующих сделок (`ai_engine_sweep`): настройки, бюджет, исходы за сутки, отметки людей
+    except Exception:  # noqa: BLE001
+        out["sweep"] = "ошибка чтения базы"
     return out

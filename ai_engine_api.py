@@ -8,7 +8,7 @@
   • ручки человека (`return_dialog`, `state`) закрыты ОТДЕЛЬНЫМ `AI_ADMIN_TOKEN`: у ИИ-сервиса его нет, и
     сервис не может сам забрать назад сделку, которую у него отняли;
   • кнопка «Дать сделку ИИ» в панели Team ходит со своим узким `X-Give-Token` (`AI_GIVE_TOKEN`): он открывает только `/give_deal`,
-    админский токен в панель не кладётся.
+    `/reassign/decision` и `/deal_mark` (отметки «не требует ответа» и «удалить»), админский токен в панель не кладётся.
 
 Рекомендация к выкатке: закрыть `/amo/internal/` в nginx (сервис ходит по docker-сети напрямую на
 `amo-fix-fields:8000`, публичный путь ему не нужен). Токены это защита второго эшелона, а не замена.
@@ -61,6 +61,13 @@ class GiveIn(BaseModel):
     contact_name: str = ""
     force: bool = False         # вопреки правилам дублей A, C, D (решение человека)
     retrigger: bool = False     # сделку ИИ уже ведёт: поставить ход-событие заново
+
+
+class DealMarkIn(BaseModel):
+    """Отметка человека по сделке (`ai_engine.mark_deal`, `ai_engine_marks`): `kind` `no_reply` («не требует ответа») или `removed` («удалить»). Форма согласована с панелью."""
+    deal_id: int
+    kind: str
+    by: str = ""
 
 
 class ReassignDecisionIn(BaseModel):
@@ -253,6 +260,22 @@ async def reassign_decision(body: ReassignDecisionIn, x_admin_token: str = Heade
         code, out = await ai_engine.reassign_decision(body.ref, body.deal_id, body.decision, body.decided_by)
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: решение по предложению %s не обработано", body.ref)
+        return JSONResponse({"detail": "engine_error"}, status_code=500)
+    return JSONResponse(out, status_code=code)
+
+
+@router.post("/deal_mark")
+async def deal_mark(body: DealMarkIn, x_admin_token: str = Header(default=""), x_give_token: str = Header(default="")):
+    """Отметка человека по сделке: «не требует ответа» (`no_reply`) или «удалить» (`removed`), решение Кати 23.11.2026. Тот же узкий токен панели `X-Give-Token`
+    (`AI_GIVE_TOKEN`), что у `give_deal`; админский тоже подходит. Ответ 200 `{ok, state: "marked" | "already_removed", kind, repeat, ...}`, повтор безопасен;
+    422: незнакомый вид или номер сделки. Что именно делает движок: `ai_engine.mark_deal`."""
+    bad = _check_give(x_give_token) if x_give_token else _check_admin(x_admin_token)
+    if bad is not None:
+        return bad
+    try:
+        code, out = await ai_engine.mark_deal(body.deal_id, body.kind, body.by)
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: отметка по сделке %s не обработана", body.deal_id)
         return JSONResponse({"detail": "engine_error"}, status_code=500)
     return JSONResponse(out, status_code=code)
 
