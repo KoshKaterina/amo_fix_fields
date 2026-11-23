@@ -44,6 +44,7 @@ import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
 import ai_engine_events as panel_events
+import ai_engine_filters as filters
 import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_intercept as intercept
@@ -380,6 +381,10 @@ async def _on_outbound(chat_key: str, m: dict) -> None:
     `Phone`) в чате, который мы ведём или ждём, забирает диалог."""
     if is_robot_author(m.get("authorName")):
         return
+    try:
+        await _db(filters.note_manager_out, chat_key, _now())      # «менеджер активен» для `existing.manager_quiet_min` (`ai_engine_filters`)
+    except Exception:  # noqa: BLE001 - учёт активности менеджера не должен мешать приёму сообщений
+        logger.exception("ai_engine: не записал время сообщения менеджера в чат %s", chat_key)
     await _followup_cancel(chat_key=chat_key, reason="manager_wrote", notify=True)      # отложенное касание ИИ не уходит
     s = await _db(store.get_session, chat_key)
     if s is None or s["state"] in (store.S_HUMAN, store.S_SKIP, store.S_RELEASED):
@@ -565,12 +570,36 @@ async def _process_collecting(s: dict) -> None:
     known = int(s["deal_id"]) if owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"] else None
     forced = known if known is not None and (await _db(give.is_forced, known) or await _db(intercept.is_taken, known)) else None
     taken = frozenset({known}) if known is not None and await _db(intercept.is_taken, known) else frozenset()   # перехваченная: любая воронка
-    res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known, force_deal_id=forced, any_pipeline_ids=taken)
+    eligible = filters.make_eligibility(mode_id, [s["phone"], s["chat_id"]]) if known is None else None     # фильтры и бюджет при взятии: только для сделок, которых ИИ ещё не ведёт
+    res = await dedup.resolve(s["chat_id"], s["phone"], known_deal_id=known, force_deal_id=forced, any_pipeline_ids=taken, eligible=eligible)
+    if res.kind == dedup.K_AI and known is None and res.deal is not None:
+        res = await _gate_take(s, res, mode_id)                  # товары (МойСклад), «менеджер активен», смена ответственного: тоже вне общего замка
     async with _get_lock():
         fresh = await _db(store.get_session, chat_key)
         if fresh is None or fresh["state"] != store.S_COLLECTING or (fresh["next_at"] or 0) > _now():
             return
         await _apply_resolution(fresh, res, mode, mode_id)
+
+
+async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str) -> dedup.Resolution:
+    """Решение «ИИ берёт эту сделку в первый раз» (`ai_engine_filters.decide_take`): фильтры, бюджет, товары (МойСклад), «существующие сделки»,
+    «менеджер активен», назначение ответственного. Сеть здесь, вне общего замка. Сделке, у которой в базе движка уже есть владелец (человек,
+    движок, ИИ), решение не нужно: его принимали раньше. Отказ это `refused` (сделка не взята, чат пропускается), сбой проверки тоже отказ."""
+    deal = res.deal
+    if await _db(store.get_owner, int(deal["id"])) is not None:
+        return res
+    explicit = settings.contacts_restricted() and settings.contact_allowed(dedup.contact_ids_of(deal), [s["phone"], s["chat_id"]])
+    try:
+        decision = await filters.decide_take(deal, mode_id=mode_id, chat_key=s["chat_key"], explicit=explicit)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: сбой проверки фильтров по сделке %s, сделку не беру", deal.get("id"))
+        return dedup.Resolution(dedup.K_REFUSED, deal=deal, note="сбой проверки фильтров")
+    if not decision.allow:
+        return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=decision.reason, retry_at=decision.retry_at)
+    res.gate = decision
+    return res
 
 
 async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: str | None = None) -> None:
@@ -601,6 +630,13 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
         return
     if res.kind == dedup.K_SKIP:
         await _db(store.put_session, chat_key, state=store.S_SKIP, skip_until=now + cfg.SKIP_TTL_S, next_at=None)
+        await _db(store.discard_pending, chat_key)
+        return
+    if res.kind == dedup.K_REFUSED:
+        # ИИ сделку не берёт (фильтры, бюджет, товары, «существующие сделки»): ничего не пишем ни клиенту, ни в amo, ни людям; причина одной строкой в лог
+        logger.info("ai_engine: сделка %s не взята: %s", (res.deal or {}).get("id"), res.note)
+        skip_until = res.retry_at if res.retry_at and res.retry_at > now else now + cfg.SKIP_TTL_S
+        await _db(store.put_session, chat_key, state=store.S_SKIP, skip_until=skip_until, next_at=None)
         await _db(store.discard_pending, chat_key)
         return
     if res.kind == dedup.K_GONE:
@@ -666,10 +702,18 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
     if await _db(store.pending_inbox, chat_key):                # настоящее сообщение клиента (в любом канале), а не служебное событие:
         await _db(silence.clear, deal_id)                      # лестница тишины сначала
     first_entry = owner is None      # ИИ входит в сделку впервые (а не после возврата диалога)
+    gate = res.gate if first_entry else None       # решение о взятии (`_gate_take`): назначить ответственного, поставить охрану инициативы
+    if gate is not None and gate.reassign and not await filters.reassign_responsible(deal_id, gate.reassign):
+        # «Перераспределить существующие»: смена ответственного не удалась, сделку не берём (причина в логе `reassign_responsible`)
+        await _db(store.put_session, chat_key, state=store.S_SKIP, skip_until=now + cfg.SKIP_TTL_S, next_at=None)
+        await _db(store.discard_pending, chat_key)
+        return
     owner = await _db(
         store.set_owner, deal_id, store.OWNER_AI, reason="client_message", chat=chat,
         pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
     )
+    if gate is not None and gate.existing:
+        await _db(filters.guard_on_take, deal_id)      # существующая сделка: инициатива (тишина, УР, касания) ждёт первого сообщения ИИ клиенту
     if first_entry:
         _spawn(ai_engine_tasks.release_intake(deal_id))     # системные «Связаться»/«Новый заказ с сайта»: теперь клиентом занят ИИ
     await _db(store.put_session, chat_key, deal_id=deal_id)
@@ -905,6 +949,8 @@ async def _fire_followup(f: dict) -> None:
         why = "deal_closed"
     elif owner["owner"] != store.OWNER_AI or int(owner["epoch"]) != int(f["epoch"]):
         why = "owner_changed"
+    elif not filters.initiative_allowed_for_deal(owner):
+        why = "ИИ ещё не писал клиенту в этой существующей сделке"      # охрана инициативы (`ai_engine_filters`)
     elif settings.effective_mode() == "off":
         why = "mode_off"
     elif not settings.pipeline_allowed(owner["pipeline_id"]) and not await _db(intercept.is_taken, deal_id):
@@ -1601,6 +1647,7 @@ async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str,
             pipeline_id=int(deal.get("pipeline_id") or 0), contact_ids=dedup.contact_ids_of(deal), mode=mode_id,
         )
         await _db(give.mark, deal_id, _now(), force, mode_id)
+        await _db(filters.guard_for_given, deal, mode_id)      # «существующая» сделка: инициатива по ней ждёт первого сообщения ИИ; фильтры к ручной передаче не применяются
         await _db(store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id, chat_type=chat_type, phone=phone,
                   contact_name=contact_name, state=store.S_AI, deal_id=deal_id, first_batch=0, last_message_id="",
                   next_at=None, has_media=0)
@@ -1662,6 +1709,8 @@ async def _silence_step(row: dict) -> None:
     if modes.is_stale(owner, settings.active_mode_id()):
         await _release_for_mode(owner, settings.active_mode_id())
         return
+    if not filters.initiative_allowed_for_deal(owner):
+        return                                              # существующая сделка: ИИ ещё не писал клиенту, лестница ждёт (`ai_engine_filters`)
     if owner is None or owner["closed"] or owner["owner"] != store.OWNER_AI or settings.effective_mode() == "off":
         await _db(silence.clear, deal_id)
         return
@@ -1719,6 +1768,8 @@ async def _ur_tick() -> None:
             if modes.is_stale(owner, active):
                 await _release_for_mode(owner, active)      # сделка из другого режима окон УР не получает: её снимаем
                 continue
+            if not filters.initiative_allowed_for_deal(owner):
+                continue                                    # существующая сделка: ИИ ещё не писал клиенту, окна УР ждут (`ai_engine_filters`)
             if await _db(intercept.is_taken, deal_id):
                 continue                                    # перехваченная сделка: окна УР не её дело
             if not settings.initiative_allowed(owner.get("pipeline_id")):

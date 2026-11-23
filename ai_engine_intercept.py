@@ -34,6 +34,7 @@ import sqlite3
 from typing import Any
 
 import ai_engine_dedup as dedup
+import ai_engine_filters as filters
 import ai_engine_settings as settings
 import ai_engine_store as store
 import amo_service
@@ -389,6 +390,9 @@ async def _skip_reason(eng, deal: dict, chat_id: str, phone: str, cfg: dict[str,
         return "контакта нет в списке режима"
     if eng._autopilot_busy(chat_id, phone, deal_id):
         return "сделку ведёт авто-режим"
+    why = await filters.intercept_refusal(deal, [phone, chat_id])      # фильтры, бюджет и товары, как при обычном взятии (`ai_engine_filters`)
+    if why:
+        return why
     if not cfg["with_calls"]:
         calls = await has_calls(deal)
         if calls is None:
