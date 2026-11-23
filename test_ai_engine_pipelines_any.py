@@ -16,6 +16,7 @@ import pytest
 
 import ai_engine as E
 import ai_engine_config as cfg
+import ai_engine_prompts as prompts
 import ai_engine_settings as settings
 import ai_engine_store as store
 from test_ai_engine import CHAN, CHAT, DEAL, PIPE_RETAIL, env, run  # noqa: F401  (env - фикстура)
@@ -27,6 +28,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.setattr(E, "_last_mode_id", None)
+    monkeypatch.setattr(prompts, "_good", prompts.Snapshot(prompt=frozenset({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}), test=frozenset(), at=0.0))   # на «чужую» воронку промпт есть:
+    monkeypatch.setattr(prompts, "_last_ok", True)                    # здесь проверяется «режим пускает или нет», а правило «нет промпта: не пишем» - в test_ai_engine_prompts.py
 
 
 def allow(env, on):

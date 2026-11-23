@@ -37,7 +37,7 @@ _TAG = re.compile(r"@([A-Za-z0-9_]{4,32})")
 _WHY = {
     "mode_off": ("режим ИИ выключен", False),
     "not_returnable": ("сделка уже закрыта или диалог уже у ИИ", False),
-    "pipeline_not_allowed": ("эта воронка не входит в режим ИИ", False),
+    "pipeline_not_allowed": ("эта воронка не входит в режим ИИ или для неё нет промпта", False),
     "ai_unavailable": ("ИИ-сервис сейчас недоступен, попробуйте позже", True),
 }
 

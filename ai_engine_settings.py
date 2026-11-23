@@ -23,6 +23,10 @@
 `pipelines_any` и `initiative_pipelines`. Функции со временем берут значения и включение отсюда (запас: прежние переменные окружения), а
 воронку сделки решают ТОЛЬКО `pipeline_allowed` (можно ли вести) и `initiative_allowed` (можно ли инициативные события); голый
 `allowed_pipelines()` для этого не используется.
+
+⚠️ Нет промпта: не пишем (решение Кати 23.11.2026). К воронке режима (`MODE_PIPELINES` или `pipelines_any`) `pipeline_allowed` добавляет второе
+условие: для воронки есть промпт в ИИ-сервисе (`ai_engine_prompts`, словарь из `GET /v1/funnels`). Режим говорит, где ИИ можно работать, словарь
+говорит, где ему есть чем. Даже `pipelines_any: true` воронку без промпта не открывает; `initiative_allowed` проходит через тот же шлюз.
 """
 import asyncio
 import datetime
@@ -34,6 +38,7 @@ from typing import Any
 import httpx
 
 import ai_engine_config as cfg
+import ai_engine_prompts as prompts
 from shared.files import read_json, write_json_atomic
 from shared.phones import digits_only, ru_8_to_7
 from shared.timez import MSK
@@ -146,15 +151,19 @@ def pipelines_any() -> bool:
 
 
 def pipeline_allowed(pipeline_id: Any) -> bool:
-    """Можно ли ИИ вести сделку этой воронки. Режим `off` и ошибки чтения (`effective_mode`): нет. `pipelines_any`: любая воронка (известный
-    номер). Иначе воронки режима (`cfg.MODE_PIPELINES`), как до этапа 2. Единственное место этого решения: следить, чтобы не появилось второе."""
+    """Можно ли ИИ вести сделку этой воронки: разрешено РЕЖИМОМ и для воронки есть ПРОМПТ в ИИ-сервисе (решение Кати 23.11.2026, нет промпта: не пишем).
+    Режим `off` и ошибки чтения (`effective_mode`): нет. Разрешено режимом: `pipelines_any` - любая воронка (известный номер), иначе воронки режима
+    (`cfg.MODE_PIPELINES`), как до этапа 2. Есть промпт: `ai_engine_prompts.has_prompt` (словарь сервиса, последний удачный ответ, при его отсутствии
+    две воронки розницы; «Тест» только в режиме `test`). Единственное место этого решения: следить, чтобы не появилось второе."""
     mode = effective_mode()
     if mode == "off":
         return False
     pid = _pos_int(pipeline_id)
     if pid is None:
         return False
-    return True if pipelines_any() else pid in cfg.MODE_PIPELINES.get(mode, frozenset())
+    if not (True if pipelines_any() else pid in cfg.MODE_PIPELINES.get(mode, frozenset())):
+        return False
+    return prompts.has_prompt(pid, mode)
 
 
 def _initiative_list() -> frozenset[int] | None:

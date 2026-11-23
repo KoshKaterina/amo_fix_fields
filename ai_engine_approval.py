@@ -501,6 +501,9 @@ async def _approve(eng, row: dict[str, Any], by: str) -> tuple[int, dict[str, An
         return await _failed(eng, row, "amo не ответила", "amoCRM не ответила, попробуйте ещё раз.", by)
     if not dedup.is_open(lead):
         return await _stale(eng, row, CANCELLED, "сделка закрыта", by)
+    if not settings.pipeline_allowed(lead.get("pipeline_id")):
+        # Пока предложение ждало человека, воронка сделки лишилась промпта (или режим перестал её пускать): ИИ в ней не пишет, ответственного не меняем.
+        return await _stale(eng, row, STALE, "воронка сделки больше не ведётся ИИ", by)
     try:
         current = int(lead.get("responsible_user_id") or 0)
     except (TypeError, ValueError):

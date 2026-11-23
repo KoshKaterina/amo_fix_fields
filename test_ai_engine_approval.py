@@ -26,6 +26,7 @@ import ai_engine_approval as A
 import ai_engine_config as cfg
 import ai_engine_events as panel_events
 import ai_engine_filters as F
+import ai_engine_prompts as prompts
 import ai_engine_settings as settings
 import ai_engine_store as store
 import amo_service
@@ -511,6 +512,19 @@ def test_approve_goes_stale_when_the_deal_no_longer_fits(env, what, expect, chan
         assert (code, out["state"]) == (200, "stale") and expect in out["detail"], out
         assert amo.patches == [] and store.get_owner(DEAL) is None and A.get(row["ref"])["state"] in ("stale", "cancelled")
         assert store.get_session(CHAT_KEY)["state"] == "skip"                                    # чат отпущен, отвечает менеджер
+    run(go())
+
+
+def test_approve_goes_stale_when_the_pipeline_lost_its_prompt(env):
+    """Правило «нет промпта: не пишем» (`ai_engine_prompts`): пока предложение ждало человека, в воронке сделки убрали промпт; ответственного не меняем, сделку не берём."""
+    async def go():
+        amo, ld, row = await make_proposal(env)
+        env.mp.setattr(prompts, "_good", prompts.Snapshot(prompt=frozenset({PIPE_RETAIL + 1}), test=frozenset(), at=0.0))
+        env.mp.setattr(prompts, "_last_ok", True)
+        code, out = await decide(row["ref"])
+        assert (code, out["state"]) == (200, "stale") and "воронка" in out["detail"], out
+        assert amo.patches == [] and store.get_owner(DEAL) is None and A.get(row["ref"])["state"] == "stale"
+        assert env.notes == [] and store.get_session(CHAT_KEY)["state"] == "skip"
     run(go())
 
 

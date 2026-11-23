@@ -29,6 +29,11 @@
 ⚠️ Режим у сделки (`ai_engine_modes`): ИИ ведёт сделку, только если взял её в активном `mode_id` панели. Сменился режим, и сделки
 чужого режима снимаются тихо (`_release_for_mode`); проверка стоит в каждой точке, где ИИ что-то делает со сделкой. Снятие уходит
 событием `mode_release` в журнал ИИ панели (`ai_engine_events`, фоном, потеря допустима).
+
+⚠️ Нет промпта: не пишем (решение Кати 23.11.2026, `ai_engine_prompts`). Воронку сделки решает `settings.pipeline_allowed`: разрешено режимом И для воронки
+есть промпт в ИИ-сервисе (словарь `GET /v1/funnels`, опрос `prompts.poll_loop` раз в минуту). Сделка ИИ в воронке без промпта не берётся (`dedup.resolve`,
+`give_deal`, подтверждение смены ответственного), не получает событий и касаний, а уже взятая и оказавшаяся в такой воронке снимается как `left_pipeline`
+(событие сделки из amo) или теряется при следующем сообщении клиента (`dedup.resolve` отвечает `K_GONE`). Перехват (`ai_engine_intercept`) ведёт свои правила воронок.
 """
 import asyncio
 import datetime
@@ -50,6 +55,7 @@ import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_intercept as intercept
 import ai_engine_modes as modes
+import ai_engine_prompts as prompts
 import ai_engine_silence as silence
 import ai_engine_ur as ur_wave
 import ai_engine_return
@@ -151,6 +157,7 @@ async def init() -> None:
         asyncio.create_task(_guarded_loop(_tick_loop, "таймеры")),
         asyncio.create_task(_guarded_loop(_dispatch_loop, "отправка ходов")),
         asyncio.create_task(_guarded_loop(_health_loop, "опрос здоровья ИИ-сервиса")),
+        asyncio.create_task(_guarded_loop(prompts.poll_loop, "опрос словаря воронок ИИ-сервиса")),
     ]
     logger.info(
         "ai_engine: включён; режим берётся из панели (пока off), каналов %s, сервис %s",
@@ -1251,6 +1258,10 @@ def decide_permit(deal_id: int, epoch: int, turn_id: int, up_to_message_id: str)
         return 200, {"allowed": False, "reason": "owner_changed"}
     if modes.is_stale(owner, settings.active_mode_id()):
         return 200, {"allowed": False, "reason": "owner_changed"}      # сделка взята в другом режиме: сервису это то же, что смена владельца
+    if not settings.pipeline_allowed(owner["pipeline_id"]) and not intercept.is_taken(deal_id):
+        # Последний рубеж перед клиентом: словарь воронок с промптом сузился или режим перестал пускать в воронку сделки, а событие сделки из amo
+        # ещё не пришло и не сняло её (`left_pipeline`). Нет промпта: не пишем. Перехваченные сделки живут по правилам перехвата, воронка у них любая.
+        return 200, {"allowed": False, "reason": "owner_changed"}
     if intercept.manager_replied_after(deal_id):          # перехват: после заметки «ИИ взял сделку» менеджер написал клиенту
         return 200, {"allowed": False, "reason": "owner_changed"}
     turn = store.get_turn(turn_id)
@@ -1958,6 +1969,11 @@ def status() -> dict[str, Any]:
         out["functions"] = settings.functions_wire()
     except Exception:  # noqa: BLE001
         out["functions"] = "ошибка чтения настроек"
+    try:
+        # Воронки, на которые есть промпт (`ai_engine_prompts`): откуда они (`service` | `cached` | `static`) и сколько секунд данным.
+        out.update(prompts.status_fields(settings.effective_mode()))
+    except Exception:  # noqa: BLE001
+        out["prompt_pipelines"] = "ошибка чтения словаря воронок"
     out["return_by_reaction"] = ai_engine_return.stats()
     try:
         out["reassign_proposals_open"] = approval.count_open()       # предложения смены ответственного, ждущие решения человека (`ai_engine_approval`)

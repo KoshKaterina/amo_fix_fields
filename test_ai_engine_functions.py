@@ -24,6 +24,7 @@ import ai_engine as E
 import ai_engine_config as cfg
 import ai_engine_followup as F
 import ai_engine_intercept as I
+import ai_engine_prompts as prompts
 import ai_engine_settings as settings
 import ai_engine_silence as S
 import ai_engine_store as store
@@ -41,11 +42,14 @@ MSK = datetime.timezone(datetime.timedelta(hours=3))
 OPEN_FULL = {"scope": "full", "restricted": False, "items": []}
 TWO = {PIPE_RETAIL, PIPE_TANGEM}
 EVERY = {PIPE_TEST, PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}
+EVERY_FULL = EVERY - {PIPE_TEST}            # в Полном «Тест» не воронка с промптом: тестовые воронки считаются только в режиме `test` (`ai_engine_prompts`)
 
 
 @pytest.fixture(autouse=True)
 def _fresh_state(monkeypatch):
     monkeypatch.setattr(cfg, "PIPELINES_ANY_ALLOWED", True)           # «любая воронка» движок разрешает переменной AI_PIPELINES_ANY_ALLOWED=1 (см. test_ai_engine_pipelines_any.py)
+    monkeypatch.setattr(prompts, "_good", prompts.Snapshot(prompt=frozenset({PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER}), test=frozenset(), at=0.0))   # на «чужую» воронку тоже есть промпт:
+    monkeypatch.setattr(prompts, "_last_ok", True)                    # здесь проверяется «режим пускает или нет», а правило «нет промпта: не пишем» - в test_ai_engine_prompts.py
     monkeypatch.setattr(E, "_last_mode_id", None)
     monkeypatch.setattr(E, "_send_failed_seen", {})
 
@@ -277,13 +281,13 @@ PIPE_CASES = {
     # название: (вид документа, ключи, воронки, где можно вести, где можно инициативу)
     "Тест, документ этапа 1": ("test", {}, {PIPE_TEST}, {PIPE_TEST}),
     "Полный, документ этапа 1": ("full", {}, TWO, TWO),
-    "Полный, pipelines_any": ("full", {"pipelines_any": True}, EVERY, TWO),
-    "Полный, pipelines_any и список из одной воронки": ("full", {"pipelines_any": True, "initiative_pipelines": [PIPE_RETAIL]}, EVERY, {PIPE_RETAIL}),
-    "Полный, pipelines_any и пустой список": ("full", {"pipelines_any": True, "initiative_pipelines": []}, EVERY, set()),
-    "Полный, pipelines_any и мусорный список": ("full", {"pipelines_any": True, "initiative_pipelines": "x"}, EVERY, TWO),
-    "Полный, pipelines_any и список из одного мусора": ("full", {"pipelines_any": True, "initiative_pipelines": [None, "a", True, -1, 0]}, EVERY, TWO),
-    "Полный, pipelines_any и мусор в списке": ("full", {"pipelines_any": True, "initiative_pipelines": [PIPE_TANGEM, None, "a"]}, EVERY, {PIPE_TANGEM}),
-    "Полный, номера строками": ("full", {"pipelines_any": True, "initiative_pipelines": [str(PIPE_RETAIL)]}, EVERY, {PIPE_RETAIL}),
+    "Полный, pipelines_any": ("full", {"pipelines_any": True}, EVERY_FULL, TWO),
+    "Полный, pipelines_any и список из одной воронки": ("full", {"pipelines_any": True, "initiative_pipelines": [PIPE_RETAIL]}, EVERY_FULL, {PIPE_RETAIL}),
+    "Полный, pipelines_any и пустой список": ("full", {"pipelines_any": True, "initiative_pipelines": []}, EVERY_FULL, set()),
+    "Полный, pipelines_any и мусорный список": ("full", {"pipelines_any": True, "initiative_pipelines": "x"}, EVERY_FULL, TWO),
+    "Полный, pipelines_any и список из одного мусора": ("full", {"pipelines_any": True, "initiative_pipelines": [None, "a", True, -1, 0]}, EVERY_FULL, TWO),
+    "Полный, pipelines_any и мусор в списке": ("full", {"pipelines_any": True, "initiative_pipelines": [PIPE_TANGEM, None, "a"]}, EVERY_FULL, {PIPE_TANGEM}),
+    "Полный, номера строками": ("full", {"pipelines_any": True, "initiative_pipelines": [str(PIPE_RETAIL)]}, EVERY_FULL, {PIPE_RETAIL}),
     "Полный, pipelines_any ложь": ("full", {"pipelines_any": False}, TWO, TWO),
     "Полный, без pipelines_any, список панели главнее": ("full", {"initiative_pipelines": [PIPE_TANGEM]}, TWO, {PIPE_TANGEM}),
     "Полный, чужая воронка в списке без pipelines_any": ("full", {"initiative_pipelines": [PIPE_OTHER]}, TWO, set()),

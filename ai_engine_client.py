@@ -1,4 +1,4 @@
-"""Движок -> ИИ-сервис: `POST /v1/turn`, `POST /v1/turn/{id}/cancel`, `GET /v1/health`.
+"""Движок -> ИИ-сервис: `POST /v1/turn`, `POST /v1/turn/{id}/cancel`, `GET /v1/health`, `GET /v1/funnels`.
 
 Только транспорт. Очередь, повторы и решения «что делать с отказом» живут в `ai_engine.py`, чтобы их
 можно было проверить без сети: тесты подставляют `transport` (httpx.MockTransport).
@@ -85,5 +85,21 @@ async def get_health() -> dict[str, Any] | None:
             return None
         data = resp.json()
         return data if isinstance(data, dict) and data.get("ok") else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+async def get_funnels() -> dict[str, Any] | None:
+    """`GET /v1/funnels`: словарь «воронка -> промпт» сервиса. Ответ 200 с JSON-объектом отдаётся как есть; всё остальное (сервис не настроен,
+    сеть, таймаут, не 200, не JSON, не объект) это None. Проверку формы и решение «что делать с отказом» берёт `ai_engine_prompts`."""
+    if not configured():
+        return None
+    try:
+        async with _client() as client:
+            resp = await client.get("/v1/funnels")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
     except (httpx.HTTPError, ValueError):
         return None
