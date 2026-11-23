@@ -756,6 +756,18 @@ SIPUNI_SET_TAGS = os.getenv("SIPUNI_SET_TAGS", "off").strip().lower() == "on"
 # распределение, поэтому 300 секунд с запасом.
 SIPUNI_ROUTING_WAIT_S = float(os.getenv("SIPUNI_ROUTING_WAIT_S", "300"))
 SIPUNI_ROUTING_POLL_S = float(os.getenv("SIPUNI_ROUTING_POLL_S", "5"))
+# Звонок, до которого НЕКОМУ было дозвониться (решение Кати 23.11.2026). Клиент дождался (звонок
+# длился не меньше SIPUNI_NOBODY_MIN_S секунд, до первой ноги обычно около 20 с), а ни одной ноги к
+# сотруднику не открылось: никто не онлайн или все заняты. Такой пропущенный идёт с пометкой
+# «Некому адресовать звонок, проверьте работу телефонии» и с пингом всего пула, без ожидания
+# распределения. Только для звонков, начатых в рабочие часы [SIPUNI_NOBODY_START_H, SIPUNI_NOBODY_END_H)
+# по Москве: вне их схема «Нерабочее время» ног не открывает по замыслу. Кнопку меню события Sipuni не
+# несут, поэтому признак косвенный (длительность). Работает при SIPUNI_EVENTS_MODE=live и только при
+# точном значении on: по умолчанию выключено, опечатка не включает алерт.
+SIPUNI_NOBODY_ALERT = os.getenv("SIPUNI_NOBODY_ALERT", "off").strip().lower() == "on"
+SIPUNI_NOBODY_MIN_S = float(os.getenv("SIPUNI_NOBODY_MIN_S", "20"))
+SIPUNI_NOBODY_START_H = int(os.getenv("SIPUNI_NOBODY_START_H", "10"))
+SIPUNI_NOBODY_END_H = int(os.getenv("SIPUNI_NOBODY_END_H", "19"))
 
 # ---------------------------------------------------------------------------
 # Wazzup — приём сообщений WA/TG для SLA-уведомлений «клиент без ответа N мин».

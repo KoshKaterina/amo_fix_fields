@@ -54,6 +54,10 @@ from waybill_config import (
     MISSED_CALLBACK_WINDOW_END_H,
     MISSED_CALLBACK_WINDOW_START_H,
     SIPUNI_EVENTS_MODE,
+    SIPUNI_NOBODY_ALERT,
+    SIPUNI_NOBODY_END_H,
+    SIPUNI_NOBODY_MIN_S,
+    SIPUNI_NOBODY_START_H,
     SIPUNI_ROUTING_POLL_S,
     SIPUNI_ROUTING_WAIT_S,
     SIPUNI_SET_TAGS,
@@ -127,15 +131,36 @@ _DROPPED_TEXT = "Клиент бросил трубку на приветств�
 _ROUTING_TIMEOUT_TEXT = "Сделка не распределилась вовремя, поэтому пингуем всех"
 _DROPPED_IN_MENU_NOTE = "ℹ️ " + _DROPPED_TEXT
 _ROUTING_TIMEOUT_NOTE = "ℹ️ " + _ROUTING_TIMEOUT_TEXT
+# Звонок, до которого некому дозвониться (решение Кати 23.11.2026, SIPUNI_NOBODY_ALERT=on): вместо
+# «бросил на приветствии» и вместе с пингом всего пула.
+_NOBODY_TEXT = "Некому адресовать звонок, проверьте работу телефонии"
+_NOBODY_NOTE = "🚨 " + _NOBODY_TEXT
 # Запись о распределении, сделанная чуть раньше начала звонка, всё равно относится к нему.
 _ROUTING_SLACK_S = 60.0
 # Ожидания назначения ответственного, которые надо отпустить при остановке приложения.
 _routing_waiters: set = set()
 
 
+def _is_nobody_to_ring(missed) -> bool:
+    """Клиент дождался, а звонить было некому: ни одной ноги к сотруднику и звонок длился не меньше
+    SIPUNI_NOBODY_MIN_S секунд (быстрые сбросы на приветствии сюда не попадают), начат в рабочие часы.
+
+    Кнопку меню события Sipuni не несут, поэтому признак косвенный: если бы кто-то был доступен, нога
+    открылась бы примерно через 20 секунд после начала звонка."""
+    if not SIPUNI_NOBODY_ALERT or not getattr(missed, "dropped_in_menu", False):
+        return False
+    first = getattr(missed, "first_ts", None)
+    last = getattr(missed, "last_ts", None)
+    if first is None or last is None or last - first < SIPUNI_NOBODY_MIN_S:
+        return False
+    hour = datetime.datetime.fromtimestamp(first, _MSK).hour
+    return SIPUNI_NOBODY_START_H <= hour < SIPUNI_NOBODY_END_H
+
+
 async def _notify_missed(
     phone: str, name: str, call_id: str, *, provider: str = "uis",
     dropped_in_menu: bool = False, call_started: float | None = None,
+    nobody_to_ring: bool = False,
 ) -> None:
     """Общая часть алерта о пропущенном звонке: сделка по телефону, текст, алерт, счётчик
     перезвона. Её зовут и вход UIS (_apply), и вход Sipuni (_sipuni_on_missed).
@@ -152,6 +177,9 @@ async def _notify_missed(
         назначит ответственного, и пингуем его; не дождались - весь пул.
     В тексте кода к такому алерту добавлена пояснительная строка (шаблон панели её не показывает).
     call_started: Unix-время начала звонка, чтобы отличить распределение этого звонка от старого.
+    nobody_to_ring (только Sipuni, вместе с dropped_in_menu): клиент дождался, а звонить было некому
+    (_is_nobody_to_ring). Решение Кати 23.11.2026: пометка «Некому адресовать звонок, проверьте работу
+    телефонии» и пинг всего пула сразу, без ожидания распределения.
     """
     label = _PROVIDER_LABELS.get(provider, provider)
     # Сделку (+ответственного) добираем с таймаутом 5с: не ответил amo вовремя
@@ -167,7 +195,11 @@ async def _notify_missed(
     ping_all = False
     note = ""
     note_text = ""     # то же без значка, для переменной шаблона панели `{{пометка}}`
-    if dropped_in_menu:
+    if dropped_in_menu and nobody_to_ring:
+        note = _NOBODY_NOTE
+        note_text = _NOBODY_TEXT
+        ping_all = True
+    elif dropped_in_menu:
         note = _DROPPED_IN_MENU_NOTE
         note_text = _DROPPED_TEXT
         if lead_id is None:
@@ -504,25 +536,29 @@ async def _sipuni_apply(payload: list) -> None:
 async def _sipuni_on_missed(missed) -> None:
     """Решение «пропущенный» принято (тихое окно истекло, ни одна нога не отвечена)."""
     dropped = bool(getattr(missed, "dropped_in_menu", False))
+    nobody = _is_nobody_to_ring(missed)
     call_click_service.schedule_attribution(missed.call_id, missed.phone, missed.first_ts, _find_lead_row)
     if SIPUNI_EVENTS_MODE != "live":
         logger.info(
-            "Sipuni пропущенный: call=%s тел=%s ног=%s к_сотрудникам=%s на_приветствии=%s "
+            "Sipuni пропущенный: call=%s тел=%s ног=%s к_сотрудникам=%s на_приветствии=%s некому=%s "
             "статусы=%s - режим log, алерт НЕ шлём",
             missed.call_id, missed.phone or "—", missed.legs,
-            getattr(missed, "staff_legs", "—"), "да" if dropped else "нет",
+            getattr(missed, "staff_legs", "—"), "да" if dropped else "нет", "да" if nobody else "нет",
             ",".join(missed.statuses) or "—",
         )
         return
     if not _is_new("sipuni:" + missed.call_id):
         logger.info("Sipuni пропущенный: дубль call_id=%s — пропускаю", missed.call_id)
         return
+    if nobody:
+        logger.warning("Sipuni пропущенный: некому адресовать звонок, ног к сотрудникам нет, клиент ждал %s с "
+                       "(call=%s)", (missed.last_ts or 0) - (missed.first_ts or 0), missed.call_id)
     try:
         # Цифры без плюса: так телефон приходит от UIS, и поиск сделки в amo проверен именно на
         # этом виде. Имени клиента у Sipuni в событиях нет, ищем только по телефону.
         await _notify_missed(
             missed.phone.lstrip("+"), "", missed.call_id, provider="sipuni",
-            dropped_in_menu=dropped, call_started=missed.first_ts,
+            dropped_in_menu=dropped, call_started=missed.first_ts, nobody_to_ring=nobody,
         )
     except Exception:
         logger.exception("Sipuni пропущенный: ошибка обработки (call=%s)", missed.call_id)
