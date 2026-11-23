@@ -1300,3 +1300,79 @@ def test_kartoteka_flag_vyklyuchen_po_umolchaniyu_voronka_odna_rozn():
     amo_service.get_leads_by_status = _real_by_status
     ozon_invoice.OZON_INVOICE_TANGEMSHOP = _TG_FLAG_WAS
 
+# ══════════════════════ «Лист ожидания»: пятая воронка ══════════════════════
+# Постановка Кати 23.11.2026: повторить автоматику оплаты, как в рознице и картотеке.
+from waybill_config import (  # noqa: E402
+    PIPELINE_WAITLIST,
+    STATUS_WAITLIST_LINK_SENT,
+    STATUS_WAITLIST_PAYMENT_RECEIVED,
+    STATUS_WAITLIST_PAYMENT_REQUESTED,
+)
+
+_asked_wl: list = []
+
+
+async def _fake_by_status_wl(status_id, with_=()):
+    _asked_wl.append(status_id)
+    return []
+
+
+def test_list_ozhidaniya_schet_za_svoim_flagom():
+    """Лист ожидания: флаг выключен по умолчанию; включён - счёт и перевод на
+    «ссылка отправлена» этой же воронки; оплата доводится и без флага"""
+    was = ozon_invoice.OZON_INVOICE_WAITLIST
+    assert was is False, "OZON_INVOICE_WAITLIST должен быть выключен по умолчанию"
+    assert PIPELINE_WAITLIST not in ozon_invoice._invoice_pipelines()
+    assert ozon_invoice.OZON_PAYMENT_STAGES[PIPELINE_WAITLIST] == (
+        STATUS_WAITLIST_PAYMENT_REQUESTED, STATUS_WAITLIST_LINK_SENT,
+        STATUS_WAITLIST_PAYMENT_RECEIVED)
+    real = amo_service.get_leads_by_status
+    try:
+        # флаг выключен + тех-этап листа ожидания -> полный скип, сверка воронку не трогает
+        _reset()
+        _install_mocks(_lead(status=STATUS_WAITLIST_PAYMENT_REQUESTED, pipeline=PIPELINE_WAITLIST))
+        assert run(ozon_invoice.process_invoice_lead(LEAD_ID)) == "skipped-moved"
+        assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+        assert not ozon_invoice.is_invoice_entry(PIPELINE_WAITLIST, STATUS_WAITLIST_PAYMENT_REQUESTED)
+        amo_service.get_leads_by_status = _fake_by_status_wl
+        run(ozon_invoice._reconcile_once())
+        assert STATUS_WAITLIST_LINK_SENT not in _asked_wl, _asked_wl
+        assert STATUS_WAITLIST_PAYMENT_REQUESTED not in _asked_wl, _asked_wl
+        amo_service.get_leads_by_status = real
+        # флаг включён: вебхук-гейт открыт, счёт создан, PATCH ведёт в «ссылка отправлена»
+        ozon_invoice.OZON_INVOICE_WAITLIST = True
+        assert PIPELINE_WAITLIST in ozon_invoice._invoice_pipelines()
+        assert ozon_invoice.is_invoice_entry(PIPELINE_WAITLIST, STATUS_WAITLIST_PAYMENT_REQUESTED)
+        assert ozon_invoice.is_invoice_entry(None, STATUS_WAITLIST_PAYMENT_REQUESTED)
+        _reset()
+        _install_mocks(_lead(status=STATUS_WAITLIST_PAYMENT_REQUESTED, pipeline=PIPELINE_WAITLIST))
+        res = run(ozon_invoice.process_invoice_lead(LEAD_ID))
+        assert res == "created", res
+        assert len(_patches) == 1, _patches
+        assert _patches[0]["status_id"] == STATUS_WAITLIST_LINK_SENT, _patches[0]
+        assert _patches[0]["pipeline_id"] == PIPELINE_WAITLIST, _patches[0]
+        # перекрёстный негатив: розничный тех-этап внутри листа ожидания -> скип
+        _reset()
+        _install_mocks(_lead(status=STATUS_PAYMENT_REQUESTED, pipeline=PIPELINE_WAITLIST))
+        assert run(ozon_invoice.process_invoice_lead(LEAD_ID)) == "skipped-moved"
+        assert not _ozon_calls and not _patches, (_ozon_calls, _patches)
+        # сверка с включённым флагом обходит оба этапа воронки
+        _asked_wl.clear()
+        amo_service.get_leads_by_status = _fake_by_status_wl
+        run(ozon_invoice._reconcile_once())
+        assert STATUS_WAITLIST_LINK_SENT in _asked_wl, _asked_wl
+        assert STATUS_WAITLIST_PAYMENT_REQUESTED in _asked_wl, _asked_wl
+        amo_service.get_leads_by_status = real
+        # оплата доводится до конца и с опущенным флагом: деньги клиента уже списаны
+        ozon_invoice.OZON_INVOICE_WAITLIST = False
+        _reset()
+        _install_mocks(_lead(status=STATUS_WAITLIST_LINK_SENT, pipeline=PIPELINE_WAITLIST))
+        res = run(ozon_invoice._mark_paid(
+            _lead(status=STATUS_WAITLIST_LINK_SENT, pipeline=PIPELINE_WAITLIST),
+            "1000", "extId wl", "вебхук"))
+        assert res == "moved", res
+        assert _patches[0]["status_id"] == STATUS_WAITLIST_PAYMENT_RECEIVED, _patches[0]
+        assert _patches[0]["pipeline_id"] == PIPELINE_WAITLIST, _patches[0]
+    finally:
+        amo_service.get_leads_by_status = real
+        ozon_invoice.OZON_INVOICE_WAITLIST = was
