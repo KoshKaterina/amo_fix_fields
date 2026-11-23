@@ -1326,6 +1326,14 @@ STATUS_ACADEMY_PAYMENT_REQUESTED = 88464042
 STATUS_ACADEMY_LINK_SENT = 88495938
 STATUS_ACADEMY_PAYMENT_RECEIVED = 88464046
 
+# Те же этапы в воронке «Лист ожидания» (постановка Кати 23.11.2026: повторить
+# автоматику оплаты, как в рознице и картотеке). «оплата запрошена» и «оплата
+# получена» в воронке были, «ссылка отправлена» заведена 23.11; на ней и на
+# «оплата получена» те же девять триггеров ботов, что в картотеке.
+STATUS_WAITLIST_PAYMENT_REQUESTED = 83670014
+STATUS_WAITLIST_LINK_SENT = 90264118
+STATUS_WAITLIST_PAYMENT_RECEIVED = 83670018
+
 # Воронка → (тех-этап входа, «ссылка отправлена», «оплата получена»).
 # Это ДАННЫЕ — что вообще бывает. Что из этого включено, решает
 # ozon_invoice._invoice_pipelines() по флагу: политику в карту не кладём, иначе
@@ -1337,6 +1345,8 @@ OZON_PAYMENT_STAGES: dict[int, tuple[int, int, int]] = {
                        STATUS_ACADEMY_PAYMENT_RECEIVED),
     PIPELINE_TANGEMSHOP: (STATUS_TANGEM_PAYMENT_REQUESTED, STATUS_TANGEM_LINK_SENT,
                           STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED),
+    PIPELINE_WAITLIST: (STATUS_WAITLIST_PAYMENT_REQUESTED, STATUS_WAITLIST_LINK_SENT,
+                        STATUS_WAITLIST_PAYMENT_RECEIVED),
 }
 
 # Счёт СБП в картотеке. Отдельный флаг от OZON_INVOICE_ENABLED: розничный контур
@@ -1350,6 +1360,8 @@ OZON_INVOICE_ACADEMY = os.getenv("OZON_INVOICE_ACADEMY", "").strip() == "1"
 # МойСкладе идут на ИП Абовян. Закрывается переменными
 # OZON_PAY_TANGEMSHOP_*, см. комментарий там же.
 OZON_INVOICE_TANGEMSHOP = os.getenv("OZON_INVOICE_TANGEMSHOP", "").strip() == "1"
+# Счёт СБП в «Листе ожидания» (23.11.2026) — свой флаг, как у картотеки.
+OZON_INVOICE_WAITLIST = os.getenv("OZON_INVOICE_WAITLIST", "").strip() == "1"
 
 # Своя пара ключей Ozon Pay для TangemShop (ИП Абовян, отдельный ЛК Ozon
 # Pay — "Магазин" в чужом ЛК деньги на другое юрлицо не переведёт). Пока
