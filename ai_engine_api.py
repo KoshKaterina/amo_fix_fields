@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 import ai_engine
 import ai_engine_config as cfg
+import ai_engine_filters
 import ai_engine_store as store
 
 logger = logging.getLogger("uvicorn")
@@ -127,6 +128,7 @@ async def permit(body: PermitIn, x_service_token: str = Header(default=""), x_co
         logger.exception("ai_engine: permit не посчитался")
         return JSONResponse({"allowed": False, "reason": "engine_error"}, status_code=500)
     if out.get("allowed"):
+        ai_engine_filters.mark_first_ai_message(body.deal_id)    # первое сообщение ИИ клиенту: охрана инициативы по «существующей» сделке снимается
         await ai_engine.silence_arm(body.deal_id)          # ИИ сейчас напишет клиенту: идёт отсчёт тишины
     return JSONResponse(out, status_code=code)
 

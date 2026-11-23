@@ -23,7 +23,7 @@
 """
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import ai_engine_config as cfg
 import ai_engine_settings as settings
@@ -53,6 +53,7 @@ K_NONE = "none"
 K_SKIP = "skip"        # контакт вне списка режима
 K_GONE = "gone"        # сделка, которую ведёт ИИ, закрыта или ушла из воронок режима
 K_ERROR = "error"      # amo не ответила
+K_REFUSED = "refused"  # ИИ сделку не берёт: не прошла фильтры, бюджет, товары или условия «существующих сделок» (`ai_engine_filters`)
 
 
 @dataclass
@@ -61,7 +62,9 @@ class Resolution:
     deal: dict | None = None
     rule: str = ""                       # "A" | "C" | "D" для kind == human
     others: list[dict] = field(default_factory=list)   # сделки, из-за которых зовём человека
-    note: str = ""
+    note: str = ""                       # для kind == refused: короткая причина отказа (без личных данных)
+    retry_at: float | None = None        # для kind == refused: раньше этого момента решение не пересматриваем (иначе обычный срок пропуска)
+    gate: Any = None                     # для kind == ai: решение о взятии (`ai_engine_filters.TakeDecision`), если его принимали
 
 
 def contact_ids_of(lead: dict) -> list[int]:
@@ -135,10 +138,16 @@ async def find_leads(chat_id: str, phone: str) -> list[dict] | None:
 
 
 async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None, force_deal_id: int | None = None,
-                  any_pipeline_ids: frozenset[int] = frozenset()) -> Resolution:
+                  any_pipeline_ids: frozenset[int] = frozenset(),
+                  eligible: Callable[[dict], str | None] | None = None) -> Resolution:
     """Выбор сделки для чата. `known_deal_id` - сделка, которую ИИ уже ведёт: тогда замеченная другая
     сделка с признаком работы называется правилом C, а не A. `any_pipeline_ids` - сделки, которые подходят в любой воронке
-    (перехваченные у менеджера, `ai_engine_intercept`)."""
+    (перехваченные у менеджера, `ai_engine_intercept`).
+
+    `eligible(lead)` - дешёвая проверка «ИИ вправе взять эту сделку» (фильтры, бюджет, «существующие сделки», `ai_engine_filters`):
+    возвращает короткую причину отказа или None. Сделка, не прошедшая проверку, не считается подходящей: правила A и D между
+    сделками, которые ИИ всё равно не возьмёт, не зовут людей. Если не осталось ни одной, результат `refused`. Проверка не
+    действует, когда сделку ИИ уже ведёт (`known_deal_id`) или её отдали вручную (`force_deal_id`)."""
     leads = await find_leads(chat_id, phone)
     if leads is None:
         return Resolution(K_ERROR, note="amoCRM не ответила на поиск сделок")
@@ -167,6 +176,19 @@ async def resolve(chat_id: str, phone: str, *, known_deal_id: int | None = None,
         forced = next((ld for ld in suitable if int(ld["id"]) == int(force_deal_id)), None)
         if forced is not None:
             return Resolution(K_AI, deal=forced)
+
+    if eligible is not None and known_deal_id is None:
+        kept: list[dict] = []
+        refused: list[tuple[dict, str]] = []
+        for ld in suitable:
+            why = eligible(ld)
+            if why:
+                refused.append((ld, why))
+            else:
+                kept.append(ld)
+        if not kept:
+            return Resolution(K_REFUSED, deal=refused[0][0], note=refused[0][1])
+        suitable = kept
 
     if len(suitable) > 1:
         # Правило D (никто не в работе) либо A (у кого-то уже есть признаки): в обоих случаях человек.
