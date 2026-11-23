@@ -635,10 +635,11 @@ async def _catalog_article(name: str) -> str | None:
             if not isinstance(rows, list):
                 continue                                    # запрос не удался или фильтр не принят: пробуем следующий каталог
             found = {
-                str(r.get("article") or "").strip() for r in rows
+                _norm_sku(r.get("article")): str(r.get("article")).strip() for r in rows
                 if isinstance(r, dict) and norm(r.get("name")) == wanted and (r.get("meta") or {}).get("type") != "service"
-            } - {""}
-            return next(iter(found)) if len(found) == 1 else ""
+                and _norm_sku(r.get("article"))
+            }
+            return next(iter(found.values())) if len(found) == 1 else ""      # один артикул (написания «TG-1» и «tg-1» считаются одним)
         return None
 
     value = await _cached(("name", wanted), load, ok_ttl=NAME_TTL_S, fail_ttl=NAME_FAIL_TTL_S)
