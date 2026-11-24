@@ -60,7 +60,6 @@ TEXT_PAUSE = "ИИ на паузе с {at}: «стоп» от {by}. ИИ не п
 TEXT_RELEASED = "Пауза снята («старт» от {by}). ИИ эту сделку раньше не вёл: войдёт в неё по обычным правилам."
 TEXT_REFUSED = {
     "mode_off": "«Старт» от {by} не сработал: ИИ-менеджер сейчас выключен. Пауза снята.",
-    "removed": "«Старт» от {by} не сработал: сделку убрали из ведения ИИ отметкой «удалить». Вернуть можно кнопкой «Дать сделку ИИ» в панели.",
     "closed": "«Старт» от {by} не сработал: сделка закрыта.",
     "pipeline_not_allowed": "«Старт» от {by} не сработал: воронку этой сделки ИИ не ведёт. Пауза снята.",
     "ai_unavailable": "«Старт» от {by} не сработал: ИИ-сервис недоступен. Напишите «старт» ещё раз позже.",
@@ -115,6 +114,15 @@ def _msk(ts: float) -> str:
 # разбор команды
 # =============================================================================================
 
+def handover_text(note: str) -> str:
+    """Текст закреплённой заметки, когда сделку отдали ИИ без сообщения клиента (подбор, «Дать ИИ», одобрение смены ответственного): текст передачи
+    и как остановить ИИ, одним примечанием вместо двух."""
+    n = str(note or "").strip().rstrip(".")
+    if not n:
+        return TEXT_AI
+    return n[:1].upper() + n[1:] + ". Чтобы остановить ИИ, напишите в сделку примечание «стоп»."
+
+
 def parse_command(text: Any) -> str | None:
     """`stop` | `start` | None. Весь текст примечания после чистки (регистр, «ё», кавычки и знаки препинания по краям и между словами) должен
     быть ровно командой: «Стоп», «стоп.», «СТАРТ ИИ», «stop». «Стоп-кран», «стоп, подожди» и любой длинный текст командой не считаются."""
@@ -167,9 +175,9 @@ def pause_drop(deal_id: int) -> bool:
 
 
 def drop_pause_owner(deal_id: int) -> bool:
-    """Убрать запись владельца, которую создал только «стоп» (человек, причина `paused`, без чата): после «старт» сделка снова ничья."""
+    """Убрать запись владельца, которую создали только «стоп» или «удалить» (человек, причина `paused`/`removed`, без чата): после «старт» сделка снова ничья."""
     with store._connect() as conn:
-        return conn.execute("DELETE FROM deal_owner WHERE deal_id=? AND owner=? AND reason='paused' AND (chat_id IS NULL OR chat_id='')",
+        return conn.execute("DELETE FROM deal_owner WHERE deal_id=? AND owner=? AND reason IN ('paused', 'removed') AND (chat_id IS NULL OR chat_id='')",
                             (int(deal_id), store.OWNER_HUMAN)).rowcount > 0
 
 
@@ -377,7 +385,7 @@ async def _poll(eng) -> None:
         await asyncio.to_thread(cursor_put, now)           # первый запуск: старые примечания не исполняем
         _state["last_poll_at"] = now
         return
-    notes = await _amo_notes_since(cursor - OVERLAP_S)
+    notes = await asyncio.wait_for(_amo_notes_since(cursor - OVERLAP_S), timeout=AMO_TIMEOUT_S * 6)
     if notes is None:
         _state["last_error"] = "amo_unavailable"
         return

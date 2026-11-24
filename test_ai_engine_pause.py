@@ -360,3 +360,32 @@ def test_stop_after_return_from_the_panel_is_a_new_stop(env, amo):
         assert store.get_owner(DEAL)["owner"] == "human"
         assert sum("ИИ на паузе" in t for t in amo.texts()) == 2
     run(go())
+
+
+def test_hand_over_writes_one_pinned_note_instead_of_two(env, amo):
+    async def go():
+        from test_ai_engine_give import drain, give
+        env.lead()
+        code, out = await give()
+        assert code == 200
+        await drain()
+        await env.advance(1)
+        assert env.notes == []                                      # отдельного примечания о передаче нет
+        pinned = amo.pinned_texts()
+        assert len(pinned) == 1 and len(amo.notes) == 1
+        assert "передана ИИ-менеджеру" in pinned[0] and "примечание «стоп»" in pinned[0]
+    run(go())
+
+
+def test_start_clears_marks_of_people_like_give(env, amo):
+    async def go():
+        await poll(env)
+        await env.start_turn()
+        code, out = await E.mark_deal(DEAL, "removed", "Иванов Иван")
+        assert code == 200 and store.get_owner(DEAL)["owner"] == "human"
+        env.t += 5
+        amo.command("старт")
+        await poll(env)
+        assert store.get_owner(DEAL)["owner"] == "ai"
+        assert E.marks.get(DEAL) is None
+    run(go())

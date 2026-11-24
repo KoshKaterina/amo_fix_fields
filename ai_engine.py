@@ -1724,7 +1724,11 @@ async def _hand_over(deal: dict, *, chat: dict[str, Any], phone: str, contact_na
     await _queue_event(owner, "deal_given")
     if release_tasks:
         _spawn(ai_engine_tasks.release_intake(deal_id))   # системные «Связаться»/«Новый заказ с сайта»: клиентом теперь занят ИИ
-    _spawn(_followup_note(deal_id, note))
+    if pause.enabled():
+        # Одно примечание вместо двух: текст передачи (подбор, «Дать ИИ», одобрение) становится закреплённой заметкой «ИИ ведёт сделку» (`ai_engine_pause`)
+        _spawn(pause.ensure_ai_pin(sys.modules[__name__], deal_id, owner, text=pause.handover_text(note)))
+    else:
+        _spawn(_followup_note(deal_id, note))
     return owner
 
 
@@ -1839,24 +1843,24 @@ async def manager_start(deal_id: int) -> dict[str, Any]:
     последнее слово за клиентом. Ответ `{"state": ...}`:
       • `returned`: ИИ снова ведёт сделку;
       • `already_ai`: ИИ и так её ведёт;
-      • `released`: ИИ эту сделку не вёл (нет чата в записи владельца): запись «пауза» убрана, ИИ войдёт по обычным правилам;
-      • `refused` + `detail` (`closed`, `removed`, `mode_off`, `pipeline_not_allowed`, `not_returnable`): вернуть нельзя;
-      • `retry` + `detail`: ИИ-сервис недоступен, повторить позже."""
+      • `released`: ИИ эту сделку не вёл (нет чата в записи владельца): запись «пауза» или «удалить» убрана, ИИ войдёт по обычным правилам;
+      • `refused` + `detail` (`closed`, `mode_off`, `pipeline_not_allowed`, `not_returnable`): вернуть нельзя;
+      • `retry` + `detail`: ИИ-сервис недоступен, повторить позже.
+    «Старт» — явная воля человека вернуть ИИ, как кнопка «Дать ИИ»: отметки людей («не требует ответа», «удалить») снимаются (`_clear_marks`)."""
     deal_id = int(deal_id)
     async with _get_lock():
         owner = await _db(store.get_owner, deal_id)
         if owner is None:
+            await _clear_marks(deal_id, "«старт» примечанием")
             return {"state": "released"}
         if owner["closed"]:
             return {"state": "refused", "detail": "closed"}
         if owner["owner"] == store.OWNER_AI and not modes.is_stale(owner, settings.active_mode_id()):
             return {"state": "already_ai"}
-        mark = await _db(marks.get, deal_id)
-        if owner.get("reason") == "removed" or (mark is not None and mark["kind"] == marks.KIND_REMOVED):
-            return {"state": "refused", "detail": "removed"}
+        await _clear_marks(deal_id, "«старт» примечанием")
         if not owner.get("chat_id") or not owner.get("channel_id"):
-            if owner["owner"] == store.OWNER_HUMAN and owner.get("reason") == PAUSE_REASON:
-                await _db(pause.drop_pause_owner, deal_id)              # запись владельца появилась только из-за «стоп»: сделка снова ничья
+            if owner["owner"] == store.OWNER_HUMAN and owner.get("reason") in (PAUSE_REASON, "removed"):
+                await _db(pause.drop_pause_owner, deal_id)              # запись владельца появилась только из-за «стоп» или «удалить»: сделка снова ничья
                 s = await _db(store.session_for_deal, deal_id)
                 if s is not None and s["state"] == store.S_HUMAN:
                     await _db(store.drop_session, s["chat_key"])        # чат пометили человеческим, пока шла пауза: следующее сообщение клиента разбирается заново
