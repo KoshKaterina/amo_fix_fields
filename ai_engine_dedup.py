@@ -65,6 +65,7 @@ class Resolution:
     others: list[dict] = field(default_factory=list)   # сделки, из-за которых зовём человека
     note: str = ""                       # для kind == refused: короткая причина отказа (без личных данных)
     retry_at: float | None = None        # для kind == refused: раньше этого момента решение не пересматриваем (иначе обычный срок пропуска)
+    temporary: bool = False              # для kind == refused: отказ временный (задача сотрудника, менеджер активен, ждём человека): сообщения клиента не сбрасываются, а пересматриваются один раз в конце окна
     gate: Any = None                     # для kind == ai: решение о взятии (`ai_engine_filters.TakeDecision`), если его принимали
 
 

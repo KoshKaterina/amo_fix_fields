@@ -6,6 +6,9 @@
 
 Окно пропуска `S_SKIP`: сообщение клиента в окне больше не отбрасывается. Оно кладётся во входящие (повтор вебхука отсекается), в конце окна чат возвращается в разбор один раз, и сделка проходит
 ВСЕ проверки заново; снова отказ: входящие сбрасываются и открывается новое окно. `awaiting` (предложение пилота) и `human` не меняются.
+При ВРЕМЕННОМ отказе (задача сотрудника, «задачи не проверить», менеджер активен, ИИ-сервис не отвечал, сделку не нашли, авто-режим, смена ответственного не удалась, предложение пилота открыто или
+отклонено) сохраняется и само сообщение, вызвавшее отказ; постоянный (фильтры, бюджет, товары, `leave`, нет пользователя ИИ, `AI_REASSIGN_DISABLED`, сделка не наша) сбрасывает его, как раньше.
+Каждое сообщение пересматривается ровно один раз: отказ на пересмотре сбрасывает всё и открывает новое окно, дальше страхует подбор. Явно разрешённые контакты правилом задач не останавливаются.
 
 Сети нет: подставной мир из test_ai_engine.py. Запуск: python -m pytest test_ai_engine_webhook.py -q
 """
@@ -108,6 +111,7 @@ def test_an_existing_deal_with_an_employee_task_is_not_taken_by_the_clients_mess
         s = store.get_session(CHAT_KEY)
         assert store.get_owner(DEAL) is None and blank(env) and len(env.tasks_open) == 1 and calls == [DEAL]     # один живой запрос, ничего не ушло
         assert s["state"] == "skip" and abs(s["skip_until"] - (env.t + cfg.TASK_RETRY_S)) < 5 and cfg.TASK_RETRY_S == 3600    # пересмотр не раньше чем через час
+        assert len(store.pending_inbox(CHAT_KEY)) == 1                                                             # отказ временный: само сообщение ждёт пересмотра
         assert any("на сделке открыта задача сотрудника" in r.getMessage() for r in caplog.records)
     run(go())
 
@@ -164,22 +168,6 @@ def test_leave_refuses_an_existing_deal_before_the_task_check_is_ever_reached(en
         calls = spy(env)
         await client_writes(env)
         assert store.get_owner(DEAL) is None and blank(env) and calls == []                                        # отказ `leave` как раньше, задач не просим
-    run(go())
-
-
-def test_an_allowed_contact_with_an_existing_deal_is_under_the_rule_too(env):
-    """Явно разрешённый контакт («пилотный список») при `leave` берёт и существующую сделку (`decision.existing`), поэтому задача менеджера его тоже останавливает."""
-    async def go():
-        Amo(env)
-        set_full(env, contacts=PILOT_LIST, existing={"policy": "leave", "since": env.t - 100, "manager_quiet_min": 15}, ai_user=AI_USER)
-        old_deal(env)
-        env.tasks_open.append(task())
-        await client_writes(env)
-        assert store.get_owner(DEAL) is None and blank(env)
-        env.tasks_open.clear()
-        env.t += cfg.TASK_RETRY_S + 1
-        await client_writes(env, "Есть новости?", mid="m-2")
-        assert store.get_owner(DEAL)["owner"] == "ai"
     run(go())
 
 
@@ -318,15 +306,19 @@ def test_the_sweep_asks_for_tasks_once_and_the_gate_does_not_repeat_it(env):
 # сообщение клиента в окне пропуска
 # =============================================================================================
 
+def ids(chat_key=CHAT_KEY):
+    return [r["message_id"] for r in store.pending_inbox(chat_key)]
+
+
 async def window(env, mid="m-1"):
-    """Существующая сделка с задачей менеджера: первое сообщение отказано, открыто окно в час. Возвращает конец окна."""
+    """Существующая сделка с задачей менеджера: первое сообщение отказано (отказ временный), открыто окно в час. Возвращает конец окна."""
     Amo(env)
     existing(env)
     old_deal(env)
     env.tasks_open.append(task())
     await client_writes(env, mid=mid)
     s = store.get_session(CHAT_KEY)
-    assert s["state"] == "skip" and store.pending_inbox(CHAT_KEY) == []                                            # само отказанное сообщение сбрасывается, как и раньше
+    assert s["state"] == "skip" and ids() == [mid]                                                                 # временный отказ: само сообщение тоже ждёт пересмотра
     return s["skip_until"]
 
 
@@ -336,9 +328,9 @@ def test_a_message_in_the_window_is_kept_and_answered_when_the_window_ends(env):
         calls = resolves(env)
         env.t += 600
         await env.say(env.msg("Есть новости?", mid="m-2"))
-        assert [r["message_id"] for r in store.pending_inbox(CHAT_KEY)] == ["m-2"]                                 # раньше здесь сообщение пропадало
+        assert ids() == ["m-1", "m-2"]                                                                             # раньше оба пропали бы
         s = store.get_session(CHAT_KEY)
-        assert s["state"] == "skip" and s["skip_until"] == end and s["next_at"] is None
+        assert s["state"] == "skip" and s["skip_until"] == end and s["next_at"] is None and s["note"] == ""
         await env.advance(120)
         assert calls == [] and env.turn_requests == []                                                             # до конца окна разбора нет
         env.tasks_open.clear()                                                                                     # менеджер закрыл задачу
@@ -346,28 +338,75 @@ def test_a_message_in_the_window_is_kept_and_answered_when_the_window_ends(env):
         await env.advance(15)  # запас на медленном диске: метки времени ходов ставит настоящие часы, ход уходит в следующем проходе
         assert calls == [CHAT] and store.get_owner(DEAL)["owner"] == "ai"
         turn = env.turn_requests[-1]
-        assert turn["reason"] == "first_message" and [m["message_id"] for m in turn["messages"]] == ["m-2"] and turn["up_to_message_id"] == "m-2"
-        assert store.get_session(CHAT_KEY)["state"] in ("in_turn", "ai")
+        assert turn["reason"] == "first_message" and [m["message_id"] for m in turn["messages"]] == ["m-1", "m-2"] and turn["up_to_message_id"] == "m-2"
+        assert store.get_session(CHAT_KEY)["state"] in ("in_turn", "ai") and store.get_session(CHAT_KEY)["note"] == ""     # пометка пересмотра снята
     run(go())
 
 
-def test_a_second_refusal_drops_the_messages_and_opens_one_new_window_without_a_loop(env):
+def test_the_message_that_caused_a_temporary_refusal_is_reviewed_once_even_when_nobody_wrote_in_the_window(env):
+    async def go():
+        end = await window(env)
+        calls = resolves(env)
+        env.tasks_open.clear()
+        await env.advance(end - env.t + 1)
+        await env.advance(15)
+        assert calls == [CHAT] and store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1"]
+    run(go())
+
+
+def test_a_task_that_hangs_for_days_costs_one_review_and_then_silence_until_a_new_message(env):
+    """Задача висит, клиент пишет раз: через час ровно один пересмотр (и один запрос задач), дальше тишина, пока клиент не напишет снова."""
+    async def go():
+        end = await window(env)
+        calls = resolves(env)
+        tasks_calls = spy(env)
+        await env.advance(end - env.t + 1)                                                                         # пересмотр: задача на месте
+        assert calls == [CHAT] and tasks_calls == [DEAL]
+        s = store.get_session(CHAT_KEY)
+        assert ids() == [] and s["state"] == "skip" and s["note"] == "" and abs(s["skip_until"] - (env.t + cfg.TASK_RETRY_S)) < 5
+        assert store.get_owner(DEAL) is None and blank(env)
+        for _ in range(30):                                                                                        # дни тишины: ни разборов, ни запросов в amo
+            await env.advance(3600)
+        assert calls == [CHAT] and tasks_calls == [DEAL] and store.due_sessions(env.t + 10 ** 6) == []
+        await env.say(env.msg("Есть новости?", mid="m-2"))                                                         # новое сообщение: новая сессия, пометки пересмотра нет
+        assert store.get_session(CHAT_KEY)["state"] == "collecting" and ids() == ["m-2"] and store.get_session(CHAT_KEY)["note"] == ""
+    run(go())
+
+
+def test_a_message_after_a_finished_review_starts_its_own_single_review(env):
+    async def go():
+        end = await window(env)
+        calls = resolves(env)
+        tasks_calls = spy(env)
+        await env.advance(end - env.t + 1)                                                                         # первый пересмотр: отказ, всё сброшено, окно снова час
+        end2 = store.get_session(CHAT_KEY)["skip_until"]
+        await env.say(env.msg("Ещё раз", mid="m-3"))                                                               # окно ещё идёт: сообщение сохраняется
+        assert ids() == ["m-3"] and store.get_session(CHAT_KEY)["state"] == "skip"
+        await env.advance(end2 - env.t + 1)                                                                        # второе окно: второй пересмотр, уже для m-3
+        assert calls == [CHAT, CHAT] and tasks_calls == [DEAL, DEAL] and ids() == [] and store.get_owner(DEAL) is None
+        for _ in range(10):
+            await env.advance(3600)
+        assert calls == [CHAT, CHAT]                                                                               # снова тишина
+    run(go())
+
+
+def test_a_second_refusal_drops_all_the_messages_and_opens_one_new_window_without_a_loop(env):
     async def go():
         end = await window(env)
         calls = resolves(env)
         await env.say(env.msg("Есть новости?", mid="m-2"))
         await env.say(env.msg("Алло", mid="m-3"))
-        assert len(store.pending_inbox(CHAT_KEY)) == 2
+        assert ids() == ["m-1", "m-2", "m-3"]
         await env.advance(end - env.t + 1)                                                                         # задача всё ещё открыта
         assert calls == [CHAT]                                                                                     # один пересмотр на окно
         s = store.get_session(CHAT_KEY)
-        assert store.pending_inbox(CHAT_KEY) == [] and s["state"] == "skip" and abs(s["skip_until"] - (env.t + cfg.TASK_RETRY_S)) < 5
+        assert ids() == [] and s["state"] == "skip" and abs(s["skip_until"] - (env.t + cfg.TASK_RETRY_S)) < 5
         assert store.get_owner(DEAL) is None and blank(env)
         for _ in range(5):
             await env.advance(30)
         assert calls == [CHAT]                                                                                     # новых разборов нет, пока нет новых сообщений
         await env.say(env.msg("Ещё раз", mid="m-4"))                                                               # новое окно: сообщение снова сохраняется
-        assert [r["message_id"] for r in store.pending_inbox(CHAT_KEY)] == ["m-4"]
+        assert ids() == ["m-4"]
     run(go())
 
 
@@ -376,7 +415,8 @@ def test_a_repeated_webhook_of_the_same_message_is_kept_once(env):
         await window(env)
         for _ in range(3):
             await env.say(env.msg("Есть новости?", mid="m-2"))
-        assert [r["message_id"] for r in store.pending_inbox(CHAT_KEY)] == ["m-2"]
+        await env.say(env.msg("Здравствуйте", mid="m-1"))                                                          # и повтор самого отказанного сообщения
+        assert ids() == ["m-1", "m-2"]
     run(go())
 
 
@@ -390,12 +430,13 @@ def test_the_window_review_re_checks_the_manager_quiet_time(env):
         await client_writes(env, mid="m-1")
         s = store.get_session(CHAT_KEY)
         assert store.get_owner(DEAL) is None and s["state"] == "skip" and abs(s["skip_until"] - (last + 15 * 60)) < 5   # окно до конца тишины менеджера
+        assert ids() == ["m-1"]                                                                                    # менеджер активен: отказ временный, сообщение ждёт
         end = s["skip_until"]
         env.t += 100
         await env.say(env.msg("Здравствуйте, вы тут?", mid="m-2"))
         await env.advance(end - env.t + 1)                                                                         # менеджер больше не писал: тишина прошла
         await env.advance(15)  # запас на медленном диске: метки времени ходов ставит настоящие часы, ход уходит в следующем проходе
-        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-2"]
+        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1", "m-2"]
     run(go())
 
 
@@ -410,7 +451,7 @@ def test_the_manager_writing_in_the_window_postpones_the_deal_again(env):
         await env.say(env.msg("Вы тут?", mid="m-2"))
         F.note_manager_out(CHAT_KEY, end - 10)                                                                     # менеджер ответил в самом конце окна
         await env.advance(end - env.t + 1)
-        assert store.get_owner(DEAL) is None and store.pending_inbox(CHAT_KEY) == [] and env.turn_requests == []
+        assert store.get_owner(DEAL) is None and ids() == [] and env.turn_requests == []                           # повторный отказ на пересмотре: сброс
         assert store.get_session(CHAT_KEY)["state"] == "skip" and store.get_session(CHAT_KEY)["skip_until"] > end
     run(go())
 
@@ -420,13 +461,13 @@ def test_an_attachment_in_the_window_is_kept_with_its_caption(env):
         end = await window(env)
         await env.say(env.msg("Вот скрин оплаты", mid="img-1", typ="image"))
         rows = store.pending_inbox(CHAT_KEY)
-        assert [(r["message_id"], r["msg_type"], r["text"]) for r in rows] == [("img-1", "image", "Вот скрин оплаты")]
+        assert [(r["message_id"], r["msg_type"], r["text"]) for r in rows][1:] == [("img-1", "image", "Вот скрин оплаты")]
         assert store.get_session(CHAT_KEY)["has_media"] == 0                                                       # картинка не «медиа»: ИИ получает строку-пометку
         env.tasks_open.clear()
         await env.advance(end - env.t + 1)
         await env.advance(15)  # запас на медленном диске: метки времени ходов ставит настоящие часы, ход уходит в следующем проходе
         texts = [m["text"] for m in env.turn_requests[-1]["messages"]]
-        assert len(texts) == 1 and "картинку" in texts[0] and "Вот скрин оплаты" in texts[0]
+        assert len(texts) == 2 and "картинку" in texts[1] and "Вот скрин оплаты" in texts[1]
     run(go())
 
 
@@ -434,7 +475,7 @@ def test_a_geo_message_in_the_window_marks_the_chat_and_goes_to_a_human_like_any
     async def go():
         end = await window(env)
         await env.say(env.msg("", mid="geo-1", typ="geo"))
-        assert store.get_session(CHAT_KEY)["has_media"] == 1 and len(store.pending_inbox(CHAT_KEY)) == 1
+        assert store.get_session(CHAT_KEY)["has_media"] == 1 and ids() == ["m-1", "geo-1"]
         env.tasks_open.clear()
         await env.advance(end - env.t + 1)
         assert store.get_owner(DEAL)["owner"] == "human" and env.turn_requests == [] and env.alerts                  # как обычное первое сообщение с геометкой
@@ -450,7 +491,7 @@ def test_a_message_right_after_the_window_keeps_the_media_flag_of_a_saved_one(en
         env.t = end + 0.5
         await env.say(env.msg("Здравствуйте?", mid="m-3"))
         s = store.get_session(CHAT_KEY)
-        assert s["state"] == "collecting" and s["has_media"] == 1 and len(store.pending_inbox(CHAT_KEY)) == 2
+        assert s["state"] == "collecting" and s["has_media"] == 1 and ids() == ["m-1", "geo-1", "m-3"] and s["note"] == "review"   # этот разбор и есть единственный пересмотр
         await env.advance(61)
         assert store.get_owner(DEAL)["owner"] == "human" and env.turn_requests == [] and env.alerts
     run(go())
@@ -461,15 +502,15 @@ def test_the_cheap_checks_of_a_new_session_apply_in_the_window(env):
         await window(env)
         env.mp.setattr(E, "_autopilot_busy", lambda *a, **k: True)                                                 # чат ведёт авто-режим
         await env.say(env.msg("Привет", mid="m-2"))
-        assert store.pending_inbox(CHAT_KEY) == []
+        assert ids() == ["m-1"]
         env.mp.setattr(E, "_autopilot_busy", lambda *a, **k: False)
         env.mp.setattr(settings, "phone_may_match", lambda *a, **k: False)                                         # контакт вне списка режима
         await env.say(env.msg("Привет ещё раз", mid="m-3"))
-        assert store.pending_inbox(CHAT_KEY) == []
+        assert ids() == ["m-1"]
     run(go())
 
 
-def test_the_give_button_after_a_window_does_not_lose_the_saved_message(env):
+def test_the_give_button_after_a_window_does_not_lose_the_saved_messages(env):
     async def go():
         await window(env)
         await env.say(env.msg("Есть новости?", mid="m-2"))
@@ -478,7 +519,7 @@ def test_the_give_button_after_a_window_does_not_lose_the_saved_message(env):
         await env.advance(30)
         assert len(env.turn_requests) == 1
         turn = env.turn_requests[-1]
-        assert turn["event"]["type"] == "deal_given" and [m["message_id"] for m in turn["messages"]] == ["m-2"]      # сообщение из окна идёт в ход передачи: не теряется и не дублируется
+        assert turn["event"]["type"] == "deal_given" and [m["message_id"] for m in turn["messages"]] == ["m-1", "m-2"]      # сообщения идут в ход передачи: не теряются и не дублируются
         assert store.pending_inbox(CHAT_KEY) == [] or all(r["consumed_turn"] for r in store.pending_inbox(CHAT_KEY))
     run(go())
 
@@ -504,14 +545,14 @@ def test_a_restart_in_the_window_loses_and_duplicates_nothing(env):
         await env.say(env.msg("Есть новости?", mid="m-2"))
         store.init()                                                                                               # контейнер перезапустили: база та же, память пуста
         env.mp.setattr(E, "_lock", None)
-        assert [r["message_id"] for r in store.pending_inbox(CHAT_KEY)] == ["m-2"]
+        assert ids() == ["m-1", "m-2"]
         assert store.due_sessions(end - 1) == [] and [s["chat_key"] for s in store.due_sessions(end + 1)] == [CHAT_KEY]
         await env.say(env.msg("Есть новости?", mid="m-2"))                                                         # вебхук после рестарта пришёл повторно
-        assert len(store.pending_inbox(CHAT_KEY)) == 1
+        assert len(store.pending_inbox(CHAT_KEY)) == 2
         env.tasks_open.clear()
         await env.advance(end - env.t + 1)
         await env.advance(15)  # запас на медленном диске: метки времени ходов ставит настоящие часы, ход уходит в следующем проходе
-        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-2"] and len(env.turn_requests) == 1
+        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1", "m-2"] and len(env.turn_requests) == 1
     run(go())
 
 
@@ -539,7 +580,11 @@ def test_due_sessions_returns_skipped_chats_only_with_messages_and_a_finished_wi
     assert store.due_sessions(env.t + 200) == []
 
 
-def test_other_refusal_reasons_keep_the_message_too(env):
+# =============================================================================================
+# какие отказы временные (сообщение сохраняется), а какие постоянные (сбрасывается, как раньше)
+# =============================================================================================
+
+def test_a_permanent_refusal_drops_the_trigger_message_but_keeps_the_window_ones_for_one_review(env):
     async def go():
         Amo(env)
         existing(env)
@@ -547,9 +592,172 @@ def test_other_refusal_reasons_keep_the_message_too(env):
         set_full(env, existing={"policy": "redistribute", "since": env.t - 100, "manager_quiet_min": 15}, ai_user=AI_USER, budget={"skip_from_rub": 1000})
         await client_writes(env, mid="m-1")
         end = store.get_session(CHAT_KEY)["skip_until"]
-        assert store.get_owner(DEAL) is None and abs(end - (env.t + cfg.SKIP_TTL_S)) < 5                           # бюджет: окно десять минут
+        assert store.get_owner(DEAL) is None and abs(end - (env.t + cfg.SKIP_TTL_S)) < 5 and ids() == []          # бюджет: окно десять минут, само сообщение сброшено
+        assert store.due_sessions(env.t + 10 ** 6) == []                                                           # без сообщений в окне пересмотра нет
         await env.say(env.msg("Подскажите", mid="m-2"))
         calls = resolves(env)
         await env.advance(end - env.t + 1)
-        assert calls == [CHAT] and store.get_owner(DEAL) is None and store.pending_inbox(CHAT_KEY) == []          # проверки те же, отказ тот же, один пересмотр
+        assert calls == [CHAT] and store.get_owner(DEAL) is None and ids() == []                                  # проверки те же, отказ тот же, один пересмотр
+    run(go())
+
+
+def test_filters_and_the_reassign_flag_are_permanent(env):
+    async def go():
+        Amo(env)
+        existing(env)
+        old_deal(env, status="Не оплачен")
+        set_full(env, existing={"policy": "redistribute", "since": env.t - 100, "manager_quiet_min": 15}, ai_user=AI_USER, filters={"payment_status": ["paid"]})
+        await client_writes(env, mid="m-1")
+        assert store.get_owner(DEAL) is None and ids() == [] and store.get_session(CHAT_KEY)["state"] == "skip"   # фильтры
+        env.t += cfg.SKIP_TTL_S + 1
+        existing(env)
+        env.mp.setattr(F, "REASSIGN_DISABLED", True)                                                               # аварийный флаг смены ответственного
+        await client_writes(env, "Ещё раз", mid="m-2")
+        assert store.get_owner(DEAL) is None and ids() == []
+    run(go())
+
+
+def test_leave_for_an_existing_deal_is_permanent(env):
+    async def go():
+        Amo(env)
+        existing(env, policy="leave")
+        old_deal(env)
+        await client_writes(env, mid="m-1")
+        assert store.get_owner(DEAL) is None and ids() == [] and store.due_sessions(env.t + 10 ** 6) == []
+    run(go())
+
+
+def test_tasks_unchecked_keeps_the_message_and_the_short_window_is_reviewed_once(env):
+    async def go():
+        Amo(env)
+        existing(env)
+        old_deal(env)
+        env.tasks_down = True
+        await client_writes(env, mid="m-1")
+        s = store.get_session(CHAT_KEY)
+        assert ids() == ["m-1"] and abs(s["skip_until"] - (env.t + cfg.TASK_UNCHECKED_RETRY_S)) < 5               # окно 120 с, сообщение сохранено
+        env.tasks_down = False                                                                                     # amo ожила, задач нет
+        await env.advance(s["skip_until"] - env.t + 1)
+        await env.advance(15)
+        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1"]
+    run(go())
+
+
+def test_the_ai_service_being_down_at_entry_keeps_the_message_and_calls_people_once(env):
+    async def go():
+        Amo(env)
+        existing(env)
+        old_deal(env)
+        env.tasks_open.clear()
+        env.health_ok = False
+        E._ai_ok_at = env.t - 1000
+        await client_writes(env, mid="m-1")
+        s = store.get_session(CHAT_KEY)
+        assert store.get_owner(DEAL) is None and ids() == ["m-1"] and abs(s["skip_until"] - (env.t + 300)) < 5
+        alerts_before = len(env.alerts)
+        assert alerts_before == 1
+        env.health_ok = True
+        await env.advance(s["skip_until"] - env.t + 1)
+        await env.advance(15)
+        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1"]
+    run(go())
+
+
+def test_the_ai_service_still_down_on_the_review_drops_the_message_and_does_not_call_people_again(env):
+    async def go():
+        Amo(env)
+        existing(env)
+        old_deal(env)
+        env.health_ok = False
+        E._ai_ok_at = env.t - 1000
+        await client_writes(env, mid="m-1")
+        end = store.get_session(CHAT_KEY)["skip_until"]
+        assert len(env.alerts) == 1 and ids() == ["m-1"]
+        env.t = max(env.t, end) + 700                                                                              # дедупликация алерта (10 минут) за это время истекла бы
+        E._alert_seen.clear()
+        E._ai_ok_at = env.t - 1000
+        await env.advance(1)
+        assert len(env.alerts) == 1 and ids() == [] and store.get_owner(DEAL) is None                              # пересмотр: сервис всё ещё лежит, людей второй раз не зовём, всё сброшено
+        assert store.get_session(CHAT_KEY)["state"] == "skip" and store.get_session(CHAT_KEY)["note"] == ""
+    run(go())
+
+
+def test_the_autopilot_busy_with_the_chat_keeps_the_message(env):
+    async def go():
+        Amo(env)
+        existing(env)
+        old_deal(env)
+        busy = {"on": True}
+        env.mp.setattr(E, "_autopilot_busy", lambda chat_id, phone, deal_id=None: busy["on"] and deal_id is not None)     # сделку ведёт авто-режим (заказ с сайта): видно, только когда сделка найдена
+        await client_writes(env, mid="m-1")
+        s = store.get_session(CHAT_KEY)
+        assert store.get_owner(DEAL) is None and ids() == ["m-1"] and s["state"] == "skip"
+        busy["on"] = False
+        await env.advance(s["skip_until"] - env.t + 1)
+        await env.advance(15)
+        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1"]
+    run(go())
+
+
+def test_a_failed_change_of_the_responsible_keeps_the_message_and_is_reviewed_once(env):
+    async def go():
+        amo = Amo(env, ok=False)                                                                                   # amo не приняла смену ответственного
+        existing(env)
+        old_deal(env)
+        await client_writes(env, mid="m-1")
+        s = store.get_session(CHAT_KEY)
+        first = len(amo.patches)
+        assert store.get_owner(DEAL) is None and ids() == ["m-1"] and s["state"] == "skip" and first >= 1
+        await env.advance(s["skip_until"] - env.t + 1)                                                             # пересмотр: снова не принято, всё сброшено
+        assert len(amo.patches) == 2 * first and ids() == [] and store.get_owner(DEAL) is None
+        for _ in range(5):
+            await env.advance(600)
+        assert len(amo.patches) == 2 * first                                                                       # без новых сообщений третьей попытки нет
+    run(go())
+
+
+def test_a_deal_that_never_appears_keeps_the_message_for_the_review(env):
+    async def go():
+        env.set_settings()
+        await env.say(env.msg("Здравствуйте", mid="m-1"))
+        for _ in range(12):                                                                                        # поиск сделки идёт десять минут с повтором раз в минуту
+            await env.advance(61)
+        s = store.get_session(CHAT_KEY)
+        assert s["state"] == "skip" and ids() == ["m-1"] and store.get_owner(DEAL) is None                         # не нашли: отказ временный, сообщение сохранено
+        env.lead()                                                                                                 # сделка появилась
+        await env.advance(s["skip_until"] - env.t + 1)
+        await env.advance(80)
+        assert store.get_owner(DEAL)["owner"] == "ai" and [m["message_id"] for m in env.turn_requests[-1]["messages"]] == ["m-1"]
+    run(go())
+
+
+def test_an_open_proposal_without_an_awaiting_chat_keeps_the_message_and_awaiting_is_untouched(env):
+    async def go():
+        Amo(env)
+        existing(env, review=True)                                                                                 # пилот
+        old_deal(env)
+        import ai_engine_approval as A
+        row = A.create(deal_id=DEAL, from_id=OLD_MANAGER, from_name="Иванова Мария", to_id=AI_USER["id"], to_name="Гладков Александер",
+                       chat={"chat_key": CHAT_KEY, "chat_id": CHAT, "chat_type": "telegram", "channel_id": CHAN}, now=env.t, source="sweep")
+        assert row is not None
+        await client_writes(env, mid="m-1")
+        s = store.get_session(CHAT_KEY)
+        assert s["state"] == "skip" and ids() == ["m-1"] and store.get_owner(DEAL) is None and blank(env)          # предложение открыто, чат не `awaiting`: временный отказ
+        await env.advance(s["skip_until"] - env.t + 1)                                                             # пересмотр: предложение всё ещё открыто, всё сброшено
+        assert ids() == [] and store.get_session(CHAT_KEY)["state"] == "skip"
+    run(go())
+
+
+def test_an_explicitly_allowed_contact_is_exempt_from_the_task_rule(env):
+    """Явно разрешённый контакт (пилотный список при `restricted`) правилом задач не останавливается (решение Кати 24.11.2026); контакты без явного разрешения блокируются (первый тест файла)."""
+    async def go():
+        Amo(env)
+        set_full(env, contacts=PILOT_LIST, existing={"policy": "leave", "since": env.t - 100, "manager_quiet_min": 15}, ai_user=AI_USER)
+        old_deal(env)
+        env.tasks_open.append(task())
+        calls = spy(env)
+        await client_writes(env, mid="m-1")
+        await drain()
+        assert store.get_owner(DEAL)["owner"] == "ai" and calls == [DEAL]                                          # взята вопреки задаче менеджера; единственный запрос: `release_intake`
+        assert not env.tasks_open[0].get("is_completed")                                                           # чужая задача не тронута
     run(go())

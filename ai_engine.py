@@ -41,8 +41,9 @@
 
 ⚠️ Открытая задача сотрудника и окно пропуска на пути по сообщению клиента (решение Кати 24.11.2026): ПЕРВОЕ взятие «существующей» сделки (`decision.existing`) блокирует любая открытая
 задача amo на любого сотрудника, кроме пользователя ИИ (`_task_guard` в `_gate_take`; новые лиды, ведомые сделки, `give_deal`, перехват и подбор правилом не затронуты; рубильник
-`AI_TASK_GUARD_DISABLED=1`). Отказ закрывает чат в `skip` до `retry_at`/`SKIP_TTL_S`, и сообщения клиента в окне больше не теряются: `_save_in_skip_window` кладёт их во входящие,
-`store.due_sessions` возвращает чат в конце окна, `_process_collecting` разбирает его заново (один раз на окно, при новом отказе входящие сбрасываются и окно открывается снова).
+`AI_TASK_GUARD_DISABLED=1`; явно разрешённые контакты правилом не останавливаются). Отказ закрывает чат в `skip` до `retry_at`/`SKIP_TTL_S`, и сообщения клиента не теряются: `_save_in_skip_window` кладёт
+пришедшие в окне во входящие, ВРЕМЕННЫЙ отказ (`dedup.Resolution.temporary`, `_close_window`) оставляет и само сообщение, `store.due_sessions` возвращает чат в конце окна, `_process_collecting`
+разбирает его заново ровно один раз (пометка `NOTE_REVIEW`): повторный отказ сбрасывает всё и открывает новое окно, дальше страхует подбор.
 """
 import asyncio
 import datetime
@@ -467,13 +468,15 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
     if s is None:
         # Окно пропуска кончилось, а таймер ещё не вернул чат в разбор: сообщения клиента, сохранённые в окне (`_save_in_skip_window`), уже лежат во входящих и пойдут в эту же пачку.
         # Вложение без текста (геометка, контакт) среди них не должно потерять пометку «медиа»: `put_session` ниже сбрасывает её.
-        carried_media = any(r["msg_type"] != "text" and r["msg_type"] not in ATTACHMENT_TYPES for r in await _db(store.pending_inbox, chat_key))
+        carried = [r for r in await _db(store.pending_inbox, chat_key) if r["message_id"] != message_id]
+        carried_media = any(r["msg_type"] != "text" and r["msg_type"] not in ATTACHMENT_TYPES for r in carried)
         s = await _db(
             store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id,
             chat_type=str(m.get("chatType") or ""), phone=phone, contact_name=str((contact or {}).get("name") or ""),
             state=store.S_COLLECTING, deal_id=None, batch_start=now, first_batch=1, last_client_at=now,
             next_at=now + timers["first_reply_wait_s"], resolve_deadline=now + timers["deal_resolve_timeout_s"],
             has_media=1 if carried_media else 0, last_message_id=message_id,
+            note=store.NOTE_REVIEW if carried else "",      # сохранённые в окне сообщения этот разбор и пересматривает: повторный временный отказ их сбросит
         )
     else:
         fields: dict[str, Any] = {"last_client_at": now, "last_message_id": message_id}
@@ -612,7 +615,7 @@ async def _process_collecting(s: dict) -> None:
         timers = settings.timers()
         due = max(now, float(s["last_client_at"] or 0) + timers["debounce_s"])
         s = await _db(store.put_session, chat_key, state=store.S_COLLECTING, batch_start=now, first_batch=0, next_at=due, skip_until=None,
-                      resolve_deadline=now + timers["deal_resolve_timeout_s"])
+                      resolve_deadline=now + timers["deal_resolve_timeout_s"], note=store.NOTE_REVIEW)      # пометка: это ЕДИНСТВЕННЫЙ пересмотр сообщений окна (`_close_window`)
         logger.info("ai_engine: окно пропуска чата %s кончилось, сообщения клиента, пришедшие в окне, разбираются заново", chat_key)
         if due > now:
             return
@@ -669,10 +672,11 @@ async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str, *, tasks_chec
         raise
     except Exception:  # noqa: BLE001
         logger.exception("ai_engine: сбой проверки фильтров по сделке %s, сделку не беру", deal.get("id"))
-        return dedup.Resolution(dedup.K_REFUSED, deal=deal, note="сбой проверки фильтров")
+        return dedup.Resolution(dedup.K_REFUSED, deal=deal, note="сбой проверки фильтров", temporary=True)
     if not decision.allow:
-        return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=decision.reason, retry_at=decision.retry_at)
-    if decision.existing and not tasks_checked and not cfg.TASK_GUARD_DISABLED:
+        # Временный отказ: «менеджер активен» (`retry_at`). Постоянные (фильтры, бюджет, товары, «существующие» при `leave`, нет пользователя ИИ, `AI_REASSIGN_DISABLED`) сообщения сбрасывают.
+        return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=decision.reason, retry_at=decision.retry_at, temporary=decision.retry_at is not None)
+    if decision.existing and not explicit and not tasks_checked and not cfg.TASK_GUARD_DISABLED:
         try:
             blocked = await _task_guard(deal)
         except asyncio.CancelledError:
@@ -681,12 +685,12 @@ async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str, *, tasks_chec
             logger.exception("ai_engine: сбой проверки задач сделки %s, сделку не беру", deal.get("id"))
             blocked = ("задачи не проверить (сбой проверки)", _now() + cfg.TASK_UNCHECKED_RETRY_S)
         if blocked is not None:
-            return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=blocked[0], retry_at=blocked[1])
+            return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=blocked[0], retry_at=blocked[1], temporary=True)
     if decision.propose:
         # Смену ответственного нужно подтвердить человеку: открытое предложение по сделке уже ждёт решения либо недавно отклонено: не создаём второе
         why = await _db(approval.block_reason, int(deal["id"]), _now())
         if why:
-            return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=why)
+            return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=why, temporary=True)
     res.gate = decision
     return res
 
@@ -699,6 +703,8 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
         # Режим сменили, пока шёл поиск в amo: выбор сделки сделан по воронкам прежнего режима, применять его нельзя. Решаем заново.
         await _db(store.put_session, chat_key, next_at=now)
         return
+    if (s.get("note") or "") == store.NOTE_REVIEW and not (res.kind in (dedup.K_ERROR, dedup.K_NONE) and now < (s["resolve_deadline"] or 0)):
+        await _db(store.put_session, chat_key, note="")       # пересмотр окончен (повтор поиска сделки в самом пересмотре ещё идёт: пометка остаётся до конца)
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
     if owner is not None and owner["owner"] == store.OWNER_HUMAN:
         await _db(store.put_session, chat_key, state=store.S_HUMAN, next_at=None)
@@ -725,8 +731,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
         # ИИ сделку не берёт (фильтры, бюджет, товары, «существующие сделки»): ничего не пишем ни клиенту, ни в amo, ни людям; причина одной строкой в лог
         logger.info("ai_engine: сделка %s не взята: %s", (res.deal or {}).get("id"), res.note)
         skip_until = res.retry_at if res.retry_at and res.retry_at > now else now + cfg.SKIP_TTL_S
-        await _db(store.put_session, chat_key, state=store.S_SKIP, skip_until=skip_until, next_at=None)
-        await _db(store.discard_pending, chat_key)
+        await _close_window(s, skip_until, temporary=res.temporary)
         return
     if res.kind == dedup.K_GONE:
         await _deal_closed(int(s["deal_id"]), "сделка закрыта или ушла из воронок режима")
@@ -762,9 +767,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
             return
     if _autopilot_busy(s["chat_id"], s["phone"], deal_id):
         logger.info("ai_engine: сделку %s ведёт авто-режим - ИИ не входит", deal_id)
-        await _db(store.put_session, chat_key, state=store.S_SKIP, deal_id=deal_id,
-                  skip_until=now + cfg.SKIP_TTL_S, next_at=None)
-        await _db(store.discard_pending, chat_key)
+        await _close_window(s, now + cfg.SKIP_TTL_S, temporary=True, deal_id=deal_id)
         return
 
     if s["has_media"]:
@@ -783,15 +786,14 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
 
     if not await _ai_is_up():
         if owner is None:
-            await _alert("ai_down_entry", [
-                "Клиент написал, а ИИ-сервис не отвечает.",
-                _client_line(s),
-                "Диалог остаётся у менеджеров, как и до ИИ.",
-                _link(deal_id),
-            ], dedupe=f"ai_down_entry:{chat_key}")
-            await _db(store.put_session, chat_key, state=store.S_SKIP, deal_id=deal_id,
-                      skip_until=now + 300, next_at=None)
-            await _db(store.discard_pending, chat_key)
+            if (s.get("note") or "") != store.NOTE_REVIEW:        # на пересмотре людей второй раз не зовём: они уже знают
+                await _alert("ai_down_entry", [
+                    "Клиент написал, а ИИ-сервис не отвечает.",
+                    _client_line(s),
+                    "Диалог остаётся у менеджеров, как и до ИИ.",
+                    _link(deal_id),
+                ], dedupe=f"ai_down_entry:{chat_key}")
+            await _close_window(s, now + 300, temporary=True, deal_id=deal_id)
         else:
             await _db(store.put_session, chat_key, next_at=now + cfg.HEALTH_POLL_S)
         return
@@ -807,8 +809,7 @@ async def _apply_resolution(s: dict, res: dedup.Resolution, mode: str, mode_id: 
     gate = res.gate if first_entry else None       # решение о взятии (`_gate_take`): назначить ответственного, поставить охрану инициативы
     if gate is not None and gate.reassign and not await filters.reassign_responsible(deal_id, gate.reassign):
         # «Перераспределить существующие»: смена ответственного не удалась, сделку не берём (причина в логе `reassign_responsible`)
-        await _db(store.put_session, chat_key, state=store.S_SKIP, skip_until=now + cfg.SKIP_TTL_S, next_at=None)
-        await _db(store.discard_pending, chat_key)
+        await _close_window(s, now + cfg.SKIP_TTL_S, temporary=True)
         return
     owner = await _db(
         store.set_owner, deal_id, store.OWNER_AI, reason="client_message", chat=chat,
@@ -828,12 +829,27 @@ def _chat_dict(s: dict) -> dict[str, Any]:
             "chat_key": s["chat_key"]}
 
 
+async def _close_window(s: dict, until: float, *, temporary: bool, **fields: Any) -> bool:
+    """Чат закрыт в окно пропуска (`S_SKIP`) до `until`. Постоянный отказ (фильтры, бюджет, товары, «существующие» при `leave`, нет пользователя ИИ, `AI_REASSIGN_DISABLED`, сделка не наша)
+    сбрасывает сообщения клиента, как раньше. ВРЕМЕННЫЙ (задача сотрудника, «задачи не проверить», менеджер активен, ждём человека по предложению, ИИ-сервис не отвечал, сделку не нашли, авто-режим,
+    смена ответственного не удалась) оставляет их во входящих: в конце окна чат вернётся в разбор ОДИН раз (`store.due_sessions`, `_process_collecting`). Каждое сообщение пересматривается ровно один раз:
+    на самом пересмотре (`note` = `NOTE_REVIEW`) отказ любого вида сбрасывает всё и открывает новое окно, дальше сделку страхует подбор. Возвращает True, если сообщения оставлены."""
+    keep = temporary and (s.get("note") or "") != store.NOTE_REVIEW
+    await _db(store.put_session, s["chat_key"], state=store.S_SKIP, skip_until=until, next_at=None, note="", **fields)
+    if not keep:
+        await _db(store.discard_pending, s["chat_key"])
+    return keep
+
+
 async def _give_up_resolving(s: dict, why: str) -> None:
     """Сделку не нашли за `deal_resolve_timeout_s`. Для ограниченных режимов (тест, пилот) зовём человека: тот,
     кто тестирует, должен видеть, почему ИИ молчит. Для открытого прода молчим: обращение без сделки
-    amo разбирает сам, а сторож розничных лидов зовёт людей там, где открытая сделка лежит в чужой воронке."""
-    await _db(store.put_session, s["chat_key"], state=store.S_SKIP, skip_until=_now() + cfg.SKIP_TTL_S, next_at=None)
-    await _db(store.discard_pending, s["chat_key"])
+    amo разбирает сам, а сторож розничных лидов зовёт людей там, где открытая сделка лежит в чужой воронке. Отказ временный: сообщения клиента сохраняются на один пересмотр
+    в конце окна (`_close_window`); на самом пересмотре людей второй раз не зовём."""
+    review = (s.get("note") or "") == store.NOTE_REVIEW
+    await _close_window(s, _now() + cfg.SKIP_TTL_S, temporary=True)
+    if review:
+        return
     # Сделки нет, поэтому контакт по id неизвестен: чат считается «из списка» только по телефону или chat_id
     # (WhatsApp: chat_id и есть телефон). Иначе алерт получал бы КАЖДЫЙ живой клиент канала, у которого нет
     # сделки в воронке режима (боевой тест 28.10.2026: клиенты «ТГ ОП» с сделками в «ОП розница»).
