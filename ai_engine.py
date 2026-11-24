@@ -60,6 +60,7 @@ import ai_engine_give as give
 import ai_engine_intercept as intercept
 import ai_engine_marks as marks
 import ai_engine_modes as modes
+import ai_engine_pause as pause
 import ai_engine_prompts as prompts
 import ai_engine_silence as silence
 import ai_engine_sweep as sweep
@@ -562,6 +563,7 @@ async def tick_once() -> None:
         _last_housekeeping = now
         await _db(store.prune, cfg.RETENTION_DAYS * 86400)
     await sweep.tick(sys.modules[__name__], now)         # подбор существующих сделок: раз в 5 минут, прогон фоновой задачей, не отдельный цикл (`ai_engine_sweep`)
+    await pause.tick(sys.modules[__name__], now)         # «стоп»/«старт» примечанием и заметка «ИИ ведёт сделку»: опрос фоновой задачей раз в 15 с (`ai_engine_pause`)
 
 
 async def _process_collecting(s: dict) -> None:
@@ -1063,6 +1065,9 @@ async def _send_turn(turn: dict) -> None:
         payload["mode_settings"] = ms
     else:
         payload.pop("mode_settings", None)
+    # До генерации ответа в сделке закреплена заметка «ИИ ведёт сделку» (решение Кати 24.11.2026). Заметка уже есть: только чтение базы; amo не ответил:
+    # ход всё равно уходит (сверка `ai_engine_pause` закрепит позже), ход ждёт amo не дольше таймаутов модуля и не чаще раза в 5 минут на сделку.
+    await pause.ensure_ai_pin(sys.modules[__name__], deal_id, owner)
     result = await client.post_turn(payload)
     if result.kind == client.SENT:
         await _db(store.update_turn, turn["turn_id"], state=store.T_ACCEPTED, accepted_at=_now())
@@ -1801,6 +1806,76 @@ async def _mark_no_reply(deal_id: int) -> dict[str, Any]:
 
 
 # =============================================================================================
+# «стоп» и «старт» примечанием (ai_engine_pause, решение Кати 24.11.2026)
+# =============================================================================================
+
+PAUSE_REASON = "paused"
+
+
+async def manager_stop(deal_id: int) -> dict[str, Any]:
+    """Менеджер написал в сделку примечание «стоп»: ИИ отпускает сделку и не берёт её до «старт». Как отметка «удалить», только обратимо: владелец `human`
+    с причиной `paused` (вход по сообщению клиента, подбор и перехват сделку с владельцем не берут), ход, касания и лестница тишины сняты, открытое
+    предложение смены ответственного закрыто, алерта и задачи нет. Сделку никто не вёл: запись владельца создаётся, чтобы ИИ её не взял.
+    Ответ `{"state": "paused" | "closed", "was_ai": bool}`. Заметки в сделку пишет `ai_engine_pause`."""
+    deal_id = int(deal_id)
+    async with _get_lock():
+        owner = await _db(store.get_owner, deal_id)
+        s = await _db(store.session_for_deal, deal_id)
+        await approval.cancel_for_deal(sys.modules[__name__], deal_id, "менеджер написал примечание «стоп»")
+        if owner is not None and owner["closed"]:
+            return {"state": "closed", "was_ai": False}
+        was_ai = owner is not None and owner["owner"] == store.OWNER_AI
+        if was_ai or s is not None:
+            await _to_human(s, PAUSE_REASON, deal_id=deal_id, alert=None)
+        elif owner is None or owner["owner"] == store.OWNER_ENGINE:
+            await _db(store.set_owner, deal_id, store.OWNER_HUMAN, reason=PAUSE_REASON)
+    logger.info("ai_engine: сделка %s: «стоп» примечанием (ИИ %s)", deal_id, "вёл" if was_ai else "не вёл")
+    return {"state": "paused", "was_ai": was_ai}
+
+
+async def manager_start(deal_id: int) -> dict[str, Any]:
+    """Менеджер написал примечание «старт»: вернуть сделку ИИ. Новая отсечка `manager_cutoff` (сообщения менеджера до «старт», в том числе за паузу,
+    ИИ видит, но они его не останавливают) и возврат диалога (`return_dialog`, событие `dialog_returned`): ИИ перечитывает переписку и отвечает, если
+    последнее слово за клиентом. Ответ `{"state": ...}`:
+      • `returned`: ИИ снова ведёт сделку;
+      • `already_ai`: ИИ и так её ведёт;
+      • `released`: ИИ эту сделку не вёл (нет чата в записи владельца): запись «пауза» убрана, ИИ войдёт по обычным правилам;
+      • `refused` + `detail` (`closed`, `removed`, `mode_off`, `pipeline_not_allowed`, `not_returnable`): вернуть нельзя;
+      • `retry` + `detail`: ИИ-сервис недоступен, повторить позже."""
+    deal_id = int(deal_id)
+    async with _get_lock():
+        owner = await _db(store.get_owner, deal_id)
+        if owner is None:
+            return {"state": "released"}
+        if owner["closed"]:
+            return {"state": "refused", "detail": "closed"}
+        if owner["owner"] == store.OWNER_AI and not modes.is_stale(owner, settings.active_mode_id()):
+            return {"state": "already_ai"}
+        mark = await _db(marks.get, deal_id)
+        if owner.get("reason") == "removed" or (mark is not None and mark["kind"] == marks.KIND_REMOVED):
+            return {"state": "refused", "detail": "removed"}
+        if not owner.get("chat_id") or not owner.get("channel_id"):
+            if owner["owner"] == store.OWNER_HUMAN and owner.get("reason") == PAUSE_REASON:
+                await _db(pause.drop_pause_owner, deal_id)              # запись владельца появилась только из-за «стоп»: сделка снова ничья
+                s = await _db(store.session_for_deal, deal_id)
+                if s is not None and s["state"] == store.S_HUMAN:
+                    await _db(store.drop_session, s["chat_key"])        # чат пометили человеческим, пока шла пауза: следующее сообщение клиента разбирается заново
+            return {"state": "released"}
+        mode_id = settings.active_mode_id()
+        if settings.effective_mode() != "off":
+            forced = bool(await _db(give.is_forced, deal_id, mode_id))
+            await _db(give.mark, deal_id, _now(), forced, mode_id)      # отсечка: сообщения менеджера до «старт» ИИ не останавливают
+    code, body = await return_dialog(deal_id)
+    if code == 200:
+        logger.info("ai_engine: сделка %s: «старт» примечанием, ИИ снова ведёт (эпоха %s)", deal_id, body.get("epoch"))
+        return {"state": "returned", "epoch": body.get("epoch")}
+    detail = str(body.get("detail") or "")
+    if code == 503:
+        return {"state": "retry", "detail": detail}
+    return {"state": "refused", "detail": detail}
+
+
+# =============================================================================================
 # лестница тишины (ai_engine_silence)
 # =============================================================================================
 
@@ -2168,4 +2243,8 @@ def status() -> dict[str, Any]:
         out["sweep"] = sweep.status_block(_now())                     # подбор существующих сделок (`ai_engine_sweep`): настройки, бюджет, исходы за сутки, отметки людей
     except Exception:  # noqa: BLE001
         out["sweep"] = "ошибка чтения базы"
+    try:
+        out["pause"] = pause.status_block(_now())                     # «стоп»/«старт» примечанием и заметки «ИИ ведёт сделку» (`ai_engine_pause`)
+    except Exception:  # noqa: BLE001
+        out["pause"] = "ошибка чтения базы"
     return out
