@@ -42,6 +42,7 @@ S_AI = "ai"                    # ИИ владеет сделкой, ждём н
 S_HUMAN = "human"              # дело человека
 S_RELEASED = "released"        # ИИ вернул сделку сценарию
 S_SKIP = "skip"                # чат не наш (не в списке, нет сделки), смотрим снова после `skip_until`
+NOTE_REVIEW = "review"         # `chat_session.note`: чат вернулся из окна пропуска и идёт ЕГО единственный пересмотр (`ai_engine._process_collecting`); повторный временный отказ сбрасывает сообщения
 
 # Состояния хода.
 T_QUEUED = "queued"            # ждёт отправки (в том числе повтора)
@@ -392,11 +393,18 @@ def drop_session(chat_key: str, *, keep_inbox: bool = False) -> None:
 
 
 def due_sessions(now: float) -> list[dict]:
+    """Чаты, которым пора в разбор: созревшие `collecting` и чаты в окне пропуска, которое кончилось, а во входящих лежат сообщения клиента, пришедшие в окне (`ai_engine._save_in_skip_window`)."""
     with _connect() as conn:
-        return [dict(r) for r in conn.execute(
+        collecting = [dict(r) for r in conn.execute(
             "SELECT * FROM chat_session WHERE state=? AND next_at IS NOT NULL AND next_at<=? ORDER BY next_at",
             (S_COLLECTING, now),
         ).fetchall()]
+        skipped = [dict(r) for r in conn.execute(
+            "SELECT * FROM chat_session WHERE state=? AND skip_until IS NOT NULL AND skip_until<=? AND EXISTS "
+            "(SELECT 1 FROM inbox WHERE inbox.chat_key=chat_session.chat_key AND inbox.consumed_turn IS NULL) ORDER BY skip_until",
+            (S_SKIP, now),
+        ).fetchall()]
+        return collecting + skipped
 
 
 def sessions_by_state(state: str) -> list[dict]:

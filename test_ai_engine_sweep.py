@@ -508,7 +508,7 @@ def test_work_with_the_base_deals_are_pool_two_answer_only_and_keep_the_initiati
         assert store.get_owner(DEAL)["owner"] == "ai" and store.get_owner(DEAL + 1) is None and store.get_owner(DEAL + 2) is None
         assert "только ответ" in last_row(DEAL + 1)["note"] and "старше 3 сут." in last_row(DEAL + 2)["note"]
         # Взятая сделка живёт по правилам воронки с инициативой: как у розницы.
-        await env.advance(1)
+        await env.advance(30)
         turn = env.turn_requests[-1]
         assert turn["event"]["type"] == "deal_given" and turn["mode_settings"]["initiative"] is True
         assert settings.initiative_allowed(PIPE_DB) is True and await E._initiative_ok(store.get_owner(DEAL)) is True
@@ -831,7 +831,7 @@ def test_a_silent_client_is_taken_only_after_the_standard_silence_threshold(env,
         w.candidates[0]["last_out_at"] = iso(env.t - 3 * HOUR - 1)
         out = await S.run_once(E)
         assert out["outcomes"] == {"given": 1}
-        await env.advance(1)
+        await env.advance(30)
         assert env.turn_requests[-1]["event"]["type"] == "deal_given"
     run(go())
 
@@ -896,7 +896,7 @@ def test_the_other_pool_answers_only_a_fresh_unanswered_client_message(env, w):
         assert out["outcomes"] == {"given": 1, "refused": 2}
         assert store.get_owner(DEAL)["owner"] == "ai" and store.get_owner(DEAL + 1) is None and store.get_owner(DEAL + 2) is None
         assert "только ответ" in last_row(DEAL + 2)["note"] and "старше 3 сут." in last_row(DEAL + 1)["note"]
-        await env.advance(1)
+        await env.advance(30)
         turn = env.turn_requests[-1]
         assert turn["event"]["type"] == "deal_given" and turn["mode_settings"]["initiative"] is False      # ИИ в этой воронке только отвечает
     run(go())
@@ -1064,7 +1064,7 @@ def test_a_taken_deal_gets_the_same_event_as_the_give_button(env, w):
         assert w.amo.patches == [(DEAL, AI_USER["id"])]                                        # «перераспределить»: ответственный стал пользователем ИИ
         assert G.cutoff_iso(DEAL) and G.is_forced(DEAL) is False and F.guard_row(DEAL)["first_msg_at"] is None
         assert last_row()["outcome"] == "given"
-        await env.advance(1)
+        await env.advance(30)
         req = env.turn_requests[-1]
         assert req["reason"] == "event" and req["event"]["type"] == "deal_given" and req["messages"] == [] and req["up_to_message_id"] == ""
         assert req["epoch"] == 1 and req["deal_id"] == DEAL and req["manager_cutoff"] and "given_forced" not in req
@@ -1130,7 +1130,7 @@ def test_an_approved_proposal_makes_the_ai_read_the_history_and_leaves_the_tasks
         assert code == 200 and out["state"] == "approved" and "перечитает переписку" in out["detail"]
         assert w.amo.patches == [(DEAL, AI_USER["id"])] and store.get_owner(DEAL)["owner"] == "ai" and store.get_owner(DEAL)["reason"] == "reassign_approved"
         assert G.cutoff_iso(DEAL) and F.guard_row(DEAL)["first_msg_at"] is None
-        await env.advance(1)
+        await env.advance(30)
         req = env.turn_requests[-1]
         assert req["reason"] == "event" and req["event"]["type"] == "deal_given" and req["messages"] == []
         assert "is_completed" not in intake and len(env.tasks_open) == 1                       # задачи amo не закрыты
@@ -1330,7 +1330,7 @@ def test_a_second_pass_over_the_same_deal_does_not_double_it(env, w):
         w.deal()
         w.ignore_exclude = True
         await S.run_once(E)
-        await env.advance(1)
+        await env.advance(30)
         turns = len(env.turn_requests)
         out = await S.run_once(E)
         assert out["outcomes"] == {"refused": 1} and "запись владельца" in last_row()["note"]

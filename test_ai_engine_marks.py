@@ -329,7 +329,7 @@ def test_the_give_button_clears_the_marks(env, kind):
         assert store.get_owner(DEAL)["owner"] == "ai" and store.get_owner(DEAL)["reason"] == "deal_given"
         events = [(r["event"], r["kind"]) for r in M.journal()]
         assert events[0] == ("cleared", kind) and "Дать сделку ИИ" in M.journal()[0]["note"]
-        await env.advance(1)
+        await env.advance(30)
         assert env.turn_requests[-1]["event"]["type"] == "deal_given"
     run(go())
 
