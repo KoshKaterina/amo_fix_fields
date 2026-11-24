@@ -22,9 +22,9 @@ import ai_engine_settings as settings
 import ai_engine_store as store
 import ai_engine_sweep as S
 from test_ai_engine import DEAL, PIPE_RETAIL, env, run  # noqa: F401  (env - фикстура)
-from test_ai_engine_filters import OLD_MANAGER
+from test_ai_engine_filters import AI_USER, OLD_MANAGER
 from test_ai_engine_followup import drain
-from test_ai_engine_sweep import HOUR, ON, _fresh, iso, last_row, setup, w  # noqa: F401  (_fresh, w - фикстуры)
+from test_ai_engine_sweep import HOUR, ON, PIPE_OTHER, _fresh, allow_other, iso, last_row, setup, w  # noqa: F401  (_fresh, w - фикстуры)
 
 
 def make_deals(w, n, start=DEAL, **kw):
@@ -549,4 +549,74 @@ def test_the_hourly_budget_stays_the_main_limit_with_a_bigger_run_ceiling(env, w
             taken += (await S.run_once(E))["outcomes"].get("given", 0)
         assert taken == 60 and S.count_taken(env.t) == 60                                        # 12 прогонов по 5 исчерпали час, дальше «лимит»
         assert "лимит за час исчерпан (60 из 60)" in (await S.run_once(E))["skipped"]
+    run(go())
+
+
+# =============================================================================================
+# задачи amo: смотрим всегда, и в первом проходе тоже (решение Кати 24.11.2026)
+# =============================================================================================
+
+def test_a_task_blocks_the_deal_inside_the_pass_in_both_pools_and_the_pass_goes_on(env, w):
+    async def go():
+        setup(env, armed=True, pipelines_any=True)
+        allow_other(env)
+        w.deal(DEAL, pipeline=PIPE_RETAIL)
+        w.deal(DEAL + 1, pipeline=PIPE_OTHER)
+        w.deal(DEAL + 2, pipeline=PIPE_RETAIL)
+        w.deal(DEAL + 3, pipeline=PIPE_OTHER)
+        w.tasks[DEAL] = w.tasks[DEAL + 1] = [{"id": 1, "responsible_user_id": OLD_MANAGER, "text": "позвонить"}]
+        w.tasks[DEAL + 3] = [{"id": 2, "responsible_user_id": AI_USER["id"]}]                  # только на пользователе ИИ: не мешает
+        out = await S.run_once(E)
+        st = S.pass_state()
+        assert out["first_pass"] and out["outcomes"] == {"blocked_by_task": 2, "given": 2}
+        assert (st["armed"], st["taken"], st["examined"]) == (False, 2, 4)                       # проход не встал на заблокированных и дошёл до конца
+        assert sorted(w.tasks_calls) == [DEAL, DEAL + 1, DEAL + 2, DEAL + 3]                     # один живой запрос на сделку
+        for deal in (DEAL, DEAL + 1):
+            row = last_row(deal)
+            assert row["outcome"] == "blocked_by_task" and abs(row["retry_at"] - (env.t + 6 * HOUR)) < 1 and store.get_owner(deal) is None
+        assert store.get_owner(DEAL + 2)["owner"] == "ai" and store.get_owner(DEAL + 3)["owner"] == "ai"
+        assert env.tasks_open == [] and w.amo.patches == [(DEAL + 2, 11513202), (DEAL + 3, 11513202)]
+        assert DEAL in w.requests[-1]["body"]["exclude"] and DEAL + 1 in w.requests[-1]["body"]["exclude"]    # отложенные не возвращаются в порциях
+    run(go())
+
+
+def test_a_deal_with_a_task_comes_back_to_the_ordinary_sweep_after_six_hours(env, w):
+    async def go():
+        setup(env, armed=True)
+        w.deal()
+        w.tasks[DEAL] = [{"id": 1, "responsible_user_id": OLD_MANAGER}]
+        await S.run_once(E)
+        assert S.pass_state()["armed"] is False and store.get_owner(DEAL) is None
+        w.tasks[DEAL] = []                                                                      # задачу закрыли
+        env.t += 6 * HOUR + 1
+        out = await S.run_once(E)
+        assert not out.get("first_pass") and out["outcomes"] == {"given": 1}
+    run(go())
+
+
+def test_amo_silence_about_tasks_is_one_failure_in_the_pass_and_does_not_stop_it(env, w):
+    async def go():
+        setup(env, armed=True, pipelines_any=True)
+        allow_other(env)
+        w.deal(DEAL, pipeline=PIPE_OTHER)
+        w.deal(DEAL + 1, pipeline=PIPE_RETAIL)
+        w.deal(DEAL + 2, pipeline=PIPE_OTHER)
+        w.tasks[DEAL] = None                                                                    # одна неудача подряд: пауза не нужна
+        out = await S.run_once(E)
+        assert out["outcomes"] == {"amo_unavailable": 1, "given": 2} and S.pass_state()["armed"] is False
+        row = last_row(DEAL)
+        assert row["outcome"] == "amo_unavailable" and abs(row["retry_at"] - (env.t + 15 * 60)) < 1 and store.get_owner(DEAL) is None
+    run(go())
+
+
+def test_two_amo_silences_about_tasks_in_a_row_pause_the_pass_in_the_other_pool_too(env, w):
+    async def go():
+        setup(env, armed=True, pipelines_any=True)
+        allow_other(env)
+        for i in range(4):
+            w.deal(DEAL + i, pipeline=PIPE_OTHER)
+            w.tasks[DEAL + i] = None
+        out = await S.run_once(E)
+        assert out["outcomes"] == {"amo_unavailable": 2} and "приостановлен на 15 мин" in out["skipped"]
+        assert S.pass_state()["active"] is True and S._next_run_at >= env.t + S.RETRY_ERROR_S
     run(go())

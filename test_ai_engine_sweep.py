@@ -500,10 +500,11 @@ def test_work_with_the_base_deals_are_pool_two_answer_only_and_keep_the_initiati
         w.deal(DEAL, pipeline=PIPE_DB, waiting=True, client_ago=HOUR)                           # старая сделка «Работы с базой», клиент ждёт ответа
         w.deal(DEAL + 1, pipeline=PIPE_DB, waiting=False, out_ago=20 * HOUR)                   # молчащий клиент: в пуле «остальные» только ответ
         w.deal(DEAL + 2, pipeline=PIPE_DB, waiting=True, client_ago=5 * 86400)                 # написал давно: за пределами `other_days`
-        w.tasks[DEAL] = w.tasks[DEAL + 1] = w.tasks[DEAL + 2] = [{"id": 1, "responsible_user_id": OLD_MANAGER}]
+        w.tasks[DEAL] = [{"id": 1, "responsible_user_id": AI_USER["id"]}]                       # задача только на пользователе ИИ не мешает
+        w.tasks[DEAL + 1] = w.tasks[DEAL + 2] = [{"id": 2, "responsible_user_id": OLD_MANAGER}]
         out = await S.run_once(E)
         assert w.requests[-1]["body"]["other_pipelines"] == sorted([PIPE_OTHER, PIPE_DB]) and PIPE_DB not in w.requests[-1]["body"]["retail_pipelines"]
-        assert out["outcomes"] == {"given": 1, "refused": 2} and w.tasks_calls == []            # задачи в этом пуле не смотрим
+        assert out["outcomes"] == {"given": 1, "refused": 2} and w.tasks_calls == [DEAL]         # живой запрос задач один и только там, где сделка дошла до сети
         assert store.get_owner(DEAL)["owner"] == "ai" and store.get_owner(DEAL + 1) is None and store.get_owner(DEAL + 2) is None
         assert "только ответ" in last_row(DEAL + 1)["note"] and "старше 3 сут." in last_row(DEAL + 2)["note"]
         # Взятая сделка живёт по правилам воронки с инициативой: как у розницы.
@@ -737,14 +738,79 @@ def test_two_amo_failures_in_a_row_stop_the_run(env, w):
     run(go())
 
 
-def test_other_pool_does_not_look_at_tasks(env, w):
+def other_world(env, w):
+    """Пул «остальные»: `pipelines_any` разрешён, на воронку есть промпт."""
+    setup(env, pipelines_any=True)
+    allow_other(env)
+
+
+def test_the_other_pool_looks_at_tasks_too_and_a_manager_task_blocks_the_deal(env, w):
     async def go():
-        setup(env, pipelines_any=True)
-        allow_other(env)
+        other_world(env, w)
         w.deal(pipeline=PIPE_OTHER)
-        w.tasks[DEAL] = [{"id": 1, "responsible_user_id": OLD_MANAGER}]
+        w.tasks[DEAL] = [{"id": 1, "responsible_user_id": OLD_MANAGER, "text": "позвонить клиенту"}]
         out = await S.run_once(E)
-        assert out["outcomes"] == {"given": 1} and w.tasks_calls == []
+        row = last_row()
+        assert out["outcomes"] == {"blocked_by_task": 1} and store.get_owner(DEAL) is None and w.tasks_calls == [DEAL]     # один живой запрос
+        assert abs(row["retry_at"] - (env.t + 6 * HOUR)) < 1 and "задач" in row["note"]
+        assert w.amo.patches == [] and env.turn_requests == [] and env.notes == [] and env.alerts == []
+        assert DEAL in S.excluded_ids(env.t + 5 * HOUR) and DEAL not in S.excluded_ids(env.t + 6 * HOUR + 1)
+        await S.run_once(E)
+        assert w.tasks_calls == [DEAL]                                                          # до конца срока сделку не просим и задачи не читаем
+    run(go())
+
+
+def test_the_other_pool_takes_a_deal_without_tasks_with_one_live_request(env, w):
+    async def go():
+        other_world(env, w)
+        w.deal(pipeline=PIPE_OTHER)
+        out = await S.run_once(E)
+        assert out["outcomes"] == {"given": 1} and store.get_owner(DEAL)["owner"] == "ai" and w.tasks_calls == [DEAL]
+    run(go())
+
+
+def test_the_other_pool_ignores_a_task_that_belongs_to_the_ai_user(env, w):
+    async def go():
+        other_world(env, w)
+        w.deal(pipeline=PIPE_OTHER)
+        w.tasks[DEAL] = [{"id": 5, "responsible_user_id": AI_USER["id"], "text": "задача ИИ"}]
+        out = await S.run_once(E)
+        assert out["outcomes"] == {"given": 1} and store.get_owner(DEAL)["owner"] == "ai"
+    run(go())
+
+
+def test_the_other_pool_does_not_read_amo_silence_as_no_tasks(env, w):
+    async def go():
+        other_world(env, w)
+        w.deal(pipeline=PIPE_OTHER)
+        w.tasks[DEAL] = None                                                                    # amo не ответила по задачам
+        out = await S.run_once(E)
+        row = last_row()
+        assert out["outcomes"] == {"amo_unavailable": 1} and store.get_owner(DEAL) is None
+        assert abs(row["retry_at"] - (env.t + 15 * 60)) < 1
+        assert DEAL in S.excluded_ids(env.t + 10 * 60) and DEAL not in S.excluded_ids(env.t + 16 * 60)
+        w.tasks[DEAL] = []                                                                      # amo ожила: через 15 минут сделку берут
+        env.t += 16 * 60
+        assert (await S.run_once(E))["outcomes"] == {"given": 1}
+    run(go())
+
+
+def test_both_pools_use_the_same_task_rule_in_one_run(env, w):
+    async def go():
+        other_world(env, w)
+        w.deal(DEAL, pipeline=PIPE_RETAIL)
+        w.deal(DEAL + 1, pipeline=PIPE_OTHER)
+        w.deal(DEAL + 2, pipeline=PIPE_RETAIL)
+        w.deal(DEAL + 3, pipeline=PIPE_OTHER)
+        w.tasks[DEAL] = w.tasks[DEAL + 1] = [{"id": 1, "responsible_user_id": OLD_MANAGER}]
+        w.tasks[DEAL + 2] = [{"id": 2, "responsible_user_id": AI_USER["id"]}]
+        env.mp.setattr(S, "MAX_PER_RUN", 4)
+        out = await S.run_once(E)
+        assert out["outcomes"] == {"blocked_by_task": 2, "given": 2}
+        assert sorted(w.tasks_calls) == [DEAL, DEAL + 1, DEAL + 2, DEAL + 3]                    # по одному запросу на сделку, не два
+        assert store.get_owner(DEAL) is None and store.get_owner(DEAL + 1) is None
+        assert store.get_owner(DEAL + 2)["owner"] == "ai" and store.get_owner(DEAL + 3)["owner"] == "ai"
+        assert env.tasks_open == []                                                             # задачи amo не создаём и не закрываем
     run(go())
 
 
