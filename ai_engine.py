@@ -38,6 +38,11 @@
 ⚠️ Подбор существующих сделок (решение Кати 23.11.2026, `ai_engine_sweep`): раз в 5 минут из `tick_once` (не отдельный цикл, `loops_alive` по-прежнему пять) фоновый прогон берёт по одной-две
 сделки из списка панели теми же правилами, что при сообщении клиента, и отдаёт их ИИ событием `deal_given` через общую с `give_deal` часть `_hand_over`. Отметки людей по сделке
 (`ai_engine_marks`, `mark_deal`): «не требует ответа» снимает ждущий ход и выводит сделку из подбора, «удалить» навсегда освобождает её от ИИ без алертов и задач; «Дать сделку ИИ» снимает обе.
+
+⚠️ Открытая задача сотрудника и окно пропуска на пути по сообщению клиента (решение Кати 24.11.2026): ПЕРВОЕ взятие «существующей» сделки (`decision.existing`) блокирует любая открытая
+задача amo на любого сотрудника, кроме пользователя ИИ (`_task_guard` в `_gate_take`; новые лиды, ведомые сделки, `give_deal`, перехват и подбор правилом не затронуты; рубильник
+`AI_TASK_GUARD_DISABLED=1`). Отказ закрывает чат в `skip` до `retry_at`/`SKIP_TTL_S`, и сообщения клиента в окне больше не теряются: `_save_in_skip_window` кладёт их во входящие,
+`store.due_sessions` возвращает чат в конце окна, `_process_collecting` разбирает его заново (один раз на окно, при новом отказе входящие сбрасываются и окно открывается снова).
 """
 import asyncio
 import datetime
@@ -434,6 +439,8 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
                 return
         elif s["state"] == store.S_SKIP:
             if s["skip_until"] and s["skip_until"] > now:
+                # Окно пропуска: сообщение больше не теряется. Сохраняем во входящие, чат пересматривается один раз в конце окна (`_process_collecting`, `store.due_sessions`).
+                await _save_in_skip_window(chat_key, chat_id, phone, message_id, mtype, text, caption, is_attachment, is_media, m, now)
                 return
             s = None
     if s is not None and s["deal_id"] is not None:
@@ -458,12 +465,15 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
         return                                          # повтор вебхука
 
     if s is None:
+        # Окно пропуска кончилось, а таймер ещё не вернул чат в разбор: сообщения клиента, сохранённые в окне (`_save_in_skip_window`), уже лежат во входящих и пойдут в эту же пачку.
+        # Вложение без текста (геометка, контакт) среди них не должно потерять пометку «медиа»: `put_session` ниже сбрасывает её.
+        carried_media = any(r["msg_type"] != "text" and r["msg_type"] not in ATTACHMENT_TYPES for r in await _db(store.pending_inbox, chat_key))
         s = await _db(
             store.put_session, chat_key, channel_id=channel_id, chat_id=chat_id,
             chat_type=str(m.get("chatType") or ""), phone=phone, contact_name=str((contact or {}).get("name") or ""),
             state=store.S_COLLECTING, deal_id=None, batch_start=now, first_batch=1, last_client_at=now,
             next_at=now + timers["first_reply_wait_s"], resolve_deadline=now + timers["deal_resolve_timeout_s"],
-            has_media=0, last_message_id=message_id,
+            has_media=1 if carried_media else 0, last_message_id=message_id,
         )
     else:
         fields: dict[str, Any] = {"last_client_at": now, "last_message_id": message_id}
@@ -487,6 +497,26 @@ async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> 
             first=bool(s["first_batch"]), batch_start=s["batch_start"], last=now, timers=timers,
         )
         await _db(store.put_session, chat_key, next_at=next_at if not s["has_media"] else now)
+
+
+async def _save_in_skip_window(chat_key: str, chat_id: str, phone: str, message_id: str, mtype: str, text: str, caption: str,
+                               is_attachment: bool, is_media: bool, m: dict, now: float) -> None:
+    """Сообщение клиента в окне пропуска (`S_SKIP`, `skip_until` в будущем: отказ по фильтрам, бюджету, задаче сотрудника, тишине менеджера, ИИ-сервис не отвечал и т.п.). Раньше `_on_inbound` выходил ДО
+    `add_inbox`, и сообщение пропадало насовсем. Теперь после тех же дешёвых проверок, что у новой сессии (контакт в списке режима, не авто-режим), оно кладётся во входящие (повтор вебхука по `messageId`
+    отсекается как всегда), а чат остаётся в `S_SKIP` до конца окна: `store.due_sessions` вернёт его по `skip_until`, `_process_collecting` переведёт в разбор, и сделка пройдёт ВСЕ проверки заново, ровно
+    один раз на окно. Снова отказ: входящие сбрасываются, новое окно (`_apply_resolution`). Вложение без текста (геометка, контакт) помечает чат `has_media`, как у любого первого сообщения."""
+    if not settings.phone_may_match(phone, chat_id):
+        return
+    if _autopilot_busy(chat_id, phone):
+        return
+    seq = await _db(store.add_inbox, message_id, chat_key, caption if is_attachment else ("" if is_media else text),
+                    mtype if (is_media or is_attachment) else "text", _sent_at(m, now), now)
+    if seq is None:
+        return                                          # повтор вебхука
+    fields: dict[str, Any] = {"last_client_at": now, "last_message_id": message_id}
+    if is_media:
+        fields["has_media"] = 1
+    await _db(store.put_session, chat_key, **fields)
 
 
 def _sent_at(m: dict, fallback_ts: float) -> str:
@@ -575,6 +605,17 @@ async def _process_collecting(s: dict) -> None:
         async with _get_lock():
             await _db(store.drop_session, chat_key)
         return
+    if s["state"] == store.S_SKIP:
+        # Окно пропуска кончилось, а во входящих лежат сообщения клиента, пришедшие в окне (`_save_in_skip_window`): чат возвращается в разбор, один раз на окно.
+        # Клиент пишет прямо сейчас: ждём тишину `debounce_s`, первого ожидания нет (сообщения уже ждали окно).
+        now = _now()
+        timers = settings.timers()
+        due = max(now, float(s["last_client_at"] or 0) + timers["debounce_s"])
+        s = await _db(store.put_session, chat_key, state=store.S_COLLECTING, batch_start=now, first_batch=0, next_at=due, skip_until=None,
+                      resolve_deadline=now + timers["deal_resolve_timeout_s"])
+        logger.info("ai_engine: окно пропуска чата %s кончилось, сообщения клиента, пришедшие в окне, разбираются заново", chat_key)
+        if due > now:
+            return
     owner = await _db(store.get_owner, s["deal_id"]) if s["deal_id"] is not None else None
     if modes.is_stale(owner, mode_id):
         # Сделку ведёт ИИ, взявший её в другом режиме: снимаем и в amo за решением не ходим.
@@ -597,10 +638,27 @@ async def _process_collecting(s: dict) -> None:
         await _apply_resolution(fresh, res, mode, mode_id)
 
 
-async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str) -> dedup.Resolution:
+async def _task_guard(deal: dict) -> tuple[str, float] | None:
+    """Правило «на сделке открыта задача сотрудника» для пути по сообщению клиента (решение Кати 24.11.2026): (причина отказа, когда пересмотреть) или None, если можно. Один живой запрос
+    открытых задач сделки (`ai_engine_tasks._get_open`), та же семантика, что у подбора: любая открытая задача на любого сотрудника, кроме пользователя ИИ (`filters.ai_user()`), блокирует
+    (`TASK_RETRY_S`, час). amo не ответила (None): «задачи не проверить», пересмотр через `TASK_UNCHECKED_RETRY_S`, это НЕ «задач нет»."""
+    now = _now()
+    tasks = await ai_engine_tasks._get_open(int(deal["id"]))
+    if tasks is None:
+        return "задачи не проверить (amo не ответила)", now + cfg.TASK_UNCHECKED_RETRY_S
+    user = filters.ai_user() or filters.DEFAULT_AI_USER
+    if ai_engine_tasks.foreign_open_tasks(tasks, int(user["id"])):
+        return "на сделке открыта задача сотрудника", now + cfg.TASK_RETRY_S
+    return None
+
+
+async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str, *, tasks_checked: bool = False) -> dedup.Resolution:
     """Решение «ИИ берёт эту сделку в первый раз» (`ai_engine_filters.decide_take`): фильтры, бюджет, товары (МойСклад), «существующие сделки»,
-    «менеджер активен», назначение ответственного. Сеть здесь, вне общего замка. Сделке, у которой в базе движка уже есть владелец (человек,
-    движок, ИИ), решение не нужно: его принимали раньше. Отказ это `refused` (сделка не взята, чат пропускается), сбой проверки тоже отказ."""
+    «менеджер активен», открытая задача сотрудника, назначение ответственного. Сеть здесь, вне общего замка. Сделке, у которой в базе движка уже есть владелец (человек,
+    движок, ИИ), решение не нужно: его принимали раньше. Отказ это `refused` (сделка не взята, чат пропускается), сбой проверки тоже отказ.
+    Открытая задача сотрудника (`_task_guard`) блокирует только ПЕРВОЕ взятие «существующей» сделки (`decision.existing`: создана до границы `existing.since`, режим «Полный»): на новые лиды
+    автоматика ставит задачу приёма, которую ИИ сам закрывает при первом входе (`release_intake`), с правилом он бы не отвечал на свежие лиды. Рубильник `AI_TASK_GUARD_DISABLED=1`.
+    `tasks_checked=True`: задачи уже смотрели (подбор `ai_engine_sweep` проверяет их сам, второго запроса на сделку нет)."""
     deal = res.deal
     if await _db(store.get_owner, int(deal["id"])) is not None:
         return res
@@ -614,6 +672,16 @@ async def _gate_take(s: dict, res: dedup.Resolution, mode_id: str) -> dedup.Reso
         return dedup.Resolution(dedup.K_REFUSED, deal=deal, note="сбой проверки фильтров")
     if not decision.allow:
         return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=decision.reason, retry_at=decision.retry_at)
+    if decision.existing and not tasks_checked and not cfg.TASK_GUARD_DISABLED:
+        try:
+            blocked = await _task_guard(deal)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("ai_engine: сбой проверки задач сделки %s, сделку не беру", deal.get("id"))
+            blocked = ("задачи не проверить (сбой проверки)", _now() + cfg.TASK_UNCHECKED_RETRY_S)
+        if blocked is not None:
+            return dedup.Resolution(dedup.K_REFUSED, deal=deal, note=blocked[0], retry_at=blocked[1])
     if decision.propose:
         # Смену ответственного нужно подтвердить человеку: открытое предложение по сделке уже ждёт решения либо недавно отклонено: не создаём второе
         why = await _db(approval.block_reason, int(deal["id"]), _now())
@@ -2141,6 +2209,7 @@ def status() -> dict[str, Any]:
         settings_age_s=settings.age_s(),
         ai_up=_ai_ok_at is not None and (_now() - _ai_ok_at) <= max(3 * cfg.HEALTH_POLL_S, 45),
         loops_alive=sum(1 for t in _tasks if not t.done()),
+        task_guard={"enabled": not cfg.TASK_GUARD_DISABLED, "retry_s": cfg.TASK_RETRY_S},      # правило «открытая задача сотрудника» на пути по сообщению клиента (`_gate_take`)
     )
     try:
         out["counts"] = store.counts()

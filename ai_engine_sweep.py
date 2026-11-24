@@ -88,6 +88,7 @@ import ai_engine_marks as marks
 import ai_engine_prompts as prompts
 import ai_engine_settings as settings
 import ai_engine_store as store
+import ai_engine_tasks
 
 logger = logging.getLogger("uvicorn")
 
@@ -548,7 +549,7 @@ def _tasks_verdict(tasks: list[dict] | None, ai_user_id: int, now: float) -> Res
     """Живой запрос открытых задач сделки (оба пула, первый проход): открытая задача на сотрудника, кроме пользователя ИИ, не пускает. None: можно."""
     if tasks is None:
         return AMO_UNAVAILABLE, "amoCRM не ответила по задачам сделки", now + RETRY_ERROR_S
-    foreign = [t for t in tasks if isinstance(t, dict) and _pos_int(t.get("responsible_user_id")) != int(ai_user_id)]
+    foreign = ai_engine_tasks.foreign_open_tasks(tasks, ai_user_id)
     if foreign:
         return BLOCKED_BY_TASK, f"открытых задач на сотрудников: {len(foreign)}", now + RETRY_TASK_S
     return None
@@ -591,7 +592,7 @@ async def _take(eng, cand: dict[str, Any], pool: str, ai_user_id: int, quiet: bo
         return verdict
     s = {"chat_key": chat_key, "chat_id": cand["chat_id"], "chat_type": cand["chat_type"], "channel_id": cand["channel_id"],
          "phone": cand["phone"], "contact_name": cand["contact_name"]}
-    res = await eng._gate_take(s, res, mode_id)                  # товары (МойСклад), тишина менеджера, смена ответственного, открытое предложение
+    res = await eng._gate_take(s, res, mode_id, tasks_checked=True)       # товары (МойСклад), тишина менеджера, смена ответственного, открытое предложение; задачи уже смотрели выше (один запрос на сделку)
     verdict = _classify(res, deal_id, eng._now())
     if verdict is not None:
         return verdict

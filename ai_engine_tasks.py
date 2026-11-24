@@ -44,6 +44,22 @@ async def _get_open(deal_id: int) -> list[dict] | None:
     return ((data.get("_embedded") or {}).get("tasks")) or []
 
 
+def foreign_open_tasks(tasks: list[dict[str, Any]] | None, ai_user_id: int) -> list[dict[str, Any]]:
+    """Открытые задачи на любого сотрудника, кроме пользователя ИИ (`filters.ai_user()`): они блокируют взятие сделки (подбор `ai_engine_sweep` и первое взятие по сообщению клиента
+    `ai_engine._gate_take`, решение Кати 24.11.2026). `tasks` это ответ `_get_open` (уже только открытые). Задача без ответственного считается чужой. None (amo не ответила) сюда не передаётся."""
+    out = []
+    for task in tasks or []:
+        if not isinstance(task, dict):
+            continue
+        try:
+            responsible = int(task.get("responsible_user_id") or 0)
+        except (TypeError, ValueError):
+            responsible = 0
+        if responsible != int(ai_user_id):
+            out.append(task)
+    return out
+
+
 async def _responsible(deal_id: int) -> int | None:
     lead = await amo_service.get_lead_full(deal_id, with_=())
     uid = (lead or {}).get("responsible_user_id")
