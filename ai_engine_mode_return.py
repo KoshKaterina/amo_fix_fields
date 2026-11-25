@@ -11,7 +11,8 @@
      Чужой режим не помечается: сделка ждёт, пока вернут её режим (или пока не пройдут трое суток);
   2. снята не раньше чем `filters.MANAGER_OUT_KEEP_S` назад (3 суток: таблица `manager_out` старше не хранит) и тогда, когда движок уже непрерывно запоминал сообщения менеджеров (`beat`, `watch_from`):
      до этой версии вебхук при «Выключено» отбрасывался целиком, и доказать, что менеджер не отвечал, по таким сделкам нечем. То же после простоя дольше `GAP_S` (откат на прежний код, выключенный движок);
-  3. после снятия человек клиенту не писал: `filters.manager_last_out` по всем чатам этой сделки и по тому же клиенту на остальных слушаемых каналах не позже снятия. Канал чата должен слушаться;
+  3. после снятия человек клиенту не писал: `filters.manager_last_out` по всем чатам этой сделки и по тому же клиенту на остальных слушаемых каналах не позже снятия. Канал чата должен слушаться.
+     И не звонил: по контактам сделки нет исходящего или отвеченного входящего звонка с момента снятия (`ai_engine_calls.had_call`, запас `CHECK_SLACK_S`; amo молчит: повторить позже; `AI_CALLS_TAKEOVER=0`: не проверяется);
   4. сделка в amo открыта, воронка разрешена режимом и с промптом (`settings.pipeline_allowed`), на ней нет открытой задачи сотрудника, кроме пользователя ИИ (та же семантика, что у `ai_engine._task_guard`),
      нет отметок людей (`ai_engine_marks`) и паузы «стоп» (`ai_engine_pause`), чат не ведёт авто-режим; выбор сделки по чату (`dedup.resolve`, как на первом ходе после возврата) даёт именно её, иначе
      возврат кончился бы передачей людям с алертом и задачей (правила A, C, D);
@@ -32,6 +33,7 @@ import logging
 from typing import Any
 
 import ai_engine_approval as approval
+import ai_engine_calls as calls
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
 import ai_engine_filters as filters
@@ -309,6 +311,15 @@ async def _remote(eng, row: dict[str, Any]) -> tuple[Verdict | None, int]:
     user = filters.ai_user() or filters.DEFAULT_AI_USER
     if ai_engine_tasks.foreign_open_tasks(tasks, int(user["id"])):
         return (KEEP, "на сделке открыта задача сотрудника"), 0
+
+    # Звонки клиенту, пока ИИ был выключен: те же правила, что у опроса звонков (`ai_engine_calls`).
+    if calls.enabled():
+        contacts = set(dedup.contact_ids_of(lead)) | calls.contact_ids_of_row(row)
+        called = await calls.had_call(contacts, (_since_ts(row) or 0.0) - calls.CHECK_SLACK_S)
+        if called is None:
+            return (FAILED, "amoCRM не ответила по звонкам клиента"), 0
+        if called:
+            return (KEEP, "после снятия был звонок менеджера или разговор с клиентом"), 0
 
     # Тот же выбор сделки, что сделает первый ход после возврата (`ai_engine._process_collecting`): иначе возврат кончился бы алертом правил A, C, D и задачей.
     chat_id, phone = await eng._db(_chat_of, row)

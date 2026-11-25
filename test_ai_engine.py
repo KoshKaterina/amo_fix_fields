@@ -74,6 +74,8 @@ class Env:
         mp.setattr(cfg, "PANEL_TOKEN", "")                   # события в панель (ai_engine_events) не уходят; их проверяет test_ai_engine_events.py
         mp.setattr(cfg, "PAUSE_NOTES_ENABLED", False)        # «стоп»/«старт» и закреплённые заметки (ai_engine_pause) проверяет test_ai_engine_pause.py
         E.pause.reset_for_tests()
+        mp.setattr(cfg, "CALLS_TAKEOVER_ENABLED", False)     # опрос звонков (ai_engine_calls) проверяет test_ai_engine_calls.py
+        E.calls.reset_for_tests()
         E.mode_return.reset_for_tests()                      # возврат после выключения режима (ai_engine_mode_return) проверяет test_ai_engine_mode_return.py
         store.init()
         self.set_settings()

@@ -204,6 +204,14 @@ def manager_replied_after(deal_id: int) -> bool:
     return bool(row and row["manager_out_at"] is not None and row["manager_out_at"] > row["cutoff_at"])
 
 
+def rearm(deal_id: int, now: float) -> None:
+    """Человек вернул сделку ИИ примечанием «старт»: прежние сообщения менеджера ИИ больше не останавливают. Без этого `permit` отказывал бы вечно, а ход уходил бы со старой отсечкой.
+    Взятая насовсем сделка получает новую отсечку; строка «ответа вместо менеджера» убирается: дальше это обычная сделка ИИ, и уборка не должна удалить её владельца."""
+    with _Db() as conn:
+        conn.execute("DELETE FROM intercept_taken WHERE deal_id=? AND kind='reply'", (int(deal_id),))
+        conn.execute("UPDATE intercept_taken SET cutoff_at=?, manager_out_at=NULL WHERE deal_id=?", (float(now), int(deal_id)))
+
+
 def has_wait(chat_key: str) -> bool:
     with _Db() as conn:
         return conn.execute("SELECT 1 FROM intercept_wait WHERE chat_key=?", (chat_key,)).fetchone() is not None

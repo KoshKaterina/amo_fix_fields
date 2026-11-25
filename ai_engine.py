@@ -46,7 +46,10 @@
 разбирает его заново ровно один раз (пометка `NOTE_REVIEW`): повторный отказ сбрасывает всё и открывает новое окно, дальше страхует подбор.
 
 ⚠️ Возврат после «Выключено» (решение Кати 25.11.2026, `ai_engine_mode_return`): сделки, снятые `_sweep_if_off` (`reason = mode_off`), движок сам возвращает ИИ, когда режим снова включён, тем же телом, что `return_dialog`,
-если менеджер за это время клиенту не писал и нет задач, отметок и паузы. Поэтому при «Выключено» вебхук не отбрасывается целиком: сообщения ЛЮДЕЙ клиенту запоминаются (`on_wazzup`, `_handle_off_payload`).
+если менеджер за это время клиенту не писал, не звонил и нет задач, отметок и паузы. Поэтому при «Выключено» вебхук не отбрасывается целиком: сообщения ЛЮДЕЙ клиенту запоминаются (`on_wazzup`, `_handle_off_payload`).
+
+⚠️ Звонок менеджера это такое же вмешательство, как сообщение (просьба Кати 25.11.2026, `ai_engine_calls`): раз в 20 с из `tick_once` читаются примечания звонков контактов, исходящий или отвеченный входящий после
+взятия сделки отдаёт её человеку (`manager_call`). Снятие из-за сообщения или звонка оставляет в сделке примечание «ИИ-менеджер приостановил ведение сделки, причина: ...» (`_to_human`, только если ИИ её вёл).
 """
 import asyncio
 import datetime
@@ -59,6 +62,7 @@ import time
 from typing import Any
 
 import ai_engine_approval as approval
+import ai_engine_calls as calls
 import ai_engine_client as client
 import ai_engine_config as cfg
 import ai_engine_dedup as dedup
@@ -644,6 +648,7 @@ async def tick_once() -> None:
         await _db(store.prune, cfg.RETENTION_DAYS * 86400)
     await sweep.tick(sys.modules[__name__], now)         # подбор существующих сделок: раз в 5 минут, прогон фоновой задачей, не отдельный цикл (`ai_engine_sweep`)
     await pause.tick(sys.modules[__name__], now)         # «стоп»/«старт» примечанием и заметка «ИИ ведёт сделку»: опрос фоновой задачей раз в 15 с (`ai_engine_pause`)
+    await calls.tick(sys.modules[__name__], now)         # звонок менеджера снимает ИИ, примечания о снятии: фоновыми задачами, не отдельный цикл (`ai_engine_calls`)
     await mode_return.tick(sys.modules[__name__], now)   # возврат ИИ сделок, снятых выключением режима: проход фоновой задачей раз в минуту (`ai_engine_mode_return`)
 
 
@@ -1583,20 +1588,37 @@ async def _on_turn_failed(turn: dict, why: str) -> None:
 # передача человеку
 # =============================================================================================
 
+async def _takeover_note(deal_id: int, kind: str) -> None:
+    """Примечание «ИИ-менеджер приостановил ведение сделки» (`ai_engine_calls`): в очередь и фоном в amo, общий замок сеть не держит. Сбой не мешает снятию. Не бросает."""
+    try:
+        await _db(calls.queue_note, deal_id, kind, _now())
+    except Exception:  # noqa: BLE001
+        logger.exception("ai_engine: примечание о снятии сделки %s не поставлено в очередь", deal_id)
+        return
+    _spawn(calls.flush_notes(sys.modules[__name__]))
+
+
 async def _to_human(
-    s: dict | None, reason: str, *, alert: list[str] | None, deal_id: int | None = None, cancel: bool = True,
+    s: dict | None, reason: str, *, alert: list[str] | None, deal_id: int | None = None, cancel: bool = True, note: str | None = None,
 ) -> None:
-    """`owner = human`, `epoch + 1`, ход снят, сообщения чата не нужны, сервису best-effort отмена."""
+    """`owner = human`, `epoch + 1`, ход снят, сообщения чата не нужны, сервису best-effort отмена.
+
+    `note`: вид примечания о снятии из-за человека (`ai_engine_calls.NOTE_*`, его называет опрос звонков); у `manager_message` оно есть всегда. Пишется, только если ИИ действительно вёл сделку:
+    повторный вебхук видит уже человека, второго примечания нет."""
+    note = note or (calls.NOTE_MESSAGE if reason == "manager_message" else None)
     if deal_id is None and s is not None:
         deal_id = s["deal_id"]
     await _followup_cancel(chat_key=s["chat_key"] if s is not None else None, deal_id=deal_id, reason="handed_to_human")
     if deal_id is not None:
         await _db(silence.clear, int(deal_id))
         owner = await _db(store.get_owner, int(deal_id))
+        ai_led = owner is not None and owner["owner"] == store.OWNER_AI and not owner["closed"]
         if owner is not None and owner["owner"] != store.OWNER_HUMAN:
             await _db(store.set_owner, int(deal_id), store.OWNER_HUMAN, reason=reason)
         elif owner is None and s is not None:
             await _db(store.set_owner, int(deal_id), store.OWNER_HUMAN, reason=reason, chat=_chat_dict(s))
+        if ai_led and note:
+            await _takeover_note(int(deal_id), note)
         if cancel:
             for t in await _db(store.cancel_active_turns, int(deal_id)):
                 _spawn(client.post_cancel(int(t["turn_id"])))
@@ -2011,6 +2033,7 @@ async def manager_start(deal_id: int) -> dict[str, Any]:
         if settings.effective_mode() != "off":
             forced = bool(await _db(give.is_forced, deal_id, mode_id))
             await _db(give.mark, deal_id, _now(), forced, mode_id)      # отсечка: сообщения менеджера до «старт» ИИ не останавливают
+            await _db(intercept.rearm, deal_id, _now())                 # то же для перехваченной сделки: у неё своя отсечка, она главнее
     code, body = await return_dialog(deal_id)
     if code == 200:
         logger.info("ai_engine: сделка %s: «старт» примечанием, ИИ снова ведёт (эпоха %s)", deal_id, body.get("epoch"))
@@ -2398,4 +2421,8 @@ def status() -> dict[str, Any]:
         out["mode_return"] = mode_return.status_block(_now())         # возврат ИИ сделок, снятых выключением режима (`ai_engine_mode_return`)
     except Exception:  # noqa: BLE001
         out["mode_return"] = "ошибка чтения базы"
+    try:
+        out["calls"] = calls.status_block(_now())                     # звонок менеджера как вмешательство и примечания о снятии (`ai_engine_calls`)
+    except Exception:  # noqa: BLE001
+        out["calls"] = "ошибка чтения базы"
     return out

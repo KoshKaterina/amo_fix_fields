@@ -318,6 +318,13 @@ def replace_reason(deal_id: int, reason: str, *, only_from: tuple[str, ...]) -> 
                             (reason, int(deal_id), OWNER_HUMAN, *only_from)).rowcount > 0
 
 
+def set_contact_ids(deal_id: int, contact_ids: list[int]) -> None:
+    """Дописать контакты сделки в запись владельца, где их нет (`ai_engine_calls`: по ним звонок находит сделку). Владельца, эпоху и `since` не трогает, имеющиеся не меняет."""
+    with _connect() as conn:
+        conn.execute("UPDATE deal_owner SET contact_ids=? WHERE deal_id=? AND contact_ids IN ('', '[]')",
+                     (json.dumps([int(c) for c in contact_ids]), int(deal_id)))
+
+
 def set_pipeline(deal_id: int, pipeline_id: int) -> None:
     """Запомнить воронку, в которую перенесли сделку (событие сделки из amo). Владельца и эпоху не трогает."""
     with _connect() as conn:
