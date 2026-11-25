@@ -491,6 +491,11 @@ def _ai_owners() -> list[dict[str, Any]]:
                                               (store.OWNER_AI,)).fetchall()]
 
 
+def last_poll_at() -> float | None:
+    """Когда команды из примечаний последний раз прочитаны удачно (с последнего запуска процесса): возврат после выключения (`ai_engine_mode_return`) ждёт этого, чтобы не пройти мимо «стоп»."""
+    return _state["last_poll_at"]
+
+
 def status_block(now: float) -> dict[str, Any]:
     """Блок `pause` среза `GET /`: включено ли, сколько сделок на паузе, сколько заметок закреплено, события за сутки, последний опрос."""
     out: dict[str, Any] = {"enabled": enabled(), "poll_s": int(cfg.PAUSE_POLL_S)}

@@ -44,6 +44,9 @@
 `AI_TASK_GUARD_DISABLED=1`; явно разрешённые контакты правилом не останавливаются). Отказ закрывает чат в `skip` до `retry_at`/`SKIP_TTL_S`, и сообщения клиента не теряются: `_save_in_skip_window` кладёт
 пришедшие в окне во входящие, ВРЕМЕННЫЙ отказ (`dedup.Resolution.temporary`, `_close_window`) оставляет и само сообщение, `store.due_sessions` возвращает чат в конце окна, `_process_collecting`
 разбирает его заново ровно один раз (пометка `NOTE_REVIEW`): повторный отказ сбрасывает всё и открывает новое окно, дальше страхует подбор.
+
+⚠️ Возврат после «Выключено» (решение Кати 25.11.2026, `ai_engine_mode_return`): сделки, снятые `_sweep_if_off` (`reason = mode_off`), движок сам возвращает ИИ, когда режим снова включён, тем же телом, что `return_dialog`,
+если менеджер за это время клиенту не писал и нет задач, отметок и паузы. Поэтому при «Выключено» вебхук не отбрасывается целиком: сообщения ЛЮДЕЙ клиенту запоминаются (`on_wazzup`, `_handle_off_payload`).
 """
 import asyncio
 import datetime
@@ -65,6 +68,7 @@ import ai_engine_followup as followup
 import ai_engine_give as give
 import ai_engine_intercept as intercept
 import ai_engine_marks as marks
+import ai_engine_mode_return as mode_return
 import ai_engine_modes as modes
 import ai_engine_pause as pause
 import ai_engine_prompts as prompts
@@ -162,6 +166,7 @@ async def init() -> None:
         logger.info("ai_engine: ВЫКЛЮЧЕН (AI_ENGINE_ENABLED не 1) - ни цикла, ни базы, ни опроса панели")
         return
     await _db(store.init)
+    await _db(mode_return.beat, _now())        # с этого момента движок запоминает сообщения менеджеров (`ai_engine_mode_return`); до первого прохода таймеров
     ai_engine_return.install(return_dialog)
     settings.start()
     _queue = asyncio.Queue(maxsize=2000)
@@ -226,10 +231,17 @@ def on_wazzup(payload: Any) -> None:
         return
     if not isinstance(payload.get("messages"), list):
         return
+    kind = "wazzup"
     if settings.effective_mode() == "off":
-        return
+        # Режим выключен (или настройки протухли): переписку не разбираем, но сообщения ЛЮДЕЙ клиентам запоминаем. Без этого после включения не отличить сделку,
+        # где менеджер уже ответил, и `ai_engine_mode_return` вернул бы её ИИ поверх человека.
+        human = [m for m in payload["messages"]
+                 if isinstance(m, dict) and wazzup_sla._is_outbound(m) and not is_robot_author(m.get("authorName"))]
+        if not human:
+            return
+        kind, payload = "wazzup_off", {"messages": human}
     try:
-        _queue.put_nowait(("wazzup", payload))
+        _queue.put_nowait((kind, payload))
     except asyncio.QueueFull:
         logger.error("ai_engine: очередь приёма полна - тело вебхука отброшено")
 
@@ -302,6 +314,9 @@ async def _ingest_loop() -> None:
             if kind == "wazzup":
                 async with _get_lock():
                     await _handle_payload(item)
+            elif kind == "wazzup_off":
+                async with _get_lock():
+                    await _handle_off_payload(item)
             elif kind == "lead":
                 await _handle_lead_event(item)
         except asyncio.CancelledError:
@@ -402,16 +417,48 @@ async def _on_outbound(chat_key: str, m: dict) -> None:
     `Phone`) в чате, который мы ведём или ждём, забирает диалог."""
     if is_robot_author(m.get("authorName")):
         return
-    try:
-        await _db(filters.note_manager_out, chat_key, _now())      # «менеджер активен» для `existing.manager_quiet_min` (`ai_engine_filters`)
-    except Exception:  # noqa: BLE001 - учёт активности менеджера не должен мешать приёму сообщений
-        logger.exception("ai_engine: не записал время сообщения менеджера в чат %s", chat_key)
+    await _note_manager_out(chat_key)
     await _followup_cancel(chat_key=chat_key, reason="manager_wrote", notify=True)      # отложенное касание ИИ не уходит
     s = await _db(store.get_session, chat_key)
     if s is None or s["state"] in (store.S_HUMAN, store.S_SKIP, store.S_RELEASED):
         return
     logger.info("ai_engine: менеджер написал в чат %s - беру диалог у ИИ", chat_key)
     await _to_human(s, "manager_message", alert=None)
+
+
+async def _note_manager_out(chat_key: str) -> None:
+    """Время сообщения человека клиенту: «менеджер активен» для `existing.manager_quiet_min` (`ai_engine_filters`) и «менеджер писал после снятия» (`ai_engine_mode_return`). Не бросает."""
+    try:
+        await _db(filters.note_manager_out, chat_key, _now())
+    except Exception:  # noqa: BLE001 - учёт активности менеджера не должен мешать приёму сообщений
+        logger.exception("ai_engine: не записал время сообщения менеджера в чат %s", chat_key)
+
+
+async def _handle_off_payload(payload: dict) -> None:
+    """Сообщения людей клиентам, пришедшие при режиме «Выключено» (`on_wazzup` отобрал только их). Запоминаем время; сделка, которую ИИ ещё не отпустил (проход `_sweep_if_off`
+    идёт раз в 10 с, а при протухших настройках не раньше 45 минут), уходит менеджеру сразу: иначе она снялась бы с `mode_off` ПОЗЖЕ этого сообщения и вернулась бы ИИ."""
+    for m in payload.get("messages") or []:
+        try:
+            channel_id, chat_id = str(m.get("channelId") or ""), str(m.get("chatId") or "")
+            if not chat_id:
+                continue
+            chat_key = chat_key_of(channel_id, chat_id)
+            await _intercept_observe(m, channel_id, chat_id, chat_key)
+            if channel_id not in cfg.CHANNELS and not await _db(intercept.is_tracked, chat_key):
+                continue
+            await _note_manager_out(chat_key)
+            s = await _db(store.get_session, chat_key)
+            for row in await _db(store.list_owned, store.OWNER_AI):
+                deal_id = int(row["deal_id"])
+                if row["chat_key"] != chat_key and not (s is not None and s["deal_id"] == deal_id):
+                    continue
+                logger.info("ai_engine: менеджер написал в чат %s при выключенном ИИ - сделка %s уходит менеджеру", chat_key, deal_id)
+                mine = s if s is not None and s["deal_id"] == deal_id else await _db(store.session_for_deal, deal_id)
+                await _to_human(mine, "manager_message", deal_id=deal_id, alert=None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("ai_engine: не разобрал сообщение менеджера при выключенном ИИ")
 
 
 async def _on_inbound(chat_key: str, channel_id: str, chat_id: str, m: dict) -> None:
@@ -597,6 +644,7 @@ async def tick_once() -> None:
         await _db(store.prune, cfg.RETENTION_DAYS * 86400)
     await sweep.tick(sys.modules[__name__], now)         # подбор существующих сделок: раз в 5 минут, прогон фоновой задачей, не отдельный цикл (`ai_engine_sweep`)
     await pause.tick(sys.modules[__name__], now)         # «стоп»/«старт» примечанием и заметка «ИИ ведёт сделку»: опрос фоновой задачей раз в 15 с (`ai_engine_pause`)
+    await mode_return.tick(sys.modules[__name__], now)   # возврат ИИ сделок, снятых выключением режима: проход фоновой задачей раз в минуту (`ai_engine_mode_return`)
 
 
 async def _process_collecting(s: dict) -> None:
@@ -1261,8 +1309,11 @@ async def _sweep_if_off() -> None:
     if not owned:
         return
     for row in owned:
-        s = await _db(store.session_for_deal, int(row["deal_id"]))
-        await _to_human(s, "mode_off", alert=None, deal_id=int(row["deal_id"]))
+        deal_id = int(row["deal_id"])
+        s = await _db(store.session_for_deal, deal_id)
+        # `mode_off` значит «вернуть ИИ после включения» (`ai_engine_mode_return`). «Ответ вместо менеджера» всегда оставался у менеджера: такую не возвращаем.
+        reason = mode_return.KEPT if await _db(intercept.kind_of, deal_id) == intercept.KIND_REPLY else mode_return.REASON
+        await _to_human(s, reason, alert=None, deal_id=deal_id)
     if not _off_alerted:
         _off_alerted = True
         await _alert("mode_off", [
@@ -1707,24 +1758,29 @@ async def _rule_c_check(lead_id: int) -> None:
 async def return_dialog(deal_id: int) -> tuple[int, dict]:
     """Человек вернул диалог ИИ (`dialog_returned`): `owner = ai`, `epoch + 1`, ход-событие сразу."""
     async with _get_lock():
-        mode = settings.effective_mode()
-        if mode == "off":
-            return 409, {"detail": "mode_off"}
-        mode_id = settings.active_mode_id()
+        return await _return_dialog_locked(deal_id)
+
+
+async def _return_dialog_locked(deal_id: int) -> tuple[int, dict]:
+    """Тело `return_dialog`, зовётся под общим замком. Тем же путём идёт возврат после выключения режима (`ai_engine_mode_return`): его проверки и возврат под одним замком."""
+    mode = settings.effective_mode()
+    if mode == "off":
+        return 409, {"detail": "mode_off"}
+    mode_id = settings.active_mode_id()
+    owner = await _db(store.get_owner, deal_id)
+    if modes.is_stale(owner, mode_id):
+        await _release_for_mode(owner, mode_id)                  # ИИ ведёт сделку из другого режима: она уже не его, человек возвращает её заново
         owner = await _db(store.get_owner, deal_id)
-        if modes.is_stale(owner, mode_id):
-            await _release_for_mode(owner, mode_id)                  # ИИ ведёт сделку из другого режима: она уже не его, человек возвращает её заново
-            owner = await _db(store.get_owner, deal_id)
-        if owner is None or owner["closed"] or owner["owner"] == store.OWNER_AI:
-            return 409, {"detail": "not_returnable"}
-        if not settings.pipeline_allowed(owner["pipeline_id"]) and not await _db(intercept.is_taken, deal_id):
-            return 409, {"detail": "pipeline_not_allowed"}
-        if not await _ai_is_up():
-            return 503, {"detail": "ai_unavailable"}
-        owner = await _db(store.set_owner, deal_id, store.OWNER_AI, reason="dialog_returned", mode=mode_id)
-        await _queue_event(owner, "dialog_returned")
-        _spawn(ai_engine_tasks.release(deal_id))      # ИИ снова ведёт диалог: задачи «Связаться» по передаче закрываем
-        return 200, {"ok": True, "epoch": owner["epoch"]}
+    if owner is None or owner["closed"] or owner["owner"] == store.OWNER_AI:
+        return 409, {"detail": "not_returnable"}
+    if not settings.pipeline_allowed(owner["pipeline_id"]) and not await _db(intercept.is_taken, deal_id):
+        return 409, {"detail": "pipeline_not_allowed"}
+    if not await _ai_is_up():
+        return 503, {"detail": "ai_unavailable"}
+    owner = await _db(store.set_owner, deal_id, store.OWNER_AI, reason="dialog_returned", mode=mode_id)
+    await _queue_event(owner, "dialog_returned")
+    _spawn(ai_engine_tasks.release(deal_id))      # ИИ снова ведёт диалог: задачи «Связаться» по передаче закрываем
+    return 200, {"ok": True, "epoch": owner["epoch"]}
 
 
 async def give_deal(deal_id: int, chat_id: str, chat_type: str, channel_id: str, phone: str = "",
@@ -1917,6 +1973,8 @@ async def manager_stop(deal_id: int) -> dict[str, Any]:
             await _to_human(s, PAUSE_REASON, deal_id=deal_id, alert=None)
         elif owner is None or owner["owner"] == store.OWNER_ENGINE:
             await _db(store.set_owner, deal_id, store.OWNER_HUMAN, reason=PAUSE_REASON)
+        # Сделка уже у человека после выключения режима: `_to_human` причину не меняет, а «стоп» должен отменить возврат ИИ (`ai_engine_mode_return`).
+        await _db(store.replace_reason, deal_id, PAUSE_REASON, only_from=(mode_return.REASON, mode_return.KEPT))
     logger.info("ai_engine: сделка %s: «стоп» примечанием (ИИ %s)", deal_id, "вёл" if was_ai else "не вёл")
     return {"state": "paused", "was_ai": was_ai}
 
@@ -2336,4 +2394,8 @@ def status() -> dict[str, Any]:
         out["pause"] = pause.status_block(_now())                     # «стоп»/«старт» примечанием и заметки «ИИ ведёт сделку» (`ai_engine_pause`)
     except Exception:  # noqa: BLE001
         out["pause"] = "ошибка чтения базы"
+    try:
+        out["mode_return"] = mode_return.status_block(_now())         # возврат ИИ сделок, снятых выключением режима (`ai_engine_mode_return`)
+    except Exception:  # noqa: BLE001
+        out["mode_return"] = "ошибка чтения базы"
     return out

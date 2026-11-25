@@ -310,6 +310,14 @@ def set_owner(
         return dict(conn.execute("SELECT * FROM deal_owner WHERE deal_id=?", (int(deal_id),)).fetchone())
 
 
+def replace_reason(deal_id: int, reason: str, *, only_from: tuple[str, ...]) -> bool:
+    """Заменить причину записи сделки, лежащей у человека, если сейчас она одна из `only_from`. Владельца, эпоху и `since` не трогает, записи не создаёт."""
+    marks = ",".join("?" * len(only_from))
+    with _connect() as conn:
+        return conn.execute(f"UPDATE deal_owner SET reason=? WHERE deal_id=? AND owner=? AND reason IN ({marks})",
+                            (reason, int(deal_id), OWNER_HUMAN, *only_from)).rowcount > 0
+
+
 def set_pipeline(deal_id: int, pipeline_id: int) -> None:
     """Запомнить воронку, в которую перенесли сделку (событие сделки из amo). Владельца и эпоху не трогает."""
     with _connect() as conn:
