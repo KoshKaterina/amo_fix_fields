@@ -114,7 +114,7 @@ def contact_ids_of_row(row: dict[str, Any]) -> set[int]:
         return set()
 
 
-def _since_ts(row: dict[str, Any]) -> float:
+def since_ts(row: dict[str, Any]) -> float:
     """Когда ИИ взял (получил обратно) сделку: `deal_owner.since`, UTC без долей секунды. Не прочиталось: ни один звонок не «позже»."""
     try:
         return datetime.datetime.strptime(str(row.get("since")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
@@ -321,7 +321,7 @@ async def _release(eng, deal_id: int, kind: str, note_id: int, called_at: float)
     async with eng._get_lock():
         row = await eng._db(store.get_owner, deal_id)
         if (row is None or row["owner"] != store.OWNER_AI or row["closed"] or modes.is_stale(row, settings.active_mode_id())
-                or called_at <= _since_ts(row)):
+                or called_at <= since_ts(row)):
             return False
         s = await eng._db(store.session_for_deal, deal_id)
         await eng._to_human(s, REASON, deal_id=deal_id, alert=None, note=kind)
@@ -361,7 +361,7 @@ async def _poll(eng) -> None:
         for created, note_id, contact_id, kind in fresh:
             acted = False
             for row in rows:
-                if contact_id not in contact_ids_of_row(row) or created <= _since_ts(row):
+                if contact_id not in contact_ids_of_row(row) or created <= since_ts(row):
                     continue
                 try:
                     acted = await _release(eng, int(row["deal_id"]), kind, note_id, created) or acted

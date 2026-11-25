@@ -12,7 +12,8 @@
   2. снята не раньше чем `filters.MANAGER_OUT_KEEP_S` назад (3 суток: таблица `manager_out` старше не хранит) и тогда, когда движок уже непрерывно запоминал сообщения менеджеров (`beat`, `watch_from`):
      до этой версии вебхук при «Выключено» отбрасывался целиком, и доказать, что менеджер не отвечал, по таким сделкам нечем. То же после простоя дольше `GAP_S` (откат на прежний код, выключенный движок);
   3. после снятия человек клиенту не писал: `filters.manager_last_out` по всем чатам этой сделки и по тому же клиенту на остальных слушаемых каналах не позже снятия. Канал чата должен слушаться.
-     И не звонил: по контактам сделки нет исходящего или отвеченного входящего звонка с момента снятия (`ai_engine_calls.had_call`, запас `CHECK_SLACK_S`; amo молчит: повторить позже; `AI_CALLS_TAKEOVER=0`: не проверяется);
+     И не звонил: по контактам сделки нет исходящего или отвеченного входящего звонка с момента снятия (`ai_engine_calls.had_call`, запас `CHECK_SLACK_S`; amo молчит: повторить позже; `AI_CALLS_TAKEOVER=0`: не проверяется).
+     «Тот же клиент» это и тот же телефон или Telegram ID в любом видимом чате (`ai_engine_same_client.wrote_after`: чаты сделки и карточки контактов; amo молчит: повторить позже; `AI_SAME_CLIENT_TAKEOVER=0`: не проверяется);
   4. сделка в amo открыта, воронка разрешена режимом и с промптом (`settings.pipeline_allowed`), на ней нет открытой задачи сотрудника, кроме пользователя ИИ (та же семантика, что у `ai_engine._task_guard`),
      нет отметок людей (`ai_engine_marks`) и паузы «стоп» (`ai_engine_pause`), чат не ведёт авто-режим; выбор сделки по чату (`dedup.resolve`, как на первом ходе после возврата) даёт именно её, иначе
      возврат кончился бы передачей людям с алертом и задачей (правила A, C, D);
@@ -43,6 +44,7 @@ import ai_engine_marks as marks
 import ai_engine_modes as modes
 import ai_engine_pause as pause
 import ai_engine_prompts as prompts
+import ai_engine_same_client as same_client
 import ai_engine_settings as settings
 import ai_engine_store as store
 import ai_engine_tasks
@@ -261,6 +263,8 @@ def _base_verdict(row: dict[str, Any]) -> Verdict | None:
     since = _since_ts(row) or 0.0
     if any((filters.manager_last_out(key) or 0.0) > since for key in _chat_keys(row)):
         return KEEP, "после снятия клиенту писал менеджер"
+    if same_client.enabled() and same_client.wrote_after(row, since):
+        return KEEP, "после снятия клиенту писал менеджер (в другом чате)"
     mark = marks.get(deal_id)
     if mark is not None:
         return KEEP, f"стоит отметка человека ({mark['kind']})"
@@ -311,6 +315,14 @@ async def _remote(eng, row: dict[str, Any]) -> tuple[Verdict | None, int]:
     user = filters.ai_user() or filters.DEFAULT_AI_USER
     if ai_engine_tasks.foreign_open_tasks(tasks, int(user["id"])):
         return (KEEP, "на сделке открыта задача сотрудника"), 0
+
+    # Сообщения клиенту в других чатах: телефоны и Telegram ID из карточек контактов сделки (`ai_engine_same_client`). Прочитанные карточки остаются в памяти: проверка под замком видит их же.
+    if same_client.enabled():
+        contacts = set(dedup.contact_ids_of(lead)) | calls.contact_ids_of_row(row)
+        if not await same_client.warm(eng, contacts):
+            return (FAILED, "amoCRM не ответила по контактам клиента"), 0
+        if await eng._db(same_client.wrote_after, row, _since_ts(row) or 0.0, contacts):
+            return (KEEP, "после снятия клиенту писал менеджер (в другом чате)"), 0
 
     # Звонки клиенту, пока ИИ был выключен: те же правила, что у опроса звонков (`ai_engine_calls`).
     if calls.enabled():

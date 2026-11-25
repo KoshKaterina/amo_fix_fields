@@ -76,6 +76,8 @@ class Env:
         E.pause.reset_for_tests()
         mp.setattr(cfg, "CALLS_TAKEOVER_ENABLED", False)     # опрос звонков (ai_engine_calls) проверяет test_ai_engine_calls.py
         E.calls.reset_for_tests()
+        mp.setattr(cfg, "SAME_CLIENT_ENABLED", False)        # сообщение из другого чата того же клиента (ai_engine_same_client, читает контакты amo) проверяет test_ai_engine_same_client.py
+        E.same_client.reset_for_tests()
         E.mode_return.reset_for_tests()                      # возврат после выключения режима (ai_engine_mode_return) проверяет test_ai_engine_mode_return.py
         store.init()
         self.set_settings()

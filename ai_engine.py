@@ -50,6 +50,7 @@
 
 ⚠️ Звонок менеджера это такое же вмешательство, как сообщение (просьба Кати 25.11.2026, `ai_engine_calls`): раз в 20 с из `tick_once` читаются примечания звонков контактов, исходящий или отвеченный входящий после
 взятия сделки отдаёт её человеку (`manager_call`). Снятие из-за сообщения или звонка оставляет в сделке примечание «ИИ-менеджер приостановил ведение сделки, причина: ...» (`_to_human`, только если ИИ её вёл).
+Сообщение менеджера считается и из другого чата того же клиента (тот же телефон или Telegram ID, `ai_engine_same_client`), в том числе при «Выключено» и в проверке возврата после него.
 """
 import asyncio
 import datetime
@@ -80,6 +81,7 @@ import ai_engine_silence as silence
 import ai_engine_sweep as sweep
 import ai_engine_ur as ur_wave
 import ai_engine_return
+import ai_engine_same_client as same_client
 import ai_engine_tasks
 import ai_engine_settings as settings
 import ai_engine_store as store
@@ -418,22 +420,28 @@ async def _intercept_observe(m: dict, channel_id: str, chat_id: str, chat_key: s
 
 async def _on_outbound(chat_key: str, m: dict) -> None:
     """Исходящее в чат. Автоматика и ИИ (`Admin`, пусто) - не менеджер и ничего не меняют. Человек (ФИО или
-    `Phone`) в чате, который мы ведём или ждём, забирает диалог."""
+    `Phone`) в чате, который мы ведём или ждём, забирает диалог. Если сам этот чат ИИ не ведёт, а клиента ведёт в другом (тот же телефон или Telegram ID), ИИ снимается и там (`ai_engine_same_client`)."""
     if is_robot_author(m.get("authorName")):
         return
-    await _note_manager_out(chat_key)
+    await _note_manager_out(chat_key, m)
     await _followup_cancel(chat_key=chat_key, reason="manager_wrote", notify=True)      # отложенное касание ИИ не уходит
     s = await _db(store.get_session, chat_key)
-    if s is None or s["state"] in (store.S_HUMAN, store.S_SKIP, store.S_RELEASED):
-        return
-    logger.info("ai_engine: менеджер написал в чат %s - беру диалог у ИИ", chat_key)
-    await _to_human(s, "manager_message", alert=None)
+    ai_chat = False
+    if s is not None and s["state"] not in (store.S_HUMAN, store.S_SKIP, store.S_RELEASED):
+        if s["deal_id"] is not None:
+            owner = await _db(store.get_owner, int(s["deal_id"]))
+            ai_chat = bool(owner and owner["owner"] == store.OWNER_AI and not owner["closed"])
+        logger.info("ai_engine: менеджер написал в чат %s - беру диалог у ИИ", chat_key)
+        await _to_human(s, "manager_message", alert=None)
+    if not ai_chat:
+        await same_client.on_manager_message(sys.modules[__name__], m)      # тот же клиент, которого ИИ ведёт в другом чате
 
 
-async def _note_manager_out(chat_key: str) -> None:
-    """Время сообщения человека клиенту: «менеджер активен» для `existing.manager_quiet_min` (`ai_engine_filters`) и «менеджер писал после снятия» (`ai_engine_mode_return`). Не бросает."""
+async def _note_manager_out(chat_key: str, m: dict) -> None:
+    """Время сообщения человека клиенту: «менеджер активен» для `existing.manager_quiet_min` (`ai_engine_filters`) и «менеджер писал после снятия» (`ai_engine_mode_return`: по чату и по ключам клиента). Не бросает."""
     try:
         await _db(filters.note_manager_out, chat_key, _now())
+        await _db(same_client.note_manager_out, same_client.message_idents(m), _now())
     except Exception:  # noqa: BLE001 - учёт активности менеджера не должен мешать приёму сообщений
         logger.exception("ai_engine: не записал время сообщения менеджера в чат %s", chat_key)
 
@@ -450,15 +458,19 @@ async def _handle_off_payload(payload: dict) -> None:
             await _intercept_observe(m, channel_id, chat_id, chat_key)
             if channel_id not in cfg.CHANNELS and not await _db(intercept.is_tracked, chat_key):
                 continue
-            await _note_manager_out(chat_key)
+            await _note_manager_out(chat_key, m)
             s = await _db(store.get_session, chat_key)
+            ai_chat = False
             for row in await _db(store.list_owned, store.OWNER_AI):
                 deal_id = int(row["deal_id"])
                 if row["chat_key"] != chat_key and not (s is not None and s["deal_id"] == deal_id):
                     continue
+                ai_chat = True
                 logger.info("ai_engine: менеджер написал в чат %s при выключенном ИИ - сделка %s уходит менеджеру", chat_key, deal_id)
                 mine = s if s is not None and s["deal_id"] == deal_id else await _db(store.session_for_deal, deal_id)
                 await _to_human(mine, "manager_message", deal_id=deal_id, alert=None)
+            if not ai_chat:
+                await same_client.on_manager_message(sys.modules[__name__], m)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
