@@ -160,6 +160,18 @@ try:
 except ValueError:
     UR_WAVE_1_BY_DAY = {}
 UR_LATE_FROM = os.getenv("AI_UR_LATE_FROM", "17:00").strip()
+# Окно УР получают ТОЛЬКО сделки этих воронок (решение Кати 26.11.2026): «ОП розница» и TangemShop. Это уже, чем `initiative_pipelines`: «Работа с базой», «Лист ожидания» и прочие
+# воронки инициативы панели события `ur_wave` не получают, остальные инициативные функции у них прежние. В режиме `test` к списку добавляется «Тест» (`ai_engine_settings.ur_window_pipelines`).
+# Переопределяется `AI_UR_PIPELINES` (номера воронок через запятую, читается при старте). Не номера пропускаются; пусто или ни одного номера: две розничные воронки, а не «все воронки».
+UR_PIPELINES_DEFAULT: frozenset[int] = frozenset({int(PIPELINE_CLEVER_MAIN), int(PIPELINE_TANGEMSHOP)})
+
+
+def _parse_pipelines(raw: str, default: frozenset[int]) -> frozenset[int]:
+    ids = frozenset(int(x) for x in (part.strip() for part in raw.split(",")) if x.isascii() and x.isdigit() and int(x) > 0)
+    return ids or default
+
+
+UR_PIPELINES: frozenset[int] = _parse_pipelines(os.getenv("AI_UR_PIPELINES", ""), UR_PIPELINES_DEFAULT)
 RETURN_BY_REACTION = os.getenv("AI_RETURN_BY_REACTION", "1").strip() == "1"
 RETURN_EMOJI = os.getenv("AI_RETURN_EMOJI", "👍").strip()            # 👍 метка «ждёт возврата» и нужная реакция
 def _parse_also(raw: str) -> frozenset:

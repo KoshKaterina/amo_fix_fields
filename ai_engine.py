@@ -1006,7 +1006,7 @@ async def _initiative_ok(owner: dict) -> bool:
 
 
 async def _event_blocked(owner: dict, event_type: str) -> str | None:
-    """Служебное событие, которое ИИ по этой сделке получать не должен: функцию выключили в панели или воронка «только отвечаем».
+    """Служебное событие, которое ИИ по этой сделке получать не должен: функцию выключили в панели, воронка «только отвечаем» или (`ur_wave`) воронка вне окна УР.
     Страховка в общей точке постановки; сами таймеры (`_silence_step`, `_ur_tick`) отсекают это раньше и ещё снимают своё состояние.
     Причина словами или None, если событие можно ставить."""
     if event_type == "silent_alt":
@@ -1015,6 +1015,8 @@ async def _event_blocked(owner: dict, event_type: str) -> str | None:
     elif event_type == "ur_wave":
         if not settings.ur_config()["enabled"]:
             return "окна УР выключены в настройках"
+        if not settings.ur_window_allowed(owner.get("pipeline_id")):
+            return "воронка сделки не входит в окно УР"
     else:
         return None
     return None if await _initiative_ok(owner) else "в воронке сделки ИИ только отвечает"
@@ -1024,7 +1026,7 @@ async def _queue_event(owner: dict, event_type: str, extra: dict | None = None) 
     """Поставить служебное событие: оно идёт отдельным ходом, как только предыдущий закончился.
     Сделке, взятой в другом режиме, событий не ставим (её снимет `_release_for_mode`): это общая точка оплаты, возврата диалога,
     касаний, лестницы тишины, окон УР и перехвата. Инициативные события (`silent_alt`, `ur_wave`) не ставятся и тогда, когда функцию
-    выключили или воронка сделки «только отвечаем» (`_event_blocked`)."""
+    выключили или воронка сделки «только отвечаем», а `ur_wave` ещё и вне воронок окна УР (`_event_blocked`)."""
     if modes.is_stale(owner, settings.active_mode_id()):
         logger.warning("ai_engine: событие %s по сделке %s не поставлено: сделка взята в другом режиме", event_type, owner.get("deal_id"))
         return
@@ -2150,7 +2152,8 @@ def _msk_at(ts: float, hhmm: str) -> float:
 
 
 async def _ur_tick() -> None:
-    """Окна перевода в УР: событие `ur_wave` всем сделкам ИИ в 17:50, а тем, кому ИИ писал в 17:00 и позже, во втором окне в 18:45."""
+    """Окна перевода в УР: событие `ur_wave` в 17:50 сделкам ИИ из воронок окна (`settings.ur_window_pipelines`: «ОП розница» и TangemShop, в режиме `test` ещё «Тест»),
+    а тем, кому ИИ писал в 17:00 и позже, во втором окне в 18:45. Воронка проверяется на каждом проходе: перенесённая до второго окна в другую воронку сделка его не получает."""
     ur = settings.ur_config()                                 # включение и времена из настроек режима (запас: AI_UR_WAVE_1, AI_UR_WAVE_2, AI_UR_LATE_FROM)
     now = _now()
     day = datetime.datetime.fromtimestamp(now, _MSK).strftime("%Y-%m-%d")
@@ -2177,6 +2180,8 @@ async def _ur_tick() -> None:
                 continue                                    # перехваченная сделка: окна УР не её дело
             if not settings.initiative_allowed(owner.get("pipeline_id")):
                 continue                                    # воронка «только отвечаем»: окон УР по ней нет
+            if not settings.ur_window_allowed(owner.get("pipeline_id")):
+                continue                                    # воронка вне окна УР (решение Кати 26.11.2026): инициатива есть, а перевода в УР по окну нет
             try:
                 w1 = await _db(ur_wave.state, day, deal_id, 1)
                 if w1 is None:
@@ -2408,6 +2413,7 @@ def status() -> dict[str, Any]:
         out["pipelines_any"] = settings.pipelines_any()
         out["pipelines_any_allowed"] = settings.pipelines_any_allowed()          # разрешено ли «любая воронка» переменной движка `AI_PIPELINES_ANY_ALLOWED`
         out["initiative_pipelines"] = sorted(settings.initiative_pipelines())
+        out["ur_window_pipelines"] = sorted(settings.ur_window_pipelines())      # кому уходит окно УР (`ur_wave`): уже, чем инициатива
         out["functions"] = settings.functions_wire()
     except Exception:  # noqa: BLE001
         out["functions"] = "ошибка чтения настроек"

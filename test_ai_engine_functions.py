@@ -10,6 +10,7 @@
   • `pipeline_allowed` и `initiative_allowed`: две воронки, остальные, «Тест», `off`, ошибки чтения; в воронке «только отвечаем»
     нет лестницы, окон УР и касаний, а ход получает `initiative: false`;
   • `mode_settings`: форма, `initiative` при версии 2, блоки `functions`/`call`/`eta` только если они есть в документе, при версии 1 блока нет;
+  • окно УР только в «ОП розница» и TangemShop (в режиме «Тест» ещё «Тест»), переменная `AI_UR_PIPELINES`, остальная инициатива прежняя;
   • совместимость: документ этапа 1 (без новых ключей) ведёт себя как раньше.
 
 Сети нет: подставный мир из test_ai_engine.py. Запуск: python -m pytest test_ai_engine_functions.py -q
@@ -17,6 +18,9 @@
 import asyncio
 import datetime
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -822,8 +826,92 @@ def test_no_ur_window_in_a_reply_only_pipeline(env):
         assert waves(env) == [] and U.state(day_of(at(12)), DEAL, 1) is None
         v2(env, "full", pipelines_any=True, initiative_pipelines=[PIPE_RETAIL, PIPE_TANGEM, PIPE_OTHER])      # панель дала воронке инициативу
         await to(env, 19, 40)
-        assert len(waves(env)) == 1
+        assert waves(env) == []                                                      # но окно УР только в двух розничных воронках
     run(go())
+
+
+# --- воронки окна УР (решение Кати 26.11.2026): «ОП розница» и TangemShop, в режиме «Тест» ещё «Тест» -----------------------------
+
+PIPE_WAITLIST = 10611934                # «Лист ожидания»
+LED = [PIPE_RETAIL, PIPE_TANGEM, PIPE_DB, PIPE_WAITLIST, PIPE_OTHER]
+
+
+def led_with_initiative(env, monkeypatch):
+    """Режим «Полный»: на все воронки `LED` есть промпт (ИИ вправе вести их сделки) и панель дала им инициативу."""
+    monkeypatch.setattr(prompts, "_good", prompts.Snapshot(prompt=frozenset(LED), test=frozenset(), at=0.0))
+    v2(env, "full", pipelines_any=True, initiative_pipelines=LED)
+
+
+@pytest.mark.parametrize("pipeline,expected", [(PIPE_RETAIL, 1), (PIPE_TANGEM, 1), (PIPE_DB, 0), (PIPE_WAITLIST, 0), (PIPE_OTHER, 0)])
+def test_ur_window_goes_only_to_the_two_retail_pipelines(env, monkeypatch, pipeline, expected):
+    async def go():
+        led_with_initiative(env, monkeypatch)
+        env.lead(pipeline=pipeline)
+        await owned_and_wrote(env, 14)
+        assert store.get_owner(DEAL)["owner"] == store.OWNER_AI and settings.initiative_allowed(pipeline)
+        await to(env, 17, 55)
+        assert len(waves(env)) == expected
+        if not expected:
+            await to(env, 19, 30)
+            assert waves(env) == [] and U.state(day_of(at(12)), DEAL, 1) is None
+    run(go())
+
+
+@pytest.mark.parametrize("moved_to,expected", [(PIPE_DB, 0), (PIPE_WAITLIST, 0), (PIPE_TANGEM, 1)])
+def test_a_deal_moved_between_the_windows_gets_the_second_one_only_in_a_window_pipeline(env, monkeypatch, moved_to, expected):
+    async def go():
+        led_with_initiative(env, monkeypatch)
+        env.lead(pipeline=PIPE_RETAIL)
+        await owned_and_wrote(env, 17, 10)                                           # писали поздно: сделка ждёт второго окна
+        await to(env, 17, 55)
+        day = day_of(at(12))
+        assert U.state(day, DEAL, 1) == "deferred" and waves(env) == []
+        env.lead(pipeline=moved_to)
+        await E._handle_lead_event(E.extract_lead_event(DEAL, moved_to, 1000, {"leads": {"update": {"0": {"id": str(DEAL)}}}}))
+        owner = store.get_owner(DEAL)
+        assert (owner["owner"], owner["pipeline_id"]) == (store.OWNER_AI, moved_to)       # ИИ сделку ведёт и дальше
+        await to(env, 18, 46)
+        assert len(waves(env)) == expected
+        assert (U.state(day, DEAL, 2) == "fired") is bool(expected)
+    run(go())
+
+
+def test_queue_event_refuses_the_ur_wave_outside_the_window_pipelines_but_keeps_other_initiative(env, monkeypatch):
+    async def go():
+        led_with_initiative(env, monkeypatch)
+        env.lead(pipeline=PIPE_DB)
+        await take(env)
+        owner = store.get_owner(DEAL)
+        await E._queue_event(owner, "ur_wave")
+        assert not store.get_session(CHAT_KEY).get("pending_event")
+        await E._queue_event(owner, "silent_alt")                                    # лестница тишины в «Работе с базой» как была
+        assert json.loads(store.get_session(CHAT_KEY)["pending_event"])["type"] == "silent_alt"
+    run(go())
+
+
+def test_the_test_pipeline_is_in_the_ur_window_only_in_the_test_mode(env):
+    v2(env)
+    assert settings.ur_window_pipelines() == frozenset(TWO | {PIPE_TEST}) and settings.ur_window_allowed(PIPE_TEST)
+    v2(env, "full", pipelines_any=True)
+    assert settings.ur_window_pipelines() == frozenset(TWO) and not settings.ur_window_allowed(PIPE_TEST)
+    assert not settings.ur_window_allowed(None) and settings.ur_window_allowed(str(PIPE_RETAIL))
+    env.set_settings(mode="off")
+    assert settings.ur_window_pipelines() == frozenset(TWO)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("", TWO), ("   ", TWO), (",,", TWO), ("all", TWO), ("*", TWO), ("0,-5", TWO), ("10593102;9822330", TWO), ("²", TWO),
+    ("11166334", {PIPE_DB}), (" 9822330 , x,", {PIPE_TANGEM}), ("10593102,9822330,11166334", TWO | {PIPE_DB}),
+])
+def test_ur_pipelines_variable_never_means_all_pipelines(raw, expected):
+    assert cfg._parse_pipelines(raw, cfg.UR_PIPELINES_DEFAULT) == frozenset(expected)
+
+
+@pytest.mark.parametrize("raw,expected", [("11166334", [PIPE_DB]), ("все", sorted(TWO))])
+def test_ur_pipelines_are_read_from_the_environment(raw, expected):
+    out = subprocess.run([sys.executable, "-c", "import ai_engine_config as c; print(sorted(c.UR_PIPELINES))"], cwd=os.path.dirname(os.path.abspath(__file__)),
+                         env={**os.environ, "AI_UR_PIPELINES": raw}, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == str(expected)
 
 
 # =============================================================================================
@@ -940,4 +1028,13 @@ def test_status_shows_what_the_engine_takes_from_the_settings(env):
     v2(env, "full", pipelines_any=True, functions={"touch_max_days": 5, "silence": {"alt_after_min": 25}})
     out = E.status()
     assert out["pipelines_any"] is True and out["pipelines_any_allowed"] is True and out["initiative_pipelines"] == sorted(INITIATIVE_DEFAULT)
+    assert out["ur_window_pipelines"] == sorted(TWO)
     assert out["functions"]["touch_max_days"] == 5 and out["functions"]["silence"]["alt_after_min"] == 25
+
+
+def test_status_shows_the_ur_window_pipelines_of_the_active_mode_and_the_override(env, monkeypatch):
+    v2(env)
+    assert E.status()["ur_window_pipelines"] == sorted(TWO | {PIPE_TEST})
+    monkeypatch.setattr(cfg, "UR_PIPELINES", frozenset({PIPE_DB}))
+    v2(env, "full", pipelines_any=True)
+    assert E.status()["ur_window_pipelines"] == [PIPE_DB]

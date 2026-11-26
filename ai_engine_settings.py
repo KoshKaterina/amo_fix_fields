@@ -196,6 +196,16 @@ def initiative_allowed(pipeline_id: Any) -> bool:
     return pid in cfg.MODE_PIPELINES.get(effective_mode(), frozenset()) or pid in cfg.INITIATIVE_PIPELINES_DEFAULT
 
 
+def ur_window_pipelines() -> frozenset[int]:
+    """Воронки, сделки которых получают окно УР (событие `ur_wave`): `cfg.UR_PIPELINES`, в режиме `test` ещё «Тест» (для проверок). Список панели `initiative_pipelines`
+    его не расширяет: окну нужны оба разрешения, это и `initiative_allowed`."""
+    return cfg.UR_PIPELINES | {cfg.PIPELINE_TEST} if effective_mode() == "test" else cfg.UR_PIPELINES
+
+
+def ur_window_allowed(pipeline_id: Any) -> bool:
+    return _pos_int(pipeline_id) in ur_window_pipelines()
+
+
 # ---------------------------------------------------------------------------------------------
 # документ версии 2: активный режим, пилот, справочник сделок (этап 1 плана «режимы ИИ-менеджера»)
 # ---------------------------------------------------------------------------------------------
