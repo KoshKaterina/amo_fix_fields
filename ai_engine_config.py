@@ -19,9 +19,11 @@ from waybill_config import (
     PIPELINE_TANGEMSHOP,
     RETAIL_GUARD_CHANNELS,
     STATUS_CLOSED_LOST,
+    STATUS_DB_PAYMENT_RECEIVED,
     STATUS_PAYMENT_RECEIVED,
     STATUS_SUCCESS,
     STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED,
+    STATUS_WAITLIST_PAYMENT_RECEIVED,
     TEAM_PANEL_BASE_URL,
 )
 
@@ -118,8 +120,10 @@ MODE_ID_TO_LEGACY = {"test": "test", "full": "prod", "help": "prod", "intercept"
 LEGACY_TO_MODE_ID = {"off": "off", "test": "test", "prod": "full"}
 
 # --- служебные события ----------------------------------------------------------------------
-# «Оплата получена» в «ОП розница» и в TangemShop (id этапов в amo уникальны на весь аккаунт, воронку сверять не нужно)
-PAYMENT_RECEIVED_STATUSES = frozenset({int(STATUS_PAYMENT_RECEIVED), int(STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED)})
+# «Оплата получена» во всех воронках, где ИИ выставляет счёт: «ОП розница», TangemShop, «Работа с базой», «Лист ожидания» (id этапов в amo уникальны на весь аккаунт, воронку сверять
+# не нужно). Воронка с автоматикой счёта, которой здесь нет, оплату ИИ не сообщает: сделка так и лежит на «оплата получена» (так было с двумя последними до 26.11.2026).
+PAYMENT_RECEIVED_STATUSES = frozenset({int(STATUS_PAYMENT_RECEIVED), int(STATUS_TANGEM_ADDITIONAL_PAYMENT_RECEIVED), int(STATUS_DB_PAYMENT_RECEIVED),
+                                       int(STATUS_WAITLIST_PAYMENT_RECEIVED)})
 FIELD_PAYMENT_STATE = 576669                              # «Статус оплаты»
 ENUM_PAYMENT_STATE_PAID = 1040151                         # значение «Оплачен»
 

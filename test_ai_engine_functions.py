@@ -328,6 +328,25 @@ def test_old_and_new_documents_without_the_new_keys_decide_the_same(env):
         assert [(settings.pipeline_allowed(p), settings.initiative_allowed(p)) for p in (*EVERY, None, 0)] == before
 
 
+@pytest.mark.parametrize("pipeline, link_stage, paid_stage", [
+    (PIPE_DB, 88412946, 88412950),                  # «Работа с базой»: «ссылка отправлена», «оплата получена»
+    (10611934, 90264118, 83670018),                 # «Лист ожидания»
+])
+def test_payment_received_event_in_database_and_waitlist_by_stage(env, monkeypatch, pipeline, link_stage, paid_stage):
+    """Счёт в этих воронках выставляется так же, как в рознице: об оплате ИИ узнаёт по своему этапу «оплата получена» (до 26.11.2026 не узнавал)."""
+    monkeypatch.setattr(prompts, "_good", prompts.Snapshot(prompt=frozenset({PIPE_RETAIL, PIPE_TANGEM, pipeline}), test=frozenset(), at=0.0))
+
+    async def go():
+        v2(env, "full", pipelines_any=True)
+        env.lead(pipeline=pipeline)
+        await take(env)
+        for status, expected in ((link_stage, []), (paid_stage, ["payment_received"])):
+            await E._handle_lead_event(E.extract_lead_event(DEAL, pipeline, status, {"leads": {"update": {"0": {"id": str(DEAL)}}}}))
+            await env.advance(5)
+            assert [r["event"]["type"] for r in env.turn_requests if r.get("event")] == expected, status
+    run(go())
+
+
 def test_mode_off_and_read_errors_mean_nowhere(env, monkeypatch):
     v2(env, "full", pipelines_any=True)
     assert settings.pipeline_allowed(PIPE_OTHER) is True
