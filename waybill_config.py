@@ -1045,6 +1045,12 @@ OZON_PAY_ACCESS_KEY = os.getenv("OZON_PAY_ACCESS_KEY", "").strip()
 OZON_PAY_SECRET_KEY = os.getenv("OZON_PAY_SECRET_KEY", "").strip()
 # Ссылка живёт сутки (дефолт Ozon 600с=10мин — протухнет раньше, чем клиент откроет).
 OZON_INVOICE_TTL_S = int(os.getenv("OZON_INVOICE_TTL_S", "86400"))
+# Счёт СБП через страницу оплаты Ozon (26.11.2026). НСПК перевёл qr.nspk.ru на сертификат
+# Минцифры: Chrome, Samsung Browser и Safari без него показывают «Подключение не защищено», и клиент
+# не может оплатить по прямой ссылке. Включено (по умолчанию) — счёт СБП создаём вместе с заказом Ozon
+# и в 577617 кладём checkout.ozon.ru (открывается везде, там СБП и карта). "0" — прежняя прямая
+# ссылка qr.nspk.ru. Галочка «Оплата картой» (578145) работает как раньше.
+OZON_INVOICE_SBP_CHECKOUT_PAGE = os.getenv("OZON_INVOICE_SBP_CHECKOUT_PAGE", "1").strip() != "0"
 OZON_INVOICE_REDIRECT_URL = os.getenv("OZON_INVOICE_REDIRECT_URL", "https://sunscrypt.ru/").strip()
 # Секрет подписи УВЕДОМЛЕНИЙ Ozon (отдельный от secretKey, ЛК Ozon Pay; тот же,
 # что у плагина сайта). Задан → в createPayment передаём notificationUrl

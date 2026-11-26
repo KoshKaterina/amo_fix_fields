@@ -1376,3 +1376,105 @@ def test_list_ozhidaniya_schet_za_svoim_flagom():
     finally:
         amo_service.get_leads_by_status = real
         ozon_invoice.OZON_INVOICE_WAITLIST = was
+
+
+# ── 26.11.2026: СБП через страницу оплаты Ozon (OZON_INVOICE_SBP_CHECKOUT_PAGE) ──
+# qr.nspk.ru на сертификате Минцифры не открывается в Chrome/Samsung/Safari, поэтому
+# счёт СБП по умолчанию создаётся вместе с заказом Ozon и клиент получает checkout.ozon.ru.
+
+# Настоящая _create_payment: другие тесты подменяют её заглушкой через _install_mocks.
+_REAL_CREATE_PAYMENT = ozon_invoice._create_payment
+
+
+class _FakeClientCapture:
+    def __init__(self, resp):
+        self.resp = resp
+        self.bodies = []
+
+    async def post(self, url, json=None):
+        self.bodies.append(json)
+        return self.resp
+
+
+def _with_flag(value, fn):
+    was = ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE
+    ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE = value
+    try:
+        return fn()
+    finally:
+        ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE = was
+
+
+def test_sbp_checkout_flag_vklyuchen_po_umolchaniyu():
+    """флаг по умолчанию включён: СБП идёт через страницу Ozon"""
+    assert ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE is True
+    assert ozon_invoice.uses_checkout_page(False) is True
+    assert ozon_invoice.uses_checkout_page(True) is True
+
+
+def test_sbp_checkout_zakaz_v_tele_ssylka_checkout_ozon_ru():
+    """СБП при включённом флаге: заказ в теле, payType SBP, ссылка checkout.ozon.ru"""
+    client = _FakeClientCapture(_FakeRespCard())
+    ozon_invoice._client = client
+    try:
+        link, pid, err = _with_flag(True, lambda: asyncio.run(
+            _REAL_CREATE_PAYMENT("amo-9-7", 1000, ms_order_name="05740")))
+    finally:
+        ozon_invoice._client = None
+    assert link == "https://checkout.ozon.ru/order/xyz" and pid == "pid-2" and err == "", (link, pid, err)
+    body = client.bodies[0]
+    assert body["payType"] == "SBP", body
+    assert body["order"]["mode"] == "MODE_SHORTENED" and body["order"]["extId"] == "05740_amo-9-7", body
+
+
+def test_sbp_checkout_ozon_ne_dal_stranicu_otdaem_pryamuyu_ssylku():
+    """страницы Ozon в ответе нет — не хуже прежнего: прямая ссылка из sbp.payload"""
+    client = _FakeClientCapture(_FakeResp())
+    ozon_invoice._client = client
+    try:
+        link, pid, err = _with_flag(True, lambda: asyncio.run(_REAL_CREATE_PAYMENT("amo-9-8", 1000)))
+    finally:
+        ozon_invoice._client = None
+    assert link == "https://qr.nspk.ru/TEST123" and err == "", (link, err)
+    assert "order" in client.bodies[0], client.bodies[0]
+
+
+def test_sbp_checkout_flag_vyklyuchen_bez_zakaza_pryamaya_ssylka():
+    """флаг "0": прежнее поведение — без заказа, прямая ссылка qr.nspk.ru"""
+    client = _FakeClientCapture(_FakeRespCard())
+    ozon_invoice._client = client
+    try:
+        link, pid, err = _with_flag(False, lambda: asyncio.run(_REAL_CREATE_PAYMENT("amo-9-9", 1000)))
+    finally:
+        ozon_invoice._client = None
+    assert "order" not in client.bodies[0], client.bodies[0]
+    assert link == "https://qr.nspk.ru/IGNORED", link
+
+
+def test_sbp_checkout_v_primechanii_vid_scheta_i_orderextid():
+    """счёт СБП через страницу Ozon: в 577617 checkout, в примечании вид счёта и orderExtId для сверки"""
+    _reset()
+    _install_mocks(_lead())
+
+    async def fake_create(ext_id, kopecks, by_card=False, ms_order_name="", pipeline_id=None):
+        _ozon_calls.append((ext_id, kopecks, by_card, ms_order_name))
+        return f"https://checkout.ozon.ru/order/{ext_id}", "pay-id-2", ""
+
+    ozon_invoice._create_payment = fake_create
+    res = _with_flag(True, lambda: run(ozon_invoice.process_invoice_lead(LEAD_ID)))
+    assert res == "created", res
+    assert _patches[0]["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://checkout.ozon.ru/"), _patches
+    note = _notes[-1][1]
+    assert note.startswith("Счёт СБП (страница оплаты Ozon) создан автоматически:"), note
+    assert "\norderExtId 01234_amo-" in note, note
+
+
+def test_sbp_checkout_flag_vyklyuchen_primechanie_kak_ranshe():
+    """флаг "0": примечание «Счёт СБП» без orderExtId, как до 26.11"""
+    _reset()
+    _install_mocks(_lead())
+    res = _with_flag(False, lambda: run(ozon_invoice.process_invoice_lead(LEAD_ID)))
+    assert res == "created", res
+    note = _notes[-1][1]
+    assert note.startswith("Счёт СБП создан автоматически:"), note
+    assert "orderExtId" not in note, note

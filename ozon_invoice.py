@@ -66,6 +66,7 @@ from waybill_config import (
     FIELD_PAYMENT_METHOD,
     OZON_INVOICE_ENABLED,
     OZON_INVOICE_REDIRECT_URL,
+    OZON_INVOICE_SBP_CHECKOUT_PAGE,
     OZON_INVOICE_TTL_S,
     OZON_PAY_ACCESS_KEY,
     OZON_PAY_API_URL,
@@ -313,6 +314,13 @@ def _all_credential_sets() -> list[tuple[str, str, str]]:
     return sets
 
 
+def uses_checkout_page(by_card: bool) -> bool:
+    """Платёж создаётся вместе с заказом Ozon и клиент получает checkout.ozon.ru:
+    всегда для «оплаты картой», для СБП — при OZON_INVOICE_SBP_CHECKOUT_PAGE.
+    Флаг читается через модуль на каждом вызове, чтобы тест мог его подменить."""
+    return bool(by_card) or bool(globals()["OZON_INVOICE_SBP_CHECKOUT_PAGE"])
+
+
 def build_order_ext_id(ext_id: str, ms_order_name: str) -> str:
     """extId заказа Ozon для оплаты картой. Одна формула на два места: тело
     createPayment и примечание в сделке (оттуда его берёт сверка)."""
@@ -331,7 +339,10 @@ async def _create_payment(
 ) -> tuple[str | None, str, str]:
     """POST /v1/createPayment. Возвращает (payLink, paymentId, err).
 
-    by_card=False (СБП): payType=SBP без заказа → прямая ссылка qr.nspk.ru.
+    by_card=False (СБП): payType=SBP. С 26.11.2026 при OZON_INVOICE_SBP_CHECKOUT_PAGE
+    (по умолчанию) платёж тоже создаётся вместе с заказом Ozon, и клиент получает
+    страницу checkout.ozon.ru: прямую ссылку qr.nspk.ru (сертификат Минцифры)
+    Chrome, Samsung Browser и Safari не открывают. Флаг "0" — прежняя прямая ссылка.
     by_card=True (оплата картой): создаём платёж ВМЕСТЕ с заказом Ozon → ссылка
     order.item.payLink ведёт на checkout.ozon.ru (страница выбора: карта/СБП/
     Ozon Карта). У Ozon нет «прямой только-карты» ссылки — карта только через
@@ -369,7 +380,8 @@ async def _create_payment(
         # URL общий для всех воронок/пар ключей — verify_notification разбирает
         # вебхук, пробуя подпись по каждой настроенной паре.
         body["notificationUrl"] = f"{PUBLIC_BASE_URL}/ozon_notify"
-    if by_card:
+    with_order = uses_checkout_page(by_card)
+    if with_order:
         # Сокращённый заказ (формат смока v0.6.1, боевой). order в подпись НЕ
         # входит. expiresAt = ttl, чек не формируем (состава нет).
         expires_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + OZON_INVOICE_TTL_S))
@@ -400,12 +412,14 @@ async def _create_payment(
     details = data.get("paymentDetails") or {}
     payment_id = str(details.get("paymentId") or "")
     order = data.get("order") or {}
-    if by_card:
-        # Оплата картой: ссылка на checkout.ozon.ru (order.item.payLink).
+    if with_order:
+        # Страница оплаты Ozon: ссылка на checkout.ozon.ru (order.item.payLink).
         pay_link = (order.get("item") or {}).get("payLink") or order.get("payLink")
-        if not pay_link:
+        if pay_link:
+            return pay_link, payment_id, ""
+        if by_card:
             return None, payment_id, f"оплата картой: в ответе Ozon нет order.item.payLink: {str(data)[:300]}"
-        return pay_link, payment_id, ""
+        # СБП: страницу Ozon не дали — не хуже прежнего, отдаём прямую ссылку ниже.
     # СБП: order=None, готовая ссылка в paymentDetails.sbp.payload (qr.nspk.ru).
     # Подтверждено боевым ответом 20.07.2026 (сделка 36515681).
     pay_link = order.get("payLink")
@@ -666,10 +680,16 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     rub = kopecks / 100
     rub_str = f"{rub:.2f}".rstrip("0").rstrip(".")
     src = "поле «Другая сумма»" if other_kopecks is not None else f"заказ МС {ms_order_name}"
-    kind = "Счёт (оплата картой, страница выбора Ozon)" if by_card else "Счёт СБП"
-    # orderExtId пишем только для карты: по нему сверка ищет оплату, когда Ozon
-    # не знает нашего платежа (order-флоу заводит внутри заказа свой).
-    order_ext_id = build_order_ext_id(ext_id, ms_order_name) if by_card else ""
+    with_order = uses_checkout_page(by_card)
+    if by_card:
+        kind = "Счёт (оплата картой, страница выбора Ozon)"
+    elif with_order and "checkout.ozon.ru" in pay_link:
+        kind = "Счёт СБП (страница оплаты Ozon)"
+    else:
+        kind = "Счёт СБП"
+    # orderExtId пишем при заказе Ozon (карта и СБП через страницу Ozon): по нему
+    # сверка ищет оплату, когда Ozon не знает нашего платежа (order-флоу заводит свой).
+    order_ext_id = build_order_ext_id(ext_id, ms_order_name) if with_order else ""
     await amo_service.add_note(
         lead_id,
         f"{kind} создан автоматически: {rub_str} ₽ ({src}), действителен "
