@@ -185,7 +185,7 @@ def _setup(order_rows, demand_rows, demands=("dem-1",), dry=False, lead=None, no
     leads_by_query["ord-1"] = [lead or _lead()]
     A._state_loaded = True
     A._created["5"] = {"order_uuid": "ord-1", "shipment_id": "dem-1"}
-    recent = (S.datetime.datetime.now(S._MSK) - S.datetime.timedelta(hours=1)).isoformat()
+    recent = "2026-09-01 00:00:00.000"
     return {"id": "ord-1", "name": "09100", "created": recent, "moment": recent, "demands": [{"id": d, "name": f"D-{d}"} for d in demands]}
 
 
@@ -213,8 +213,8 @@ def test_changed_order_recreated_with_diff():
 def test_recent_update_does_not_touch_historical_order():
     for field in ("created", "moment"):
         o = _setup([pos(TANGEM, 2, 1)], [pos(TANGEM, 1, 1)])
-        o[field] = "2026-04-13 18:27:00.000"
-        o["updated"] = (S.datetime.datetime.now(S._MSK) - S.datetime.timedelta(minutes=1)).isoformat()
+        o[field] = "2026-08-31 23:59:59.999"
+        o["updated"] = "2026-11-26 19:01:00.000"
         assert run(S.handle_order(o)) == "historical-order"
         assert calls == [] and sent == [] and patched_amo == []
 

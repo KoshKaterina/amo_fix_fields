@@ -10,7 +10,7 @@
 «Заказ №X (ссылка) изменён пользователем Y в воронке Офис, отгрузка пересоздана /
 не изменена. @Катя обрати внимание на изменение заказа. Заказ до → после».
 
-Заказы старше семи дней пропускаем по дате создания и дате документа.
+Заказы до 1 сентября 2026 года пропускаем по дате создания и дате документа.
 Чужие отгрузки не пересоздаём: их состав может отражать ручную замену.
 
 Как ловим. Не по событиям, а по СОСТОЯНИЮ: раз в `SHIPMENT_RESYNC_INTERVAL_S` берём заказы
@@ -67,7 +67,7 @@ SHIPMENT_RESYNC_TAG = os.getenv("SHIPMENT_RESYNC_TAG", "@kathrina_bistraya")
 _CURSOR_PATH = pathlib.Path(os.getenv("SHIPMENT_RESYNC_CURSOR", "/app/var/shipment_resync_cursor.json"))
 EVENT_KEY = "shipment_resync"
 _MSK = datetime.timezone(datetime.timedelta(hours=3))
-_MAX_ORDER_AGE = datetime.timedelta(days=7)
+_ORDER_CUTOFF = datetime.datetime(2026, 9, 1, tzinfo=_MSK)
 _GOODS = {"product", "variant", "bundle", "consignment"}
 
 _task: asyncio.Task | None = None
@@ -294,14 +294,13 @@ def _save_cursor(ts: int) -> None:
         logger.exception("Пересоздание отгрузок: курсор не записался")
 
 
-def _is_recent_order(order: dict) -> bool:
-    now = datetime.datetime.now(_MSK)
+def _is_supported_order_date(order: dict) -> bool:
     try:
         dates = [datetime.datetime.fromisoformat(order[field]) for field in ("created", "moment")]
     except (KeyError, TypeError, ValueError):
         return False
     return all(
-        now - _MAX_ORDER_AGE <= (date if date.tzinfo else date.replace(tzinfo=_MSK)) <= now
+        (date if date.tzinfo else date.replace(tzinfo=_MSK)) >= _ORDER_CUTOFF
         for date in dates
     )
 
@@ -311,7 +310,7 @@ async def handle_order(order: dict) -> str:
     demands = _demands(order)
     if not demands:
         return "no-demand"
-    if not _is_recent_order(order):
+    if not _is_supported_order_date(order):
         return "historical-order"
     order_id = str(order.get("id") or "")
     order_rows = await _positions("customerorder", order_id)
