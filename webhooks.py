@@ -54,6 +54,7 @@ import preorder_lead_name
 import order_watchdog
 import ms_payment_flow
 import ozon_invoice
+import pay_page
 import retail_lead_guard
 import reserve_service
 import showroom_alert
@@ -111,7 +112,8 @@ from waybill_config import (
 # перенос в заголовки требует перенастройки на стороне Jivo, UIS, Wazzup и BotHelp), путь
 # нельзя писать в журнал целиком.
 SECRET_PATH_PREFIXES = ("/jivo/", "/uis/", "/wazzup/", "/bothelp/academy/",
-                        "/admin/lead-distribution/", "/getcourse/", "/sipuni/")
+                        "/admin/lead-distribution/", "/getcourse/", "/sipuni/",
+                        "/o/")  # номер своей страницы оплаты (pay_page.py): по нему открывается счёт
 
 
 def mask_secret_path(path: str) -> str:
@@ -337,6 +339,8 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(lead_distribution_router)
 # Внутренний API для ИИ-сервиса (permit, result): под токеном и флагом, подробности в ai_engine_api.py.
 app.include_router(ai_engine_api.router)
+# Своя страница оплаты счёта из amo (pay.sunscrypt.ru/o/<номер>), подробности в pay_page.py.
+app.include_router(pay_page.router)
 
 logger = logging.getLogger("uvicorn")
 

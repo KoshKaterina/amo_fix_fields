@@ -1569,3 +1569,114 @@ def test_status_paid_zakaza_v_slovare_oplat():
     for bad in ("STATUS_PAYMENT_PENDING", "STATUS_NEW", "STATUS_AUTHORIZED",
                 "STATUS_CANCELED", "STATUS_EXPIRED"):
         assert not ozon_invoice.is_paid_status(bad), bad
+
+
+# --- своя страница оплаты: 577617 = pay.sunscrypt.ru/o/<номер> (26.11.2026) -----
+import re  # noqa: E402
+
+import pay_page  # noqa: E402
+
+
+def _own_page_on(fn, tmp_db):
+    was = (ozon_invoice.OZON_INVOICE_OWN_PAGE, ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE, pay_page._DB)
+    ozon_invoice.OZON_INVOICE_OWN_PAGE = True
+    ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE = True
+    pay_page._DB = tmp_db
+    try:
+        return fn()
+    finally:
+        ozon_invoice.OZON_INVOICE_OWN_PAGE, ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE, pay_page._DB = was
+
+
+def _fake_create_with_payload(payload="https://qr.nspk.ru/AD10TEST"):
+    async def fake_create(ext_id, kopecks, by_card=False, ms_order_name="", pipeline_id=None):
+        _ozon_calls.append((ext_id, kopecks, by_card, ms_order_name))
+        if payload:
+            ozon_invoice._created_extra[ext_id] = {"sbp_payload": payload}
+        return f"https://checkout.ozon.ru/order/{ext_id}", "pay-id-3", ""
+    return fake_create
+
+
+def test_svoya_stranica_v_577617_i_v_primechanii(tmp_path):
+    """флаг включён: в 577617 своя ссылка, в примечании вид счёта, ссылка Ozon и orderExtId"""
+    _reset()
+    _install_mocks(_lead())
+    ozon_invoice._create_payment = _fake_create_with_payload()
+    res = _own_page_on(lambda: run(ozon_invoice.process_invoice_lead(LEAD_ID)), tmp_path / "p.sqlite3")
+    assert res == "created", res
+    link = _patches[0]["custom_fields"][FIELD_PAYMENT_LINK]
+    assert re.fullmatch(r"https://pay\.sunscrypt\.ru/o/[A-Za-z0-9_-]{16}", link), link
+    note = _notes[-1][1]
+    assert note.startswith("Счёт СБП (страница оплаты Sunscrypt) создан автоматически:"), note
+    assert link in note and "\nстраница Ozon (с телефона): https://checkout.ozon.ru/order/" in note, note
+    assert "\norderExtId 01234_amo-" in note, note
+    pay_page._DB = tmp_path / "p.sqlite3"
+    try:
+        saved = pay_page.get_link(link.rsplit("/", 1)[1])
+    finally:
+        pay_page._DB = pay_page.Path(pay_page.__file__).parent / "var" / "pay_page.sqlite3"
+    assert saved["amount"] == 1234500 and saved["order_name"] == "01234" and saved["lead_id"] == LEAD_ID
+    assert saved["order_ext_id"].startswith("01234_amo-") and saved["sbp_payload"] == "https://qr.nspk.ru/AD10TEST"
+    # сверка по-прежнему находит extId и orderExtId в примечании
+    assert ozon_invoice._NOTE_EXT_RE.search(note).group(1).startswith("amo-")
+    assert ozon_invoice._NOTE_ORDER_EXT_RE.search(note).group(1).startswith("01234_amo-")
+    assert not [k for k in ozon_invoice._created_extra if k.startswith(f"amo-{LEAD_ID}-")]
+
+
+def test_svoya_stranica_bez_koda_qr_ssylka_ozon(tmp_path):
+    """Ozon не дал код QR: страницу не создаём, клиент получает ссылку Ozon"""
+    _reset()
+    _install_mocks(_lead())
+    ozon_invoice._create_payment = _fake_create_with_payload(payload="")
+    res = _own_page_on(lambda: run(ozon_invoice.process_invoice_lead(LEAD_ID)), tmp_path / "p.sqlite3")
+    assert res == "created", res
+    assert _patches[0]["custom_fields"][FIELD_PAYMENT_LINK].startswith("https://checkout.ozon.ru/")
+    assert _notes[-1][1].startswith("Счёт СБП (страница оплаты Ozon) создан автоматически:")
+
+
+def test_svoya_stranica_ne_dlya_karty_i_ne_dlya_tangemshop(tmp_path):
+    """«Оплата картой» и TangemShop: своя страница не нужна, ссылка Ozon"""
+    from waybill_config import PIPELINE_TANGEMSHOP
+    assert not ozon_invoice.uses_own_page(True, PIPELINE_CLEVER_MAIN) or not ozon_invoice.OZON_INVOICE_OWN_PAGE
+    was = ozon_invoice.OZON_INVOICE_OWN_PAGE
+    ozon_invoice.OZON_INVOICE_OWN_PAGE = True
+    try:
+        assert ozon_invoice.uses_own_page(False, PIPELINE_CLEVER_MAIN)
+        assert not ozon_invoice.uses_own_page(True, PIPELINE_CLEVER_MAIN)
+        assert not ozon_invoice.uses_own_page(False, PIPELINE_TANGEMSHOP)
+        assert not ozon_invoice.uses_own_page(False, None)
+    finally:
+        ozon_invoice.OZON_INVOICE_OWN_PAGE = was
+
+
+def test_svoya_stranica_vyklyuchena_po_umolchaniyu():
+    """без OZON_INVOICE_OWN_PAGE=1 своей страницы нет"""
+    import waybill_config
+    assert waybill_config.OZON_INVOICE_OWN_PAGE is False or __import__("os").getenv("OZON_INVOICE_OWN_PAGE") == "1"
+    assert waybill_config.OZON_INVOICE_PAGE_BASE == "https://pay.sunscrypt.ru/o" or __import__("os").getenv("OZON_INVOICE_PAGE_BASE")
+
+
+def test_kod_qr_iz_otveta_ozon_popadaet_v_created_extra():
+    """_create_payment (настоящий): при заказе Ozon код QR кладётся в _created_extra"""
+    class _Resp:
+        status_code = 200
+        text = ""
+        def json(self):
+            return {"paymentDetails": {"paymentId": "p-1", "sbp": {"payload": "https://qr.nspk.ru/AD10X"}},
+                    "order": {"item": {"payLink": "https://checkout.ozon.ru/order/o-1"}}}
+
+    class _Client:
+        async def post(self, url, json=None):
+            return _Resp()
+
+    was = (ozon_invoice._client, ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE)
+    ozon_invoice._client, ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE = _Client(), True
+    ozon_invoice._created_extra.clear()
+    try:
+        link, pid, err = run(_REAL_CREATE_PAYMENT("amo-1-2", 100, by_card=False))
+        assert (link, pid, err) == ("https://checkout.ozon.ru/order/o-1", "p-1", "")
+        assert ozon_invoice._created_extra.pop("amo-1-2") == {"sbp_payload": "https://qr.nspk.ru/AD10X"}
+        run(_REAL_CREATE_PAYMENT("amo-1-3", 100, by_card=True))
+        assert "amo-1-3" not in ozon_invoice._created_extra
+    finally:
+        ozon_invoice._client, ozon_invoice.OZON_INVOICE_SBP_CHECKOUT_PAGE = was

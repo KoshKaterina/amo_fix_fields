@@ -65,6 +65,8 @@ from waybill_config import (
     FIELD_PAYMENT_LINK,
     FIELD_PAYMENT_METHOD,
     OZON_INVOICE_ENABLED,
+    OZON_INVOICE_OWN_PAGE,
+    OZON_INVOICE_PAGE_BASE,
     OZON_INVOICE_REDIRECT_URL,
     OZON_INVOICE_SBP_CHECKOUT_PAGE,
     OZON_INVOICE_TTL_S,
@@ -321,6 +323,26 @@ def uses_checkout_page(by_card: bool) -> bool:
     return bool(by_card) or bool(globals()["OZON_INVOICE_SBP_CHECKOUT_PAGE"])
 
 
+def uses_own_page(by_card: bool, pipeline_id) -> bool:
+    """Ссылка клиенту — своя страница pay.sunscrypt.ru/o/… (pay_page.py), а не checkout.ozon.ru.
+    Только счёт СБП, только поверх страницы Ozon (нужны и ссылка Ozon для телефона, и код QR),
+    и только на ключах розницы: у TangemShop своё юрлицо и свой бренд, страница Sunscrypt
+    с реквизитами ИП Перфилова там не к месту."""
+    if by_card or not globals()["OZON_INVOICE_OWN_PAGE"] or not uses_checkout_page(by_card):
+        return False
+    try:
+        pid = int(pipeline_id)
+    except (TypeError, ValueError):
+        return False
+    return pid not in _pipeline_key_overrides()
+
+
+# Что ещё дал Ozon при создании счёта, кроме ссылки: код QR НСПК для своей страницы.
+# _create_payment кладёт, process_invoice_lead забирает (pop) сразу после вызова.
+# Отдельно от возвращаемого кортежа, чтобы не трогать его форму у всех вызовов и моков.
+_created_extra: dict[str, dict] = {}
+
+
 def build_order_ext_id(ext_id: str, ms_order_name: str) -> str:
     """extId заказа Ozon для оплаты картой. Одна формула на два места: тело
     createPayment и примечание в сделке (оттуда его берёт сверка)."""
@@ -416,6 +438,9 @@ async def _create_payment(
         # Страница оплаты Ozon: ссылка на checkout.ozon.ru (order.item.payLink).
         pay_link = (order.get("item") or {}).get("payLink") or order.get("payLink")
         if pay_link:
+            payload = (details.get("sbp") or {}).get("payload")
+            if not by_card and isinstance(payload, str) and payload.startswith("http"):
+                _created_extra[ext_id] = {"sbp_payload": payload}
             return pay_link, payment_id, ""
         if by_card:
             return None, payment_id, f"оплата картой: в ответе Ozon нет order.item.payLink: {str(data)[:300]}"
@@ -657,9 +682,28 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
         ext_id, kopecks, by_card=by_card, ms_order_name=ms_order_name,
         pipeline_id=lead.get("pipeline_id"),
     )
+    extra = _created_extra.pop(ext_id, {})
     if not pay_link:
         await _fail(lead, "Ozon не создал счёт - ссылки нет", detail=err)
         return "failed-ozon"
+
+    # Своя страница оплаты: клиенту pay.sunscrypt.ru/o/<номер>. Не вышло сохранить —
+    # клиент получает ссылку Ozon, как без страницы: оплате это не мешает.
+    page_link = ""
+    if uses_own_page(by_card, lead.get("pipeline_id")) and "checkout.ozon.ru" in pay_link:
+        import pay_page
+        try:
+            token = pay_page.create_link(
+                lead_id=int(lead_id), ext_id=ext_id,
+                order_ext_id=build_order_ext_id(ext_id, ms_order_name),
+                pipeline_id=lead.get("pipeline_id"), amount_kopecks=kopecks,
+                order_name=ms_order_name, sbp_payload=str(extra.get("sbp_payload") or ""),
+                checkout_url=pay_link, ttl_s=OZON_INVOICE_TTL_S,
+            )
+            page_link = f"{globals()['OZON_INVOICE_PAGE_BASE']}/{token}"
+        except Exception as exc:  # noqa: BLE001 - страница не должна ломать выставление счёта
+            logger.warning("Lead %s: своя страница оплаты не создана (%s) - отдаём ссылку Ozon", lead_id, exc)
+    client_link = page_link or pay_link
 
     # Атомарно: ссылка в 577617 + перевод в «Ссылка отправлена» одним PATCH.
     # DP-боты этапа сработают на переход и прочитают сделку с уже заполненным
@@ -668,13 +712,13 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     # сделка обязана остаться в картотеке, а не уехать в розницу.
     patched = await amo_service.patch_lead(
         lead_id,
-        custom_fields={FIELD_PAYMENT_LINK: pay_link},
+        custom_fields={FIELD_PAYMENT_LINK: client_link},
         status_id=stages[1],
         pipeline_id=int(lead.get("pipeline_id")),
     )
     if not patched.get("ok"):
         await _fail(lead, "Ссылка создана, но не записалась в сделку - отправьте клиенту вручную",
-                    detail=f"{pay_link}\nextId {ext_id}")
+                    detail=f"{client_link}\nextId {ext_id}")
         return "failed-patch"
 
     rub = kopecks / 100
@@ -683,6 +727,8 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     with_order = uses_checkout_page(by_card)
     if by_card:
         kind = "Счёт (оплата картой, страница выбора Ozon)"
+    elif page_link:
+        kind = "Счёт СБП (страница оплаты Sunscrypt)"
     elif with_order and "checkout.ozon.ru" in pay_link:
         kind = "Счёт СБП (страница оплаты Ozon)"
     else:
@@ -693,7 +739,9 @@ async def process_invoice_lead(lead_id, source: str = "webhook") -> str:
     await amo_service.add_note(
         lead_id,
         f"{kind} создан автоматически: {rub_str} ₽ ({src}), действителен "
-        f"{OZON_INVOICE_TTL_S // 3600} ч.\n{pay_link}\nextId {ext_id}"
+        f"{OZON_INVOICE_TTL_S // 3600} ч.\n{client_link}"
+        + (f"\nстраница Ozon (с телефона): {pay_link}" if page_link else "")
+        + f"\nextId {ext_id}"
         + (f"\npaymentId {payment_id}" if payment_id else "")
         + (f"\norderExtId {order_ext_id}" if order_ext_id else ""),
     )

@@ -1052,6 +1052,12 @@ OZON_INVOICE_TTL_S = int(os.getenv("OZON_INVOICE_TTL_S", "86400"))
 # ссылка qr.nspk.ru. Галочка «Оплата картой» (578145) работает как раньше.
 OZON_INVOICE_SBP_CHECKOUT_PAGE = os.getenv("OZON_INVOICE_SBP_CHECKOUT_PAGE", "1").strip() != "0"
 OZON_INVOICE_REDIRECT_URL = os.getenv("OZON_INVOICE_REDIRECT_URL", "https://sunscrypt.ru/").strip()
+# Своя страница оплаты (pay_page.py, 26.11.2026): в 577617 вместо checkout.ozon.ru кладём
+# https://pay.sunscrypt.ru/o/<номер>; компьютер видит QR, телефон уходит на страницу Ozon.
+# Только счёт СБП на ключах розницы (не «Оплата картой», не TangemShop) и только поверх
+# OZON_INVOICE_SBP_CHECKOUT_PAGE. По умолчанию ВЫКЛЮЧЕНО: "1" включает.
+OZON_INVOICE_OWN_PAGE = os.getenv("OZON_INVOICE_OWN_PAGE", "").strip() == "1"
+OZON_INVOICE_PAGE_BASE = os.getenv("OZON_INVOICE_PAGE_BASE", "https://pay.sunscrypt.ru/o").strip().rstrip("/")
 # Секрет подписи УВЕДОМЛЕНИЙ Ozon (отдельный от secretKey, ЛК Ozon Pay; тот же,
 # что у плагина сайта). Задан → в createPayment передаём notificationUrl
 # (PUBLIC_BASE_URL/ozon_notify) и по вебхуку «Completed» сами двигаем сделку в
