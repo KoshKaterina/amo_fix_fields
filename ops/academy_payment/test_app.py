@@ -288,7 +288,13 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_and_script_have_no_sbp_word_and_split_desktop_phone(self):
         r = await self.client.get(module.PREFIX + "/deposit-10000")
         self.assertNotIn("СБП", r.text)
-        self.assertIn('<section id="qr" hidden', r.text)
+        self.assertIn('<section id="qr" class="box" hidden', r.text)
+        # Оформление как у своей страницы оплаты amo: логотип, блок, реквизиты получателя.
+        self.assertIn('aria-label="Sunscrypt"', r.text)
+        self.assertIn('<div id="paid" class="box paid" hidden>', r.text)
+        self.assertIn("ИНН 773423812500", r.text)
+        self.assertEqual(r.text.count("Предоплата 10&nbsp;000&nbsp;₽</h1>"), 1)
+        self.assertNotIn('id="start-title">Предоплата 10 000 ₽<', r.text)
         self.assertIn("Наведите камеру телефона на QR-код или отсканируйте его в приложении банка.", r.text)
         js = (await self.client.get(module.PREFIX + "/payment.js")).text
         self.assertIn("matchMedia('(hover:hover) and (pointer:fine)')", js)

@@ -129,42 +129,161 @@ def payment(session):
         return conn.execute("SELECT * FROM payments WHERE session=?", (session_hash(session),)).fetchone()
 
 
-_STYLE = """body{margin:0;background:#fff;color:#151b26;font:17px/1.5 system-ui,sans-serif}
-main{max-width:560px;padding:40px 24px;margin:8vh auto}h1{font-size:28px;line-height:1.2;text-wrap:balance}
-p{max-width:60ch}button,a{font:inherit}button{min-height:48px;border:0;border-radius:8px;padding:12px 20px;background:#0164fa;color:#fff;cursor:pointer}
-button:disabled{opacity:.6}a{color:#0149bf}:focus-visible{outline:3px solid #151b26;outline-offset:4px}
-#qr[hidden]{display:none}#qr{margin:24px 0 0;padding:20px 22px;border:1px solid #e1e6f0;border-radius:16px;background:#f0f5fa}
-#qr .t{font-size:19px;font-weight:700;line-height:1.2;margin:0 0 7px}#qr p{margin:7px 0 0;font-size:15px;color:#37414d}
-#qr .row{display:flex;gap:22px;align-items:center;margin:16px 0 0}
-#qr .code{flex:0 0 auto;width:232px;height:232px;padding:6px;box-sizing:border-box;background:#fff;border:1px solid #e1e6f0;border-radius:12px}
-#qr .code svg{display:block;width:100%;height:100%}
-#qr .wait{display:flex;align-items:center;gap:10px;margin-top:16px}
-#qr .spin{width:16px;height:16px;flex:0 0 auto;border:2.5px solid #cdd8ea;border-top-color:#0164fa;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){#qr .spin{animation:none}}
-@media (max-width:600px){#qr .row{flex-direction:column;align-items:stretch;gap:12px}#qr .code{margin:0 auto}}"""
+_STYLE = """*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:#fff;color:#0f141e;
+font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+header{border-bottom:1px solid #e1e6f0}
+header .in,main,footer .in{width:100%;max-width:720px;margin:0 auto;padding-left:24px;padding-right:24px}
+header .in{padding-top:18px;padding-bottom:18px}
+header a{display:inline-block;line-height:0}
+header svg{display:block;width:170px;height:auto}
+main{flex:1 0 auto;padding-top:40px;padding-bottom:40px}
+h1{font-size:28px;line-height:1.2;letter-spacing:-.01em;margin:0 0 24px}
+.box{display:flex;gap:15px;align-items:flex-start;border:1px solid #e1e6f0;border-radius:16px;padding:20px 22px;background:#f0f5fa}
+.box[hidden]{display:none}
+.ic{width:42px;height:42px;border-radius:12px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0164fa,#0046b0)}
+.ic svg{display:block}.ic .i-alert{display:none}
+.body{flex:1 1 auto;min-width:0}
+.t{font-size:19px;font-weight:700;letter-spacing:-.01em;line-height:1.2;margin:0 0 7px}
+p{margin:7px 0 0;font-size:15px;line-height:1.5;color:#37414d}
+.t+p{margin-top:0}
+#status:empty{display:none}
+a{color:#0164fa;font-weight:600;text-decoration:underline;text-underline-offset:2px}
+.paid{background:#edf3ff;border-color:#cfe0ff}
+.err{background:#fdf1ec;border-color:#f6d3c4}.err .ic{background:#ed5c2a}.err .ic .i-main{display:none}.err .ic .i-alert{display:block}
+form{margin:16px 0 0}
+.btn{display:block;width:100%;margin:0;padding:14px 18px;border-radius:12px;background:#0164fa;border:1.5px solid #0164fa;color:#fff;
+font:inherit;font-size:16px;font-weight:700;line-height:1.25;text-align:center;cursor:pointer}
+.btn[hidden]{display:none}.btn:disabled{opacity:.6;cursor:wait}
+.btn:focus-visible,a:focus-visible{outline:3px solid #9cc2ff;outline-offset:2px}
+.qr-wrap{display:flex;gap:22px;align-items:center;margin:18px 0 0}
+.qr{flex:0 0 auto;width:232px;height:232px;padding:6px;background:#fff;border:1px solid #e1e6f0;border-radius:12px}
+.qr svg{display:block;width:100%;height:100%}
+.qr-text{flex:1 1 auto;min-width:0}
+.qr-text p{margin:0}
+.wait{display:flex;align-items:center;gap:10px;margin-top:16px}
+.spin{width:16px;height:16px;flex:0 0 auto;border:2.5px solid #cdd8ea;border-top-color:#0164fa;border-radius:50%;display:inline-block;animation:spin .8s linear infinite}
+.spin[hidden]{display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.note{font-size:13px;line-height:1.45;color:#5b6676}
+footer{border-top:1px solid #e1e6f0;color:#5b6676;font-size:13px;line-height:1.6}
+footer .in{padding-top:20px;padding-bottom:24px}
+footer p{margin:0;font-size:13px;color:#5b6676}
+footer a{color:inherit;font-weight:400}
+@media (max-width:600px){main{padding-top:28px}h1{font-size:24px}.box>.ic{display:none}
+.qr-wrap{flex-direction:column;align-items:stretch;gap:12px}.qr{margin:0 auto}}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}}"""
 
-# Desktop QR block: filled by payment.js with the server-generated SVG. Hidden until then.
-_QR_BLOCK = """<section id="qr" hidden aria-live="polite"><div class="t">Оплатите онлайн</div>
-<p>Предоплата 10 000 ₽ за четвёртый поток «Инвестиции в DeFi».</p>
-<div class="row"><div class="code" id="qr-code"></div>
-<p>Наведите камеру телефона на QR-код или отсканируйте его в приложении банка.</p></div>
-<p class="wait"><span class="spin" aria-hidden="true"></span><span id="qr-wait">Ждём оплату. После оплаты страница обновится сама.</span></p></section>"""
+# Как своя страница оплаты amo (pay_page.py): тот же логотип, иконки, блоки и реквизиты получателя.
+# Логотип встроен: контейнер монтирует только app.py.
+_LOGO = """<svg role="img" aria-label="Sunscrypt" version="1.1" xmlns="http://www.w3.org/2000/svg"
+viewBox="0 0 4786 719">
+<style type="text/css">
+.st0{fill:#0F141E;}
+.st1{fill-rule:evenodd;clip-rule:evenodd;fill:#0F141E;}
+.st2{fill:url(#SVGID_1_);}
+</style>
+<g>
+<path class="st0" d="M4785.7,491.2v75.3c-29.3,6.2-53.8,9.3-73.5,9.3c-48.4,0-86.2-12.1-113.2-36.4
+c-26.5-24.3-39.7-60.4-39.7-108.4V219.3h-67.6v-77h67.6V1h89.6v141.3h123.4v77h-123.4v204.1c0,26,6.5,44.6,19.4,55.9
+c13.5,10.7,34.4,16.1,62.5,16.1C4740.4,495.4,4758.7,494,4785.7,491.2z"/>
+<path class="st0" d="M4425.6,359.2c0,61.8-19.4,113.5-58.2,155.1c-38.2,41-86.5,61.5-145,61.5c-57.3,0-103.4-20-138.2-59.8v202.3
+h-88.5V143.1h82.6v67.8c31.5-45,79.5-67.4,144.1-67.4c58.4,0,106.8,20.8,145,62.4C4406.2,246.8,4425.6,297.9,4425.6,359.2z
+M4298.3,457c24.2-25.3,36.2-57.6,36.2-96.9c0-39.3-12.1-71.6-36.2-96.9c-24.2-25.8-54.2-38.8-90.2-38.8
+c-34.8,0-64.4,11.8-88.5,35.4c-24.2,23.6-36.2,56.8-36.2,99.5c0,43.3,12.1,76.7,36.2,100.3c24.2,23.6,53.7,35.4,88.5,35.4
+C4244.1,494.9,4274.1,482.3,4298.3,457z"/>
+<path class="st0" d="M3835.2,143.4h94.4l-201.5,461.1c-17.4,39.3-38.2,68-62.4,86c-24.2,18.5-53.9,27.8-89.4,27.8
+c-23.6,0-46.4-2.8-68.3-8.4v-75c23,2.2,39.3,3.4,48.9,3.4c42.7,0,72.8-20.2,90.2-60.7l16.9-38.8l-165.2-395.3h95.2l118.8,300.9
+L3835.2,143.4z"/>
+<path class="st0" d="M3432.7,152v78.6h-27c-36,0-65.3,10.1-87.9,30.4c-22.5,20.3-33.8,48.4-33.8,84.5v230.4h-88.7V143.4h82.8V206
+c31-38.9,71.2-58.3,120.8-58.3C3410.2,147.7,3421.4,149.2,3432.7,152z"/>
+<path class="st0" d="M2734.9,359.2c-1.1-59,20.3-109.9,64.2-152.6c43.9-43.3,95.7-64.3,155.3-63.2c77.7,0,135.9,32,174.8,96.1
+l-62.5,48.9c-29.3-42.1-66.4-63.2-111.4-63.2c-37.1,0-68.1,12.9-92.9,38.8s-37.1,57.6-37.1,95.2c0,38.2,12.4,70.2,37.1,96.1
+c24.8,25.8,55.7,38.8,92.9,38.8c43.9,0,81-20.8,111.4-62.4l62.5,48c-18.6,30.3-43,53.9-73.4,70.8c-30.4,16.9-64.2,25.3-101.3,25.3
+c-61.3,0-113.4-21.1-156.2-63.2C2756,470.5,2734.9,419.3,2734.9,359.2z"/>
+<path class="st0" d="M2345.7,495.8l51-55.6c38,39.3,77.1,59,117.3,59c19.8,0,36-3.9,48.5-11.8c12.5-8.4,18.7-19.9,18.7-34.6
+c0-11.2-4.2-20.2-12.8-27c-8.5-7.3-23.8-15.5-45.9-24.4l-42.5-17.7c-38-15.7-65.7-32.6-83.3-50.6c-17-18.5-25.5-41.9-25.5-70
+c0-36.5,13.6-65.5,40.8-86.8c27.8-21.9,63.2-32.9,106.3-32.9c60.1,0,108.3,21.4,144.5,64.1l-48.5,54.8
+c-27.2-28.1-59.8-42.1-97.8-42.1c-38,0-56.9,13.2-56.9,39.6c0,10.1,4,18.8,11.9,26.1c7.9,6.7,22.4,14.3,43.4,22.8l40,16
+c40.2,16.9,69.1,34.8,86.7,53.9c18.1,18.5,27.2,42.1,27.2,70.8c0,39.9-14.7,71.1-44.2,93.6c-29.5,21.9-66.3,32.9-110.5,32.9
+C2443.2,575.8,2387.1,549.1,2345.7,495.8z"/>
+<path class="st0" d="M2279.6,308.6v267.2h-88.7V320.5c0-28.7-8.5-51.8-25.3-69.3c-16.3-18-38-27-65.1-27c-27.6,0-50.4,9-68.4,27
+c-17.5,18-26.2,41.1-26.2,69.3v255.4h-88.7V143.4h82.8v50.3c31.5-33.2,72.9-49.8,124.2-49.8c47.9,0,85.6,14.9,113.2,44.8
+C2265.5,218.5,2279.6,258.5,2279.6,308.6z"/>
+<path class="st0" d="M1014.5,495.8l50.6-55.6c37.7,39.3,76.5,59,116.4,59c19.7,0,35.7-3.9,48.1-11.8c12.4-8.4,18.6-19.9,18.6-34.6
+c0-11.2-4.2-20.2-12.7-27c-8.4-7.3-23.6-15.5-45.5-24.4l-42.2-17.7c-37.7-15.7-65.2-32.6-82.7-50.6c-16.9-18.5-25.3-41.9-25.3-70
+c0-36.5,13.5-65.5,40.5-86.8c27.5-21.9,62.7-32.9,105.4-32.9c59.6,0,107.4,21.4,143.4,64.1l-48.1,54.8c-27-28.1-59.3-42.1-97-42.1
+c-37.7,0-56.5,13.2-56.5,39.6c0,10.1,3.9,18.8,11.8,26.1c7.9,6.7,22.2,14.3,43,22.8l39.7,16c39.9,16.9,68.6,34.8,86,53.9
+c18,18.5,27,42.1,27,70.8c0,39.9-14.6,71.1-43.9,93.6c-29.2,21.9-65.8,32.9-109.7,32.9C1111.2,575.8,1055.6,549.1,1014.5,495.8z"/>
+<path class="st1" d="M1526.9,450.8c-24.1-24.4-37.5-57.1-37.5-102.7h-88.2c0,65.4,20.2,122.1,63.6,165.8l0.3,0.3l0.3,0.3
+c43.5,42.4,98.6,62.7,161.6,62.7c62.4,0,116.7-20.9,159.5-63.9c43.8-43.5,64.6-99.9,64.6-165h-88.2c0,44.8-13.6,77.3-38.4,101.9
+l-0.1,0.1l-0.1,0.1c-24.8,24.9-56,38-97.2,38C1584.2,488.2,1552.1,475.1,1526.9,450.8z"/>
+</g>
+<g>
+<linearGradient id="SVGID_1_" gradientUnits="userSpaceOnUse" x1="2011.88" y1="2051.6814" x2="1616.9149" y2="2050.6155" gradientTransform="matrix(0.5 -0.866 -0.866 -0.5 1270.5447 2956.1777)">
+<stop  offset="0" style="stop-color:#0036FF"/>
+<stop  offset="1" style="stop-color:#00C2FF"/>
+</linearGradient>
+<polygon class="st2" points="252.4,505.3 452.7,158.3 549.8,214.4 349.5,561.4 	"/>
+<path class="st0" d="M362.3,12.2c-100.1,0-192.6,53.4-242.7,140.1L0.2,359.2l97.1,56.1l168-291h336.2V12.2H362.3z"/>
+<path class="st0" d="M682.3,567c-50,86.7-142.6,140.1-242.7,140.1H200.7V595h335.9l168.2-291.4l97.1,56.1L682.3,567z"/>
+</g>
+</svg>"""
+_IC_QR = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1.5" stroke="#fff" stroke-width="2"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1.5" stroke="#fff" stroke-width="2"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1.5" stroke="#fff" stroke-width="2"/><path d="M14 14h2.5v2.5H14zM18 18h2.5v2.5H18zM18 14h2.5v2.5H18zM14 18h2.5v2.5H14z" fill="#fff"/></svg>'
+_IC_CHECK = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.2 4.2L19 7" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+_IC_ALERT = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 7.5v6" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/><circle cx="12" cy="17" r="1.5" fill="#fff"/></svg>'
+_CONTACT = ('позвоните по номеру <a href="tel:+79056063678">+7&nbsp;(905)&nbsp;606-36-78</a> или напишите в '
+            '<a href="https://t.me/Sunscrypt_manager" target="_blank" rel="noopener noreferrer">Телеграм</a>.')
+_WHAT = "Предоплата 10&nbsp;000&nbsp;₽ за четвёртый поток «Инвестиции в DeFi»"
+_FOOTER = ('<footer aria-label="Реквизиты получателя"><div class="in">'
+           '<p>Получатель: ИП Перфилов Андрей Владимирович, ИНН 773423812500, ОГРНИП 322774600771372</p>'
+           '<p><a href="https://sunscrypt.ru/about/" target="_blank" rel="noopener noreferrer">Все реквизиты</a></p>'
+           '</div></footer>')
+
+# Блок QR для компьютера: payment.js вставляет SVG с сервера и показывает блок.
+_QR_BLOCK = ('<section id="qr" class="box" hidden aria-live="polite"><span class="ic">' + _IC_QR + '</span><div class="body">'
+             '<div class="t">Оплатите заказ онлайн</div>'
+             '<p>' + _WHAT + '. Осталось оплатить.</p>'
+             '<div class="qr-wrap"><div class="qr" id="qr-code"></div><div class="qr-text">'
+             '<p>Наведите камеру телефона на QR-код или отсканируйте его в приложении банка.</p></div></div>'
+             '<p class="wait"><span class="spin" aria-hidden="true"></span><span id="qr-wait">Ждём оплату. После оплаты страница обновится сама.</span></p>'
+             '<p class="note">Ссылка на оплату действует сутки. Не получается оплатить? Чтобы связаться с нами, ' + _CONTACT + '</p>'
+             '</div></section>')
+
+_PAID_BLOCK = ('<div id="paid" class="box paid"{hidden}><span class="ic">' + _IC_CHECK + '</span><div class="body">'
+               '<div class="t">Предоплата получена</div>'
+               '<p>Спасибо! ' + _WHAT + ' оплачена.</p>'
+               '<p>Менеджер свяжется с вами. Если есть вопросы, ' + _CONTACT + '</p></div></div>')
 
 
 def page(title, message, session, returning=False):
     # This is a payment/status page, not the external Academy contact form.
-    content = f"""<!doctype html><html lang="ru"><meta charset="utf-8">
+    # title — состояние («Предоплата 10 000 ₽» = открываем оплату, «Проверяем оплату», «Предоплата получена»).
+    # Заголовок страницы один — что оплачиваем; состояние говорит блок под ним (как в pay_page.py).
+    paid = title == "Предоплата получена"
+    box_title = "Оплатите заказ онлайн" if title == "Предоплата 10 000 ₽" else title
+    start = ('<div id="start" class="box"' + (" hidden" if paid else "") + '><span class="ic">'
+             '<span class="i-main">' + _IC_QR + '</span><span class="i-alert">' + _IC_ALERT + '</span></span><div class="body">'
+             f'<div class="t" id="start-title">{html.escape(box_title)}</div>'
+             '<p>' + _WHAT + '.</p>'
+             f'<p id="status" role="status">{html.escape(message)}</p>'
+             f'<form method="post" action="{PREFIX}/create"><input type="hidden" name="csrf" value="{csrf(session)}">'
+             '<button id="pay" class="btn" type="submit">Перейти к оплате 10&nbsp;000&nbsp;₽</button></form>'
+             '<p class="note">Не получается оплатить? Чтобы связаться с нами, ' + _CONTACT + '</p>'
+             '</div></div>')
+    content = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer">
 <meta name="csrf" content="{csrf(session)}"><title>{html.escape(title)} — Sunscrypt</title>
-<style>{_STYLE}</style>
-<main data-return="{str(returning).lower()}"><p>Sunscrypt Академия</p><h1>{html.escape(title)}</h1>
-<p>Четвёртый поток «Инвестиции в DeFi»</p><p id="status" role="status">{html.escape(message)}</p>
-<form method="post" action="{PREFIX}/create"><input type="hidden" name="csrf" value="{csrf(session)}">
-<button id="pay" type="submit">Перейти к оплате 10 000 ₽</button></form>
+<style>{_STYLE}</style></head><body>
+<header><div class="in"><a href="https://sunscrypt.ru/" rel="noopener noreferrer">{_LOGO}</a></div></header>
+<main data-return="{str(returning).lower()}"><h1>Предоплата 10&nbsp;000&nbsp;₽</h1>
+{start}
 {_QR_BLOCK}
-<p><a href="https://t.me/Sunscrypt_manager">Связаться с менеджером</a></p></main>
-<script src="{PREFIX}/payment.js" defer></script></html>"""
+{_PAID_BLOCK.format(hidden="" if paid else " hidden")}
+</main>{_FOOTER}
+<script src="{PREFIX}/payment.js" defer></script></body></html>"""
     response = HTMLResponse(content)
     response.set_cookie(COOKIE, session, max_age=TTL, secure=True, httponly=True, samesite="lax", path=PREFIX)
     return response
@@ -202,10 +321,11 @@ async def entry(request: Request):
 _SCRIPT = """const button=document.querySelector('#pay'), status=document.querySelector('#status');
 const returning=document.querySelector('main').dataset.return==='true';
 const desktop=window.matchMedia('(hover:hover) and (pointer:fine)').matches;
-function paidView(){document.querySelector('h1').textContent='Предоплата получена';status.textContent='Спасибо! Менеджер свяжется с вами.';
-button.hidden=true;const q=document.querySelector('#qr');if(q)q.hidden=true;}
+const startBox=document.querySelector('#start');
+function paidView(){button.hidden=true;['#start','#qr'].forEach(s=>{const b=document.querySelector(s);if(b)b.hidden=true;});
+const p=document.querySelector('#paid');if(p)p.hidden=false;document.title='Предоплата получена — Sunscrypt';}
 function showQr(svg){const box=document.querySelector('#qr');document.querySelector('#qr-code').innerHTML=svg;box.hidden=false;
-status.textContent='';button.hidden=true;watch();}
+status.textContent='';button.hidden=true;if(startBox)startBox.hidden=true;document.title='Оплатите заказ онлайн — Sunscrypt';watch();}
 function watch(){const started=Date.now();let timer=null,busy=false,done=false;
 const delay=()=>Date.now()-started<180000?4000:10000;
 function giveUp(){done=true;const w=document.querySelector('#qr-wait');if(w)w.textContent='Пока не видим оплату. Если вы уже оплатили, обновите страницу через минуту.';
@@ -220,7 +340,7 @@ try{const r=await fetch('/academy-pay/create',{method:'POST',headers:{'X-Academy
 const d=await r.json();if(!r.ok)throw new Error(d.detail||'Оплата временно недоступна');
 if(d.paid){paidView();return;}
 if(desktop&&d.qr){showQr(d.qr);return;}
-window.location.replace(d.url);}catch(e){status.textContent=e.message;button.disabled=false;}}
+window.location.replace(d.url);}catch(e){status.textContent=e.message;button.disabled=false;if(startBox){startBox.classList.add('err');document.querySelector('#start-title').textContent='Оплата пока не открылась';}}}
 document.querySelector('form').addEventListener('submit',start);
 if(!returning)start();else{button.hidden=true;let count=0;
 async function check(){try{const r=await fetch('/academy-pay/status',{cache:'no-store'});const d=await r.json();
