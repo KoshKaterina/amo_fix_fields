@@ -10,6 +10,9 @@
 «Заказ №X (ссылка) изменён пользователем Y в воронке Офис, отгрузка пересоздана /
 не изменена. @Катя обрати внимание на изменение заказа. Заказ до → после».
 
+Заказы старше семи дней пропускаем по дате создания и дате документа.
+Чужие отгрузки не пересоздаём: их состав может отражать ручную замену.
+
 Как ловим. Не по событиям, а по СОСТОЯНИЮ: раз в `SHIPMENT_RESYNC_INTERVAL_S` берём заказы
 покупателя, изменённые с прошлого прохода, и у тех, где ровно одна отгрузка, сравниваем
 товары заказа с товарами отгрузки (товар + количество + цена). Совпали - всё в порядке.
@@ -64,6 +67,7 @@ SHIPMENT_RESYNC_TAG = os.getenv("SHIPMENT_RESYNC_TAG", "@kathrina_bistraya")
 _CURSOR_PATH = pathlib.Path(os.getenv("SHIPMENT_RESYNC_CURSOR", "/app/var/shipment_resync_cursor.json"))
 EVENT_KEY = "shipment_resync"
 _MSK = datetime.timezone(datetime.timedelta(hours=3))
+_MAX_ORDER_AGE = datetime.timedelta(days=7)
 _GOODS = {"product", "variant", "bundle", "consignment"}
 
 _task: asyncio.Task | None = None
@@ -243,6 +247,7 @@ def build_message(order: dict, lead: dict, who: str, outcome: str, lines: list[s
         "recreated": "отгрузка пересоздана",
         "would": "отгрузка НЕ пересоздана (режим проверки): склад списал старый состав",
         "multi": "отгрузка НЕ изменена: у заказа несколько отгрузок, поправьте руками",
+        "protected": "отгрузка сохранена: она не была создана этим обработчиком",
         "delete_failed": "отгрузка НЕ изменена",
         "create_failed": "⚠️ старая отгрузка удалена, новая НЕ создалась - товар вернулся на склад, "
                          "создайте отгрузку руками",
@@ -289,11 +294,25 @@ def _save_cursor(ts: int) -> None:
         logger.exception("Пересоздание отгрузок: курсор не записался")
 
 
+def _is_recent_order(order: dict) -> bool:
+    now = datetime.datetime.now(_MSK)
+    try:
+        dates = [datetime.datetime.fromisoformat(order[field]) for field in ("created", "moment")]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(
+        now - _MAX_ORDER_AGE <= (date if date.tzinfo else date.replace(tzinfo=_MSK)) <= now
+        for date in dates
+    )
+
+
 async def handle_order(order: dict) -> str:
     """Один изменённый заказ. Возвращает исход для лога и тестов."""
     demands = _demands(order)
     if not demands:
         return "no-demand"
+    if not _is_recent_order(order):
+        return "historical-order"
     order_id = str(order.get("id") or "")
     order_rows = await _positions("customerorder", order_id)
     if order_rows is None:
@@ -341,6 +360,13 @@ async def handle_order(order: dict) -> str:
         return "dry"
 
     res = await amgroup_shipment.recreate_shipment(lead, order_id, str(demands[0].get("id")))
+    if res["protected"]:
+        key = (order_id, json.dumps(sorted((list(k), v) for k, v in after.items())))
+        if key in _changed_notified:
+            return "notify-known"
+        _changed_notified.add(key)
+        await _send(build_message(order, lead, who, "protected", lines), lead)
+        return "protected"
     if res["ok"]:
         outcome, extra = "recreated", (f"Отгрузка № {demands[0].get('name') or '?'} → "
                                        f"№ {res['result']['shipment_number']}.")
@@ -376,7 +402,7 @@ async def sweep_once() -> dict:
             logger.exception("Пересоздание отгрузок: заказ %s упал", order.get("name"))
             o = "error"
         outcomes[o] += 1
-        if o in ("recreated", "create_failed", "delete_failed", "multi", "dry", "notified"):
+        if o in ("recreated", "create_failed", "delete_failed", "multi", "dry", "notified", "protected"):
             acted += 1
     # Курсор не двигаем, если что-то отложили: следующий проход доберёт.
     if not outcomes.get("deferred") and not outcomes.get("ms-silent"):

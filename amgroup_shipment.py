@@ -616,15 +616,25 @@ async def recreate_shipment(lead: dict, order_uuid: str, old_demand_id: str) -> 
     Порядок: удалить старую отгрузку → собрать шаблон по заказу → создать новую →
     переписать три поля сделки. Шаблон собираем ПОСЛЕ удаления: МойСклад кладёт в
     шаблон только неотгруженный остаток заказа, при живой старой отгрузке он был бы пуст.
-    Возвращает {"ok", "deleted", "result", "reason"}: ok - новая отгрузка создана;
+    Удалять можно только отгрузку, которую этот сервис сам создал для этого заказа.
+    Возвращает {"ok", "deleted", "protected", "result", "reason"}: ok - новая отгрузка создана;
     deleted - старая удалена (при ok=False это значит: товар вернулся на склад, а новой
     отгрузки нет - человек должен создать руками, причина в reason).
     """
     lead_id = lead.get("id")
     key = str(lead_id)
-    out = {"ok": False, "deleted": False, "result": None, "reason": None}
+    out = {"ok": False, "deleted": False, "protected": False, "result": None, "reason": None}
     async with _lock_for(lead_id):
         _load_state()
+        previous = _created.get(key) or {}
+        if (
+            not order_uuid or not old_demand_id
+            or previous.get("order_uuid") != order_uuid
+            or previous.get("shipment_id") != old_demand_id
+            or previous.get("pending")
+        ):
+            out["protected"] = True
+            return out
         deleted = await ms_client.delete(f"entity/demand/{old_demand_id}")
         if not deleted:
             out["reason"] = human_reason({"kind": "post_failed", "detail": ms_client.last_error})                 .replace("в создании отгрузки", "в удалении старой отгрузки")

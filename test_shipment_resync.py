@@ -183,7 +183,10 @@ def _setup(order_rows, demand_rows, demands=("dem-1",), dry=False, lead=None, no
     amo_notes.clear()
     leads_by_query.clear()
     leads_by_query["ord-1"] = [lead or _lead()]
-    return {"id": "ord-1", "name": "09100", "demands": [{"id": d, "name": f"D-{d}"} for d in demands]}
+    A._state_loaded = True
+    A._created["5"] = {"order_uuid": "ord-1", "shipment_id": "dem-1"}
+    recent = (S.datetime.datetime.now(S._MSK) - S.datetime.timedelta(hours=1)).isoformat()
+    return {"id": "ord-1", "name": "09100", "created": recent, "moment": recent, "demands": [{"id": d, "name": f"D-{d}"} for d in demands]}
 
 
 TANGEM, LEDGER, DELIVERY = "t2", "ln", "dlv"
@@ -205,6 +208,35 @@ def test_changed_order_recreated_with_diff():
     assert "№09100" in t and "kirillp" in t and "пересоздана" in t and "@kathrina_bistraya" in t
     assert "Tangem 2.0: ×1 → ×2" in t and "+ Ledger ×1" in t
     assert sent[0]["message_thread_id"] == 10479
+
+
+def test_recent_update_does_not_touch_historical_order():
+    for field in ("created", "moment"):
+        o = _setup([pos(TANGEM, 2, 1)], [pos(TANGEM, 1, 1)])
+        o[field] = "2026-04-13 18:27:00.000"
+        o["updated"] = (S.datetime.datetime.now(S._MSK) - S.datetime.timedelta(minutes=1)).isoformat()
+        assert run(S.handle_order(o)) == "historical-order"
+        assert calls == [] and sent == [] and patched_amo == []
+
+
+def test_missing_or_invalid_order_date_does_not_trigger_resync():
+    for value in (None, "unknown"):
+        o = _setup([pos(TANGEM, 2, 1)], [pos(TANGEM, 1, 1)])
+        o["created"] = value
+        assert run(S.handle_order(o)) == "historical-order"
+        assert calls == []
+
+
+def test_manual_shipment_on_recent_order_is_preserved():
+    for previous in ({}, {"order_uuid": "ord-1", "shipment_id": "another-demand"},
+                     {"order_uuid": "another-order", "shipment_id": "dem-1"}):
+        o = _setup([pos(TANGEM, 2, 1)], [pos(TANGEM, 1, 1)])
+        A._created["5"] = previous
+        assert run(S.handle_order(o)) == "protected"
+        assert run(S.handle_order(o)) == "notify-known"
+        assert len(sent) == 1 and "отгрузка сохранена" in sent[0]["text"]
+        assert not any(c[0] in ("DELETE", "POST", "PUT") for c in calls)
+        assert patched_amo == []
 
 
 def test_price_change_counts_and_removed_item():
