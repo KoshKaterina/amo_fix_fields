@@ -1478,3 +1478,94 @@ def test_sbp_checkout_flag_vyklyuchen_primechanie_kak_ranshe():
     note = _notes[-1][1]
     assert note.startswith("Счёт СБП создан автоматически:"), note
     assert "orderExtId" not in note, note
+
+
+# --- сверка заказа Ozon: getOrderStatus по extId заказа (26.11.2026) ----------
+class _ClientOrderFlow:
+    """Как боевой Ozon 26.11 по счёту со страницей checkout.ozon.ru: getPaymentDetails
+    по paymentId пусто, по нашим extId 403; getOrderStatus отдаёт заказ."""
+    def __init__(self, order):
+        self.order = order
+        self.calls = []
+    async def post(self, url, json=None):
+        self.calls.append((url.rsplit("/", 1)[-1], json))
+        if url.endswith("/v1/getOrderStatus"):
+            return _RespDetails(self.order)
+        if json.get("id"):
+            return _RespDetails({"items": []})
+        return _RespDenied()
+
+
+def _order(status="STATUS_PAID", ext="ord-777002-1795678928", **over):
+    data = {"id": "01a216ce-order", "extId": ext, "status": status, "isTestMode": False,
+            "originalAmount": {"currencyCode": "643", "value": "100"}}
+    data.update(over)
+    return data
+
+
+def test_zakaz_ozon_oplachen_nahoditsya_po_getorderstatus():
+    """заказ Ozon: после пустоты и 403 getPaymentDetails статус берётся из getOrderStatus"""
+    ozon_invoice.get_payment_status = _REAL_GET_PAYMENT_STATUS
+    client = _ClientOrderFlow(_order())
+    ozon_invoice._client = client
+    status, kopecks, err = run(ozon_invoice.get_payment_status(
+        "pay-o", "amo-777002-1795678928", "ord-777002-1795678928"))
+    assert (status, kopecks, err) == ("STATUS_PAID", 100, ""), (status, kopecks, err)
+    assert ozon_invoice.is_paid_status(status)
+    assert [c[0] for c in client.calls] == [
+        "getPaymentDetails", "getPaymentDetails", "getPaymentDetails", "getOrderStatus"], client.calls
+    body = client.calls[-1][1]
+    assert body["extId"] == "ord-777002-1795678928" and "id" not in body, body
+    assert body["requestSign"] == hashlib.sha256(
+        f"ord-777002-1795678928{ozon_invoice.OZON_PAY_ACCESS_KEY}"
+        f"{ozon_invoice.OZON_PAY_SECRET_KEY}".encode()).hexdigest()
+    ozon_invoice._client = None
+
+
+def test_zakaz_ozon_ozhidaet_oplaty_ne_oplachen():
+    """заказ Ozon ждёт оплаты: статус есть, но это не оплата"""
+    ozon_invoice.get_payment_status = _REAL_GET_PAYMENT_STATUS
+    ozon_invoice._client = _ClientOrderFlow(_order("STATUS_PAYMENT_PENDING"))
+    status, _, err = run(ozon_invoice.get_payment_status(
+        "pay-o", "amo-777002-1795678928", "ord-777002-1795678928"))
+    assert (status, err) == ("STATUS_PAYMENT_PENDING", ""), (status, err)
+    assert not ozon_invoice.is_paid_status(status)
+    ozon_invoice._client = None
+
+
+def test_zakaz_ozon_chuzhoy_testovyy_ne_rubli_ne_oplata():
+    """чужой заказ, тестовый режим, не рубли, оплата без суммы: статуса нет, сделку не двигаем"""
+    ozon_invoice.get_payment_status = _REAL_GET_PAYMENT_STATUS
+    for bad in (
+        _order(ext="ord-999-1"),
+        _order(isTestMode=True),
+        _order(originalAmount={"currencyCode": "840", "value": "100"}),
+        _order(originalAmount={"currencyCode": "643", "value": "0"}),
+        _order(id=""),
+    ):
+        ozon_invoice._client = _ClientOrderFlow(bad)
+        status, _, err = run(ozon_invoice.get_payment_status(
+            "pay-o", "amo-777002-1795678928", "ord-777002-1795678928"))
+        assert status == "" and err, (bad, status, err)
+        assert not ozon_invoice.is_paid_status(status)
+    ozon_invoice._client = None
+
+
+def test_pryamoy_sbp_naiden_po_paymentid_zakaz_ne_sprashivaem():
+    """прямой СБП нашёлся по paymentId: getOrderStatus не зовём"""
+    ozon_invoice.get_payment_status = _REAL_GET_PAYMENT_STATUS
+    client = _ClientDetails({"items": [{"status": "PAYMENT_NEW", "amount": {"value": "100"}}]})
+    ozon_invoice._client = client
+    status, _, err = run(ozon_invoice.get_payment_status(
+        "pay-d", "amo-777003-1", "ord-777003-1"))
+    assert (status, err) == ("PAYMENT_NEW", ""), (status, err)
+    assert [u.rsplit("/", 1)[-1] for u, _ in client.bodies] == ["getPaymentDetails"], client.bodies
+    ozon_invoice._client = None
+
+
+def test_status_paid_zakaza_v_slovare_oplat():
+    """STATUS_PAID заказа = оплачен; прочие STATUS_* заказа = нет"""
+    assert ozon_invoice.is_paid_status("STATUS_PAID")
+    for bad in ("STATUS_PAYMENT_PENDING", "STATUS_NEW", "STATUS_AUTHORIZED",
+                "STATUS_CANCELED", "STATUS_EXPIRED"):
+        assert not ozon_invoice.is_paid_status(bad), bad

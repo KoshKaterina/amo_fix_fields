@@ -1056,7 +1056,56 @@ def is_paid_status(status: str) -> bool:
     return status.strip().upper() in {
         "COMPLETED", "PAYMENT_COMPLETED", "PAYMENT_COMPLETE", "PAYMENT_CONFIRMED",
         "SUCCESS", "PAYMENT_SUCCESS", "PAID", "PAYMENT_PAID",
+        "STATUS_PAID",  # getOrderStatus (заказ Ozon), см. _extract_order_status
     }
+
+
+async def _order_status_request(
+    order_ext_id: str, access_key: str, secret_key: str,
+) -> tuple[dict | None, str]:
+    """Один POST /v1/getOrderStatus по extId ЗАКАЗА Ozon. Подпись та же, что у
+    getPaymentDetails: <extId> + accessKey + secretKey (так же подписывают мост
+    Tangemshop и ссылки на оплату Team)."""
+    if _client is None:
+        return None, "httpx-клиент Ozon не инициализирован"
+    body = {
+        "extId": order_ext_id,
+        "accessKey": access_key,
+        "requestSign": _sign_get_details(order_ext_id, access_key, secret_key),
+    }
+    try:
+        resp = await _client.post(f"{OZON_PAY_API_URL}/v1/getOrderStatus", json=body)
+    except httpx.RequestError as exc:
+        return None, f"сеть/таймаут Ozon: {exc.__class__.__name__}"
+    if resp.status_code >= 400:
+        return None, f"Ozon HTTP {resp.status_code}: {resp.text[:200]}"
+    try:
+        return resp.json(), ""
+    except ValueError:
+        return None, "Ozon вернул невалидный JSON"
+
+
+def _extract_order_status(data: dict, order_ext_id: str) -> tuple[str, int | None]:
+    """(status, amount_kopecks) из ответа getOrderStatus. Боевая форма (26.11.2026,
+    счёт 1 ₽): {"id":…, "extId":"ord-…", "originalAmount":{"currencyCode":"643",
+    "value":"100"}, "status":"STATUS_PAYMENT_PENDING", "isTestMode":false}.
+    Чужой заказ, тестовый режим, не рубли, оплата без суммы — статуса нет:
+    лучше не двинуть сделку, чем двинуть по чужому или тестовому заказу."""
+    if not isinstance(data, dict) or not data.get("id"):
+        return "", None
+    if str(data.get("extId") or "") != order_ext_id or data.get("isTestMode") is True:
+        return "", None
+    money = data.get("originalAmount")
+    if not isinstance(money, dict) or str(money.get("currencyCode") or "") not in {"643", "RUB"}:
+        return "", None
+    try:
+        kopecks = int(round(float(money.get("value"))))
+    except (TypeError, ValueError):
+        kopecks = None
+    status = str(data.get("status") or "")
+    if is_paid_status(status) and (kopecks is None or kopecks <= 0):
+        return "", None
+    return status, kopecks
 
 
 async def get_payment_status(
@@ -1097,6 +1146,23 @@ async def get_payment_status(
             logger.info("ozon сверка: статус %r по %s=%s", status, key, value)
             return status, kopecks, ""
         logger.info("ozon сверка: по %s=%s платёж не найден: %s", key, value, str(data)[:300])
+    # Последний шаг — статус ЗАКАЗА Ozon. Счета со страницей checkout.ozon.ru
+    # (карта, а с 26.11.2026 и СБП) getPaymentDetails не видит: по paymentId
+    # пусто, по нашим extId 403 (28.09 и 26.11). getOrderStatus по extId заказа
+    # отвечает (26.11, счёт 1 ₽) — тем же методом сверяют мост Tangemshop и
+    # ссылки Team. Шаг последний, чтобы прямой СБП, найденный по paymentId,
+    # не платил лишним запросом.
+    if order_ext_id:
+        data, err = await _order_status_request(order_ext_id, access_key, secret_key)
+        if err:
+            last_err = err
+            logger.info("ozon сверка: статус заказа extId=%s спросить не вышло (%s)", order_ext_id, err)
+        else:
+            status, kopecks = _extract_order_status(data or {}, order_ext_id)
+            if status:
+                logger.info("ozon сверка: статус заказа %r по extId=%s", status, order_ext_id)
+                return status, kopecks, ""
+            logger.info("ozon сверка: заказ extId=%s не найден: %s", order_ext_id, str(data)[:300])
     if last_err:
         return "", None, last_err
     return "", None, "платёж не найден ни по paymentId, ни по extId"
