@@ -72,7 +72,10 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         body = self.mock.call_args.args[0]
         self.assertEqual(body["amount"]["value"], "1000000")
         self.assertEqual(body["payType"], "SBP")
-        self.assertNotIn("order", body)
+        order = body["order"]
+        self.assertEqual(order["mode"], "MODE_SHORTENED")
+        self.assertEqual(order["amount"]["value"], "1000000")
+        self.assertEqual(order["extId"], self.row()["order_ext_id"])
         self.assertNotIn("amo-", body["extId"])
 
     async def test_refresh_and_concurrent_requests_reuse_one_bill(self):
@@ -89,8 +92,7 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status_code, 200)
         a, b = [call.args[0] for call in self.mock.call_args_list]
         self.assertNotEqual(a["extId"], b["extId"])
-        self.assertNotIn("order", a)
-        self.assertNotIn("order", b)
+        self.assertNotEqual(a["order"]["extId"], b["order"]["extId"])
 
     async def test_foreign_origin_and_wrong_csrf_fail_before_bank(self):
         headers = await self.enter()
@@ -116,40 +118,74 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         r = await self.client.post(module.PREFIX + "/create", headers=headers)
         self.assertEqual(r.status_code, 502)
 
-    async def test_checkout_without_sbp_is_never_a_fallback(self):
-        self.mock.return_value = {"order": {"item": {"payLink": "https://checkout.ozon.ru/order/test"}}}
-        headers = await self.enter()
-        r = await self.client.post(module.PREFIX + "/create", headers=headers)
-        self.assertEqual(r.status_code, 502)
+    async def test_checkout_without_qr_or_qr_without_checkout_is_rejected(self):
+        for value in ({"order": {"item": {"payLink": "https://checkout.ozon.ru/order/test"}}},
+                      {"paymentDetails": {"paymentId": "p", "sbp": {"payload": "https://qr.nspk.ru/TEST"}}}):
+            self.mock.return_value = value
+            async with self.new_client() as other:
+                headers = await self.enter(other)
+                r = await other.post(module.PREFIX + "/create", headers=headers)
+                self.assertEqual(r.status_code, 502)
 
-    async def test_sbp_wins_over_checkout_and_amount_is_encoded(self):
+    async def test_phone_link_is_checkout_and_desktop_gets_qr(self):
         headers = await self.enter()
         r = await self.client.post(module.PREFIX + "/create", headers=headers)
-        self.assertTrue(r.json()["url"].startswith("https://qr.nspk.ru/"))
-        self.assertEqual(module.safe_link({"paymentDetails": {"sbp": {"payload": "https://qr.nspk.ru/OPAQUE"}}}), "https://qr.nspk.ru/OPAQUE")
+        d = r.json()
+        self.assertEqual(d["url"], "https://checkout.ozon.ru/pay/test")
+        self.assertTrue(d["qr"].startswith('<svg xmlns="http://www.w3.org/2000/svg"'))
+        self.assertIn('aria-label="QR-код для оплаты"', d["qr"])
+        self.assertNotIn("qr.nspk.ru", d["qr"])  # the code is drawn, the link itself is not in the page
+        row = self.row()
+        self.assertEqual((row["with_order"], row["qr_payload"], row["pay_link"]),
+                         (1, "https://qr.nspk.ru/TEST?type=02&sum=1000000&cur=RUB", "https://checkout.ozon.ru/pay/test"))
+        # reopening the page reuses the same bill and answer
+        r2 = await self.client.post(module.PREFIX + "/create", headers=headers)
+        self.assertEqual(r2.json(), d)
+        self.mock.assert_awaited_once()
+
+    async def test_qr_and_checkout_links_are_validated(self):
+        self.assertEqual(module.safe_payload({"paymentDetails": {"sbp": {"payload": "https://qr.nspk.ru/OPAQUE"}}}), "https://qr.nspk.ru/OPAQUE")
         for url in ("https://qr.nspk.ru/T?type=02&sum=100&cur=RUB", "https://qr.nspk.ru.evil.invalid/T?type=02&sum=1000000&cur=RUB", "https://qr.nspk.ru/T?type=01&sum=1000000&cur=RUB"):
             with self.assertRaises(ValueError):
-                module.safe_link({"paymentDetails": {"sbp": {"payload": url}}})
+                module.safe_payload({"paymentDetails": {"sbp": {"payload": url}}})
+        self.assertEqual(module.safe_checkout({"order": {"payLink": "https://checkout.ozon.ru/order/x"}}), "https://checkout.ozon.ru/order/x")
+        for url in ("http://checkout.ozon.ru/order/x", "https://checkout.ozon.ru.evil.invalid/x", "https://user@checkout.ozon.ru/x", "https://checkout.ozon.ru/", "https://qr.nspk.ru/T"):
+            with self.assertRaises(ValueError):
+                module.safe_checkout({"order": {"item": {"payLink": url}}})
 
-    async def test_legacy_unpaid_checkout_session_gets_new_sbp_cookie(self):
-        headers = await self.issue()
-        old = self.client.cookies[module.COOKIE]
-        with module.db() as conn:
-            conn.execute("UPDATE payments SET pay_link='https://checkout.ozon.ru/order/old' WHERE session=?", (module.session_hash(old),))
-        self.client.cookies.clear()
-        self.client.cookies.set(module.LEGACY_COOKIE, old, domain="team.sunscrypt.ru", path=module.PREFIX)
-        await self.enter()
-        self.assertNotEqual(self.client.cookies[module.COOKIE], old)
+    async def test_legacy_unpaid_session_gets_new_cookie(self):
+        for name in module.LEGACY_COOKIES:
+            async with self.new_client() as c:
+                headers = await self.enter(c)
+                await c.post(module.PREFIX + "/create", headers=headers)
+                old = c.cookies[module.COOKIE]
+                with module.db() as conn:
+                    conn.execute("UPDATE payments SET pay_link='https://qr.nspk.ru/OLD',with_order=0 WHERE session=?", (module.session_hash(old),))
+                c.cookies.clear()
+                c.cookies.set(name, old, domain="team.sunscrypt.ru", path=module.PREFIX)
+                await self.enter(c)
+                self.assertNotEqual(c.cookies[module.COOKIE], old)
 
     async def test_legacy_paid_session_stays_paid(self):
-        await self.issue()
-        old = self.client.cookies[module.COOKIE]
-        await self.client.post(module.PREFIX + "/notify", json=self.signed(self.row()))
-        self.client.cookies.clear()
-        self.client.cookies.set(module.LEGACY_COOKIE, old, domain="team.sunscrypt.ru", path=module.PREFIX)
-        r = await self.client.get(module.PREFIX + "/deposit-10000")
-        self.assertIn("Предоплата получена", r.text)
-        self.assertEqual(self.client.cookies[module.COOKIE], old)
+        for name in module.LEGACY_COOKIES:
+            async with self.new_client() as c:
+                headers = await self.enter(c)
+                await c.post(module.PREFIX + "/create", headers=headers)
+                old = c.cookies[module.COOKIE]
+                await c.post(module.PREFIX + "/notify", json=self.signed(module.payment(old)))
+                c.cookies.clear()
+                c.cookies.set(name, old, domain="team.sunscrypt.ru", path=module.PREFIX)
+                r = await c.get(module.PREFIX + "/deposit-10000")
+                self.assertIn("Предоплата получена", r.text)
+                self.assertEqual(c.cookies[module.COOKIE], old)
+
+    async def test_pending_sbp_only_bill_is_not_handed_out(self):
+        headers = await self.issue()
+        with module.db() as conn:
+            conn.execute("UPDATE payments SET pay_link='https://qr.nspk.ru/OLD',with_order=0,qr_payload=NULL")
+        r = await self.client.post(module.PREFIX + "/create", headers=headers)
+        self.assertEqual(r.status_code, 409)
+        self.mock.assert_awaited_once()
 
     async def test_unsigned_and_wrong_amount_notifications_do_not_mark_paid(self):
         await self.issue()
@@ -194,6 +230,7 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         headers = await self.enter()
         r = await self.client.post(module.PREFIX + "/create", headers={"Origin": module.ORIGIN}, data={"csrf": headers["X-Academy-CSRF"]})
         self.assertEqual(r.status_code, 303)
+        self.assertEqual(r.headers["Location"], "https://checkout.ozon.ru/pay/test")
         self.assertEqual(r.headers["Cache-Control"], "no-store")
         self.assertIn("frame-ancestors 'none'", r.headers["Content-Security-Policy"])
 
@@ -207,6 +244,72 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         r = await self.client.post(module.PREFIX + "/create", headers=headers)
         self.assertEqual(r.status_code, 429)
         self.mock.assert_not_awaited()
+
+
+    # --- 26.11.2026: confirmation by getOrderStatus, desktop QR, phone to Ozon page --------
+
+    def order(self, **over):
+        d = {"id": "ozon-order", "extId": self.row()["order_ext_id"], "status": "STATUS_PAID", "isTestMode": False,
+             "originalAmount": {"currencyCode": "643", "value": "1000000"}}
+        d.update(over)
+        return d
+
+    async def test_status_asks_ozon_order_and_marks_paid(self):
+        await self.issue()
+        status = AsyncMock(return_value=self.order())
+        with patch.object(module, "order_status_ozon", status):
+            self.assertTrue((await self.client.get(module.PREFIX + "/status")).json()["paid"])
+            self.assertTrue((await self.client.get(module.PREFIX + "/status")).json()["paid"])
+        status.assert_awaited_once_with(self.row()["order_ext_id"])
+        self.assertEqual(self.row()["status"], "paid")
+        r = await self.client.get(module.PREFIX + "/deposit-10000")
+        self.assertIn("Предоплата получена", r.text)
+
+    async def test_status_not_paid_for_foreign_test_or_wrong_amount(self):
+        await self.issue()
+        for over in ({"status": "STATUS_PAYMENT_PENDING"}, {"extId": "DEFI4-10000_foreign"}, {"isTestMode": True},
+                     {"originalAmount": {"currencyCode": "643", "value": "100"}},
+                     {"originalAmount": {"currencyCode": "840", "value": "1000000"}}, {"id": ""}):
+            with module.db() as conn:
+                conn.execute("UPDATE payments SET checked_at=NULL")
+            with patch.object(module, "order_status_ozon", AsyncMock(return_value=self.order(**over))):
+                self.assertFalse((await self.client.get(module.PREFIX + "/status")).json()["paid"], over)
+        self.assertEqual(self.row()["status"], "pending")
+
+    async def test_status_asks_bank_at_most_every_ten_seconds_and_survives_errors(self):
+        await self.issue()
+        status = AsyncMock(side_effect=httpx.ConnectError("down"))
+        with patch.object(module, "order_status_ozon", status):
+            for _ in range(5):
+                r = await self.client.get(module.PREFIX + "/status")
+                self.assertEqual((r.status_code, r.json()["paid"]), (200, False))
+        status.assert_awaited_once()
+
+    async def test_page_and_script_have_no_sbp_word_and_split_desktop_phone(self):
+        r = await self.client.get(module.PREFIX + "/deposit-10000")
+        self.assertNotIn("СБП", r.text)
+        self.assertIn('<section id="qr" hidden', r.text)
+        self.assertIn("Наведите камеру телефона на QR-код или отсканируйте его в приложении банка.", r.text)
+        js = (await self.client.get(module.PREFIX + "/payment.js")).text
+        self.assertIn("matchMedia('(hover:hover) and (pointer:fine)')", js)
+        self.assertIn("if(desktop&&d.qr){showQr(d.qr);return;}", js)
+        self.assertIn("window.location.replace(d.url)", js)
+        self.assertIn("visibilitychange", js)
+
+    def test_embedded_qr_generator_matches_pay_qr(self):
+        import sys
+        parents = Path(__file__).resolve().parents
+        root = parents[2] if len(parents) > 2 else parents[-1]
+        if not (root / "pay_qr.py").exists():
+            self.skipTest("pay_qr.py рядом нет (проверка в образе без репозитория)")
+        sys.path.insert(0, str(root))
+        try:
+            import pay_qr
+        finally:
+            sys.path.remove(str(root))
+        for data in ("https://qr.nspk.ru/AD10107AGA7BIIL69PAA6FVRC08GR4LE", "https://qr.nspk.ru/" + "A1" * 120, ""):
+            self.assertEqual(module.qr_matrix(data), pay_qr.matrix(data))
+            self.assertEqual(module.qr_svg(data, "t"), pay_qr.svg(data, "t"))
 
 
 if __name__ == "__main__":
