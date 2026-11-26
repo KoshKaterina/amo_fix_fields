@@ -880,12 +880,15 @@ def test_queue_event_refuses_the_ur_wave_outside_the_window_pipelines_but_keeps_
     async def go():
         led_with_initiative(env, monkeypatch)
         env.lead(pipeline=PIPE_DB)
-        await take(env)
+        await owned_and_wrote(env, 14)                                               # окна включены (стенд по умолчанию их выключает), часы до первого окна
+        assert settings.ur_config()["enabled"] is True
         owner = store.get_owner(DEAL)
         await E._queue_event(owner, "ur_wave")
         assert not store.get_session(CHAT_KEY).get("pending_event")
         await E._queue_event(owner, "silent_alt")                                    # лестница тишины в «Работе с базой» как была
         assert json.loads(store.get_session(CHAT_KEY)["pending_event"])["type"] == "silent_alt"
+        await E._queue_event(dict(owner, pipeline_id=PIPE_RETAIL), "ur_wave")        # та же сделка в воронке окна: событие ставится
+        assert json.loads(store.get_session(CHAT_KEY)["pending_event"])["type"] == "ur_wave"
     run(go())
 
 
